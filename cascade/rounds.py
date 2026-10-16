@@ -56,6 +56,7 @@ class Ledger:
     status: str = STATUS_RUNNING
     hold_choices: dict[str, str] = field(default_factory=dict)
     opinions: dict[str, str] = field(default_factory=dict)
+    docs: list[str] = field(default_factory=list)
 
     def current_round(self) -> RoundRecord | None:
         return self.rounds[-1] if self.rounds else None

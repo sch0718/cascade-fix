@@ -76,7 +76,6 @@ class ConfigTest(unittest.TestCase):
     def test_exit_codes(self):
         self.assertEqual((config.ExitCodes.NO_VERIFY_CONFIG, config.ExitCodes.PARSE_ERROR, config.ExitCodes.NEEDS_USER), (4, 5, 6))
 
-    @unittest.skip("Task 11")
     def test_missing_verify_config_exits_4(self):
         result_file = self.tmp / "result.json"
         result_file.write_text("{}", encoding="utf-8")
