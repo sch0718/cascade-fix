@@ -36,6 +36,9 @@ class RoundRecord:
     final: bool = False
     started_at: str = ""
     events: list[dict] = field(default_factory=list)
+    base_commit: str = ""
+    result_commit: str = ""
+    hold_findings: list[dict] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict) -> "RoundRecord":
@@ -56,7 +59,7 @@ class Ledger:
     status: str = STATUS_RUNNING
     hold_choices: dict[str, str] = field(default_factory=dict)
     opinions: dict[str, str] = field(default_factory=dict)
-    docs: list[str] = field(default_factory=list)
+    docs: dict[str, str] = field(default_factory=dict)
 
     def current_round(self) -> RoundRecord | None:
         return self.rounds[-1] if self.rounds else None

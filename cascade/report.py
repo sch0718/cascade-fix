@@ -62,7 +62,7 @@ def _bucket_of(decision: dict) -> str | None:
 
 
 def _finding_of(rnd, finding_id: str) -> dict:
-    for f in rnd.findings:
+    for f in [*rnd.findings, *rnd.hold_findings]:
         if f.get("id") == finding_id:
             return f
     return {"id": finding_id, "severity": "-", "location": "-", "body": "", "thread_id": None}

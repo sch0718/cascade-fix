@@ -40,7 +40,7 @@ from cascade.rounds import (
     classify_recheck,
     parse_recheck,
 )
-from cascade.snapshot import RUN_DIR_NAME, add_worktree, cleanup, create_snapshot, ensure_excluded
+from cascade.snapshot import RUN_DIR_NAME, add_worktree, cleanup, create_snapshot, ensure_excluded, snapshot_tree
 from cascade.verify import repro_cmds, run_repro, run_verifiers
 
 SOURCES = ("codex-doc", "codex-code", "pr-comment")
@@ -72,8 +72,8 @@ def _new_run_id(root: Path) -> str:
     return run_id
 
 
-def _split_docs(root: Path, docs: list[str]) -> tuple[list[str], list[Path]]:
-    names: list[str] = []
+def _split_docs(root: Path, docs: list[str]) -> tuple[dict[str, str], list[Path]]:
+    names: dict[str, str] = {}
     external: list[Path] = []
     for raw in docs:
         path = Path(raw).resolve()
@@ -83,10 +83,10 @@ def _split_docs(root: Path, docs: list[str]) -> tuple[list[str], list[Path]]:
             rel = path.relative_to(root).as_posix()
             ignored = subprocess.run(["git", "check-ignore", "-q", rel], cwd=root).returncode == 0
             if not ignored:
-                names.append(rel)
+                names[rel] = str(path)
                 continue
         external.append(path)
-        names.append(f"외부/{path.name}")
+        names[f"{s.EXTERNAL_PREFIX}{path.name}"] = str(path)
     return names, external
 
 
@@ -140,7 +140,8 @@ def cmd_init(args) -> int:
         dry_run=args.dry_run,
         max_rechecks=args.max_rechecks,
         rounds=[RoundRecord(no=1, findings=[f.to_dict() for f in findings], decisions=[], adopted=[],
-                            recheck_opened=False, started_at=stamp, events=[{"step": "init", "at": stamp}])],
+                            recheck_opened=False, started_at=stamp, events=[{"step": "init", "at": stamp}],
+                            base_commit=snap.commit)],
         docs=docs,
     )
     write_findings(s.round_dir(snap.run_dir, 1) / "findings.json", findings)
@@ -162,8 +163,9 @@ def cmd_jobs(args) -> int:
     s.guard(rnd, "jobs", args.force)
     cfg = s.cfg_for(ledger.source, Path(ledger.root))
     snap = s.snapshot_of(ledger)
-    if "base" not in snap.worktrees:
-        add_worktree(snap, "base")
+    base = s.base_of(ledger, rnd)
+    if s.base_name(rnd) not in snap.worktrees:
+        add_worktree(snap, s.base_name(rnd), base)
     roles = ("a", "b", "writer") if ledger.mode == "doc" else ("a", "b")
     findings = s.findings_of(rnd)
     wts: dict[str, dict[str, Path]] = {}
@@ -171,7 +173,7 @@ def cmd_jobs(args) -> int:
         wts[f.id] = {}
         for role in roles:
             name = s.wt_name(f.id, role)
-            wts[f.id][role] = snap.worktrees[name] if name in snap.worktrees else add_worktree(snap, name)
+            wts[f.id][role] = snap.worktrees[name] if name in snap.worktrees else add_worktree(snap, name, base)
     rd = s.round_dir(run_dir, rnd.no)
     out = rd / "stage1-args.json"
     s.write_json(out, build_stage1_jobs(findings, cfg, wts, ledger.mode))
@@ -183,28 +185,29 @@ def cmd_jobs(args) -> int:
     return 0
 
 
-def _judge_code(ledger, f, results, snap, cfg):
+def _judge_code(ledger, rnd, f, results, snap, cfg):
     wt_a, wt_b = s.worktree(snap, f.id, "a"), s.worktree(snap, f.id, "b")
     a, b = s.pick(results, f.id, "a"), s.pick(results, f.id, "b")
-    pa, pb = extract(wt_a, snap.commit, cfg), extract(wt_b, snap.commit, cfg)
+    base = s.base_of(ledger, rnd)
+    pa, pb = extract(wt_a, base, cfg), extract(wt_b, base, cfg)
     a.patch, b.patch = pa, pb
     va = run_verifiers(wt_a, cfg, changed_files(pa), "worker")
     vb = run_verifiers(wt_b, cfg, changed_files(pb), "worker")
     if ledger.source == s.SOURCE_PR:
         cmds = repro_cmds(f)
-        base = snap.worktrees["base"]
-        va += run_repro(base, wt_a, cmds)
-        vb += run_repro(base, wt_b, cmds)
+        base_wt = snap.worktrees[s.base_name(rnd)]
+        va += run_repro(base_wt, wt_a, cmds)
+        vb += run_repro(base_wt, wt_b, cmds)
     sensitive = s.is_sensitive(changed_files(pa) + changed_files(pb), cfg)
-    d = decide(a, b, va, vb, pa, pb, sensitive)
+    d = s.without_empty_patch(decide(a, b, va, vb, pa, pb, sensitive), {"a": pa, "b": pb}, adjudicated=False)
     workers = {"a": a, "b": b}
     return d, workers, {"a": [r.to_dict() for r in va], "b": [r.to_dict() for r in vb]}
 
 
-def _judge_doc_inputs(ledger, f, results, snap, cfg):
+def _judge_doc_inputs(ledger, rnd, f, results, snap, cfg):
     wt = s.worktree(snap, f.id, "writer")
     a, b, writer = (s.pick(results, f.id, r) for r in ("a", "b", "writer"))
-    writer.patch = extract(wt, snap.commit, cfg)
+    writer.patch = extract(wt, s.base_of(ledger, rnd), cfg)
     missing, snippets = s.doc_checks(wt, writer.patch, ledger, cfg)
     return {"a": a, "b": b, "writer": writer}, s.doc_problems(missing, snippets), [r.to_dict() for r in snippets]
 
@@ -232,7 +235,7 @@ def cmd_judge(args) -> int:
     doc_problems: dict[str, list[str]] = {}
     for f in findings:
         if ledger.mode == "doc":
-            workers, problems, snippets = _judge_doc_inputs(ledger, f, results, snap, cfg)
+            workers, problems, snippets = _judge_doc_inputs(ledger, rnd, f, results, snap, cfg)
             verify[f.id] = {"writer": snippets}
             doc_problems[f.id] = problems
             writer_patches[f.id] = workers["writer"].patch
@@ -241,7 +244,7 @@ def cmd_judge(args) -> int:
                 if checker_results is not None and f"{f.id}:checker" in checker_results:
                     workers["checker"] = checker_results[f"{f.id}:checker"]
         else:
-            d, workers, verify[f.id] = _judge_code(ledger, f, results, snap, cfg)
+            d, workers, verify[f.id] = _judge_code(ledger, rnd, f, results, snap, cfg)
             decisions.append(d)
         for role, w in workers.items():
             merged[f"{f.id}:{role}"] = w.to_dict()
@@ -262,14 +265,15 @@ def cmd_judge(args) -> int:
         for f in findings:
             a, b = s.worker_from(merged, f.id, "a"), s.worker_from(merged, f.id, "b")
             checker = s.worker_from(merged, f.id, "checker") if f"{f.id}:checker" in merged else None
-            decisions.append(decide_doc(a, b, checker, doc_problems[f.id]))
+            d = decide_doc(a, b, checker, doc_problems[f.id])
+            decisions.append(s.without_empty_patch(d, {"writer": writer_patches[f.id]}, adjudicated=False))
 
     by_id = {f.id: f for f in findings}
     adj_items = []
     for d in decisions:
         if d.outcome == OUTCOME_ADJUDICATE:
             name = s.wt_name(d.finding_id, "adjudicator")
-            wt = snap.worktrees[name] if name in snap.worktrees else add_worktree(snap, name)
+            wt = snap.worktrees[name] if name in snap.worktrees else add_worktree(snap, name, s.base_of(ledger, rnd))
             adj_items.append(s.adj_input(ledger, by_id[d.finding_id], merged, verify, wt, cfg, d.reasons))
     if adj_items:
         s.write_json(rd / "adj-args.json", build_adjudicator_jobs(adj_items))
@@ -283,13 +287,13 @@ def cmd_judge(args) -> int:
     return 0
 
 
-def _adjudicate_verify(ledger, f, wt, patch, snap, cfg):
+def _adjudicate_verify(ledger, rnd, f, wt, patch, snap, cfg):
     if ledger.mode == "doc":
         missing, snippets = s.doc_checks(wt, patch, ledger, cfg)
         return s.doc_verify(missing, snippets)
     results = run_verifiers(wt, cfg, changed_files(patch), "worker")
     if ledger.source == s.SOURCE_PR and patch.strip():
-        results += run_repro(snap.worktrees["base"], wt, repro_cmds(f))
+        results += run_repro(snap.worktrees[s.base_name(rnd)], wt, repro_cmds(f))
     return results
 
 
@@ -318,11 +322,12 @@ def cmd_adjudicate(args) -> int:
         f = by_id[d.finding_id]
         wt = s.worktree(snap, f.id, "adjudicator")
         adj = s.pick(results, f.id, "adjudicator")
-        adj.patch = extract(wt, snap.commit, cfg)
-        vadj = _adjudicate_verify(ledger, f, wt, adj.patch, snap, cfg)
+        adj.patch = extract(wt, s.base_of(ledger, rnd), cfg)
+        vadj = _adjudicate_verify(ledger, rnd, f, wt, adj.patch, snap, cfg)
         if ledger.mode == "code" and s.is_sensitive(changed_files(adj.patch), cfg) and REASON_SENSITIVE not in d.reasons:
             d.reasons.append(REASON_SENSITIVE)
-        new = after_adjudication(d, adj, vadj)
+        patches = {role: s.worker_from(merged, f.id, role).patch for role in ("a", "b", "writer")}
+        new = s.without_empty_patch(after_adjudication(d, adj, vadj), {**patches, "adjudicator": adj.patch}, adjudicated=True)
         if adj.patch.strip():
             s.patch_path(rd, f.id, "adjudicator").write_text(adj.patch, encoding="utf-8")
         merged[f"{f.id}:adjudicator"] = adj.to_dict()
@@ -360,7 +365,10 @@ def cmd_opinion(args) -> int:
     return 0
 
 
-def _final_suite(root: Path, cfg, changed: list[str]) -> tuple[bool | None, str]:
+def _final_suite(root: Path, cfg, mode: str, changed: list[str]) -> tuple[bool | None, str]:
+    cfg, warning = s.final_suite_cfg(cfg, mode, root, changed)
+    if warning:
+        print(warning)
     if cfg is None or not cfg.full_tests:
         return None, ""
     results = run_verifiers(root, cfg, changed, "final")
@@ -390,12 +398,12 @@ def cmd_apply(args) -> int:
         data = {"dry_run": True, "applied": [], "failed": [], "would_apply": rnd.adopted}
         print(f"dry-run: 적용하지 않음 (채택 {len(patches)}건)")
     else:
-        report = apply_all(root, patches)
+        report = apply_all(root, patches, s.external_docs(ledger))
         for fid, tail in report.failed:
             _set_decision(rnd, fid, OUTCOME_UNDECIDABLE, f"{REASON_APPLY_FAILED}: {s.first_line(tail)}")
         texts = dict(patches)
         changed = list(dict.fromkeys(p for fid in report.applied for p in changed_files(texts[fid])))
-        final_ok, final_tail = _final_suite(root, cfg, changed) if report.applied else (None, "")
+        final_ok, final_tail = _final_suite(root, cfg, ledger.mode, changed) if report.applied else (None, "")
         data = {**report.to_dict(), "final_ok": final_ok, "final_tail": final_tail}
         rnd.adopted = list(report.applied)
         if final_ok is False:
@@ -405,12 +413,16 @@ def cmd_apply(args) -> int:
             rnd.adopted = []
             print("전체 테스트가 깨졌다(간섭 의심). 적용한 패치는 작업 트리에 그대로 두었다 — 되돌릴지는 사람이 정한다")
         print(f"적용 {len(report.applied)}건, 실패 {len(report.failed)}건")
+        rnd.result_commit = snapshot_tree(s.snapshot_of(ledger), list(s.external_docs(ledger).values()))
     s.write_json(rd / "apply.json", data)
     s.write_json(rd / "decisions.json", rnd.decisions)
     if s.recheck_needed(ledger, rnd):
         texts = dict(patches)
         adopted = [f for f in s.findings_of(rnd) if f.id in rnd.adopted]
-        diff = "".join(texts[f.id] for f in adopted)
+        if rnd.result_commit:
+            diff = s.range_diff(root, s.base_of(ledger, rnd), rnd.result_commit)
+        else:
+            diff = "".join(texts[f.id] for f in adopted)
         (rd / "recheck-prompt.md").write_text(build_recheck_prompt(adopted, diff, ledger.mode), encoding="utf-8")
         rnd.recheck_opened = True
         print(f"재검토 필요: {rd / 'recheck-prompt.md'}")
@@ -457,11 +469,11 @@ def cmd_recheck(args) -> int:
     max_reached = s.rechecks_done(ledger) >= ledger.max_rechecks
     next_round, hold, undecidable = classify_recheck(combined, rnd, max_reached, final=rnd.final)
     for f in hold:
-        rnd.findings.append(f.to_dict())
+        rnd.hold_findings.append(f.to_dict())
         rnd.decisions.append(Decision(f.id, OUTCOME_HOLD, None, [_hold_reason(f, rnd, max_reached)]).to_dict())
     for f in undecidable:
         reason = "「지금 반영」 뒤 재검토의 Critical" if rnd.final else "같은 위치 Critical 두 회차 연속"
-        rnd.findings.append(f.to_dict())
+        rnd.hold_findings.append(f.to_dict())
         rnd.decisions.append(Decision(f.id, OUTCOME_UNDECIDABLE, None, [reason]).to_dict())
     s.write_json(rd / "decisions.json", rnd.decisions)
     s.mark(rnd, "recheck")
@@ -471,7 +483,8 @@ def cmd_recheck(args) -> int:
         no = rnd.no + 1
         write_findings(s.round_dir(run_dir, no) / "findings.json", next_round)
         ledger.rounds.append(RoundRecord(no=no, findings=[f.to_dict() for f in next_round], decisions=[],
-                                         adopted=[], recheck_opened=False, started_at=s.now()))
+                                         adopted=[], recheck_opened=False, started_at=s.now(),
+                                         base_commit=rnd.result_commit or s.base_of(ledger, rnd)))
     else:
         ledger.status = STATUS_DONE
     print(f"status={ledger.status}")
@@ -502,9 +515,10 @@ def cmd_resume(args) -> int:
     chosen = [fid for fid, c in choices.items() if c == CHOICE_NOW]
     if chosen:
         no = max(r.no for r in ledger.rounds) + 1
-        findings = [next(f for f in holds[fid].findings if f["id"] == fid) for fid in chosen]
+        findings = [next(f for f in [*holds[fid].findings, *holds[fid].hold_findings] if f["id"] == fid) for fid in chosen]
+        last = ledger.rounds[-1]
         rnd = RoundRecord(no=no, findings=findings, decisions=[], adopted=[], recheck_opened=False,
-                          final=True, started_at=s.now())
+                          final=True, started_at=s.now(), base_commit=last.result_commit or last.base_commit)
         ledger.rounds.append(rnd)
         s.write_json(s.round_dir(run_dir, no) / "findings.json", findings)
         ledger.status = STATUS_RUNNING
@@ -534,11 +548,9 @@ def _interference_note(ledger: Ledger, run_dir: Path) -> str:
 def cmd_report(args) -> int:
     run_dir = Path(args.run_dir)
     ledger = s.load_ledger(run_dir)
-    s.mark(ledger.current_round(), "report")
     text = render(ledger, ledger.dry_run, run_dir) + _interference_note(ledger, run_dir)
     write_prepared(run_dir, ledger)
     (run_dir / "report.md").write_text(text, encoding="utf-8")
-    s.save_ledger(run_dir, ledger)
     print(text)
     print(f"보고서: {run_dir / 'report.md'} · 준비됨: {run_dir / 'prepared'}")
     return 0

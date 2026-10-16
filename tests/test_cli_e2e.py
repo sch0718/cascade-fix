@@ -8,6 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from cascade import cli_steps  # noqa: E402
 from cascade.rounds import Ledger, RoundRecord  # noqa: E402
 from cascade.snapshot import commit_worktree  # noqa: E402
 from helpers import git, make_repo, run_cli, write_repos_toml  # noqa: E402
@@ -59,6 +60,16 @@ Suggestion
 def fix(text, old, new):
     assert old in text, old
     return text.replace(old, new)
+
+
+def worker_output(verdict, model, reason="근거"):
+    return {"verdict": verdict, "needs_design_decision": False, "reason": reason, "verify": [], "model_id": model}
+
+
+def results_json(path, items):
+    path.write_text(json.dumps({"results": [{"id": i, "output": o} for i, o in items]}, ensure_ascii=False),
+                    encoding="utf-8")
+    return path
 
 
 class CliTestBase(unittest.TestCase):
@@ -176,11 +187,16 @@ class CliEndToEndTest(CliTestBase):
         self.assertEqual(len(ledger.rounds), 1)
         hold = [d for d in ledger.rounds[0].decisions if d["outcome"] == "보류후보"]
         self.assertEqual(len(hold), 1)
-        held = next(f for f in ledger.rounds[0].findings if f["id"] == hold[0]["finding_id"])
+        self.assertEqual(len(ledger.rounds[0].findings), 2)
+        held = next(f for f in ledger.rounds[0].hold_findings if f["id"] == hold[0]["finding_id"])
         self.assertEqual(held["severity"], "Suggestion")
 
+        events = len(ledger.rounds[0].events)
         p = self.cli("report", "--run-dir", str(self.run_dir))
         self.assertIn("ident에 타입 힌트가 없다", p.stdout)
+        self.assertIn("| 1 | 2 | 1 | 1 | 0 | 1 |", p.stdout)
+        self.assertIn("Suggestion, calc.py:5", p.stdout)
+        self.assertEqual(len(self.ledger().rounds[0].events), events)
         p = self.cli("status", "--run-dir", str(self.run_dir))
         self.assertIn("cleanup", p.stdout)
 
@@ -245,6 +261,80 @@ class CliEndToEndTest(CliTestBase):
         self.assertEqual((self.run_dir / "prepared" / "commit-message.txt").read_text(encoding="utf-8"), "")
 
 
+    def test_second_round_starts_from_applied_fixes(self):
+        self.run_to_apply()
+        result = self.tmp / "recheck.final"
+        result.write_text(
+            "## 해소 여부\n- r1-01: 해소됨 — 됐다\n- r1-02: 해소됨 — 됐다\n\n"
+            "Critical\n1. mul이 정수를 돌려주지 않는다\n   위치: calc.py:14\n   근거: 실수가 나온다\n   제안: int로 감싼다\n\n"
+            "Warning\n없음.\n\nSuggestion\n없음.\n",
+            encoding="utf-8",
+        )
+        self.cli("recheck", "--run-dir", str(self.run_dir), "--round", "1", "--result", str(result))
+        ledger = self.ledger()
+        self.assertEqual((len(ledger.rounds), ledger.status), (2, "진행"))
+        self.assertTrue(ledger.rounds[0].result_commit)
+        self.assertEqual(ledger.rounds[1].base_commit, ledger.rounds[0].result_commit)
+
+        self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "2")
+        for name in ("r2-01-a", "r2-01-b"):
+            wt = self.wt(name)
+            text = (wt / "calc.py").read_text(encoding="utf-8")
+            self.assertIn("return a + b\n\n\ndef ident", text)
+            (wt / "calc.py").write_text(fix(text, "return a * b", "return int(a * b)"), encoding="utf-8")
+            commit_worktree(wt, name)
+        stage1 = results_json(self.run_dir / "round-2" / "stage1.json", [
+            ("r2-01:a", worker_output("사실", "claude-sonnet-5-5")),
+            ("r2-01:b", worker_output("사실", "claude-haiku-5-5")),
+        ])
+        self.cli("judge", "--run-dir", str(self.run_dir), "--round", "2", "--results", str(stage1))
+        self.assertEqual([d["outcome"] for d in self.ledger().rounds[1].decisions], ["합의-사실"])
+        self.cli("apply", "--run-dir", str(self.run_dir), "--round", "2")
+        apply = json.loads((self.run_dir / "round-2" / "apply.json").read_text(encoding="utf-8"))
+        self.assertEqual((apply["applied"], apply["failed"]), (["r2-01"], []))
+        calc = (self.repo / "calc.py").read_text(encoding="utf-8")
+        self.assertIn("return int(a * b)", calc)
+        self.assertIn("return a + b\n\n\ndef ident", calc)
+        prompt = (self.run_dir / "round-2" / "recheck-prompt.md").read_text(encoding="utf-8")
+        self.assertIn("+    return int(a * b)", prompt)
+        self.assertNotIn("return a - b", prompt)
+
+    def test_both_fact_without_patch_goes_to_opus_then_undecidable(self):
+        self.init()
+        self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1")
+        stage1 = results_json(self.run_dir / "round-1" / "stage1.json", [
+            ("r1-01:a", worker_output("사실", "claude-sonnet-5-5")),
+            ("r1-01:b", worker_output("사실", "claude-haiku-5-5")),
+            ("r1-02:a", worker_output("아님", "claude-sonnet-5-5")),
+            ("r1-02:b", worker_output("아님", "")),
+        ])
+        p = self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1))
+        self.assertIn("r1-02:b 모델 ID가 비어 있다", p.stdout)
+        d = {x["finding_id"]: x for x in self.ledger().rounds[0].decisions}
+        self.assertEqual((d["r1-01"]["outcome"], d["r1-01"]["patch_from"]), ("판가름", None))
+        self.assertIn("패치 없음", d["r1-01"]["reasons"])
+        adj_args = json.loads((self.run_dir / "round-1" / "adj-args.json").read_text(encoding="utf-8"))
+        self.assertEqual([j["id"] for j in adj_args["jobs"]], ["r1-01:adjudicator"])
+        adj = results_json(self.run_dir / "round-1" / "adj.json", [
+            ("r1-01:adjudicator", worker_output("사실", "claude-opus-5-5")),
+        ])
+        self.cli("adjudicate", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(adj))
+        d = {x["finding_id"]: x for x in self.ledger().rounds[0].decisions}
+        self.assertEqual(d["r1-01"]["outcome"], "판단불가")
+        self.assertEqual(d["r1-01"]["reasons"][-1], "패치 없음")
+        self.cli("apply", "--run-dir", str(self.run_dir), "--round", "1")
+        self.assertEqual(self.ledger().rounds[0].adopted, [])
+        self.assertEqual(self.ledger().status, "종료")
+
+    def test_missing_full_tests_falls_back_to_tests_with_warning(self):
+        toml = write_repos_toml(self.tmp, {str(self.repo): {"tests": ["python3 -m unittest {files}"]}})
+        self.env["CASCADE_REPOS_TOML"] = str(toml)
+        p = self.run_to_apply()
+        self.assertIn("full_tests가 없어", p.stdout)
+        apply = json.loads((self.run_dir / "round-1" / "apply.json").read_text(encoding="utf-8"))
+        self.assertIs(apply["final_ok"], True)
+
+
     def run_to_apply_with_conflict(self):
         self.init()
         self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1")
@@ -268,6 +358,8 @@ class CliEndToEndTest(CliTestBase):
 
 
 class CliDocModeTest(CliTestBase):
+    PLAN = "# 계획\n\n1단계는 `calc.py`를 고친다.\n"
+
     def test_doc_mode_runs_checker_loop_and_applies_writer_patch(self):
         plan = "# 계획\n\n1단계는 `calc.py`를 고친다.\n"
         (self.repo / "plan.md").write_text(plan, encoding="utf-8")
@@ -275,7 +367,7 @@ class CliDocModeTest(CliTestBase):
         raw.write_text("Warning\n1. 단계가 모호하다\n   위치: plan.md:3\n   근거: 무엇을 고치는지 없다\n", encoding="utf-8")
         p = self.cli("init", "--source", "codex-doc", "--input", str(raw), "--doc", str(self.repo / "plan.md"))
         self.run_dir = Path(next(x for x in p.stdout.splitlines() if x.startswith("run_dir=")).split("=", 1)[1])
-        self.assertEqual(self.ledger().docs, ["plan.md"])
+        self.assertEqual(self.ledger().docs, {"plan.md": str(self.repo / "plan.md")})
         self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1")
         args = json.loads((self.run_dir / "round-1" / "stage1-args.json").read_text(encoding="utf-8"))
         self.assertEqual([j["id"] for j in args["jobs"]], ["r1-01:a", "r1-01:b", "r1-01:writer"])
@@ -307,6 +399,49 @@ class CliDocModeTest(CliTestBase):
         self.cli("apply", "--run-dir", str(self.run_dir), "--round", "1")
         self.assertIn("add가 더하게", (self.repo / "plan.md").read_text(encoding="utf-8"))
         self.assertTrue((self.run_dir / "round-1" / "recheck-prompt.md").is_file())
+
+
+    def _run_doc_to_apply(self, doc, location):
+        doc.write_text(self.PLAN, encoding="utf-8")
+        raw = self.tmp / "doc.final"
+        raw.write_text(f"Warning\n1. 단계가 모호하다\n   위치: {location}:3\n   근거: 무엇을 고치는지 없다\n", encoding="utf-8")
+        p = self.cli("init", "--source", "codex-doc", "--input", str(raw), "--doc", str(doc))
+        self.run_dir = Path(next(x for x in p.stdout.splitlines() if x.startswith("run_dir=")).split("=", 1)[1])
+        self.assertEqual(self.ledger().docs, {location: str(doc.resolve())})
+        self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1")
+        wt = self.wt("r1-01-writer")
+        target = wt / location
+        target.write_text(target.read_text(encoding="utf-8").replace("고친다", "고쳐 add가 더하게 한다"), encoding="utf-8")
+        commit_worktree(wt, "writer")
+        stage1 = results_json(self.run_dir / "round-1" / "stage1.json", [
+            ("r1-01:a", worker_output("사실", "claude-sonnet-5-5")),
+            ("r1-01:b", worker_output("사실", "claude-haiku-5-5")),
+            ("r1-01:writer", worker_output("사실", "claude-sonnet-5-5")),
+        ])
+        self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1))
+        checker = self.run_dir / "round-1" / "checker.json"
+        checker.write_text(json.dumps({"results": [{"id": "r1-01:checker", "output": {
+            "verdict": "사실", "needs_design_decision": False, "reason": "해소한다", "checker_ok": True,
+            "model_id": "claude-haiku-5-5"}}]}, ensure_ascii=False), encoding="utf-8")
+        self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1),
+                 "--checker-results", str(checker))
+        self.cli("apply", "--run-dir", str(self.run_dir), "--round", "1")
+        apply = json.loads((self.run_dir / "round-1" / "apply.json").read_text(encoding="utf-8"))
+        self.assertEqual((apply["applied"], apply["failed"]), (["r1-01"], []))
+        self.assertIn("add가 더하게", doc.read_text(encoding="utf-8"))
+        self.assertFalse((self.repo / "외부").exists())
+        prompt = (self.run_dir / "round-1" / "recheck-prompt.md").read_text(encoding="utf-8")
+        self.assertIn("add가 더하게", prompt)
+
+    def test_doc_outside_repo_is_fixed_in_place(self):
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        self._run_doc_to_apply(outside / "plan.md", "외부/plan.md")
+
+    def test_gitignored_doc_in_repo_is_fixed_in_place(self):
+        (self.repo / ".gitignore").write_text("__pycache__/\nnotes/\n", encoding="utf-8")
+        (self.repo / "notes").mkdir()
+        self._run_doc_to_apply(self.repo / "notes" / "plan.md", "외부/plan.md")
 
 
 class CliPrCommentTest(CliTestBase):
@@ -365,7 +500,7 @@ class CliInitTest(CliTestBase):
         run_dir = Path(next(x for x in p.stdout.splitlines() if x.startswith("run_dir=")).split("=", 1)[1])
         ledger = Ledger.load(run_dir / "ledger.json")
         self.assertEqual(ledger.mode, "doc")
-        self.assertEqual(ledger.docs, ["외부/plan.md"])
+        self.assertEqual(ledger.docs, {"외부/plan.md": str(doc)})
         self.assertIn("외부/plan.md", git(self.repo, "-c", "core.quotepath=false", "ls-tree", "-r", "--name-only", ledger.snapshot["commit"]))
 
 
@@ -403,6 +538,26 @@ class CliResumeTest(unittest.TestCase):
             bad.write_text(json.dumps({"r9-01": "지금 반영"}, ensure_ascii=False), encoding="utf-8")
             p = run_cli(["resume", "--run-dir", str(run_dir), "--choices", str(bad)], cwd=td)
             self.assertNotEqual(p.returncode, 0)
+
+
+class CliStepsTest(unittest.TestCase):
+    def _ledger(self, severity):
+        done = [RoundRecord(no=n, findings=[], decisions=[], adopted=[], recheck_opened=True) for n in (1, 2)]
+        rnd = RoundRecord(no=3, findings=[{"id": "r3-01", "severity": severity}], decisions=[],
+                          adopted=["r3-01"], recheck_opened=False)
+        return Ledger(run_id="cf-x", source="codex-code", mode="code", root="/x", snapshot={}, dry_run=False,
+                      max_rechecks=2, rounds=[*done, rnd]), rnd
+
+    def test_adopted_critical_opens_recheck_past_limit(self):
+        ledger, rnd = self._ledger("Critical")
+        self.assertTrue(cli_steps.recheck_needed(ledger, rnd))
+
+    def test_adopted_warning_past_limit_does_not_recheck(self):
+        ledger, rnd = self._ledger("Warning")
+        self.assertFalse(cli_steps.recheck_needed(ledger, rnd))
+
+    def test_next_step_paths_are_shell_quoted(self):
+        self.assertIn("--run-dir '/a b/run'", cli_steps._cmd("report", Path("/a b/run")))
 
 
 if __name__ == "__main__":

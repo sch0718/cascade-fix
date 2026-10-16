@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import shlex
 import subprocess
 import tomllib
 from dataclasses import replace
@@ -12,24 +13,29 @@ from cascade.config import ExitCodes, RepoConfig, detect_candidates, load_repo_c
 from cascade.consensus import (
     OUTCOME_ADJUDICATE,
     OUTCOME_AGREED_FACT,
+    OUTCOME_UNDECIDABLE,
     VERDICT_FACT,
     VERDICT_UNDECIDED,
+    Decision,
     WorkerResult,
 )
 from cascade.findings import Finding
 from cascade.jobs import ROLES, AdjInput
-from cascade.patches import changed_files
+from cascade.patches import DIFF_FLAGS, changed_files
 from cascade.rounds import STATUS_DONE, Ledger, RoundRecord, ledger_path, needs_recheck
 from cascade.snapshot import Snapshot
-from cascade.verify import VerifyResult, check_doc_refs, check_snippets
+from cascade.verify import VerifyResult, check_doc_refs, check_snippets, related_tests
 
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 RUN_REVIEW = SKILL_ROOT.parent / "codex-review" / "scripts" / "run-review.sh"
-CLI = f"PYTHONPATH={SKILL_ROOT} python3 -m cascade.cli"
+CLI = f"PYTHONPATH={shlex.quote(str(SKILL_ROOT))} python3 -m cascade.cli"
 ROLE_SUFFIX = {"a": "a", "b": "b", "writer": "writer", "adjudicator": "adj"}
 DOC_SUFFIXES = (".md", ".markdown", ".txt", ".rst")
 SOURCE_DOC = "codex-doc"
 SOURCE_PR = "pr-comment"
+EXTERNAL_PREFIX = "외부/"
+REASON_NO_PATCH = "패치 없음"
+CALL_FAILED = "호출 실패"
 
 
 class CliError(Exception):
@@ -165,7 +171,7 @@ def findings_of(rnd: RoundRecord) -> list[Finding]:
 def failed_result(fid: str, role: str) -> WorkerResult:
     return WorkerResult(
         finding_id=fid, role=role, verdict=VERDICT_UNDECIDED, needs_design_decision=False,
-        reason="호출 실패", verify=[], checker_ok=None, model_id="",
+        reason=CALL_FAILED, verify=[], checker_ok=None, model_id="",
     )
 
 
@@ -182,7 +188,9 @@ def model_warnings(results: dict[str, WorkerResult]) -> list[str]:
     out = []
     for key, r in results.items():
         expected = ROLES.get(r.role, (None,))[0]
-        if r.model_id and expected and r.model_id != expected:
+        if not r.model_id and r.reason != CALL_FAILED:
+            out.append(f"경고: {key} 모델 ID가 비어 있다(기대값 {expected})")
+        elif r.model_id and expected and r.model_id != expected:
             out.append(f"경고: {key} 모델 ID가 {r.model_id} 이다(기대값 {expected})")
     return out
 
@@ -260,7 +268,47 @@ def recheck_needed(ledger: Ledger, rnd: RoundRecord) -> bool:
         return False
     if rnd.final:
         return needs_recheck(replace(rnd, final=False), 1, 0)
+    adopted = set(rnd.adopted)
+    if any(f.get("severity") == "Critical" for f in rnd.findings if f.get("id") in adopted):
+        return True
     return needs_recheck(rnd, ledger.max_rechecks, rechecks_done(ledger, exclude=rnd.no))
+
+
+def base_of(ledger: Ledger, rnd: RoundRecord) -> str:
+    return rnd.base_commit or ledger.snapshot.get("commit", "")
+
+
+def base_name(rnd: RoundRecord) -> str:
+    return "base" if rnd.no == 1 else f"base-r{rnd.no}"
+
+
+def external_docs(ledger: Ledger) -> dict[str, Path]:
+    return {k: Path(v) for k, v in ledger.docs.items() if k.startswith(EXTERNAL_PREFIX)}
+
+
+def range_diff(root: Path, old: str, new: str) -> str:
+    p = subprocess.run(["git", "-c", "core.quotepath=false", "diff", *DIFF_FLAGS, old, new],
+                       cwd=root, capture_output=True)
+    if p.returncode != 0:
+        raise CliError(f"git diff 실패: {p.stderr.decode('utf-8', errors='replace').strip()}")
+    return p.stdout.decode("utf-8", errors="replace")
+
+
+def without_empty_patch(d: Decision, patches: dict[str, str], adjudicated: bool) -> Decision:
+    if not is_adopted(d.to_dict()) or patches.get(d.patch_from, "").strip():
+        return d
+    if adjudicated or d.outcome != OUTCOME_AGREED_FACT:
+        return Decision(d.finding_id, OUTCOME_UNDECIDABLE, None, [*d.reasons, REASON_NO_PATCH])
+    return Decision(d.finding_id, OUTCOME_ADJUDICATE, None, [*d.reasons, REASON_NO_PATCH])
+
+
+def final_suite_cfg(cfg: RepoConfig | None, mode: str, root: Path, changed: list[str]) -> tuple[RepoConfig | None, str | None]:
+    if cfg is None or cfg.full_tests or mode == "doc" or not cfg.tests:
+        return cfg, None
+    files = " ".join(shlex.quote(f) for f in related_tests(root, changed))
+    fallback = replace(cfg, full_tests=[c.replace("{files}", files) for c in cfg.tests])
+    return fallback, "경고: full_tests가 없어 바뀐 파일 전체의 관련 테스트(tests 명령)로 대신 돌린다"
+
 
 
 def renumber(items: list[Finding], round_no: int, source: str) -> list[Finding]:
@@ -278,12 +326,16 @@ def parse_remote(url: str) -> tuple[str, str]:
     return m.group(1), m.group(2)
 
 
+def _q(value) -> str:
+    return shlex.quote(str(value))
+
+
 def run_review_cmd(mode: str, prompt: Path, root: str, out: Path) -> str:
-    return f"{RUN_REVIEW} --{mode} {prompt} --repo {root} --out {out}"
+    return f"{_q(RUN_REVIEW)} --{mode} {_q(prompt)} --repo {_q(root)} --out {_q(out)}"
 
 
 def _cmd(name: str, run_dir: Path, *rest: str) -> str:
-    return " ".join([CLI, name, "--run-dir", str(run_dir), *rest])
+    return " ".join([CLI, name, "--run-dir", _q(run_dir), *rest])
 
 
 def next_steps(ledger: Ledger, run_dir: Path) -> list[str]:
@@ -292,7 +344,7 @@ def next_steps(ledger: Ledger, run_dir: Path) -> list[str]:
         return ["회차가 없다"]
     if ledger.status == STATUS_DONE:
         steps = []
-        if not any(step_done(r, "report") for r in ledger.rounds):
+        if not (Path(run_dir) / "report.md").is_file():
             steps.append(_cmd("report", run_dir))
         elif not any(step_done(r, "cleanup") for r in ledger.rounds):
             steps.append(_cmd("cleanup", run_dir))
@@ -309,16 +361,16 @@ def next_steps(ledger: Ledger, run_dir: Path) -> list[str]:
         if step_done(rnd, "judge-checker") and (rd / "checker-args.json").is_file():
             return [
                 f"Workflow 실행: script=workflows/run-jobs.js 내용, args={rd / 'checker-args.json'} 내용 → 결과를 {rd / 'checker.json'} 에 저장",
-                _cmd("judge", run_dir, n, f"--results {rd / 'stage1.json'}", f"--checker-results {rd / 'checker.json'}"),
+                _cmd("judge", run_dir, n, f"--results {_q(rd / 'stage1.json')}", f"--checker-results {_q(rd / 'checker.json')}"),
             ]
         return [
             f"Workflow 실행: script=workflows/run-jobs.js 내용, args={rd / 'stage1-args.json'} 내용 → 결과를 {rd / 'stage1.json'} 에 저장",
-            _cmd("judge", run_dir, n, f"--results {rd / 'stage1.json'}"),
+            _cmd("judge", run_dir, n, f"--results {_q(rd / 'stage1.json')}"),
         ]
     if (rd / "adj-args.json").is_file() and not step_done(rnd, "adjudicate"):
         return [
             f"Workflow 실행: script=workflows/run-jobs.js 내용, args={rd / 'adj-args.json'} 내용 → 결과를 {rd / 'adj.json'} 에 저장",
-            _cmd("adjudicate", run_dir, n, f"--results {rd / 'adj.json'}"),
+            _cmd("adjudicate", run_dir, n, f"--results {_q(rd / 'adj.json')}"),
         ]
     for prompt in sorted(rd.glob("opinion-*.md")):
         fid = prompt.stem[len("opinion-"):]
@@ -326,7 +378,7 @@ def next_steps(ledger: Ledger, run_dir: Path) -> list[str]:
             out = rd / f"opinion-{fid}.out"
             return [
                 run_review_cmd("opinion", prompt, ledger.root, out),
-                _cmd("opinion", run_dir, n, f"--id {fid}", f"--result {out}.final"),
+                _cmd("opinion", run_dir, n, f"--id {fid}", f"--result {_q(str(out) + '.final')}"),
             ]
     if not step_done(rnd, "apply"):
         return [_cmd("apply", run_dir, n)]
@@ -334,6 +386,6 @@ def next_steps(ledger: Ledger, run_dir: Path) -> list[str]:
         out = rd / "recheck.out"
         return [
             run_review_cmd("recheck", rd / "recheck-prompt.md", ledger.root, out),
-            _cmd("recheck", run_dir, n, f"--result {out}.final"),
+            _cmd("recheck", run_dir, n, f"--result {_q(str(out) + '.final')}"),
         ]
     return [_cmd("report", run_dir)]
