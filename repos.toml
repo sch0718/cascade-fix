@@ -1,0 +1,16 @@
+# 저장소별 검증 명령 설정. 키는 [repos."<저장소 루트 절대 경로>"] 형식이다.
+# 명령에 쓸 수 있는 자리표시자: {files}(관련 테스트 파일 목록), {file}(검사할 단일 파일)
+#
+# [repos."/Users/me/work/example-repo"]
+# tests = ["pytest {files}"]               # 변경과 관련된 테스트만 돌리는 명령
+# full_tests = ["pytest"]                  # 전체 테스트 명령
+# build = ["npm run build"]                # 빌드 명령
+# typecheck = ["mypy ."]                   # 타입 검사 명령
+# lint = ["ruff check ."]                  # 린트 명령
+# format = ["ruff format ."]               # 포맷 명령
+# sensitive_paths = ["**/auth*", "**/security*", "**/*delete*", "**/migrations/**"]  # 보안·인증·데이터 삭제 경로(glob)
+#
+# [repos."/Users/me/work/example-repo".doc_snippet_check]
+# python = "python -m py_compile {file}"   # 문서 속 코드 조각 검사 명령(언어별)
+
+[repos]
