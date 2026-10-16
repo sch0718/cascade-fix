@@ -1,5 +1,6 @@
 import os
 import re
+import shlex
 import signal
 import subprocess
 from dataclasses import asdict, dataclass
@@ -43,7 +44,9 @@ def _run(cmd: str, cwd: Path) -> tuple[int, str, bool]:
         cwd=cwd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
         text=True,
+        errors="replace",
         start_new_session=True,
     )
     try:
@@ -84,8 +87,14 @@ def _python_import_pattern(rel: Path) -> re.Pattern | None:
     if not modules:
         return None
     alt = "|".join(re.escape(m) for m in modules)
+    stem = re.escape(modules[-1].rsplit(".", 1)[-1])
+    parents = [m.rsplit(".", 1)[0] for m in modules if "." in m]
+    package = "|".join([r"\.+", *(rf"\.*{re.escape(p)}" for p in parents)])
     return re.compile(
-        rf"^[ \t]*(?:import\s+(?:[\w.]+\s*,\s*)*(?:{alt})\b|from\s+(?:{alt})\s+import\b)", re.M
+        rf"^[ \t]*(?:import\s+(?:[\w.]+\s*,\s*)*(?:{alt})\b"
+        rf"|from\s+(?:\.*(?:{alt}))\s+import\b"
+        rf"|from\s+(?:{package})\s+import\s+[^\n]*\b{stem}\b)",
+        re.M,
     )
 
 
@@ -103,7 +112,7 @@ def related_tests(root: Path, changed: list[str]) -> list[str]:
     for rel_str in changed:
         rel = Path(rel_str)
         stem = rel.stem
-        name_matches = {f"test_{stem}", f"{stem}_test", f"{stem}.test"}
+        name_matches = {f"test_{stem}", f"{stem}_test", f"{stem}.test", f"{stem}.spec"}
         import_pattern = None
         if rel.suffix == ".py":
             import_pattern = _python_import_pattern(rel)
@@ -132,7 +141,7 @@ def run_verifiers(
     if stage == "final":
         commands = list(cfg.full_tests)
     else:
-        files = " ".join(related_tests(wt, changed))
+        files = " ".join(shlex.quote(f) for f in related_tests(wt, changed))
         commands = [c.replace("{files}", files) for c in cfg.tests]
         commands += [*cfg.build, *cfg.typecheck, *cfg.lint, *cfg.format]
     return [_result(cmd, wt) for cmd in commands]
@@ -153,6 +162,7 @@ def _looks_like_path(token: str) -> bool:
 
 def check_doc_refs(wt: Path, doc: Path) -> list[str]:
     wt = Path(wt)
+    wt_root = wt.resolve()
     text = URL.sub("", _strip_fences(Path(doc).read_text(encoding="utf-8")))
     candidates = [m.group(1) for m in PATH_LINE.finditer(text)]
     candidates += [LINE_SUFFIX.sub("", m.group(1)).rstrip(".,;)") for m in BACKTICK.finditer(text)]
@@ -160,9 +170,12 @@ def check_doc_refs(wt: Path, doc: Path) -> list[str]:
     for path in candidates:
         if not path or not _looks_like_path(path):
             continue
-        if path.startswith(("http", EXTERNAL_PREFIX)) or "*" in path or "{" in path:
+        if path.startswith(("http://", "https://", EXTERNAL_PREFIX)) or "*" in path or "{" in path:
             continue
-        if not (wt / path).exists():
+        target = (wt / path).resolve()
+        if not target.is_relative_to(wt_root):
+            continue
+        if not target.exists():
             missing.add(path)
     return sorted(missing)
 

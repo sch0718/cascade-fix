@@ -135,6 +135,54 @@ class VerifyTest(unittest.TestCase):
         reply = "**확인한 내용**: 재현\n\n```sh\nfoo\n```\n\n답글(작성자):\n```sh\nnot-this\n```\n"
         self.assertEqual(verify.repro_cmds(finding(reply)), ["foo"])
 
+    def test_related_tests_from_package_and_relative_imports(self):
+        repo = make_repo(self.tmp / "repo", {
+            "cascade/verify.py": "x = 1\n",
+            "tests/test_pkg_style.py": "from cascade import verify\n",
+            "tests/test_multi.py": "from cascade import config, verify\n",
+            "tests/test_other.py": "from cascade import config\n",
+            "cascade/test_rel_a.py": "from .verify import x\n",
+            "pkg/mod.py": "x = 1\n",
+            "pkg/test_rel_b.py": "from . import mod\n",
+            "pkg/test_rel_c.py": "from .other import y\n",
+        })
+        self.assertEqual(
+            verify.related_tests(repo, ["cascade/verify.py"]),
+            ["cascade/test_rel_a.py", "tests/test_multi.py", "tests/test_pkg_style.py"],
+        )
+        self.assertEqual(verify.related_tests(repo, ["pkg/mod.py"]), ["pkg/test_rel_b.py", "pkg/test_rel_c.py"])
+
+    def test_related_tests_includes_spec_named_file_under_tests_dir(self):
+        repo = make_repo(self.tmp / "repo", {"web/util.ts": "x\n", "tests/util.spec.ts": "x\n"})
+        self.assertEqual(verify.related_tests(repo, ["web/util.ts"]), ["tests/util.spec.ts"])
+
+    def test_run_verifiers_quotes_related_test_paths(self):
+        repo = make_repo(self.tmp / "repo", {"a.py": "x\n", "test_a b.py": "pass\n"})
+        cfg = RepoConfig(tests=["python3 -c 'import sys; print(sys.argv[1:])' {files}"])
+        r = verify.run_verifiers(repo, cfg, ["a.py"], "worker")
+        self.assertTrue(r[0].ok)
+        self.assertIn("['test_a b.py']", r[0].tail)
+
+    def test_run_verifiers_survives_non_utf8_output(self):
+        repo = make_repo(self.tmp / "repo", {"a.py": "x\n"})
+        cfg = RepoConfig(full_tests=["python3 -c \"import sys; sys.stdout.buffer.write(b'\\xff\\xfe')\""])
+        r = verify.run_verifiers(repo, cfg, [], "final")
+        self.assertEqual(len(r), 1)
+        self.assertTrue(r[0].ok)
+
+    def test_commands_do_not_inherit_stdin(self):
+        repo = make_repo(self.tmp / "repo", {"a.py": "x\n"})
+        cfg = RepoConfig(full_tests=["cat; echo done"])
+        r = verify.run_verifiers(repo, cfg, [], "final")
+        self.assertTrue(r[0].ok)
+        self.assertIn("done", r[0].tail)
+
+    def test_check_doc_refs_ignores_paths_outside_worktree(self):
+        repo = make_repo(self.tmp / "repo", {"a.py": "x\n"})
+        doc = repo / "doc.md"
+        doc.write_text("`../outside.py` `/nonexistent/abs.py` `ghost.py` http://h/x.py:3\n", encoding="utf-8")
+        self.assertEqual(verify.check_doc_refs(repo, doc), ["ghost.py"])
+
     def test_run_repro_requires_fail_before_and_pass_after(self):
         base = self.tmp / "base"
         fix = self.tmp / "fix"
