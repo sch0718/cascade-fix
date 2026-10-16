@@ -1,0 +1,55 @@
+--- /Users/sch0718/.claude/skills/cascade-fix/.superpowers/sdd/2026-10-17-model-cascade-fix-skill-plan/run-review.sh.before	2026-10-16 14:20:09
++++ /Users/sch0718/.claude/skills/codex-review/scripts/run-review.sh	2026-10-17 03:46:59
+@@ -2,17 +2,20 @@
+ # MCP·플러그인 없는 임시 CODEX_HOME에서 Codex 리뷰를 실행한다.
+ # 코드 변경: run-review.sh (--uncommitted | --base <브랜치> | --commit <SHA>) [--korean] [--out <파일>]
+ # 문서(설계·계획): run-review.sh --doc <파일> [--doc <파일>...] [--kind spec|plan] [--focus <관점>] [--repo <디렉터리>] [--out <파일>]
++# 프롬프트 파일 실행(cascade-fix 재검토·의견): run-review.sh (--recheck | --opinion) <프롬프트 파일> [--repo <디렉터리>] [--out <파일>]
+ set -euo pipefail
+ 
+-usage() { sed -n '2,4p' "$0" | sed 's/^# //' >&2; exit 64; }
++usage() { sed -n '2,5p' "$0" | sed 's/^# //' >&2; exit 64; }
+ 
+-mode=""; target=""; korean=0; out=""; kind=""; focus=""; repo=""; docs=()
++mode=""; target=""; korean=0; out=""; kind=""; focus=""; repo=""; docs=(); prompt_file=""
+ while [ $# -gt 0 ]; do
+   case "$1" in
+     --uncommitted) mode=uncommitted; shift ;;
+     --base) mode=base; target="${2:?--base 에는 브랜치가 필요하다}"; shift 2 ;;
+     --commit) mode=commit; target="${2:?--commit 에는 SHA가 필요하다}"; shift 2 ;;
+     --doc) mode=doc; docs+=("${2:?--doc 에는 파일이 필요하다}"); shift 2 ;;
++    --recheck) mode=recheck; prompt_file="${2:?--recheck 에는 프롬프트 파일이 필요하다}"; shift 2 ;;
++    --opinion) mode=opinion; prompt_file="${2:?--opinion 에는 프롬프트 파일이 필요하다}"; shift 2 ;;
+     --kind) kind="${2:?--kind 에는 spec 또는 plan이 필요하다}"; shift 2 ;;
+     --focus) focus="${2:?--focus 에는 관점이 필요하다}"; shift 2 ;;
+     --repo) repo="${2:?--repo 에는 디렉터리가 필요하다}"; shift 2 ;;
+@@ -54,6 +57,18 @@
+       *) kind=spec ;;
+     esac
+   fi
++elif [ "$mode" = recheck ] || [ "$mode" = opinion ]; then
++  [ -f "$prompt_file" ] || { echo "프롬프트 파일을 찾지 못했다: $prompt_file" >&2; exit 3; }
++  { [ -r "$prompt_file" ] && [ -s "$prompt_file" ]; } || { echo "프롬프트 파일을 읽을 수 없거나 비어 있다: $prompt_file" >&2; exit 3; }
++  prompt_file=$(abs "$prompt_file")
++  prompt=$(cat "$prompt_file") || { echo "프롬프트 파일을 읽지 못했다: $prompt_file" >&2; exit 3; }
++  [ -n "$prompt" ] || { echo "프롬프트 파일을 읽을 수 없거나 비어 있다: $prompt_file" >&2; exit 3; }
++  if [ -n "$repo" ]; then
++    [ -d "$repo" ] || { echo "저장소 디렉터리를 찾지 못했다: $repo" >&2; exit 3; }
++  else
++    repo=$(dirname "$prompt_file")
++  fi
++  ROOT=$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null) || ROOT=$(cd "$repo" && pwd -P)
+ else
+   ROOT=$(git rev-parse --show-toplevel)
+ fi
+@@ -127,6 +142,10 @@
+ if [ "$mode" = doc ]; then
+   CODEX_HOME="$HOME_DIR" "$CODEX" exec -s read-only --ephemeral -C "$ROOT" \
+     -o "$out.final" "$(doc_prompt)" > "$out" 2>&1 || status=$?
++elif [ "$mode" = recheck ] || [ "$mode" = opinion ]; then
++  # 프롬프트는 stdin(-)으로 넘긴다. 큰 diff가 인자 길이 상한(ARG_MAX)에 걸리지 않게 한다
++  CODEX_HOME="$HOME_DIR" "$CODEX" exec -s read-only --ephemeral -C "$ROOT" \
++    -o "$out.final" - < "$prompt_file" > "$out" 2>&1 || status=$?
+ else
+   case "$mode" in
+     uncommitted) args=(--uncommitted) ;;
