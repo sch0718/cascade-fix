@@ -51,33 +51,41 @@ PYTHONPATH=~/.claude/skills/cascade-fix python3 -m cascade.cli
    PYTHONPATH=~/.claude/skills/cascade-fix python3 -c 'import json; from pathlib import Path; from cascade.config import detect_candidates; print(json.dumps(detect_candidates(Path(".")), ensure_ascii=False, indent=2))'
    ```
 
-   후보를 사용자에게 보이고 쓸 명령을 확인받은 뒤 항목을 적는다. 형식은 `repos.toml` 머리 주석에 있다. `tests`에는 `{files}`(관련 테스트 파일 목록) 자리표시자를 쓴다.
+   후보를 사용자에게 보이고 쓸 명령을 확인받은 뒤 항목을 적는다. 형식은 `repos.toml` 머리 주석에 있다. `tests`에는 `{files}`(관련 테스트 파일 목록) 자리표시자를 쓴다. `format`은 작업자가 바꾼 파일에만 돈다(`ruff format {files}`처럼 쓴다).
+3. **워크트리 준비.** 워크트리는 대상 저장소의 `.cascade-fix/` 아래에 생기고 `node_modules`·`.venv`가 없다. 필요하면 `setup`(예: `ln -s {root}/node_modules node_modules`)을 적는다. jest·vitest·eslint는 `.cascade-fix`를 제외 설정에 넣으라고 사용자에게 알린다.
 
 ## 절차
 
 대상 저장소 루트에서 실행한다. 각 명령은 끝에 다음 할 일을 출력한다. 막히면 `CF status --run-dir <run_dir>`를 본다.
 
+`jobs`·`judge`·`adjudicate`·`apply`는 검증 명령과 테스트를 돌려 Bash 시간 제한을 넘길 수 있다. Bash 도구의 `run_in_background`로 돌리고 완료 알림을 기다린 뒤 출력을 읽는다.
+
 1. **init** — `CF init --source <종류> --input <결과 파일|PR 번호> [--doc <문서>…] [--dry-run] [--max-rechecks N]`
    - 출력의 `run_dir=<경로>`를 이후 모든 명령에 `--run-dir`로 준다.
    - 종료 코드 4: 검증 설정 없음(위 「실행 전 확인」 2). 5: 결과 파일을 해석하지 못함 — 출력된 줄을 사용자에게 보이고 멈춘다.
    - 「지적 0건 — 원문을 확인하라」가 나오면 출력된 원문 앞부분을 사용자에게 보이고 끝낸다.
-2. **jobs** — `CF jobs --run-dir <run_dir> --round N` → `round-N/stage1-args.json`.
-3. **Workflow(1단계)** — `~/.claude/skills/cascade-fix/workflows/run-jobs.js`를 Read로 읽어 그 내용을 Workflow 도구의 `script` 입력으로 통째로 넘긴다(`scriptPath`는 작업 디렉터리 밖이라 거부된다). `args`는 `stage1-args.json`의 내용(JSON 객체)이다. 반환값 `{results: [...]}`를 그대로 `round-N/stage1.json`에 저장한다.
-4. **judge** — `CF judge --run-dir <run_dir> --round N --results <run_dir>/round-N/stage1.json`
+2. **jobs** — `CF jobs --run-dir <run_dir> --round N` → `round-N/stage1-args.json`. 기준선(수정 전 base 워크트리)에서 검증 명령을 한 번 돌려 이미 실패하는 명령을 `round-N/baseline.json`에 적는다(판정에서 제외).
+   - `pr-comment`이면 코멘트에서 뽑은 재현 명령을 `round-N/repro-cmds.json`에 쓰고 출력한다. 이 명령은 사용자 셸에서 돈다. 사용자에게 명령 목록을 보이고 승인받은 뒤 `judge`에 `--allow-repro <run_dir>/round-N/repro-cmds.json`으로 넘긴다. 승인이 없으면 재현 검증을 건너뛴다(경고만 낸다).
+3. **Workflow(1단계)** — `~/.claude/skills/cascade-fix/workflows/run-jobs.js`를 Read로 읽어 그 내용을 Workflow 도구의 `script` 입력으로 통째로 넘긴다(`scriptPath`는 작업 디렉터리 밖이라 거부된다). `args`는 `stage1-args.json`의 내용(JSON 객체)이다. 작업마다 `{id, label, model, effort, kind, promptPath}`만 있고 프롬프트 본문은 `round-N/prompts/`의 파일에 있다. 프롬프트를 읽어 옮겨 적지 않는다. 반환값 `{results: [...]}`를 그대로 `round-N/stage1.json`에 저장한다.
+4. **judge** — `CF judge --run-dir <run_dir> --round N --results <run_dir>/round-N/stage1.json [--allow-repro <승인한 목록>]`
+   - 종료 코드 6: jobs 뒤 사용자 저장소(작업 트리·HEAD·stash·브랜치)가 바뀌었다. 작업자가 워크트리 밖을 건드렸을 수 있다. 출력된 `git diff --stat`을 사용자에게 보이고 멈춘다. `adjudicate`도 같은 검사를 한다.
    - 문서 모드에서 `checker-args.json`이 나오면 같은 방식으로 Workflow를 돌려 `round-N/checker.json`에 저장하고, `CF judge … --results …/stage1.json --checker-results …/checker.json`으로 다시 부른다.
    - 판가름 대상이 있으면 `round-N/adj-args.json`이 생긴다.
 5. **Workflow(판가름)** — `adj-args.json`이 있으면 3과 같은 방식으로 돌려 `round-N/adj.json`에 저장한다.
 6. **adjudicate** — `CF adjudicate --run-dir <run_dir> --round N --results <run_dir>/round-N/adj.json`. 판단 불가마다 `round-N/opinion-<id>.md`가 생긴다.
 7. **Codex 의견** — `opinion-<id>.md`마다 `RR --opinion <run_dir>/round-N/opinion-<id>.md --repo <저장소 루트> --out <run_dir>/round-N/opinion-<id>.out`.
 8. **opinion** — `CF opinion --run-dir <run_dir> --round N --id <id> --result <run_dir>/round-N/opinion-<id>.out.final`. Codex 의견은 자동 채택하지 않고 사람 목록에 붙기만 한다.
-9. **apply** — `CF apply --run-dir <run_dir> --round N`. 채택 패치를 작업 트리에 하나씩 적용하고(dry-run이면 건너뜀) 전체 테스트를 한 번 돌린다. 적용 실패와 전체 테스트 실패(간섭 의심)는 판단 불가로 간다. 작업 트리는 되돌리지 않는다.
-10. **Codex 재검토** — `round-N/recheck-prompt.md`가 생겼으면 `RR --recheck <run_dir>/round-N/recheck-prompt.md --repo <저장소 루트> --out <run_dir>/round-N/recheck.out`.
+9. **apply** — `CF apply --run-dir <run_dir> --round N`. 채택 패치를 작업 트리에 하나씩 적용하고, 그 회차의 작업자·판가름 워크트리를 지운 뒤 전체 테스트를 기준선(base 워크트리)과 작업 트리에서 돌린다. 적용 실패와 전체 테스트 실패(간섭 의심)는 판단 불가로 간다. 기준선부터 실패하면 「기준선부터 실패」로 적고 채택을 유지한다. 작업 트리는 되돌리지 않는다. 적용이 끝난 뒤 중단됐다가 다시 돌리면 적용은 건너뛰고 뒷단계만 한다.
+   - dry-run이면 작업 트리 대신 `result-rN` 워크트리에 적용·커밋해 다음 회차의 기준으로 삼는다.
+10. **Codex 재검토** — `round-N/recheck-prompt.md`가 생겼으면 `RR --recheck <run_dir>/round-N/recheck-prompt.md --repo <round-N/recheck-repo.txt의 경로> --out <run_dir>/round-N/recheck.out`. `recheck-repo.txt`는 보통 저장소 루트이고 dry-run이면 `result-rN` 워크트리다. 재검토가 바꾼 파일 밖을 지적하면 「재검토 범위 밖」 보류 후보로 간다.
 11. **recheck** — `CF recheck --run-dir <run_dir> --round N --result <run_dir>/round-N/recheck.out.final`. 다음 회차가 열리면 N+1로 2부터 반복한다. 아니면 `status=종료`.
 12. **report** — `CF report --run-dir <run_dir>`. 보고서(`report.md`)와 `prepared/`(커밋 메시지 초안·답글 초안·resolve 대상)를 만든다.
 13. **보류 후보 선택(있으면)** — 사용자에게 보류 후보마다 「지금 반영 / 구현 때 테스트로 / 보류」를 받아 `{"<id>": "<선택>"}` JSON 파일로 저장하고 `CF resume --run-dir <run_dir> --choices <파일>`. 「지금 반영」이 있으면 마지막 회차가 열리므로 2부터 다시 돌리고 12로 온다. 그 회차의 재검토 지적은 목록으로만 간다. cleanup 전에 한다.
 14. **cleanup** — `CF cleanup --run-dir <run_dir>`. 임시 브랜치와 워크트리를 지운다. 원장과 보고서는 남는다.
 
 이미 한 단계는 다시 하지 않는다. 다시 해야 하면 `--force`를 붙인다.
+
+어느 단계에서든 멈추거나 그만두면 `CF cleanup --run-dir <run_dir>`를 돌려 임시 브랜치와 워크트리를 지운다(보류 후보 선택을 받을 거면 그 뒤에).
 
 ## 규칙
 

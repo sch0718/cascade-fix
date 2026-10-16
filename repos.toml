@@ -1,14 +1,18 @@
 # 저장소별 검증 명령 설정. 키는 [repos."<저장소 루트 절대 경로>"] 형식이다.
-# 명령에 쓸 수 있는 자리표시자: {files}(관련 테스트 파일 목록), {file}(검사할 단일 파일)
+# 명령에 쓸 수 있는 자리표시자: {files}(tests는 관련 테스트 파일 목록, format은 작업자가 바꾼 파일 목록),
+# {file}(검사할 단일 파일), {root}(setup에서 원래 저장소 루트)
+# 값은 모두 문자열 목록이다(tests = "pytest"처럼 문자열 하나를 쓰면 init이 종료 코드 5로 멈춘다).
+# 워크트리는 저장소 안 .cascade-fix/ 에 생긴다. jest·vitest·eslint는 .cascade-fix 를 제외 설정에 넣는다.
 #
 # [repos."/Users/me/work/example-repo"]
+# setup = ["ln -s {root}/node_modules node_modules"]  # 워크트리마다 한 번 돌리는 명령(만든 파일은 .gitignore 대상이어야 한다)
 # tests = ["pytest {files}"]               # 변경과 관련된 테스트만 돌리는 명령
 # full_tests = ["pytest"]                  # 전체 테스트 명령
 # build = ["npm run build"]                # 빌드 명령
 # typecheck = ["mypy ."]                   # 타입 검사 명령
 # lint = ["ruff check ."]                  # 린트 명령
-# format = ["ruff format ."]               # 포맷 명령
-# sensitive_paths = ["**/auth*", "**/security*", "**/*delete*", "**/migrations/**"]  # 보안·인증·데이터 삭제 경로(glob)
+# format = ["ruff format {files}"]         # 포맷 명령. 바꾼 파일에만 돈다({files}가 없으면 파일을 뒤에 붙인다)
+# sensitive_paths = ["**/auth*", "**/security*", "**/*delete*", "**/migrations/**"]  # 보안·인증·데이터 삭제 경로(glob, 대소문자 무시)
 #
 # [repos."/Users/me/work/example-repo".doc_snippet_check]
 # python = "python -m py_compile {file}"   # 문서 속 코드 조각 검사 명령(언어별)
