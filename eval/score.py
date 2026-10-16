@@ -14,6 +14,7 @@ OUTCOME_ADJUDICATED = "판가름"
 OUTCOMES_TO_HUMAN = ("판단불가", "설계결정", "보류후보")
 REASON_PATCH_DIFFERS = "패치가 다름"
 REASON_ADJUDICATED_NO = "판가름: 아님"
+UNMEASURED = "측정 불가(dry-run은 전체 테스트를 돌리지 않음)"
 PATH_KEYS = ("합의", "판가름", "Codex 검토", "사람")
 
 
@@ -92,7 +93,7 @@ def checker_stats(ledger: dict, run_dir: Path) -> tuple[int, int]:
 
 def compute(runs, sample: dict[str, dict]) -> dict:
     runs = Path(runs)
-    m = {"items": 0, "errors": 0, "missing": 0, "agree": 0, "judged": 0, "opus_calls": 0, "baseline_calls": 0,
+    m = {"items": 0, "errors": 0, "incomplete": 0, "missing": 0, "regression_measured": False, "agree": 0, "judged": 0, "opus_calls": 0, "baseline_calls": 0,
          "patch_differs": 0, "regressions": 0, "paths": dict.fromkeys(PATH_KEYS, 0), "predicted": {}}
     checker_fixed = checker_false = 0
     for item_id, item in sample.items():
@@ -100,8 +101,12 @@ def compute(runs, sample: dict[str, dict]) -> dict:
         if not (base / "meta.json").is_file():
             m["missing"] += 1
             continue
-        if "error" in read_json(base / "meta.json"):
+        meta = read_json(base / "meta.json")
+        if "error" in meta:
             m["errors"] += 1
+            continue
+        if meta.get("incomplete"):
+            m["incomplete"] += 1
             continue
         if not (base / "ledger.json").is_file():
             m["missing"] += 1
@@ -123,7 +128,9 @@ def compute(runs, sample: dict[str, dict]) -> dict:
             m["patch_differs"] += 1
         m["opus_calls"] += len(count_roles(run_dir, "adjudicator"))
         m["baseline_calls"] += item.get("baseline_opus_calls", 1)
-        m["regressions"] += any(a.get("final_ok") is False for a in round_files(run_dir, "apply.json"))
+        applies = list(round_files(run_dir, "apply.json"))
+        m["regression_measured"] |= any(a.get("final_ok") is not None for a in applies)
+        m["regressions"] += any(a.get("final_ok") is False for a in applies)
         fixed, false_ids = checker_stats(ledger, run_dir)
         checker_fixed += fixed
         checker_false += false_ids
@@ -145,12 +152,16 @@ def passed(ok: bool) -> str:
     return "통과" if ok else "미달"
 
 
+def regression_text(m: dict) -> str:
+    return f"회귀 {m['regressions']}건" if m["regression_measured"] else "회귀 미측정"
+
+
 def verdict_line(m: dict) -> str:
     agree_ok = m["agreement"] is not None and m["agreement"] >= TARGET_AGREEMENT
     opus_ok = m["opus_ratio"] is not None and m["opus_ratio"] <= TARGET_OPUS
     return (f"성공 기준: 판정 일치 {ratio_text(m['agreement'])} (목표 95%) {passed(agree_ok)}"
             f" · Opus 호출 {ratio_text(m['opus_ratio'])} (목표 40% 이하) {passed(opus_ok)}"
-            f" · 회귀 {m['regressions']}건 (목표 0) {passed(m['regressions'] == 0)}")
+            f" · {regression_text(m)} (목표 0)" + ("" if not m["regression_measured"] else f" {passed(m['regressions'] == 0)}"))
 
 
 def render(m: dict) -> str:
@@ -162,10 +173,11 @@ def render(m: dict) -> str:
         ("Opus 호출 수", str(m["opus_calls"])),
         ("기준 Opus 호출 수", str(m["baseline_calls"])),
         ("Opus 호출 비율", ratio_text(m["opus_ratio"])),
-        ("회귀 건수", str(m["regressions"])),
+        ("회귀 건수", str(m["regressions"]) if m["regression_measured"] else UNMEASURED),
         ("문서 점검자 정확도", pct(*m["checker"])),
         ("채점한 항목 수", str(m["items"])),
         ("오류 항목 수", str(m["errors"])),
+        ("미완료 항목 수", str(m["incomplete"])),
         ("실행 기록 없는 항목 수", str(m["missing"])),
     ]
     lines = ["| 값 | 결과 |", "| --- | --- |", *(f"| {k} | {v} |" for k, v in rows), "", verdict_line(m), ""]

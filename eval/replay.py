@@ -81,17 +81,18 @@ def read_json(path: Path):
 
 def finish_item(base: Path, repo: Path, wt: Path, run_dir: Path | None, env: dict) -> None:
     errors = []
-    if run_dir is not None and (run_dir / "ledger.json").is_file():
-        try:
-            cli(wt, env, "cleanup", "--run-dir", str(run_dir))
-        except RuntimeError as e:
-            errors.append(str(e))
-        shutil.rmtree(base / "run", ignore_errors=True)
-        shutil.copytree(run_dir, base / "run")
-        shutil.copyfile(run_dir / "ledger.json", base / "ledger.json")
-    if wt.exists():
-        git(repo, "worktree", "remove", "--force", str(wt), check=False)
-    git(repo, "worktree", "prune", check=False)
+    try:
+        if run_dir is not None and (run_dir / "ledger.json").is_file():
+            try:
+                cli(wt, env, "cleanup", "--run-dir", str(run_dir))
+            except RuntimeError as e:
+                errors.append(str(e))
+            shutil.rmtree(base / "run", ignore_errors=True)
+            shutil.copytree(run_dir, base / "run")
+            shutil.copyfile(run_dir / "ledger.json", base / "ledger.json")
+    finally:
+        if wt.exists():
+            git(repo, "worktree", "remove", "--force", str(wt), check=False)
     if errors:
         raise RuntimeError("; ".join(errors))
 
@@ -114,6 +115,10 @@ def run_item(item: dict, out: Path, repos_toml: Path, fake: Path | None) -> None
     try:
         if not wt.exists():
             git(repo, "worktree", "add", "--detach", str(wt), item["commit"])
+        else:
+            head, wanted = git(wt, "rev-parse", "HEAD"), git(repo, "rev-parse", "--verify", f"{item['commit']}^{{commit}}")
+            if head != wanted:
+                raise RuntimeError(f"기존 워크트리의 HEAD {head[:12]}가 표본의 커밋 {wanted[:12]}와 다르다")
         wt = wt.resolve()
         write_worktree_toml(repos_toml, repo, wt, base / "repos.toml")
         findings = base / "findings-input.json"
@@ -161,10 +166,16 @@ def collect_item(item: dict, out: Path, repos_toml: Path) -> bool:
     pending = meta.get("pending_run_dir")
     if not pending:
         return False
+    ledger = read_json(Path(pending) / "ledger.json")
+    last = ledger["rounds"][-1]["no"]
+    if not (Path(pending) / f"round-{last}" / "apply.json").is_file():
+        write_json(meta_path, {**meta, "incomplete": True})
+        return False
     repo = Path(item["repo"]).resolve()
     wt = (base / "wt").resolve()
     finish_item(base, repo, wt, Path(pending), base_env(base / "repos.toml"))
     meta.pop("pending_run_dir")
+    meta.pop("incomplete", None)
     write_json(meta_path, meta)
     return True
 
@@ -186,7 +197,7 @@ def main(argv=None) -> int:
     for item in items:
         try:
             if args.collect:
-                print(f"{item['id']}: {'수집' if collect_item(item, out, toml) else '건너뜀(대기 중인 실행 없음)'}")
+                print(f"{item['id']}: {'수집' if collect_item(item, out, toml) else '건너뜀(대기 중이 아니거나 apply 전)'}")
             else:
                 run_item(item, out, toml, fake)
                 print(f"{item['id']}: 완료" if fake else "")
@@ -194,7 +205,7 @@ def main(argv=None) -> int:
             failed += 1
             print(f"{item['id']}: 오류 — {str(e).splitlines()[0] if str(e) else type(e).__name__}")
     print(f"항목 {len(items)}건, 오류 {failed}건")
-    return 0
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

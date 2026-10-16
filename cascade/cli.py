@@ -1,5 +1,6 @@
 import argparse
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -92,6 +93,7 @@ def _split_docs(root: Path, docs: list[str]) -> tuple[dict[str, str], list[Path]
 
 
 FINDING_REQUIRED = ("id", "severity", "location", "body")
+FINDING_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 def _load_findings_json(path: str, source: str) -> list[Finding]:
@@ -103,7 +105,13 @@ def _load_findings_json(path: str, source: str) -> list[Finding]:
         missing = [k for k in FINDING_REQUIRED if not isinstance(item, dict) or k not in item]
         if missing:
             raise s.CliError(f"--findings-json {i}번째 지적에 {', '.join(missing)} 가 없다", ExitCodes.PARSE_ERROR)
+        if not isinstance(item["id"], str) or not FINDING_ID.match(item["id"]):
+            raise s.CliError(f"--findings-json {i}번째 지적의 id가 형식에 맞지 않는다: {item['id']!r}", ExitCodes.PARSE_ERROR)
         findings.append(Finding.from_dict({"source": source, "evidence": "", **item}))
+    ids = [f.id for f in findings]
+    duplicated = sorted({fid for fid in ids if ids.count(fid) > 1})
+    if duplicated:
+        raise s.CliError(f"--findings-json에 id가 겹친다: {', '.join(duplicated)}", ExitCodes.PARSE_ERROR)
     return findings
 
 

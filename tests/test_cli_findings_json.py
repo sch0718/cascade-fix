@@ -37,6 +37,13 @@ class FindingsJsonTest(CliTestBase):
         self.assertEqual(p.returncode, 5)
         self.assertIn("body", p.stdout)
 
+    def test_init_rejects_bad_or_duplicate_ids(self):
+        for findings, word in (([{**FINDING, "id": "../x"}], "id"),
+                               ([FINDING, {**FINDING, "location": "calc.py:5"}], "겹친다")):
+            p = self.cli("init", "--source", "codex-code", "--findings-json", str(self.write(findings)), ok=False)
+            self.assertEqual(p.returncode, 5)
+            self.assertIn(word, p.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

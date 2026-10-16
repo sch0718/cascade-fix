@@ -70,7 +70,7 @@ class ScoreTest(unittest.TestCase):
         self.sample = FIXTURES / "sample.jsonl"
 
     def three_runs(self):
-        make_run(self.runs, "s1", [decision("합의-사실", "a")])
+        make_run(self.runs, "s1", [decision("합의-사실", "a")], apply={"final_ok": True})
         make_run(self.runs, "s2",
                  [decision("판가름", "adjudicator", ["패치가 다름", "판가름: 곱셈이 맞다"])],
                  {"r1-01:adjudicator": worker("사실", "adjudicator")})
@@ -101,6 +101,25 @@ class ScoreTest(unittest.TestCase):
         line = "성공 기준: 판정 일치 100.0% (목표 95%) 통과 · Opus 호출 66.7% (목표 40% 이하) 미달 · 회귀 0건 (목표 0) 통과"
         self.assertIn(line, p.stdout)
         self.assertIn(line, out.read_text(encoding="utf-8"))
+
+    def test_dry_run_only_runs_report_regression_as_unmeasured(self):
+        make_run(self.runs, "s1", [decision("합의-사실", "a")], apply={"dry_run": True, "applied": []})
+        make_run(self.runs, "s3", [decision("합의-아님")], apply={"dry_run": True, "applied": []})
+        m = score.compute(self.runs, score.load_sample(self.sample))
+        self.assertFalse(m["regression_measured"])
+        segment = score.verdict_line(m).split(" · ")[-1]
+        self.assertIn("회귀 미측정", segment)
+        self.assertNotIn("통과", segment)
+        self.assertNotIn("미달", segment)
+        self.assertIn("| 회귀 건수 | 측정 불가(dry-run은 전체 테스트를 돌리지 않음) |", score.render(m))
+
+    def test_incomplete_items_are_excluded_and_counted(self):
+        make_run(self.runs, "s1", [decision("합의-사실", "a")])
+        make_run(self.runs, "s2", [decision("합의-사실", "a")])
+        write_json(self.runs / "s2" / "meta.json", {"incomplete": True})
+        m = score.compute(self.runs, score.load_sample(self.sample))
+        self.assertEqual((m["incomplete"], m["items"], m["baseline_calls"]), (1, 1, 1))
+        self.assertIn("| 미완료 항목 수 | 1 |", score.render(m))
 
     def test_fail_line_when_regression_and_low_agreement(self):
         make_run(self.runs, "s1", [decision("합의-아님")], apply={"final_ok": False})
@@ -205,7 +224,7 @@ class ReplayTest(unittest.TestCase):
     def test_replay_records_error_and_continues(self):
         sample = self.write_sample([self.item("bad", commit="deadbeef" * 5), self.item("item-02")])
         fake = self.write_fake("item-02")
-        self.assertEqual(self.run_replay(sample, "--fake-results", str(fake)), 0)
+        self.assertEqual(self.run_replay(sample, "--fake-results", str(fake)), 1)
         meta = json.loads((self.out / "bad" / "meta.json").read_text(encoding="utf-8"))
         self.assertIn("error", meta)
         self.assertTrue((self.out / "item-02" / "ledger.json").is_file())
@@ -228,11 +247,33 @@ class ReplayTest(unittest.TestCase):
         run_dir = Path(meta["pending_run_dir"])
         self.assertTrue((run_dir / "round-1" / "stage1-args.json").is_file())
         self.assertTrue((base / "wt").is_dir())
+
+        self.assertEqual(self.run_replay(sample, "--collect"), 0)
+        meta = json.loads((base / "meta.json").read_text(encoding="utf-8"))
+        self.assertIs(meta["incomplete"], True)
+        self.assertIn("pending_run_dir", meta)
+        self.assertFalse((base / "ledger.json").exists())
+        self.assertTrue((base / "wt").is_dir())
+        m = score.compute(self.out, score.load_sample(sample))
+        self.assertEqual((m["incomplete"], m["items"]), (1, 0))
+
+        write_json(run_dir / "round-1" / "apply.json", {"dry_run": True, "applied": []})
         self.assertEqual(self.run_replay(sample, "--collect"), 0)
         meta = json.loads((base / "meta.json").read_text(encoding="utf-8"))
         self.assertNotIn("pending_run_dir", meta)
+        self.assertNotIn("incomplete", meta)
         self.assertTrue((base / "ledger.json").is_file())
         self.assertFalse((base / "wt").exists())
+        self.assertEqual(git(self.repo, "worktree", "list", "--porcelain").count("worktree "), 1)
+
+    def test_replay_rejects_reused_worktree_at_other_commit(self):
+        (self.repo / "calc.py").write_text(CALC + "\n", encoding="utf-8")
+        git(self.repo, "commit", "-qam", "second")
+        git(self.repo, "worktree", "add", "--detach", str(self.out / "item-01" / "wt"), self.head)
+        sample = self.write_sample([self.item("item-01", commit=git(self.repo, "rev-parse", "HEAD"))])
+        self.assertEqual(self.run_replay(sample, "--fake-results", str(self.write_fake("item-01"))), 1)
+        meta = json.loads((self.out / "item-01" / "meta.json").read_text(encoding="utf-8"))
+        self.assertIn("HEAD", meta["error"])
         self.assertEqual(git(self.repo, "worktree", "list", "--porcelain").count("worktree "), 1)
 
 
