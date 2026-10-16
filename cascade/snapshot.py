@@ -110,7 +110,7 @@ def commit_worktree(wt: Path, message: str) -> str | None:
     _git(wt, "add", "-A")
     if _git(wt, "status", "--porcelain") == "":
         return None
-    _git(wt, *COMMIT_IDENTITY, "commit", "-q", "-m", message)
+    _git(wt, *COMMIT_IDENTITY, "commit", "-q", "--no-verify", "-m", message)
     return _git(wt, "rev-parse", "HEAD")
 
 

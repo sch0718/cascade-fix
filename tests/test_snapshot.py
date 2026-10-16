@@ -86,6 +86,19 @@ class SnapshotTest(unittest.TestCase):
         self.assertEqual(git(repo, "rev-parse", "--abbrev-ref", "HEAD"), "main")
         self.assertEqual((repo / "a.py").read_text(), "x=2\n")
 
+    def test_commit_worktree_skips_hooks(self):
+        repo = make_repo(self.tmp / "repo", {"a.py": "x=1\n"})
+        hook = repo / ".git" / "hooks" / "pre-commit"
+        hook.parent.mkdir(parents=True, exist_ok=True)
+        hook.write_text("#!/bin/sh\nexit 1\n")
+        hook.chmod(0o755)
+        snap = snapshot.create_snapshot(repo, "run1", [])
+        wt = snapshot.add_worktree(snap, "w1")
+        (wt / "a.py").write_text("x=3\n")
+        sha = snapshot.commit_worktree(wt, "훅 무시")
+        self.assertRegex(sha, r"^[0-9a-f]{40}$")
+        self.assertEqual(git(wt, "rev-parse", f"{sha}^"), snap.commit)
+
     def test_cleanup_removes_branch_and_worktrees(self):
         repo = make_repo(self.tmp / "repo", {"a.py": "x=1\n"})
         snap = snapshot.create_snapshot(repo, "run1", [])
