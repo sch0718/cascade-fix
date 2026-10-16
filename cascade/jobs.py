@@ -1,5 +1,5 @@
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -20,7 +20,7 @@ ROLES = {
 _COMMIT_RULE = (
     "작업을 마치면 워크트리에서 "
     '`git add -A && git -c core.hooksPath=/dev/null commit --no-verify -q -m "cascade-fix <지적 id> <역할>"`'
-    "로 커밋한다."
+    "로 커밋한다. 고친 것이 없으면 커밋하지 않는다."
 )
 _SHARED_RULES = [
     "추측하지 않는다. 재현한 것만 사실로 판정한다.",
@@ -72,6 +72,13 @@ _PLACEHOLDER = re.compile(r"\{([a-z_]+)\}")
 _MODE_NAMES = {"code": "코드", "doc": "문서"}
 _TEST_FILES_HINT = "<바꾼 코드와 관련된 테스트 파일>"
 _SNIPPET_FILE_HINT = "<코드 블록을 옮겨 적은 파일>"
+_TAIL_LINES = 5
+_ADJ_CODE_NOTE = "두 판정자는 각자 다른 워크트리에서 판정하고, 「사실」이면 직접 고쳤다."
+_ADJ_DOC_NOTE = (
+    "문서 지적이다. 판정자 둘은 판정만 했고 수정은 작성자 패치 하나다. "
+    "점검자가 작성자 패치를 세 질문(해소하는가 / 문서의 다른 곳과 어긋나는가 / 가리키는 파일·함수가 실제로 있는가)으로 점검했다."
+)
+_ADJ_DOC_NO_PATCH_B = "(문서 모드에서는 판정자가 패치를 내지 않는다. 패치는 위 작성자 패치 하나뿐이다)"
 
 
 @dataclass
@@ -85,6 +92,9 @@ class AdjInput:
     verify_b: list[dict]
     worktree: Path
     mode: str
+    cfg: RepoConfig | None = None
+    checker: WorkerResult | None = None
+    escalation_reasons: list[str] = field(default_factory=list)
 
 
 def _render(template_name: str, values: dict[str, str]) -> str:
@@ -102,6 +112,10 @@ def _finding_values(f: Finding, role: str, worktree: Path) -> dict[str, str]:
         "evidence": f.evidence or "(없음)",
         "worktree": str(worktree),
     }
+
+
+def _lines_plain(items: list[str]) -> str:
+    return "\n".join(f"- {s}" for s in items) if items else "(없음)"
 
 
 def _lines(items: list[str]) -> str:
@@ -184,11 +198,32 @@ def _format_result(r: WorkerResult) -> str:
 def _format_verify(results: list[dict]) -> str:
     if not results:
         return "(돌린 검증 없음)"
-    return "\n".join(f"- {r.get('cmd', '?')}: {'통과' if r.get('ok') else '실패'}" for r in results)
+    lines = []
+    for r in results:
+        lines.append(f"- {r.get('cmd', '?')}: {'통과' if r.get('ok') else '실패'}")
+        tail = (r.get("tail") or "").rstrip("\n")
+        if tail:
+            lines.extend(f"    {line}" for line in tail.splitlines()[-_TAIL_LINES:])
+    return "\n".join(lines)
 
 
 def _format_patch(patch: str) -> str:
-    return patch.rstrip("\n") if patch.strip() else "(패치 없음)"
+    return f"````diff\n{patch.rstrip(chr(10))}\n````" if patch.strip() else "(패치 없음)"
+
+
+def _format_checker(checker: WorkerResult | None, mode: str) -> str:
+    if mode != "doc":
+        return "(코드 모드에는 점검자가 없다)"
+    if checker is None:
+        return "(점검자 결과 없음)"
+    ok = {True: "예", False: "아니오"}.get(checker.checker_ok, "없음")
+    return "\n".join([f"- 판정: {checker.verdict}", f"- 점검 통과: {ok}", f"- 근거: {checker.reason}"])
+
+
+def _adj_verify_cmds(cfg: RepoConfig | None, mode: str) -> str:
+    if cfg is None:
+        return "(없음)"
+    return _doc_verify_cmds(cfg) if mode == "doc" else _code_verify_cmds(cfg)
 
 
 def build_adjudicator_jobs(items: list[AdjInput]) -> dict:
@@ -200,8 +235,13 @@ def build_adjudicator_jobs(items: list[AdjInput]) -> dict:
             "mode": _MODE_NAMES.get(item.mode, item.mode),
             "result_a": _format_result(item.a),
             "result_b": _format_result(item.b),
+            "mode_note": _ADJ_DOC_NOTE if item.mode == "doc" else _ADJ_CODE_NOTE,
+            "escalation_reasons": _lines_plain(item.escalation_reasons),
+            "patch_a_title": "작성자 패치" if item.mode == "doc" else "판정자 a의 패치",
             "patch_a": _format_patch(item.patch_a),
-            "patch_b": _format_patch(item.patch_b),
+            "patch_b": _ADJ_DOC_NO_PATCH_B if item.mode == "doc" else _format_patch(item.patch_b),
+            "checker_result": _format_checker(item.checker, item.mode),
+            "verify_cmds": _adj_verify_cmds(item.cfg, item.mode),
             "verify_a": _format_verify(item.verify_a),
             "verify_b": _format_verify(item.verify_b),
             "rules": RULES,

@@ -62,7 +62,7 @@ def result(verdict="사실", reason="근거", design=False, role="a"):
     )
 
 
-def adj_input(mode="code"):
+def adj_input(mode="code", cfg=CFG, checker=None, reasons=("판정이 갈림: a=사실, b=아님",)):
     return jobs.AdjInput(
         finding=F1,
         a=result("사실", "a가 재현함", role="a"),
@@ -70,10 +70,18 @@ def adj_input(mode="code"):
         patch_a=PATCH_A,
         patch_b=PATCH_B,
         verify_a=[{"cmd": "pytest tests/test_m.py", "ok": True}],
-        verify_b=[{"cmd": "pytest tests/test_m.py", "ok": False}],
+        verify_b=[{"cmd": "pytest tests/test_m.py", "ok": False, "tail": "\n".join(f"줄{i}" for i in range(1, 9))}],
         worktree=WT_ADJ,
         mode=mode,
+        cfg=cfg,
+        checker=checker,
+        escalation_reasons=list(reasons),
     )
+
+
+def checker_result(ok=False, reason="2번 예: 3절과 단계 수가 어긋난다"):
+    return WorkerResult(finding_id="r1-01", role="checker", verdict="사실", needs_design_decision=False,
+                        reason=reason, verify=[], checker_ok=ok, model_id="m")
 
 
 class Stage1CodeTest(unittest.TestCase):
@@ -110,7 +118,7 @@ class Stage1CodeTest(unittest.TestCase):
             jobs.build_stage1_jobs([F1, F2], CFG, wts_for(F1, F2), "code"),
             jobs.build_stage1_jobs([F1, F2], CFG, wts_for(F1, F2), "doc"),
             jobs.build_checker_jobs([F1, F2], wts_for(F1, F2), {"r1-01": PATCH_A, "r1-02": PATCH_B}),
-            jobs.build_adjudicator_jobs([adj_input("code"), adj_input("doc")]),
+            jobs.build_adjudicator_jobs([adj_input("code"), adj_input("doc"), adj_input("doc", checker=checker_result(True))]),
         ]
         for args in built:
             for j in args["jobs"]:
@@ -183,6 +191,55 @@ class AdjudicatorTest(unittest.TestCase):
             self.assertIn(text, p)
         self.assertIn("pytest tests/test_m.py: 통과", p)
         self.assertIn("pytest tests/test_m.py: 실패", p)
+        self.assertIn("줄8", p)
+        self.assertIn("줄4", p)
+        self.assertNotIn("줄3", p)
+
+    def test_adjudicator_prompt_has_verify_cmds_from_cfg(self):
+        code = jobs.build_adjudicator_jobs([adj_input("code")])["jobs"][0]["prompt"]
+        self.assertIn("## 검증 명령", code)
+        for cmd in ("pytest <바꾼 코드와 관련된 테스트 파일>", "make build", "ruff check ."):
+            self.assertIn(cmd, code)
+        self.assertNotIn("python3 -m py_compile", code)
+        doc = jobs.build_adjudicator_jobs([adj_input("doc", checker=checker_result())])["jobs"][0]["prompt"]
+        self.assertIn("## 검증 명령", doc)
+        self.assertIn("python3 -m py_compile <코드 블록을 옮겨 적은 파일>", doc)
+        self.assertNotIn("make build", doc)
+        none = jobs.build_adjudicator_jobs([adj_input("code", cfg=None)])["jobs"][0]["prompt"]
+        self.assertIn("## 검증 명령", none)
+        self.assertIsNone(PLACEHOLDER.search(none))
+
+    def test_adjudicator_doc_mode_shows_writer_patch_and_checker(self):
+        p = jobs.build_adjudicator_jobs([adj_input("doc", checker=checker_result())])["jobs"][0]["prompt"]
+        self.assertIn("판정자 둘은 판정만 했고 수정은 작성자 패치 하나다", p)
+        self.assertIn("작성자 패치", p)
+        self.assertIn(PATCH_A, p)
+        self.assertNotIn("판정자 a의 패치", p)
+        self.assertIn("## 점검자 결과", p)
+        self.assertIn("2번 예: 3절과 단계 수가 어긋난다", p)
+        self.assertIn("점검 통과: 아니오", p)
+        code = jobs.build_adjudicator_jobs([adj_input("code")])["jobs"][0]["prompt"]
+        self.assertNotIn("판정자 둘은 판정만 했고", code)
+        self.assertIn("판정자 a의 패치", code)
+        self.assertIn(PATCH_B, code)
+        missing = jobs.build_adjudicator_jobs([adj_input("doc", checker=None)])["jobs"][0]["prompt"]
+        self.assertIn("점검자 결과 없음", missing)
+
+    def test_adjudicator_prompt_lists_escalation_reasons(self):
+        for mode in ("code", "doc"):
+            p = jobs.build_adjudicator_jobs([adj_input(mode, reasons=("점검자 아니오", "참조 없음: docs/x.md"))])["jobs"][0]["prompt"]
+            self.assertIn("## 판가름으로 온 이유", p)
+            self.assertIn("- 점검자 아니오", p)
+            self.assertIn("- 참조 없음: docs/x.md", p)
+
+    def test_adjinput_new_fields_have_defaults(self):
+        item = jobs.AdjInput(finding=F1, a=result(), b=result(role="b"), patch_a="", patch_b="",
+                             verify_a=[], verify_b=[], worktree=WT_ADJ, mode="code")
+        self.assertIsNone(item.cfg)
+        self.assertIsNone(item.checker)
+        self.assertEqual(item.escalation_reasons, [])
+        p = jobs.build_adjudicator_jobs([item])["jobs"][0]["prompt"]
+        self.assertIsNone(PLACEHOLDER.search(p))
 
 
 class ReadResultsTest(unittest.TestCase):
@@ -265,6 +322,7 @@ class SchemaAndRulesTest(unittest.TestCase):
             "작업을 마치면 워크트리에서 `git add -A && git -c core.hooksPath=/dev/null commit --no-verify -q -m \"cascade-fix <지적 id> <역할>\"`로 커밋한다.",
         ):
             self.assertIn(s, jobs.RULES)
+        self.assertIn("고친 것이 없으면 커밋하지 않는다.", jobs.RULES)
 
 
 if __name__ == "__main__":
