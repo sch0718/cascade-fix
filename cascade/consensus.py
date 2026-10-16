@@ -17,6 +17,8 @@ OUTCOME_HOLD = "보류후보"
 
 REASON_SENSITIVE = "보안 경로"
 REASON_NO_VERIFIER = "검증기 없음"
+REASON_SENSITIVE_NO_ADOPT = "보안 경로: 자동 채택 안 함"
+VERDICTS = (VERDICT_FACT, VERDICT_NO, VERDICT_UNREPRODUCIBLE, VERDICT_UNDECIDED)
 
 
 @dataclass
@@ -64,7 +66,14 @@ def _decision(a: WorkerResult, outcome: str, reasons: list[str], patch_from: str
     return Decision(finding_id=a.finding_id, outcome=outcome, patch_from=patch_from, reasons=reasons)
 
 
+def _check_verdict(w: WorkerResult) -> None:
+    if w.verdict not in VERDICTS:
+        raise ValueError(f"알 수 없는 판정: {w.verdict!r} (role={w.role})")
+
+
 def _agree_on_verdict(a: WorkerResult, b: WorkerResult) -> Decision | None:
+    _check_verdict(a)
+    _check_verdict(b)
     if a.verdict == VERDICT_UNDECIDED and b.verdict == VERDICT_UNDECIDED:
         return _decision(a, OUTCOME_UNDECIDABLE, ["호출 실패"])
     if a.verdict != b.verdict:
@@ -128,8 +137,10 @@ def decide_doc(
         return d
     if refs_missing:
         return _decision(judge_a, OUTCOME_ADJUDICATE, [f"참조 없음: {', '.join(refs_missing)}"])
-    if checker is None or checker.checker_ok is None:
+    if checker is None:
         return _decision(judge_a, OUTCOME_ADJUDICATE, ["점검자 없음"])
+    if checker.checker_ok is None:
+        return _decision(judge_a, OUTCOME_ADJUDICATE, ["점검자 결과 없음"])
     if checker.checker_ok is False:
         return _decision(judge_a, OUTCOME_ADJUDICATE, ["점검자 아니오"])
     return _decision(judge_a, OUTCOME_AGREED_FACT, [], "writer")
@@ -138,6 +149,7 @@ def decide_doc(
 def after_adjudication(d: Decision, adj: WorkerResult, vadj: list[VerifyResult]) -> Decision:
     if d.outcome != OUTCOME_ADJUDICATE:
         raise ValueError(f"판가름 단계가 아닌 결정에는 쓸 수 없다: {d.outcome}")
+    _check_verdict(adj)
     note = f"판가름: {adj.reason}"
 
     def result(outcome: str, patch_from: str | None, *extra: str) -> Decision:
@@ -151,6 +163,8 @@ def after_adjudication(d: Decision, adj: WorkerResult, vadj: list[VerifyResult])
         return result(OUTCOME_ADJUDICATE, None, "판가름: 아님")
     if adj.needs_design_decision:
         return result(OUTCOME_DESIGN, None)
+    if REASON_SENSITIVE in d.reasons:
+        return result(OUTCOME_UNDECIDABLE, None, REASON_SENSITIVE_NO_ADOPT)
     if not _all_ok(vadj):
         return result(OUTCOME_UNDECIDABLE, None, "판가름 패치 검증 실패")
     if not adj.patch and d.patch_from in ("a", "b"):
