@@ -68,6 +68,7 @@ class PatchesTest(unittest.TestCase):
         self.assertEqual(rep.failed[0][0], "r1-02")
         self.assertTrue(rep.failed[0][1])
         self.assertIn("x=A", (self.repo / "a.py").read_text())
+        self.assertEqual(git(self.repo, "diff", "--cached"), "")
 
     def test_apply_all_does_not_touch_index(self):
         rep = patches.apply_all(self.repo, [("r1-01", P_LINE3_A), ("r1-00", "")])
@@ -78,6 +79,61 @@ class PatchesTest(unittest.TestCase):
     def test_apply_report_roundtrip_dict(self):
         rep = patches.ApplyReport(applied=["r1-01"], failed=[("r1-02", "err")])
         self.assertEqual(rep.to_dict(), {"applied": ["r1-01"], "failed": [["r1-02", "err"]]})
+
+    def test_changed_files_ignores_hunk_body_lookalikes(self):
+        diff = (
+            "diff --git a/a.py b/a.py\nindex 1..2 100644\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n"
+            "--- a/fake.py\n+++ b/fake.py\n"
+        )
+        self.assertEqual(patches.changed_files(diff), ["a.py"])
+
+    def test_changed_files_covers_mode_only_and_binary(self):
+        diff = (
+            "diff --git a/run.sh b/run.sh\nold mode 100644\nnew mode 100755\n"
+            "diff --git a/img.bin b/img.bin\nnew file mode 100644\nindex 0000000..1234567\n"
+            "GIT binary patch\nliteral 0\nHcmV?d00001\n\n"
+        )
+        self.assertEqual(patches.changed_files(diff), ["run.sh", "img.bin"])
+
+    def test_extract_ignores_user_diff_config(self):
+        git(self.repo, "config", "diff.noprefix", "true")
+        git(self.repo, "config", "diff.renames", "copies")
+        snap = snapshot.create_snapshot(self.repo, "run1", [])
+        wt = snapshot.add_worktree(snap, "w1")
+        (wt / "a.py").write_text("a=0\nb=0\nx=1\nd=0\n")
+        diff = patches.extract(wt, snap.commit)
+        self.assertIn("+++ b/a.py", diff)
+        self.assertEqual(patches.changed_files(diff), ["a.py"])
+
+    def test_extract_covers_rename_mode_and_binary_and_applies(self):
+        snap = snapshot.create_snapshot(self.repo, "run1", [])
+        wt = snapshot.add_worktree(snap, "w1")
+        (wt / "a.py").rename(wt / "b.py")
+        (wt / "tool.sh").write_text("echo\n")
+        (wt / "tool.sh").chmod(0o755)
+        (wt / "img.bin").write_bytes(bytes(range(256)) * 4)
+        diff = patches.extract(wt, snap.commit)
+        self.assertEqual(sorted(patches.changed_files(diff)), ["a.py", "b.py", "img.bin", "tool.sh"])
+        rep = patches.apply_all(self.repo, [("r1-01", diff)])
+        self.assertEqual(rep.failed, [])
+        self.assertFalse((self.repo / "a.py").exists())
+        self.assertEqual((self.repo / "img.bin").read_bytes(), bytes(range(256)) * 4)
+        self.assertTrue((self.repo / "tool.sh").stat().st_mode & 0o100)
+
+    def test_crlf_patch_roundtrips_through_extract_and_apply(self):
+        repo = make_repo(self.tmp / "crlf", {"c.txt": "a\r\nb\r\nc\r\n"})
+        snap = snapshot.create_snapshot(repo, "run1", [])
+        wt = snapshot.add_worktree(snap, "w1")
+        (wt / "c.txt").write_bytes(b"a\r\nB\r\nc\r\n")
+        diff = patches.extract(wt, snap.commit)
+        self.assertIn("+B\r\n", diff)
+        rep = patches.apply_all(repo, [("r1-01", diff)])
+        self.assertEqual(rep.failed, [])
+        self.assertEqual((repo / "c.txt").read_bytes(), b"a\r\nB\r\nc\r\n")
+
+    def test_same_sees_crlf_difference(self):
+        crlf = P_LINE3_A.replace("+x=A\n", "+x=A\r\n")
+        self.assertFalse(patches.same(P_LINE3_A, crlf))
 
     def test_extract_runs_format_then_diffs_against_snapshot(self):
         snap = snapshot.create_snapshot(self.repo, "run1", [])
