@@ -21,6 +21,9 @@ for a in "$@"; do
   prev="$a"
 done
 for a in "$@"; do printf '%s\\0' "$a"; done > "$FAKE_CODEX_OUT"
+last=""
+for a in "$@"; do last="$a"; done
+[ "$last" = "-" ] && cat > "$FAKE_CODEX_OUT.stdin"
 [ -n "$out_file" ] && echo "fake result" > "$out_file"
 echo "fake log"
 exit 0
@@ -59,6 +62,9 @@ class RunReviewModesTest(unittest.TestCase):
     def captured_args(self):
         return self.capture.read_bytes().decode("utf-8").split("\0")[:-1]
 
+    def stdin_text(self):
+        return Path(f"{self.capture}.stdin").read_text(encoding="utf-8")
+
     def assert_exec_command(self, mode):
         proc = self.run_script(f"--{mode}", str(self.prompt), "--repo", str(self.repo), "--out", str(self.out))
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -69,7 +75,8 @@ class RunReviewModesTest(unittest.TestCase):
         self.assertIn("--ephemeral", args)
         self.assertEqual(args[args.index("-C") + 1], str(self.repo))
         self.assertEqual(args[args.index("-o") + 1], f"{self.out}.final")
-        self.assertEqual(args[-1], "재검토 프롬프트 본문\n둘째 줄")
+        self.assertEqual(args[-1], "-")
+        self.assertEqual(self.stdin_text(), "재검토 프롬프트 본문\n둘째 줄")
         self.assertIn(f"mode={mode}", proc.stdout)
         self.assertIn("exit=0", proc.stdout)
         self.assertIn(f"full_log={self.out}", proc.stdout)
@@ -83,6 +90,14 @@ class RunReviewModesTest(unittest.TestCase):
 
     def test_run_review_opinion_mode_builds_exec_command(self):
         self.assert_exec_command("opinion")
+
+    def test_large_recheck_prompt_is_not_passed_as_argument(self):
+        big = "diff 줄\n" * 300000
+        self.prompt.write_text(big, encoding="utf-8")
+        proc = self.run_script("--recheck", str(self.prompt), "--repo", str(self.repo), "--out", str(self.out))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.captured_args()[-1], "-")
+        self.assertEqual(self.stdin_text(), big)
 
     def test_recheck_root_defaults_to_prompt_file_repo(self):
         prompt = self.repo / "p.md"
