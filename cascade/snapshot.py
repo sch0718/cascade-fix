@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -7,6 +8,8 @@ from pathlib import Path
 RUN_DIR_NAME = ".cascade-fix"
 EXCLUDE_LINE = f"{RUN_DIR_NAME}/"
 EXTERNAL_PREFIX = "외부"
+SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+INHERITED_GIT_ENV = ("GIT_INDEX_FILE", "GIT_DIR", "GIT_WORK_TREE")
 COMMIT_IDENTITY = ["-c", "user.name=cascade-fix", "-c", "user.email=cascade-fix@local", "-c", "commit.gpgsign=false"]
 
 
@@ -42,11 +45,24 @@ class Snapshot:
 
 
 def _git(cwd: Path, *args: str, env: dict | None = None) -> str:
+    full_env = {k: v for k, v in os.environ.items() if k not in INHERITED_GIT_ENV}
+    full_env.update(env or {})
     try:
-        p = subprocess.run(["git", *args], cwd=cwd, env=env, check=True, capture_output=True, text=True)
+        p = subprocess.run(["git", *args], cwd=cwd, env=full_env, check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"git 명령 실패 (git {' '.join(args)}): {e.stderr.strip()}") from e
     return p.stdout.strip()
+
+
+def _no_hooks(run_dir: Path) -> list[str]:
+    empty = run_dir / "no-hooks"
+    empty.mkdir(parents=True, exist_ok=True)
+    return ["-c", f"core.hooksPath={empty}"]
+
+
+def _check_name(name: str, what: str) -> None:
+    if not SAFE_NAME.fullmatch(name):
+        raise RuntimeError(f"{what}에 쓸 수 없는 값: {name!r} (영문·숫자로 시작하고 영문·숫자·._- 만)")
 
 
 def ensure_excluded(root: Path) -> None:
@@ -64,9 +80,10 @@ def ensure_excluded(root: Path) -> None:
 
 
 def create_snapshot(root: Path, run_id: str, extra_files: list[Path]) -> Snapshot:
+    _check_name(run_id, "실행 ID")
     root = Path(root).resolve()
     try:
-        _git(root, "rev-parse", "--verify", "-q", "HEAD")
+        head = _git(root, "rev-parse", "--verify", "-q", "HEAD^{commit}")
     except RuntimeError:
         raise RuntimeError("커밋이 없는 저장소") from None
     names = [Path(p).name for p in extra_files]
@@ -77,9 +94,10 @@ def create_snapshot(root: Path, run_id: str, extra_files: list[Path]) -> Snapsho
     ensure_excluded(root)
     run_dir = root / RUN_DIR_NAME / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
-    env = {**os.environ, "GIT_INDEX_FILE": str(run_dir / "index.tmp")}
-    _git(root, "read-tree", "HEAD", env=env)
-    _git(root, "add", "-A", env=env)
+    no_hooks = _no_hooks(run_dir)
+    env = {"GIT_INDEX_FILE": str(run_dir / "index.tmp")}
+    _git(root, *no_hooks, "read-tree", head, env=env)
+    _git(root, *no_hooks, "add", "-A", env=env)
 
     if extra_files:
         external = run_dir / "external"
@@ -87,43 +105,78 @@ def create_snapshot(root: Path, run_id: str, extra_files: list[Path]) -> Snapsho
         for src in extra_files:
             copy = external / Path(src).name
             shutil.copyfile(src, copy)
-            blob = _git(root, "hash-object", "-w", str(copy))
-            _git(root, "update-index", "--add", "--cacheinfo", f"100644,{blob},{EXTERNAL_PREFIX}/{copy.name}", env=env)
+            blob = _git(root, *no_hooks, "hash-object", "-w", str(copy))
+            _git(root, *no_hooks, "update-index", "--add", "--cacheinfo",
+                 f"100644,{blob},{EXTERNAL_PREFIX}/{copy.name}", env=env)
 
-    tree = _git(root, "write-tree", env=env)
-    commit = _git(root, *COMMIT_IDENTITY, "commit-tree", tree, "-p", "HEAD", "-m", f"cascade-fix 스냅샷 {run_id}")
+    tree = _git(root, *no_hooks, "write-tree", env=env)
+    commit = _git(root, *no_hooks, *COMMIT_IDENTITY, "commit-tree", tree, "-p", head,
+                  "-m", f"cascade-fix 스냅샷 {run_id}")
     branch = f"cascade-fix/{run_id}"
-    _git(root, "branch", branch, commit)
+    _git(root, *no_hooks, "branch", branch, commit)
     return Snapshot(root=root, run_id=run_id, branch=branch, commit=commit, run_dir=run_dir)
 
 
 def add_worktree(snap: Snapshot, name: str) -> Path:
+    _check_name(name, "워크트리 이름")
     path = snap.run_dir / "wt" / name
     path.parent.mkdir(parents=True, exist_ok=True)
-    _git(snap.root, "worktree", "add", "--detach", str(path), snap.commit)
+    _git(snap.root, *_no_hooks(snap.run_dir), "worktree", "add", "--detach", str(path), snap.commit)
     snap.worktrees[name] = path
     return path
 
 
 def commit_worktree(wt: Path, message: str) -> str | None:
     wt = Path(wt)
-    _git(wt, "add", "-A")
-    if _git(wt, "status", "--porcelain") == "":
+    no_hooks = _no_hooks(wt.parent.parent)
+    _git(wt, *no_hooks, "add", "-A")
+    if _git(wt, *no_hooks, "status", "--porcelain") == "":
         return None
-    _git(wt, *COMMIT_IDENTITY, "commit", "-q", "--no-verify", "-m", message)
+    _git(wt, *no_hooks, *COMMIT_IDENTITY, "commit", "-q", "--no-verify", "-m", message)
     return _git(wt, "rev-parse", "HEAD")
 
 
+def _run_worktrees(snap: Snapshot) -> list[Path]:
+    wt_root = (snap.run_dir / "wt").resolve()
+    listed = _git(snap.root, "worktree", "list", "--porcelain").splitlines()
+    paths = [Path(line[len("worktree "):]) for line in listed if line.startswith("worktree ")]
+    return [p for p in paths if p.resolve().is_relative_to(wt_root)]
+
+
 def cleanup(snap: Snapshot, keep_run_dir: bool) -> None:
-    for path in snap.worktrees.values():
+    run_dir = snap.run_dir.resolve()
+    if run_dir.parent != (snap.root / RUN_DIR_NAME).resolve():
+        raise RuntimeError(f"run_dir이 {snap.root / RUN_DIR_NAME} 아래가 아니라 정리하지 않는다: {snap.run_dir}")
+    no_hooks = _no_hooks(snap.run_dir)
+    errors: list[str] = []
+
+    def attempt(*args: str) -> None:
+        try:
+            _git(snap.root, *no_hooks, *args)
+        except RuntimeError as e:
+            errors.append(str(e))
+
+    try:
+        paths = set(_run_worktrees(snap))
+    except RuntimeError as e:
+        errors.append(str(e))
+        paths = set()
+    paths |= {p for p in snap.worktrees.values()}
+    for path in sorted(paths):
         if path.exists():
-            _git(snap.root, "worktree", "remove", "--force", str(path))
-    _git(snap.root, "worktree", "prune")
+            attempt("worktree", "remove", "--force", str(path))
     snap.worktrees.clear()
-    if _git(snap.root, "branch", "--list", snap.branch):
-        _git(snap.root, "branch", "-D", snap.branch)
-    if not keep_run_dir:
+    try:
+        if _git(snap.root, "branch", "--list", snap.branch):
+            attempt("branch", "-D", snap.branch)
+    except RuntimeError as e:
+        errors.append(str(e))
+
+    if keep_run_dir:
+        shutil.rmtree(snap.run_dir / "wt", ignore_errors=True)
+        (snap.run_dir / "index.tmp").unlink(missing_ok=True)
+    else:
         shutil.rmtree(snap.run_dir, ignore_errors=True)
-        return
-    shutil.rmtree(snap.run_dir / "wt", ignore_errors=True)
-    (snap.run_dir / "index.tmp").unlink(missing_ok=True)
+    attempt("worktree", "prune")
+    if errors:
+        raise RuntimeError("정리 실패 (나머지는 정리함):\n" + "\n".join(errors))

@@ -1,8 +1,10 @@
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -88,16 +90,24 @@ class SnapshotTest(unittest.TestCase):
 
     def test_commit_worktree_skips_hooks(self):
         repo = make_repo(self.tmp / "repo", {"a.py": "x=1\n"})
-        hook = repo / ".git" / "hooks" / "pre-commit"
-        hook.parent.mkdir(parents=True, exist_ok=True)
-        hook.write_text("#!/bin/sh\nexit 1\n")
-        hook.chmod(0o755)
+        markers = self.tmp / "markers"
+        markers.mkdir()
+        hooks = repo / ".git" / "hooks"
+        hooks.mkdir(parents=True, exist_ok=True)
+        names = ["pre-commit", "prepare-commit-msg", "commit-msg", "post-commit",
+                 "post-checkout", "post-index-change", "reference-transaction"]
+        for name in names:
+            hook = hooks / name
+            hook.write_text(f"#!/bin/sh\ntouch '{markers}/{name}'\nexit 1\n")
+            hook.chmod(0o755)
         snap = snapshot.create_snapshot(repo, "run1", [])
         wt = snapshot.add_worktree(snap, "w1")
         (wt / "a.py").write_text("x=3\n")
         sha = snapshot.commit_worktree(wt, "훅 무시")
+        snapshot.cleanup(snap, keep_run_dir=True)
+        self.assertEqual(sorted(p.name for p in markers.iterdir()), [])
         self.assertRegex(sha, r"^[0-9a-f]{40}$")
-        self.assertEqual(git(wt, "rev-parse", f"{sha}^"), snap.commit)
+        self.assertEqual(git(repo, "rev-parse", f"{sha}^"), snap.commit)
 
     def test_cleanup_removes_branch_and_worktrees(self):
         repo = make_repo(self.tmp / "repo", {"a.py": "x=1\n"})
@@ -118,6 +128,62 @@ class SnapshotTest(unittest.TestCase):
         self.assertFalse(snap2.run_dir.exists())
         self.assertEqual(git(repo, "branch", "--list", "cascade-fix/*"), "")
         self.assertEqual(git(repo, "status", "--porcelain"), "")
+
+    def test_cleanup_removes_unregistered_worktree(self):
+        repo = make_repo(self.tmp / "repo", {"a.py": "x=1\n"})
+        snap = snapshot.create_snapshot(repo, "run1", [])
+        ghost = snap.run_dir / "wt" / "ghost"
+        git(repo, "worktree", "add", "--detach", str(ghost), snap.commit)
+        self.assertNotIn("ghost", snap.worktrees)
+        snapshot.cleanup(snap, keep_run_dir=False)
+        listed = [l for l in git(repo, "worktree", "list", "--porcelain").splitlines() if l.startswith("worktree ")]
+        self.assertEqual(listed, [f"worktree {repo}"])
+        self.assertEqual(list((repo / ".git" / "worktrees").glob("*")) if (repo / ".git" / "worktrees").exists() else [], [])
+        self.assertFalse(snap.run_dir.exists())
+
+    def test_cleanup_continues_after_worktree_failure(self):
+        repo = make_repo(self.tmp / "repo", {"a.py": "x=1\n"})
+        snap = snapshot.create_snapshot(repo, "run1", [])
+        locked = snapshot.add_worktree(snap, "locked")
+        other = snapshot.add_worktree(snap, "other")
+        git(repo, "worktree", "lock", str(locked))
+        with self.assertRaisesRegex(RuntimeError, "정리 실패"):
+            snapshot.cleanup(snap, keep_run_dir=True)
+        self.assertFalse(other.exists())
+        self.assertEqual(git(repo, "branch", "--list", "cascade-fix/*"), "")
+        git(repo, "worktree", "unlock", str(locked))
+        git(repo, "worktree", "prune")
+
+    def test_rejects_unsafe_run_id_and_worktree_name(self):
+        repo = make_repo(self.tmp / "repo", {"a.py": "x=1\n"})
+        for bad in ["../x", "a/b", "", ".hidden", "-x"]:
+            with self.assertRaisesRegex(RuntimeError, "실행 ID"):
+                snapshot.create_snapshot(repo, bad, [])
+        snap = snapshot.create_snapshot(repo, "run1.a_b-c", [])
+        with self.assertRaisesRegex(RuntimeError, "워크트리 이름"):
+            snapshot.add_worktree(snap, "../x")
+        self.assertEqual(git(repo, "branch", "--list", "cascade-fix/*").strip(), "cascade-fix/run1.a_b-c")
+
+    def test_cleanup_refuses_run_dir_outside_root(self):
+        repo = make_repo(self.tmp / "repo", {"a.py": "x=1\n"})
+        snap = snapshot.create_snapshot(repo, "run1", [])
+        victim = self.tmp / "victim"
+        victim.mkdir()
+        snap.run_dir = victim
+        with self.assertRaisesRegex(RuntimeError, "run_dir"):
+            snapshot.cleanup(snap, keep_run_dir=False)
+        self.assertTrue(victim.exists())
+
+    def test_snapshot_ignores_inherited_git_env(self):
+        repo = make_repo(self.tmp / "repo", {"a.py": "x=1\n"})
+        other = make_repo(self.tmp / "other", {"b.py": "y=1\n"})
+        env = {"GIT_DIR": str(other / ".git"), "GIT_WORK_TREE": str(other),
+               "GIT_INDEX_FILE": str(other / ".git" / "index")}
+        with mock.patch.dict(os.environ, env):
+            snap = snapshot.create_snapshot(repo, "run1", [])
+        tree = git(repo, "ls-tree", "-r", "--name-only", snap.commit).splitlines()
+        self.assertEqual(tree, ["a.py"])
+        self.assertEqual(git(other, "branch", "--list", "cascade-fix/*"), "")
 
     def test_ensure_excluded_adds_once(self):
         repo = make_repo(self.tmp / "repo", {"a.py": "x=1\n"})
