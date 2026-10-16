@@ -96,6 +96,35 @@ class RunReviewModesTest(unittest.TestCase):
         proc = self.run_script("--recheck", str(self.prompt) + ".none", "--out", str(self.out))
         self.assertEqual(proc.returncode, 3)
 
+    def test_recheck_empty_prompt_file_exits_3_without_calling_codex(self):
+        empty = self.repo / "empty.md"
+        empty.write_text("", encoding="utf-8")
+        for mode in ("recheck", "opinion"):
+            proc = self.run_script(f"--{mode}", str(empty), "--repo", str(self.repo), "--out", str(self.out))
+            self.assertEqual(proc.returncode, 3, proc.stderr)
+            self.assertIn("비어 있다", proc.stderr)
+        self.assertFalse(self.capture.exists())
+
+    def test_recheck_unreadable_prompt_file_exits_3_without_calling_codex(self):
+        locked = self.repo / "locked.md"
+        locked.write_text("본문", encoding="utf-8")
+        locked.chmod(0)
+        try:
+            if os.access(locked, os.R_OK):
+                self.skipTest("root 권한이라 chmod 000이 읽기를 막지 못한다")
+            proc = self.run_script("--recheck", str(locked), "--repo", str(self.repo), "--out", str(self.out))
+        finally:
+            locked.chmod(0o644)
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertIn("읽을 수 없거나", proc.stderr)
+        self.assertFalse(self.capture.exists())
+
+    def test_recheck_missing_repo_exits_3_without_calling_codex(self):
+        proc = self.run_script("--recheck", str(self.prompt), "--repo", str(self.repo) + "-none", "--out", str(self.out))
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertIn("저장소 디렉터리", proc.stderr)
+        self.assertFalse(self.capture.exists())
+
     def test_doc_mode_still_works_with_fake_codex(self):
         doc = self.repo / "a.md"
         proc = self.run_script("--doc", str(doc), "--out", str(self.out))

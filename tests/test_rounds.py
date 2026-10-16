@@ -56,6 +56,13 @@ class NeedsRecheckTest(unittest.TestCase):
         self.assertFalse(rounds.needs_recheck(record([PREV_CRIT, WARN, SUGG], ["r1-01"]), 2, 2))
         self.assertTrue(rounds.needs_recheck(record([PREV_CRIT], ["r1-01"]), 2, 1))
 
+    def test_needs_recheck_ignores_findings_without_id_or_severity(self):
+        rec = record([WARN], ["r1-02"])
+        rec.findings = [{"severity": "Warning"}, {"id": "r1-09"}, *rec.findings]
+        self.assertTrue(rounds.needs_recheck(rec, 2, 0))
+        rec.adopted = ["r1-09"]
+        self.assertFalse(rounds.needs_recheck(rec, 2, 0))
+
     def test_final_round_never_needs_recheck(self):
         self.assertFalse(rounds.needs_recheck(record([PREV_CRIT], ["r1-01"], final=True), 2, 0))
 
@@ -146,6 +153,16 @@ class LedgerTest(unittest.TestCase):
         self.assertEqual(loaded.status, "진행")
         self.assertEqual(loaded.max_rechecks, 2)
         self.assertIsInstance(loaded.rounds[0], rounds.RoundRecord)
+
+    def test_save_is_atomic_and_leaves_no_temp_file(self):
+        ledger = rounds.Ledger(run_id="r", source="s", mode="doc", root="/", snapshot={}, dry_run=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = rounds.ledger_path(Path(tmp))
+            ledger.save(path)
+            ledger.status = "종료"
+            ledger.save(path)
+            self.assertEqual(rounds.Ledger.load(path).status, "종료")
+            self.assertEqual([p.name for p in Path(tmp).iterdir()], ["ledger.json"])
 
     def test_current_round_none_when_empty(self):
         ledger = rounds.Ledger(run_id="r", source="s", mode="doc", root="/", snapshot={}, dry_run=True)

@@ -1,4 +1,5 @@
 import json
+import os
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
@@ -62,7 +63,9 @@ class Ledger:
     def save(self, path: Path) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(asdict(self), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(asdict(self), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
 
     @classmethod
     def load(cls, path: Path) -> "Ledger":
@@ -82,7 +85,7 @@ def needs_recheck(round: RoundRecord, max_rechecks: int, rechecks_done: int) -> 
         return False
     adopted = set(round.adopted)
     return any(
-        f["severity"] in ("Critical", "Warning") for f in round.findings if f["id"] in adopted
+        f.get("severity") in ("Critical", "Warning") for f in round.findings if f.get("id") in adopted
     )
 
 
