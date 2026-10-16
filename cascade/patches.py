@@ -85,22 +85,65 @@ def changed_files(diff: str) -> list[str]:
     return files
 
 
-def apply_all(root: Path, patches: list[tuple[str, str]]) -> ApplyReport:
+def _sections(diff: str) -> list[tuple[str | None, str]]:
+    sections: list[tuple[str | None, list[str]]] = []
+    for line in diff.splitlines(keepends=True):
+        if line.startswith(GIT_HEADER) or not sections:
+            path = _git_header_path(line.rstrip("\r\n")) if line.startswith(GIT_HEADER) else None
+            sections.append((path, []))
+        sections[-1][1].append(line)
+    return [(path, "".join(lines)) for path, lines in sections]
+
+
+def _apply_outside(work: Path, rel: str, original: Path, text: str) -> tuple[bytes | None, str | None]:
+    target = work / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if original.is_file():
+        target.write_bytes(original.read_bytes())
+    patch_file = work / "section.patch"
+    patch_file.write_bytes(text.encode("utf-8"))
+    env = {k: v for k, v in os.environ.items() if k not in INHERITED_GIT_ENV}
+    env["GIT_CEILING_DIRECTORIES"] = str(work.parent)
+    p = subprocess.run(["git", "apply", str(patch_file)], cwd=work, env=env, capture_output=True, check=False)
+    if p.returncode != 0:
+        return None, _decode(p.stderr)[-STDERR_TAIL:]
+    return (target.read_bytes() if target.exists() else None), None
+
+
+def apply_all(root: Path, patches: list[tuple[str, str]], external: dict[str, Path] | None = None) -> ApplyReport:
     root = Path(root)
+    external = {k: Path(v) for k, v in (external or {}).items()}
     report = ApplyReport()
     with tempfile.TemporaryDirectory() as tmp:
         for index, (finding_id, diff) in enumerate(patches):
             if not diff.strip():
                 report.applied.append(finding_id)
                 continue
-            patch_file = Path(tmp) / f"{index}.patch"
-            patch_file.write_bytes(diff.encode("utf-8"))
-            check = _git(root, "apply", "--check", str(patch_file))
-            if check.returncode == 0:
-                done = _git(root, "apply", str(patch_file))
-                if done.returncode == 0:
-                    report.applied.append(finding_id)
-                    continue
-                check = done
-            report.failed.append((finding_id, _decode(check.stderr)[-STDERR_TAIL:]))
+            sections = _sections(diff)
+            inner = "".join(text for path, text in sections if path not in external)
+            outside: dict[str, bytes | None] = {}
+            error = None
+            for n, (path, text) in enumerate(sections):
+                if path in external:
+                    content, error = _apply_outside(Path(tmp) / f"{index}-{n}", path, external[path], text)
+                    if error is not None:
+                        break
+                    outside[path] = content
+            if error is None and inner.strip():
+                patch_file = Path(tmp) / f"{index}.patch"
+                patch_file.write_bytes(inner.encode("utf-8"))
+                check = _git(root, "apply", "--check", str(patch_file))
+                if check.returncode == 0:
+                    check = _git(root, "apply", str(patch_file))
+                if check.returncode != 0:
+                    error = _decode(check.stderr)[-STDERR_TAIL:]
+            if error is not None:
+                report.failed.append((finding_id, error))
+                continue
+            for path, content in outside.items():
+                if content is None:
+                    external[path].unlink(missing_ok=True)
+                else:
+                    external[path].write_bytes(content)
+            report.applied.append(finding_id)
     return report

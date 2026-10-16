@@ -205,5 +205,33 @@ class SnapshotTest(unittest.TestCase):
         self.assertEqual(snapshot.Snapshot.from_dict(data), snap)
 
 
+    def test_snapshot_tree_advances_branch_with_current_tree(self):
+        repo = make_repo(self.tmp / "repo", {"a.py": "x=1\n"})
+        ext = self.tmp / "outside" / "spec.md"
+        ext.parent.mkdir()
+        ext.write_text("# 1\n")
+        snap = snapshot.create_snapshot(repo, "run1", [ext])
+        (repo / "a.py").write_text("x=2\n")
+        ext.write_text("# 2\n")
+        before = git(repo, "status", "--porcelain")
+        new = snapshot.snapshot_tree(snap, [ext])
+        self.assertEqual(git(repo, "rev-parse", snap.branch), new)
+        self.assertEqual(git(repo, "rev-parse", f"{new}^"), snap.commit)
+        self.assertEqual(show(repo, f"{new}:a.py"), "x=2\n")
+        self.assertEqual(show(repo, f"{new}:외부/spec.md"), "# 2\n")
+        self.assertEqual(git(repo, "status", "--porcelain"), before)
+        newer = snapshot.snapshot_tree(snap, [ext])
+        self.assertEqual(git(repo, "rev-parse", f"{newer}^"), new)
+
+    def test_add_worktree_from_given_commit(self):
+        repo = make_repo(self.tmp / "repo", {"a.py": "x=1\n"})
+        snap = snapshot.create_snapshot(repo, "run1", [])
+        (repo / "a.py").write_text("x=2\n")
+        new = snapshot.snapshot_tree(snap, [])
+        old_wt = snapshot.add_worktree(snap, "old")
+        new_wt = snapshot.add_worktree(snap, "new", new)
+        self.assertEqual((old_wt / "a.py").read_text(), "x=1\n")
+        self.assertEqual((new_wt / "a.py").read_text(), "x=2\n")
+
 if __name__ == "__main__":
     unittest.main()

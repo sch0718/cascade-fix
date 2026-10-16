@@ -94,11 +94,20 @@ def create_snapshot(root: Path, run_id: str, extra_files: list[Path]) -> Snapsho
     ensure_excluded(root)
     run_dir = root / RUN_DIR_NAME / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
+    tree = _write_tree(root, run_dir, head, extra_files)
+    no_hooks = _no_hooks(run_dir)
+    commit = _git(root, *no_hooks, *COMMIT_IDENTITY, "commit-tree", tree, "-p", head,
+                  "-m", f"cascade-fix 스냅샷 {run_id}")
+    branch = f"cascade-fix/{run_id}"
+    _git(root, *no_hooks, "branch", branch, commit)
+    return Snapshot(root=root, run_id=run_id, branch=branch, commit=commit, run_dir=run_dir)
+
+
+def _write_tree(root: Path, run_dir: Path, head: str, extra_files: list[Path]) -> str:
     no_hooks = _no_hooks(run_dir)
     env = {"GIT_INDEX_FILE": str(run_dir / "index.tmp")}
     _git(root, *no_hooks, "read-tree", head, env=env)
     _git(root, *no_hooks, "add", "-A", env=env)
-
     if extra_files:
         external = run_dir / "external"
         external.mkdir(exist_ok=True)
@@ -108,20 +117,27 @@ def create_snapshot(root: Path, run_id: str, extra_files: list[Path]) -> Snapsho
             blob = _git(root, *no_hooks, "hash-object", "-w", str(copy))
             _git(root, *no_hooks, "update-index", "--add", "--cacheinfo",
                  f"100644,{blob},{EXTERNAL_PREFIX}/{copy.name}", env=env)
-
-    tree = _git(root, *no_hooks, "write-tree", env=env)
-    commit = _git(root, *no_hooks, *COMMIT_IDENTITY, "commit-tree", tree, "-p", head,
-                  "-m", f"cascade-fix 스냅샷 {run_id}")
-    branch = f"cascade-fix/{run_id}"
-    _git(root, *no_hooks, "branch", branch, commit)
-    return Snapshot(root=root, run_id=run_id, branch=branch, commit=commit, run_dir=run_dir)
+    return _git(root, *no_hooks, "write-tree", env=env)
 
 
-def add_worktree(snap: Snapshot, name: str) -> Path:
+def snapshot_tree(snap: Snapshot, extra_files: list[Path]) -> str:
+    root = Path(snap.root)
+    head = _git(root, "rev-parse", "--verify", "-q", "HEAD^{commit}")
+    ref = f"refs/heads/{snap.branch}"
+    parent = _git(root, "rev-parse", "--verify", "-q", f"{ref}^{{commit}}")
+    tree = _write_tree(root, snap.run_dir, head, extra_files)
+    no_hooks = _no_hooks(snap.run_dir)
+    commit = _git(root, *no_hooks, *COMMIT_IDENTITY, "commit-tree", tree, "-p", parent,
+                  "-m", f"cascade-fix 스냅샷 {snap.run_id} 갱신")
+    _git(root, *no_hooks, "update-ref", ref, commit, parent)
+    return commit
+
+
+def add_worktree(snap: Snapshot, name: str, commit: str | None = None) -> Path:
     _check_name(name, "워크트리 이름")
     path = snap.run_dir / "wt" / name
     path.parent.mkdir(parents=True, exist_ok=True)
-    _git(snap.root, *_no_hooks(snap.run_dir), "worktree", "add", "--detach", str(path), snap.commit)
+    _git(snap.root, *_no_hooks(snap.run_dir), "worktree", "add", "--detach", str(path), commit or snap.commit)
     snap.worktrees[name] = path
     return path
 

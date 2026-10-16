@@ -152,5 +152,37 @@ class PatchesTest(unittest.TestCase):
         self.assertEqual(git(self.repo, "status", "--porcelain"), "")
 
 
+    def _external_patch(self, old, new):
+        return (
+            "diff --git a/외부/plan.md b/외부/plan.md\n"
+            "--- a/외부/plan.md\n"
+            "+++ b/외부/plan.md\n"
+            "@@ -1,2 +1,2 @@\n"
+            " # 계획\n"
+            f"-{old}\n"
+            f"+{new}\n"
+        )
+
+    def test_apply_all_writes_external_section_to_original_file(self):
+        doc = self.tmp / "outside" / "plan.md"
+        doc.parent.mkdir()
+        doc.write_text("# 계획\n1단계\n", encoding="utf-8")
+        report = patches.apply_all(self.repo, [("r1-01", P_LINE3_A + self._external_patch("1단계", "1단계: 고친다"))],
+                                   {"외부/plan.md": doc})
+        self.assertEqual(report.applied, ["r1-01"])
+        self.assertEqual(doc.read_text(encoding="utf-8"), "# 계획\n1단계: 고친다\n")
+        self.assertIn("x=A", (self.repo / "a.py").read_text())
+        self.assertFalse((self.repo / "외부").exists())
+
+    def test_apply_all_external_failure_changes_nothing(self):
+        doc = self.tmp / "outside" / "plan.md"
+        doc.parent.mkdir()
+        doc.write_text("# 계획\n다른 줄\n", encoding="utf-8")
+        report = patches.apply_all(self.repo, [("r1-01", P_LINE3_A + self._external_patch("1단계", "x"))],
+                                   {"외부/plan.md": doc})
+        self.assertEqual([fid for fid, _ in report.failed], ["r1-01"])
+        self.assertEqual(doc.read_text(encoding="utf-8"), "# 계획\n다른 줄\n")
+        self.assertEqual((self.repo / "a.py").read_text(), BASE)
+
 if __name__ == "__main__":
     unittest.main()
