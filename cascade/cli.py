@@ -20,6 +20,7 @@ from cascade.consensus import (
     decide_doc,
 )
 from cascade.findings import (
+    Finding,
     ParseError,
     fetch_pr_findings,
     parse_codex_code,
@@ -90,7 +91,27 @@ def _split_docs(root: Path, docs: list[str]) -> tuple[dict[str, str], list[Path]
     return names, external
 
 
+FINDING_REQUIRED = ("id", "severity", "location", "body")
+
+
+def _load_findings_json(path: str, source: str) -> list[Finding]:
+    data = s.read_json(Path(path))
+    if not isinstance(data, list):
+        raise s.CliError(f"--findings-json은 지적 객체의 목록이다: {path}", ExitCodes.PARSE_ERROR)
+    findings = []
+    for i, item in enumerate(data, 1):
+        missing = [k for k in FINDING_REQUIRED if not isinstance(item, dict) or k not in item]
+        if missing:
+            raise s.CliError(f"--findings-json {i}번째 지적에 {', '.join(missing)} 가 없다", ExitCodes.PARSE_ERROR)
+        findings.append(Finding.from_dict({"source": source, "evidence": "", **item}))
+    return findings
+
+
 def _parse_input(args, root: Path):
+    if args.findings_json:
+        return _load_findings_json(args.findings_json, args.source), ""
+    if not args.input:
+        raise s.CliError("--input 또는 --findings-json 중 하나를 준다")
     if args.source == "pr-comment":
         if args.pr_repo:
             owner, _, name = args.pr_repo.partition("/")
@@ -599,7 +620,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = add("init", cmd_init, run_dir=False, force=False)
     p.add_argument("--source", choices=SOURCES, required=True)
-    p.add_argument("--input", required=True)
+    p.add_argument("--input")
+    p.add_argument("--findings-json")
     p.add_argument("--doc", action="append")
     p.add_argument("--pr-repo")
     p.add_argument("--me")
