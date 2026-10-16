@@ -239,6 +239,66 @@ class RenderTest(unittest.TestCase):
         self.assertNotIn("### PR 답글 초안", local)
         self.assertNotIn("### resolve 대상", local)
 
+    def _failed_apply_ledger(self):
+        findings = [finding("F1", thread_id="T1", body="고칠 것 1"), finding("F2", thread_id="T2", body="고칠 것 2")]
+        decisions = [
+            decision("F1", OUTCOME_AGREED_FACT, "a", ["통과"]),
+            decision("F2", OUTCOME_AGREED_FACT, "a", ["통과"]),
+        ]
+        return make_ledger(findings, decisions, source="pr-comment")
+
+    def _write_apply(self, run_dir, payload):
+        (run_dir / "round-1").mkdir(exist_ok=True)
+        (run_dir / "round-1" / "apply.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    def test_apply_failure_excluded_from_prepared_files(self):
+        ledger = self._failed_apply_ledger()
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            self._write_apply(run_dir, {"applied": ["F1"], "failed": [["F2", "충돌 발생\n둘째 줄"]]})
+            report.write_prepared(run_dir, ledger)
+            message = (run_dir / "prepared" / "commit-message.txt").read_text(encoding="utf-8")
+            replies = json.loads((run_dir / "prepared" / "replies.json").read_text(encoding="utf-8"))
+            resolve = json.loads((run_dir / "prepared" / "resolve.json").read_text(encoding="utf-8"))
+            text = report.render(ledger, False, run_dir=run_dir)
+        self.assertEqual([line for line in message.splitlines() if line.startswith("- ")], ["- F1 src/a.py:10: 고칠 것 1"])
+        self.assertTrue(message.startswith("fix: 고칠 것 1\n"))
+        self.assertEqual(resolve, ["T1"])
+        self.assertTrue(replies["T1"].startswith("반영했습니다."))
+        self.assertEqual(replies["T2"], "적용 실패: 충돌 발생. 검토 중입니다.")
+        self.assertIn("적용 실패: 충돌 발생. 검토 중입니다.", section(text, "### PR 답글 초안"))
+        self.assertNotIn("T2", section(text, "### resolve 대상"))
+        self.assertNotIn("- F2 ", section(text, "### 커밋 메시지 초안"))
+
+    def test_malformed_apply_failed_entries_are_skipped(self):
+        ledger = self._failed_apply_ledger()
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            self._write_apply(run_dir, {"applied": ["F1"], "failed": ["F2", ["F2"], 5, None]})
+            text = report.render(ledger, False, run_dir=run_dir)
+            report.write_prepared(run_dir, ledger)
+            resolve = json.loads((run_dir / "prepared" / "resolve.json").read_text(encoding="utf-8"))
+        self.assertIn("### 적용 결과", text)
+        self.assertEqual(resolve, ["T1", "T2"])
+
+    def test_empty_worker_reason_falls_back_to_decision_reasons(self):
+        ledger = full_ledger()
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "round-1").mkdir()
+            results = {"F3:a": worker("F3", "a", ""), "F3:b": worker("F3", "b", "B 근거")}
+            (run_dir / "round-1" / "results.json").write_text(json.dumps(results, ensure_ascii=False), encoding="utf-8")
+            text = report.render(ledger, False, run_dir=run_dir)
+        rebuttal = section(text, "### 반박")
+        self.assertIn("a: 코드에 없음", rebuttal)
+        self.assertIn("b: 이미 처리됨", rebuttal)
+        self.assertNotIn("B 근거", rebuttal)
+
+    def test_single_commit_subject_when_body_first_line_empty(self):
+        ledger = make_ledger([finding("F1", body="")], [decision("F1", OUTCOME_AGREED_FACT, "a")])
+        block = section(report.render(ledger, False), "### 커밋 메시지 초안")
+        self.assertIn("fix: 리뷰 지적 F1 반영", block)
+
     def test_call_counts_and_elapsed(self):
         events = [
             {"step": "start", "at": "2026-10-17T10:00:00+00:00"},

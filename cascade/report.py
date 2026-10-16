@@ -103,6 +103,22 @@ def _load_apply(run_dir: Path | None, round_no: int) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+def _failed_items(apply: dict | None) -> list[tuple[str, str]]:
+    items = []
+    for entry in (apply or {}).get("failed", []) or []:
+        if isinstance(entry, (list, tuple)) and len(entry) == 2:
+            items.append((str(entry[0]), str(entry[1])))
+    return items
+
+
+def _failed_ids(ledger: Ledger, run_dir: Path | None) -> dict[str, str]:
+    failed: dict[str, str] = {}
+    for rnd in ledger.rounds:
+        for fid, tail in _failed_items(_load_apply(run_dir, rnd.no)):
+            failed[fid] = tail
+    return failed
+
+
 def _worker_reason(results: dict | None, finding_id: str, role: str) -> str | None:
     if not results:
         return None
@@ -136,7 +152,7 @@ def _rebuttal_lines(decision: dict, results: dict | None) -> list[str]:
     fid = decision["finding_id"]
     a = _worker_reason(results, fid, "a")
     b = _worker_reason(results, fid, "b")
-    if a is not None and b is not None:
+    if a and b:
         extra = [r for r in decision.get("reasons", []) if not r.startswith(("a:", "b:"))]
         return [f"a: {a}", f"b: {b}", *extra]
     return list(decision.get("reasons", []))
@@ -195,21 +211,22 @@ def _round_row(rnd, ledger: Ledger) -> str:
     return f"| {rnd.no} | {len(rnd.findings)} | {consensus} | {adjudicated} | {codex} | {human} |"
 
 
-def _adopted_pairs(ledger: Ledger) -> list[tuple[dict, dict]]:
+def _adopted_pairs(ledger: Ledger, failed: dict[str, str]) -> list[tuple[dict, dict]]:
     pairs = []
     for rnd in ledger.rounds:
         for d in rnd.decisions:
-            if _is_adopted(d):
+            if _is_adopted(d) and d["finding_id"] not in failed:
                 pairs.append((_finding_of(rnd, d["finding_id"]), d))
     return pairs
 
 
-def _commit_message(ledger: Ledger) -> str:
-    pairs = _adopted_pairs(ledger)
+def _commit_message(ledger: Ledger, failed: dict[str, str]) -> str:
+    pairs = _adopted_pairs(ledger, failed)
     if not pairs:
         return ""
     if len(pairs) == 1:
-        subject = f"fix: {_first_line(pairs[0][0].get('body', ''))[:COMMIT_SUBJECT_MAX]}"
+        first = _first_line(pairs[0][0].get("body", ""))[:COMMIT_SUBJECT_MAX]
+        subject = f"fix: {first}" if first else f"fix: 리뷰 지적 {pairs[0][0]['id']} 반영"
     else:
         subject = f"fix: {len(pairs)}건의 리뷰 지적 반영"
     bullets = [f"- {f['id']} {f.get('location', '-')}: {_first_line(f.get('body', ''))}" for f, _ in pairs]
@@ -224,7 +241,7 @@ def _final_decisions(ledger: Ledger) -> dict[str, tuple[int, dict]]:
     return final
 
 
-def _reply_drafts(ledger: Ledger, run_dir: Path | None) -> dict[str, str]:
+def _reply_drafts(ledger: Ledger, run_dir: Path | None, failed: dict[str, str]) -> dict[str, str]:
     final = _final_decisions(ledger)
     drafts: dict[str, str] = {}
     for rnd in ledger.rounds:
@@ -238,7 +255,9 @@ def _reply_drafts(ledger: Ledger, run_dir: Path | None) -> dict[str, str]:
                 continue
             round_no, d = entry
             reasons = d.get("reasons", [])
-            if _is_adopted(d):
+            if _is_adopted(d) and f["id"] in failed:
+                drafts[thread_id] = f"적용 실패: {_first_line(failed[f['id']])}. 검토 중입니다."
+            elif _is_adopted(d):
                 drafts[thread_id] = " ".join(["반영했습니다.", *reasons[:1]]).strip()
             elif _bucket_of(d) == BUCKET_REBUTTAL:
                 lines = _rebuttal_lines(d, _load_results(run_dir, round_no))
@@ -248,9 +267,9 @@ def _reply_drafts(ledger: Ledger, run_dir: Path | None) -> dict[str, str]:
     return drafts
 
 
-def _resolve_targets(ledger: Ledger) -> list[str]:
+def _resolve_targets(ledger: Ledger, failed: dict[str, str]) -> list[str]:
     targets = []
-    for f, _ in _adopted_pairs(ledger):
+    for f, _ in _adopted_pairs(ledger, failed):
         thread_id = f.get("thread_id")
         if thread_id and thread_id not in targets:
             targets.append(thread_id)
@@ -259,17 +278,18 @@ def _resolve_targets(ledger: Ledger) -> list[str]:
 
 def _prepared_section(ledger: Ledger, run_dir: Path | None) -> list[str]:
     out = ["## 준비됨", "", "### 커밋 메시지 초안", ""]
-    message = _commit_message(ledger)
+    failed = _failed_ids(ledger, run_dir)
+    message = _commit_message(ledger, failed)
     out.extend([_fenced(message.rstrip("\n")) if message else "(채택된 지적 없음)", ""])
     if ledger.source == SOURCE_PR_COMMENT:
         out.extend(["### PR 답글 초안", ""])
-        drafts = _reply_drafts(ledger, run_dir)
+        drafts = _reply_drafts(ledger, run_dir, failed)
         if not drafts:
             out.append("- 없음")
         for thread_id, draft in drafts.items():
             out.extend([f"thread {thread_id}:", draft, ""])
         out.extend(["### resolve 대상", ""])
-        targets = _resolve_targets(ledger)
+        targets = _resolve_targets(ledger, failed)
         out.extend([f"- {t}" for t in targets] or ["- 없음"])
         out.append("")
     apply_lines = []
@@ -278,7 +298,7 @@ def _prepared_section(ledger: Ledger, run_dir: Path | None) -> list[str]:
         if applied is None:
             continue
         apply_lines.append(f"- 회차 {rnd.no} 적용: {', '.join(applied.get('applied', [])) or '없음'}")
-        for fid, tail in applied.get("failed", []):
+        for fid, tail in _failed_items(applied):
             apply_lines.extend([f"- 회차 {rnd.no} 실패 **{fid}**:", "", _fenced(str(tail)), ""])
     if apply_lines:
         out.extend(["### 적용 결과", "", *apply_lines, ""])
@@ -357,11 +377,12 @@ def render(ledger: Ledger, dry_run: bool, run_dir: Path | None = None) -> str:
 def write_prepared(run_dir: Path, ledger: Ledger) -> None:
     prepared = Path(run_dir) / "prepared"
     prepared.mkdir(parents=True, exist_ok=True)
-    (prepared / "commit-message.txt").write_text(_commit_message(ledger), encoding="utf-8")
-    replies = _reply_drafts(ledger, Path(run_dir)) if ledger.source == SOURCE_PR_COMMENT else {}
+    failed = _failed_ids(ledger, Path(run_dir))
+    (prepared / "commit-message.txt").write_text(_commit_message(ledger, failed), encoding="utf-8")
+    replies = _reply_drafts(ledger, Path(run_dir), failed) if ledger.source == SOURCE_PR_COMMENT else {}
     (prepared / "replies.json").write_text(json.dumps(replies, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     (prepared / "resolve.json").write_text(
-        json.dumps(_resolve_targets(ledger) if ledger.source == SOURCE_PR_COMMENT else [], ensure_ascii=False, indent=2)
+        json.dumps(_resolve_targets(ledger, failed) if ledger.source == SOURCE_PR_COMMENT else [], ensure_ascii=False, indent=2)
         + "\n",
         encoding="utf-8",
     )
