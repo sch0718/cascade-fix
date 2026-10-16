@@ -64,7 +64,7 @@ PYTHONPATH=~/.claude/skills/cascade-fix python3 -m cascade.cli
    - 출력의 `run_dir=<경로>`를 이후 모든 명령에 `--run-dir`로 준다.
    - 종료 코드 4: 검증 설정 없음(위 「실행 전 확인」 2). 5: 결과 파일을 해석하지 못함 — 출력된 줄을 사용자에게 보이고 멈춘다.
    - 「지적 0건 — 원문을 확인하라」가 나오면 출력된 원문 앞부분을 사용자에게 보이고 끝낸다.
-2. **jobs** — `CF jobs --run-dir <run_dir> --round N` → `round-N/stage1-args.json`. 기준선(수정 전 base 워크트리)에서 검증 명령을 한 번 돌려 이미 실패하는 명령을 `round-N/baseline.json`에 적는다(판정에서 제외).
+2. **jobs** — `CF jobs --run-dir <run_dir> --round N` → `round-N/stage1-args.json`. 기준선(수정 전 base 워크트리)에서 build·typecheck·lint 명령을 한 번 돌려 이미 실패하는 명령을 `round-N/baseline.json`에 적는다(판정에서 제외). `tests` 명령은 기준선에서 실패해도 제외하지 않는다(지적이 곧 실패하는 테스트면 수정이 통과시켜야 한다).
    - `pr-comment`이면 코멘트에서 뽑은 재현 명령을 `round-N/repro-cmds.json`에 쓰고 출력한다. 이 명령은 사용자 셸에서 돈다. 사용자에게 명령 목록을 보이고 승인받은 뒤 `judge`에 `--allow-repro <run_dir>/round-N/repro-cmds.json`으로 넘긴다. 승인이 없으면 재현 검증을 건너뛴다(경고만 낸다).
 3. **Workflow(1단계)** — `~/.claude/skills/cascade-fix/workflows/run-jobs.js`를 Read로 읽어 그 내용을 Workflow 도구의 `script` 입력으로 통째로 넘긴다(`scriptPath`는 작업 디렉터리 밖이라 거부된다). `args`는 `stage1-args.json`의 내용(JSON 객체)이다. 작업마다 `{id, label, model, effort, kind, promptPath}`만 있고 프롬프트 본문은 `round-N/prompts/`의 파일에 있다. 프롬프트를 읽어 옮겨 적지 않는다. 반환값 `{results: [...]}`를 그대로 `round-N/stage1.json`에 저장한다.
 4. **judge** — `CF judge --run-dir <run_dir> --round N --results <run_dir>/round-N/stage1.json [--allow-repro <승인한 목록>]`
@@ -75,7 +75,7 @@ PYTHONPATH=~/.claude/skills/cascade-fix python3 -m cascade.cli
 6. **adjudicate** — `CF adjudicate --run-dir <run_dir> --round N --results <run_dir>/round-N/adj.json`. 판단 불가마다 `round-N/opinion-<id>.md`가 생긴다.
 7. **Codex 의견** — `opinion-<id>.md`마다 `RR --opinion <run_dir>/round-N/opinion-<id>.md --repo <저장소 루트> --out <run_dir>/round-N/opinion-<id>.out`.
 8. **opinion** — `CF opinion --run-dir <run_dir> --round N --id <id> --result <run_dir>/round-N/opinion-<id>.out.final`. Codex 의견은 자동 채택하지 않고 사람 목록에 붙기만 한다.
-9. **apply** — `CF apply --run-dir <run_dir> --round N`. 채택 패치를 작업 트리에 하나씩 적용하고, 그 회차의 작업자·판가름 워크트리를 지운 뒤 전체 테스트를 기준선(base 워크트리)과 작업 트리에서 돌린다. 적용 실패와 전체 테스트 실패(간섭 의심)는 판단 불가로 간다. 기준선부터 실패하면 「기준선부터 실패」로 적고 채택을 유지한다. 작업 트리는 되돌리지 않는다. 적용이 끝난 뒤 중단됐다가 다시 돌리면 적용은 건너뛰고 뒷단계만 한다.
+9. **apply** — `CF apply --run-dir <run_dir> --round N`. 채택 패치를 작업 트리에 하나씩 적용하고, 그 회차의 작업자·판가름 워크트리를 지운 뒤 전체 테스트를 한 번 돌린다. 적용 실패와 전체 테스트 실패는 판단 불가로 간다. 전체 테스트가 실패하면 기준선(base 워크트리)에서도 돌려 사유를 「전체 테스트 실패(기준선도 실패)」와 「전체 테스트 실패(간섭 의심)」로 나눈다. 작업 트리는 되돌리지 않는다. 적용이 끝난 뒤 중단됐다가 다시 돌리면 적용은 건너뛰고 뒷단계만 한다.
    - dry-run이면 작업 트리 대신 `result-rN` 워크트리에 적용·커밋해 다음 회차의 기준으로 삼는다.
 10. **Codex 재검토** — `round-N/recheck-prompt.md`가 생겼으면 `RR --recheck <run_dir>/round-N/recheck-prompt.md --repo <round-N/recheck-repo.txt의 경로> --out <run_dir>/round-N/recheck.out`. `recheck-repo.txt`는 보통 저장소 루트이고 dry-run이면 `result-rN` 워크트리다. 재검토가 바꾼 파일 밖을 지적하면 「재검토 범위 밖」 보류 후보로 간다.
 11. **recheck** — `CF recheck --run-dir <run_dir> --round N --result <run_dir>/round-N/recheck.out.final`. 다음 회차가 열리면 N+1로 2부터 반복한다. 아니면 `status=종료`.
@@ -101,5 +101,5 @@ PYTHONPATH=~/.claude/skills/cascade-fix python3 -m cascade.cli
 
 1. 회차별 표(지적·합의·판가름·Codex 검토·사람 건수)와 dry-run 여부.
 2. 사람이 볼 목록 네 칸 — **반박**(동의 / 그래도 고친다), **설계 결정**, **판단 불가**(Opus·Codex 의견, 패치 경로), **보류 후보**(지금 반영 / 구현 때 테스트로 / 보류). 칸마다 사람이 고를 것을 묻는다.
-3. 「간섭 의심」 절이 있으면 작업 트리에 패치가 남아 있다는 사실과 되돌릴지 사람이 정해야 한다는 것.
+3. 「간섭 의심」 절이 있으면(기준선도 실패한 경우 포함) 작업 트리에 패치가 남아 있다는 사실과 되돌릴지 사람이 정해야 한다는 것.
 4. **준비됨** — 커밋 메시지 초안(`prepared/commit-message.txt`), PR이면 답글 초안(`prepared/replies.json`)과 resolve 대상(`prepared/resolve.json`). 누르는 것은 사람이다.

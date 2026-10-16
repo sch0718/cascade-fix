@@ -277,7 +277,7 @@ def worker_verify(wt: Path, cfg: RepoConfig, changed: list[str], baseline: set[s
     judged: list[VerifyResult] = []
     recorded: list[VerifyResult] = []
     for template, r in run_worker_verifiers(wt, cfg, changed):
-        if template in baseline:
+        if template in baseline and template in baseline_excludable(cfg):
             recorded.append(VerifyResult(cmd=BASELINE_TAG + r.cmd, ok=r.ok, tail=r.tail))
             continue
         judged.append(r)
@@ -293,8 +293,13 @@ def baseline_failed(rd: Path) -> set[str]:
     return set(data.get("failed", [])) if isinstance(data, dict) else set()
 
 
+def baseline_excludable(cfg: RepoConfig) -> set[str]:
+    return {*cfg.build, *cfg.typecheck, *cfg.lint, *cfg.format} - set(cfg.tests)
+
+
 def write_baseline(rd: Path, base_wt: Path, cfg: RepoConfig, changed: list[str]) -> list[str]:
-    results = [(t, r) for t, r in run_worker_verifiers(base_wt, cfg, changed) if t not in cfg.format]
+    measured = baseline_excludable(cfg) - set(cfg.format)
+    results = [(t, r) for t, r in run_worker_verifiers(base_wt, cfg, changed) if t in measured]
     failed = sorted({t for t, r in results if not r.ok})
     write_json(Path(rd) / BASELINE_FILE, {
         "failed": failed,

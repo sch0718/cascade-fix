@@ -42,6 +42,7 @@ class RoundRecord:
     base_commit: str = ""
     result_commit: str = ""
     hold_findings: list[dict] = field(default_factory=list)
+    approved_repro: dict[str, list[str]] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: dict) -> "RoundRecord":

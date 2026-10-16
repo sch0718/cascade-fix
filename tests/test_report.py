@@ -411,7 +411,7 @@ class BaselineAndTimingTest(unittest.TestCase):
             text = report.render(ledger, False, run_dir)
         body = section(text, "## 기준선 실패")
         self.assertIn("`ruff check .`", body)
-        self.assertIn("간섭 판정을 하지 않았다", body)
+        self.assertIn("기준선(수정 전)에서도 실패했다", body)
         self.assertNotIn("## 기준선 실패", report.render(ledger, False))
 
     def test_report_events_do_not_count_in_elapsed(self):

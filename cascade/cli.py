@@ -69,6 +69,7 @@ HOLD_CHOICES = ("지금 반영", "구현 때 테스트로", "보류")
 CHOICE_NOW = "지금 반영"
 REASON_APPLY_FAILED = "패치 적용 실패"
 REASON_INTERFERENCE = "전체 테스트 실패(간섭 의심)"
+REASON_FINAL_BASELINE_FAILED = "전체 테스트 실패(기준선도 실패)"
 REASON_OUT_OF_SCOPE = "재검토 범위 밖"
 RAW_PREVIEW_LINES = 5
 FINAL_TAIL_CHARS = 2000
@@ -364,6 +365,7 @@ def cmd_judge(args) -> int:
     rnd.decisions = [d.to_dict() for d in decisions]
     s.write_json(rd / "decisions.json", rnd.decisions)
     ledger.snapshot = snap.to_dict()
+    rnd.approved_repro = dict(repro or {})
     s.mark(rnd, "judge", repro_allowed=repro is not None)
     s.save_ledger(run_dir, ledger)
     print("판정: " + ", ".join(f"{k} {v}" for k, v in Counter(d.outcome for d in decisions).items()))
@@ -377,8 +379,7 @@ def _adjudicate_verify(ledger, rnd, f, wt, patch, snap, cfg, rd):
         results = s.doc_verify(missing, snippets)
         return results, results
     judged, recorded = s.worker_verify(wt, cfg, changed_files(patch), s.baseline_failed(rd))
-    judge_event = s.last_event(rnd, "judge") or {}
-    cmds = s.repro_listed(rd).get(f.id) if judge_event.get("repro_allowed") else None
+    cmds = rnd.approved_repro.get(f.id)
     if ledger.source == s.SOURCE_PR and patch.strip() and cmds:
         extra = run_repro(snap.worktrees[s.base_name(rnd)], wt, cmds)
         judged += extra
@@ -461,14 +462,12 @@ def _final_suite(root: Path, base_wt: Path | None, cfg, mode: str, changed: list
         print(warning)
     if cfg is None or not cfg.full_tests:
         return {"final_ok": None, "final_tail": ""}
-    if base_wt is not None and Path(base_wt).is_dir():
-        base = run_verifiers(base_wt, cfg, changed, "final")
-        if not all(r.ok for r in base):
-            tail = "\n".join(r.tail for r in base if not r.ok)[-FINAL_TAIL_CHARS:]
-            return {"final_ok": None, "final_tail": tail, "baseline_failed": True}
     results = run_verifiers(root, cfg, changed, "final")
     tail = "\n".join(r.tail for r in results if not r.ok)[-FINAL_TAIL_CHARS:]
-    return {"final_ok": all(r.ok for r in results), "final_tail": tail}
+    final = {"final_ok": all(r.ok for r in results), "final_tail": tail}
+    if not final["final_ok"] and base_wt is not None and Path(base_wt).is_dir():
+        final["baseline_failed"] = not all(r.ok for r in run_verifiers(base_wt, cfg, changed, "final"))
+    return final
 
 
 def _adopted_patches(rnd: RoundRecord, rd: Path) -> list[tuple[str, str]]:
@@ -553,14 +552,13 @@ def cmd_apply(args) -> int:
         base_wt = s.snapshot_of(ledger).worktrees.get(s.base_name(rnd))
         final = _final_suite(root, base_wt, cfg, ledger.mode, changed) if applied else {"final_ok": None, "final_tail": ""}
         data.update(final)
-        if final.get("baseline_failed"):
-            print("전체 테스트가 기준선(수정 전)부터 실패한다 — 간섭 판정을 하지 않는다")
-        elif final["final_ok"] is False:
+        if final["final_ok"] is False:
             data["interference"] = True
+            reason = REASON_FINAL_BASELINE_FAILED if final.get("baseline_failed") else REASON_INTERFERENCE
             for fid in applied:
-                _set_decision(rnd, fid, OUTCOME_UNDECIDABLE, REASON_INTERFERENCE)
+                _set_decision(rnd, fid, OUTCOME_UNDECIDABLE, reason)
             rnd.adopted = []
-            print("전체 테스트가 깨졌다(간섭 의심). 적용한 패치는 작업 트리에 그대로 두었다 — 되돌릴지는 사람이 정한다")
+            print(f"{reason}. 적용한 패치는 작업 트리에 그대로 두었다 — 되돌릴지는 사람이 정한다")
     s.write_json(rd / "apply.json", data)
     s.write_json(rd / "decisions.json", rnd.decisions)
     if s.recheck_needed(ledger, rnd):
@@ -693,6 +691,7 @@ def _interference_note(ledger: Ledger, run_dir: Path) -> str:
             lines += [
                 f"- 회차 {rnd.no}: 적용한 패치 {', '.join(data.get('applied', []))} 를 모두 넣은 뒤 전체 테스트가 깨졌다.",
                 "  작업 트리는 되돌리지 않았다. 되돌릴지·어느 패치를 뺄지는 사람이 정한다.",
+                *(["  기준선(수정 전)에서도 전체 테스트가 실패했다."] if data.get("baseline_failed") else []),
                 f"  마지막 출력: {s.first_line(data.get('final_tail', ''))}",
             ]
     return "\n".join(["", "## 간섭 의심", "", *lines, ""]) if lines else ""

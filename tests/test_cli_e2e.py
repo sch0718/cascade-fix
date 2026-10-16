@@ -534,6 +534,20 @@ class CliPrCommentTest(CliTestBase):
                  "--allow-repro", str(approved))
         self.assertTrue((base / "REPRO_RAN").exists())
         self.assertFalse((self.repo / "REPRO_RAN").exists())
+        self.assertEqual(self.ledger().rounds[0].approved_repro, {"r1-01": ["touch REPRO_RAN"]})
+        self.assertEqual(self.ledger().rounds[0].decisions[0]["outcome"], "판가름")
+        listed.write_text(json.dumps({"r1-01": ["touch TAMPERED"]}), encoding="utf-8")
+        wt = self.wt("r1-01-adj")
+        (wt / "calc.py").write_text(fix(CALC, "return a - b", "return a + b"), encoding="utf-8")
+        commit_worktree(wt, "adjudicator")
+        (base / "REPRO_RAN").unlink()
+        adj = results_json(self.run_dir / "round-1" / "adj.json", [
+            ("r1-01:adjudicator", worker_output("사실", "claude-opus-5-5")),
+        ])
+        self.cli("adjudicate", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(adj))
+        self.assertTrue((base / "REPRO_RAN").exists())
+        for where in (base, wt, self.repo):
+            self.assertFalse((where / "TAMPERED").exists(), where)
 
     def test_pr_comment_without_config_exits_4(self):
         p = run_cli(["init", "--source", "pr-comment", "--input", "7", "--pr-repo", "o/r"],
@@ -634,21 +648,59 @@ class CliSafetyTest(CliTestBase):
         p = self.cli("report", "--run-dir", str(self.run_dir))
         self.assertIn("## 기준선 실패", p.stdout)
         self.assertIn(lint, p.stdout)
+        self.assertNotIn("python3 -m unittest {files}", baseline["failed"])
 
-    def test_full_suite_failing_before_fix_is_not_interference(self):
+    def test_full_suite_failing_after_fix_is_undecidable_even_if_baseline_failed(self):
         toml = write_repos_toml(self.tmp, {str(self.repo): {
             "tests": ["python3 -m unittest {files}"],
             "full_tests": ["python3 -c 'import sys; sys.exit(3)'"],
         }})
         self.env["CASCADE_REPOS_TOML"] = str(toml)
         p = self.run_to_apply()
-        self.assertIn("기준선(수정 전)부터 실패", p.stdout)
+        self.assertIn("전체 테스트 실패(기준선도 실패)", p.stdout)
         apply = json.loads((self.run_dir / "round-1" / "apply.json").read_text(encoding="utf-8"))
+        self.assertIs(apply["final_ok"], False)
         self.assertIs(apply["baseline_failed"], True)
-        self.assertIsNone(apply["final_ok"])
-        self.assertNotIn("interference", apply)
-        self.assertEqual(self.ledger().rounds[0].adopted, ["r1-01", "r1-02"])
-        self.assertTrue(all(d["outcome"] != "판단불가" for d in self.ledger().rounds[0].decisions))
+        self.assertEqual(self.ledger().rounds[0].adopted, [])
+        for d in self.ledger().rounds[0].decisions:
+            self.assertEqual(d["outcome"], "판단불가")
+            self.assertIn("전체 테스트 실패(기준선도 실패)", d["reasons"])
+        self.assertIn("return a * b", (self.repo / "calc.py").read_text(encoding="utf-8"))
+        p = self.cli("report", "--run-dir", str(self.run_dir))
+        self.assertIn("기준선(수정 전)에서도 전체 테스트가 실패했다", p.stdout)
+
+    def test_tests_failing_at_baseline_still_judge_adjudicator_patch(self):
+        test_calc = TEST_CALC.replace("from calc import ident", "from calc import add, ident") + (
+            "\n    def test_add(self):\n        self.assertEqual(add(2, 3), 5)\n")
+        (self.repo / "test_calc.py").write_text(test_calc, encoding="utf-8")
+        git(self.repo, "commit", "-qam", "add 시험")
+        items = self.tmp / "findings.json"
+        items.write_text(json.dumps([{"id": "r1-01", "severity": "Warning", "location": "calc.py:14",
+                                      "body": "mul이 더한다"}], ensure_ascii=False), encoding="utf-8")
+        p = self.cli("init", "--source", "codex-code", "--findings-json", str(items))
+        self.run_dir = Path(next(x for x in p.stdout.splitlines() if x.startswith("run_dir=")).split("=", 1)[1])
+        self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1")
+        self.assertEqual(json.loads((self.run_dir / "round-1" / "baseline.json").read_text(encoding="utf-8"))["failed"], [])
+        stage1 = results_json(self.run_dir / "round-1" / "stage1.json", [
+            ("r1-01:a", worker_output("사실", "claude-sonnet-5-5")),
+            ("r1-01:b", worker_output("아님", "claude-haiku-5-5")),
+        ])
+        self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1))
+        self.assertEqual(self.ledger().rounds[0].decisions[0]["outcome"], "판가름")
+        wt = self.wt("r1-01-adj")
+        broken = fix(fix(CALC, "return a + b", "return a * b"), "    return x\n", "    return x + 1\n")
+        (wt / "calc.py").write_text(broken, encoding="utf-8")
+        commit_worktree(wt, "adjudicator")
+        adj = results_json(self.run_dir / "round-1" / "adj.json", [
+            ("r1-01:adjudicator", worker_output("사실", "claude-opus-5-5")),
+        ])
+        self.cli("adjudicate", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(adj))
+        d = self.ledger().rounds[0].decisions[0]
+        self.assertEqual(d["outcome"], "판단불가")
+        self.assertIn("판가름 패치 검증 실패", d["reasons"])
+        self.cli("apply", "--run-dir", str(self.run_dir), "--round", "1")
+        self.assertEqual((self.repo / "calc.py").read_text(encoding="utf-8"), CALC)
+        self.assertEqual(git(self.repo, "status", "--porcelain"), "")
 
     def test_apply_rerun_after_patching_does_not_reapply(self):
         self.run_to_apply()

@@ -390,7 +390,7 @@ def _baseline_section(ledger: Ledger, run_dir: Path | None) -> list[str]:
         if failed:
             lines.append(f"- 회차 {rnd.no}: 수정 전부터 실패한 검증 명령(판정에서 제외): " + ", ".join(f"`{c}`" for c in failed))
         if (_load_apply(run_dir, rnd.no) or {}).get("baseline_failed"):
-            lines.append(f"- 회차 {rnd.no}: 전체 테스트가 기준선(수정 전)부터 실패해 간섭 판정을 하지 않았다")
+            lines.append(f"- 회차 {rnd.no}: 수정 뒤 전체 테스트가 실패했고 기준선(수정 전)에서도 실패했다. 적용분은 판단 불가로 보냈다")
     return ["## 기준선 실패", "", *lines, ""] if lines else []
 
 
