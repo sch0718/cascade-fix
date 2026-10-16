@@ -128,6 +128,20 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(undec, [new_crit])
         self.assertEqual(hold, [warn, sugg])
 
+    def test_out_of_scope_findings_go_to_hold_without_opening_round(self):
+        inside = finding("r2-01", "Warning", "docs/a.md:12")
+        outside = finding("r2-02", "Critical", "src/other.py:3")
+        nowhere = finding("r2-03", "Warning", "-")
+        nxt, hold, undec = rounds.classify_recheck(
+            [inside, outside, nowhere], record([WARN], ["r1-02"]), max_reached=False, in_scope={"docs/a.md"})
+        self.assertEqual(nxt, [])
+        self.assertEqual(hold, [outside, inside, nowhere])
+        self.assertEqual(undec, [])
+        self.assertEqual(rounds.out_of_scope([inside, outside, nowhere], {"docs/a.md"}), [outside])
+        self.assertEqual(rounds.out_of_scope([outside], None), [])
+        nxt, _, _ = rounds.classify_recheck([outside], record([WARN], ["r1-02"]), max_reached=False)
+        self.assertEqual(nxt, [outside])
+
 
 class LedgerTest(unittest.TestCase):
     def test_ledger_roundtrip_and_resume_from_last_round(self):
@@ -233,6 +247,15 @@ class ParseRecheckTest(unittest.TestCase):
         self.assertEqual(resolved, {"r1-01": True})
         self.assertEqual(new, [])
 
+    def test_parse_recheck_strips_markup_around_ids(self):
+        text = (
+            "## 해소 여부\n- **r1-01**: 해소됨 — 됐다\n- `r1-02`: **해소 안 됨** — 아직\n"
+            "- **r1-03: 해소됨** — 됐다\n- custom-id: 해소됨 — 됐다\n\n"
+            "Critical\n없음.\n\nWarning\n없음.\n\nSuggestion\n없음.\n"
+        )
+        resolved, _ = rounds.parse_recheck(text, 2)
+        self.assertEqual(resolved, {"r1-01": True, "r1-02": False, "r1-03": True, "custom-id": True})
+
     def test_parse_recheck_error_propagates(self):
         with self.assertRaises(ParseError):
             rounds.parse_recheck("## 해소 여부\n- r1-01: 해소됨 — x\n\n그냥 글", 2)
@@ -259,6 +282,20 @@ class OpinionPromptTest(unittest.TestCase):
                        "어느 쪽이 맞는가, 혹은 둘 다 틀렸는가", "파일을 수정하지 않는다"):
             self.assertIn(needle, prompt)
         self.assertNotRegex(prompt, r"\{[a-z_]+\}")
+        self.assertIn("### 작성자 패치", prompt)
+        self.assertNotIn("### a의 패치", prompt)
+        self.assertIn("판정만 함", prompt)
+
+    def test_opinion_prompt_code_mode_keeps_worker_patch_titles(self):
+        item = AdjInput(
+            finding=finding("r1-01", "Warning", "a.py:1"), a=worker("a", "사실", "x"), b=worker("b", "아님", "y"),
+            patch_a="--- a\n+++ a\n+A", patch_b="--- b\n+++ b\n+B", verify_a=[], verify_b=[],
+            worktree=Path("/wt"), mode="code", cfg=RepoConfig(),
+        )
+        prompt = rounds.build_opinion_prompt(item, worker("adjudicator", "사실", "z"))
+        self.assertIn("### a의 패치", prompt)
+        self.assertIn("### b의 패치", prompt)
+        self.assertNotIn("판정만 함", prompt)
 
 
 if __name__ == "__main__":

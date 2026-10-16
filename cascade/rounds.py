@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from cascade.jobs import (
     _format_result,
     _format_verify,
     _render,
+    location_file,
 )
 
 STATUS_RUNNING = "진행"
@@ -19,6 +21,7 @@ STATUS_DONE = "종료"
 DEFAULT_MAX_RECHECKS = 2
 CONVERGED_MAX = 2
 RESOLUTION_HEADER = "## 해소 여부"
+FINDING_ID_IN_LINE = re.compile(r"r\d+-\d+")
 
 _MODE_NOTES = {
     "doc": "문서의 바뀐 절과 그 수정이 지적을 해소했는지만 본다.",
@@ -102,9 +105,21 @@ def repeated_critical(prev: list[Finding], new: list[Finding]) -> list[Finding]:
     return [f for f in new if f.severity == "Critical" and f.location in prev_locations]
 
 
+def out_of_scope(findings: list[Finding], in_scope: set[str] | None) -> list[Finding]:
+    if in_scope is None:
+        return []
+    return [f for f in findings if location_file(f.location) is not None and location_file(f.location) not in in_scope]
+
+
 def classify_recheck(
-    new: list[Finding], prev: RoundRecord, max_reached: bool, final: bool = False
+    new: list[Finding], prev: RoundRecord, max_reached: bool, final: bool = False, in_scope: set[str] | None = None
 ) -> tuple[list[Finding], list[Finding], list[Finding]]:
+    outside = out_of_scope(new, in_scope)
+    if outside:
+        outside_ids = {f.id for f in outside}
+        nxt, hold, undecidable = classify_recheck(
+            [f for f in new if f.id not in outside_ids], prev, max_reached, final)
+        return nxt, outside + hold, undecidable
     if final:
         undecidable = [f for f in new if f.severity == "Critical"]
         return [], [f for f in new if f.severity != "Critical"], undecidable
@@ -160,11 +175,14 @@ def parse_recheck(text: str, round_no: int) -> tuple[dict[str, bool], list[Findi
             fid, sep, verdict = body.partition(":")
             if not sep:
                 continue
-            verdict = verdict.strip()
+            fid = fid.strip().strip("*`").strip()
+            m = FINDING_ID_IN_LINE.search(fid)
+            fid = m.group(0) if m else fid
+            verdict = verdict.strip().strip("*`").strip()
             if verdict.startswith("해소 안 됨"):
-                resolved[fid.strip()] = False
+                resolved[fid] = False
             elif verdict.startswith("해소됨"):
-                resolved[fid.strip()] = True
+                resolved[fid] = True
         rest = lines[end:]
     return resolved, parse_codex_doc("\n".join(rest), round_no)
 
@@ -175,8 +193,10 @@ def build_opinion_prompt(item: AdjInput, adj: WorkerResult) -> str:
         "mode": item.mode,
         "result_a": _format_result(item.a) + "\n\n검증 결과:\n\n" + _format_verify(item.verify_a),
         "result_b": _format_result(item.b) + "\n\n검증 결과:\n\n" + _format_verify(item.verify_b),
+        "patch_a_title": "작성자 패치" if item.mode == "doc" else "a의 패치",
+        "patch_b_title": "b의 패치",
         "patch_a": _format_patch(item.patch_a),
-        "patch_b": _format_patch(item.patch_b),
+        "patch_b": "(판정만 함 — 문서 모드의 판정자는 패치를 내지 않는다)" if item.mode == "doc" else _format_patch(item.patch_b),
         "result_adj": _format_result(adj) + "\n\n검증 결과:\n\n" + _format_verify(adj.verify),
         "patch_adj": _format_patch(adj.patch),
     })

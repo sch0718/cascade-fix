@@ -23,7 +23,7 @@
 
 {result_a}
 
-### a의 패치
+### {patch_a_title}
 
 {patch_a}
 
@@ -31,7 +31,7 @@
 
 {result_b}
 
-### b의 패치
+### {patch_b_title}
 
 {patch_b}
 

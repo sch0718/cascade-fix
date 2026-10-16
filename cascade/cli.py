@@ -15,6 +15,7 @@ from cascade.consensus import (
     OUTCOME_HOLD,
     OUTCOME_UNDECIDABLE,
     REASON_SENSITIVE,
+    VERDICT_FACT,
     Decision,
     after_adjudication,
     decide,
@@ -28,8 +29,15 @@ from cascade.findings import (
     parse_codex_doc,
     write_findings,
 )
-from cascade.jobs import build_adjudicator_jobs, build_checker_jobs, build_stage1_jobs, read_results
-from cascade.patches import apply_all, changed_files, extract
+from cascade.jobs import (
+    build_adjudicator_jobs,
+    build_checker_jobs,
+    build_stage1_jobs,
+    location_file,
+    read_results,
+    write_job_args,
+)
+from cascade.patches import ApplyReport, apply_all, changed_files, extract
 from cascade.report import render, write_prepared
 from cascade.rounds import (
     RESOLUTION_HEADER,
@@ -40,9 +48,20 @@ from cascade.rounds import (
     build_opinion_prompt,
     build_recheck_prompt,
     classify_recheck,
+    out_of_scope,
     parse_recheck,
 )
-from cascade.snapshot import RUN_DIR_NAME, add_worktree, cleanup, create_snapshot, ensure_excluded, snapshot_tree
+from cascade.snapshot import (
+    RUN_DIR_NAME,
+    add_worktree,
+    cleanup,
+    commit_worktree,
+    create_snapshot,
+    ensure_excluded,
+    remove_worktree,
+    snapshot_tree,
+    user_tree_fingerprint,
+)
 from cascade.verify import repro_cmds, run_repro, run_verifiers
 
 SOURCES = ("codex-doc", "codex-code", "pr-comment")
@@ -50,6 +69,7 @@ HOLD_CHOICES = ("지금 반영", "구현 때 테스트로", "보류")
 CHOICE_NOW = "지금 반영"
 REASON_APPLY_FAILED = "패치 적용 실패"
 REASON_INTERFERENCE = "전체 테스트 실패(간섭 의심)"
+REASON_OUT_OF_SCOPE = "재검토 범위 밖"
 RAW_PREVIEW_LINES = 5
 FINAL_TAIL_CHARS = 2000
 
@@ -115,6 +135,17 @@ def _load_findings_json(path: str, source: str) -> list[Finding]:
     return findings
 
 
+def _warn_pr_head(root: Path, gh: list[str], owner: str, name: str, number: str) -> None:
+    p = subprocess.run([*gh, "pr", "view", number, "-R", f"{owner}/{name}", "--json", "headRefOid", "--jq", ".headRefOid"],
+                       capture_output=True, text=True)
+    pr_head = p.stdout.strip() if p.returncode == 0 else ""
+    local = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True).stdout.strip()
+    if not pr_head:
+        print(f"경고: PR #{number}의 head 커밋을 확인하지 못했다. 로컬 HEAD가 PR 브랜치인지 직접 확인한다")
+    elif pr_head != local:
+        print(f"경고: 로컬 HEAD({local[:12]})가 PR #{number}의 head({pr_head[:12]})와 다르다. PR 브랜치를 받아 온 뒤 실행한다")
+
+
 def _parse_input(args, root: Path):
     if args.findings_json:
         return _load_findings_json(args.findings_json, args.source), ""
@@ -135,6 +166,7 @@ def _parse_input(args, root: Path):
                 print("경고: 내 계정을 알 수 없어 본인 코멘트를 거르지 못한다(--me 로 준다)")
         if not args.input.isdigit():
             raise s.CliError(f"pr-comment의 --input은 PR 번호다: {args.input}")
+        _warn_pr_head(root, gh, owner, name, args.input)
         return fetch_pr_findings(owner, name, int(args.input), me, gh, 1), ""
     raw = s.read_text(Path(args.input))
     parser = parse_codex_doc if args.source == "codex-doc" else parse_codex_code
@@ -193,51 +225,69 @@ def cmd_jobs(args) -> int:
     cfg = s.cfg_for(ledger.source, Path(ledger.root))
     snap = s.snapshot_of(ledger)
     base = s.base_of(ledger, rnd)
-    if s.base_name(rnd) not in snap.worktrees:
-        add_worktree(snap, s.base_name(rnd), base)
+    base_wt = snap.worktrees.get(s.base_name(rnd)) or s.new_worktree(snap, s.base_name(rnd), base, cfg)
     roles = ("a", "b", "writer") if ledger.mode == "doc" else ("a", "b")
-    findings = s.findings_of(rnd)
+    findings = s.prompt_findings(ledger, s.findings_of(rnd))
     wts: dict[str, dict[str, Path]] = {}
     for f in findings:
         wts[f.id] = {}
         for role in roles:
             name = s.wt_name(f.id, role)
-            wts[f.id][role] = snap.worktrees[name] if name in snap.worktrees else add_worktree(snap, name, base)
+            wts[f.id][role] = snap.worktrees[name] if name in snap.worktrees else s.new_worktree(snap, name, base, cfg)
     rd = s.round_dir(run_dir, rnd.no)
+    if ledger.mode == "code" and cfg.tests:
+        located = list(dict.fromkeys(p for f in findings if (p := location_file(f.location))))
+        failed = s.write_baseline(rd, base_wt, cfg, located)
+        if failed:
+            print(f"기준선에서 이미 실패하는 검증 명령(판정에서 제외): {', '.join(failed)}")
+    if ledger.source == s.SOURCE_PR:
+        listed = {f.id: repro_cmds(f) for f in findings}
+        s.write_json(rd / s.REPRO_FILE, listed)
+        if any(listed.values()):
+            print(f"재현 명령(승인 전에는 돌리지 않는다): {rd / s.REPRO_FILE}")
+            for fid, cmds in listed.items():
+                for cmd in cmds:
+                    print(f"  {fid}: {cmd}")
     out = rd / "stage1-args.json"
-    s.write_json(out, build_stage1_jobs(findings, cfg, wts, ledger.mode))
+    s.write_json(out, write_job_args(build_stage1_jobs(findings, cfg, wts, ledger.mode), rd / "prompts"))
     ledger.snapshot = snap.to_dict()
-    s.mark(rnd, "jobs", worktrees={fid: {r: str(p) for r, p in m.items()} for fid, m in wts.items()})
+    fingerprint = user_tree_fingerprint(snap.root, snap.run_dir)
+    s.mark(rnd, "jobs", worktrees={fid: {r: str(p) for r, p in m.items()} for fid, m in wts.items()},
+           fingerprint=fingerprint)
     s.save_ledger(run_dir, ledger)
     print(f"작업 {len(findings) * len(roles)}건: {out}")
     _print_next(ledger, run_dir)
     return 0
 
 
-def _judge_code(ledger, rnd, f, results, snap, cfg):
+def _judge_code(ledger, rnd, f, results, snap, cfg, baseline, repro):
     wt_a, wt_b = s.worktree(snap, f.id, "a"), s.worktree(snap, f.id, "b")
     a, b = s.pick(results, f.id, "a"), s.pick(results, f.id, "b")
     base = s.base_of(ledger, rnd)
     pa, pb = extract(wt_a, base, cfg), extract(wt_b, base, cfg)
     a.patch, b.patch = pa, pb
-    va = run_verifiers(wt_a, cfg, changed_files(pa), "worker")
-    vb = run_verifiers(wt_b, cfg, changed_files(pb), "worker")
-    if ledger.source == s.SOURCE_PR:
-        cmds = repro_cmds(f)
-        base_wt = snap.worktrees[s.base_name(rnd)]
-        va += run_repro(base_wt, wt_a, cmds)
-        vb += run_repro(base_wt, wt_b, cmds)
+    if a.verdict != VERDICT_FACT and b.verdict != VERDICT_FACT and not pa.strip() and not pb.strip():
+        va, vb, ra, rb = [], [], [], []
+    else:
+        va, ra = s.worker_verify(wt_a, cfg, changed_files(pa), baseline)
+        vb, rb = s.worker_verify(wt_b, cfg, changed_files(pb), baseline)
+        if repro and repro.get(f.id):
+            base_wt = snap.worktrees[s.base_name(rnd)]
+            for wt, judged, recorded in ((wt_a, va, ra), (wt_b, vb, rb)):
+                extra = run_repro(base_wt, wt, repro[f.id])
+                judged += extra
+                recorded += extra
     sensitive = s.is_sensitive(changed_files(pa) + changed_files(pb), cfg)
     d = s.without_empty_patch(decide(a, b, va, vb, pa, pb, sensitive), {"a": pa, "b": pb}, adjudicated=False)
     workers = {"a": a, "b": b}
-    return d, workers, {"a": [r.to_dict() for r in va], "b": [r.to_dict() for r in vb]}
+    return d, workers, {"a": [r.to_dict() for r in ra], "b": [r.to_dict() for r in rb]}
 
 
 def _judge_doc_inputs(ledger, rnd, f, results, snap, cfg):
     wt = s.worktree(snap, f.id, "writer")
     a, b, writer = (s.pick(results, f.id, r) for r in ("a", "b", "writer"))
     writer.patch = extract(wt, s.base_of(ledger, rnd), cfg)
-    missing, snippets = s.doc_checks(wt, writer.patch, ledger, cfg)
+    missing, snippets = s.doc_checks(wt, snap.worktrees.get(s.base_name(rnd)), writer.patch, ledger, cfg)
     return {"a": a, "b": b, "writer": writer}, s.doc_problems(missing, snippets), [r.to_dict() for r in snippets]
 
 
@@ -248,11 +298,14 @@ def cmd_judge(args) -> int:
     s.guard(rnd, "judge", args.force)
     if not s.step_done(rnd, "jobs"):
         raise s.CliError(f"회차 {rnd.no}의 jobs 단계를 먼저 한다")
+    s.check_user_tree(ledger, rnd)
     cfg = s.cfg_for(ledger.source, Path(ledger.root))
     snap = s.snapshot_of(ledger)
     rd = s.round_dir(run_dir, rnd.no)
     results = read_results(s.read_json(args.results))
     checker_results = read_results(s.read_json(args.checker_results)) if args.checker_results else None
+    baseline = s.baseline_failed(rd)
+    repro = s.approved_repro(rd, args.allow_repro) if ledger.source == s.SOURCE_PR else None
     for warning in s.model_warnings({**results, **(checker_results or {})}):
         print(warning)
     findings = s.findings_of(rnd)
@@ -273,7 +326,7 @@ def cmd_judge(args) -> int:
                 if checker_results is not None and f"{f.id}:checker" in checker_results:
                     workers["checker"] = checker_results[f"{f.id}:checker"]
         else:
-            d, workers, verify[f.id] = _judge_code(ledger, rnd, f, results, snap, cfg)
+            d, workers, verify[f.id] = _judge_code(ledger, rnd, f, results, snap, cfg, baseline, repro)
             decisions.append(d)
         for role, w in workers.items():
             merged[f"{f.id}:{role}"] = w.to_dict()
@@ -285,7 +338,9 @@ def cmd_judge(args) -> int:
     if ledger.mode == "doc":
         if pending and checker_results is None:
             out = rd / "checker-args.json"
-            s.write_json(out, build_checker_jobs(pending, {f.id: {"writer": s.worktree(snap, f.id, "writer")} for f in pending}, writer_patches))
+            wts = {f.id: {"writer": s.worktree(snap, f.id, "writer")} for f in pending}
+            jobs = build_checker_jobs(s.prompt_findings(ledger, pending), wts, writer_patches)
+            s.write_json(out, write_job_args(jobs, rd / "prompts"))
             s.mark(rnd, "judge-checker")
             s.save_ledger(run_dir, ledger)
             print(f"점검자 작업 {len(pending)}건: {out}")
@@ -297,33 +352,38 @@ def cmd_judge(args) -> int:
             d = decide_doc(a, b, checker, doc_problems[f.id])
             decisions.append(s.without_empty_patch(d, {"writer": writer_patches[f.id]}, adjudicated=False))
 
-    by_id = {f.id: f for f in findings}
+    by_id = {f.id: f for f in s.prompt_findings(ledger, findings)}
     adj_items = []
     for d in decisions:
         if d.outcome == OUTCOME_ADJUDICATE:
             name = s.wt_name(d.finding_id, "adjudicator")
-            wt = snap.worktrees[name] if name in snap.worktrees else add_worktree(snap, name, s.base_of(ledger, rnd))
+            wt = snap.worktrees[name] if name in snap.worktrees else s.new_worktree(snap, name, s.base_of(ledger, rnd), cfg)
             adj_items.append(s.adj_input(ledger, by_id[d.finding_id], merged, verify, wt, cfg, d.reasons))
     if adj_items:
-        s.write_json(rd / "adj-args.json", build_adjudicator_jobs(adj_items))
+        s.write_json(rd / "adj-args.json", write_job_args(build_adjudicator_jobs(adj_items), rd / "prompts"))
     rnd.decisions = [d.to_dict() for d in decisions]
     s.write_json(rd / "decisions.json", rnd.decisions)
     ledger.snapshot = snap.to_dict()
-    s.mark(rnd, "judge")
+    s.mark(rnd, "judge", repro_allowed=repro is not None)
     s.save_ledger(run_dir, ledger)
     print("판정: " + ", ".join(f"{k} {v}" for k, v in Counter(d.outcome for d in decisions).items()))
     _print_next(ledger, run_dir)
     return 0
 
 
-def _adjudicate_verify(ledger, rnd, f, wt, patch, snap, cfg):
+def _adjudicate_verify(ledger, rnd, f, wt, patch, snap, cfg, rd):
     if ledger.mode == "doc":
-        missing, snippets = s.doc_checks(wt, patch, ledger, cfg)
-        return s.doc_verify(missing, snippets)
-    results = run_verifiers(wt, cfg, changed_files(patch), "worker")
-    if ledger.source == s.SOURCE_PR and patch.strip():
-        results += run_repro(snap.worktrees[s.base_name(rnd)], wt, repro_cmds(f))
-    return results
+        missing, snippets = s.doc_checks(wt, snap.worktrees.get(s.base_name(rnd)), patch, ledger, cfg)
+        results = s.doc_verify(missing, snippets)
+        return results, results
+    judged, recorded = s.worker_verify(wt, cfg, changed_files(patch), s.baseline_failed(rd))
+    judge_event = s.last_event(rnd, "judge") or {}
+    cmds = s.repro_listed(rd).get(f.id) if judge_event.get("repro_allowed") else None
+    if ledger.source == s.SOURCE_PR and patch.strip() and cmds:
+        extra = run_repro(snap.worktrees[s.base_name(rnd)], wt, cmds)
+        judged += extra
+        recorded += extra
+    return judged, recorded
 
 
 def cmd_adjudicate(args) -> int:
@@ -333,6 +393,7 @@ def cmd_adjudicate(args) -> int:
     s.guard(rnd, "adjudicate", args.force)
     if not s.step_done(rnd, "judge"):
         raise s.CliError(f"회차 {rnd.no}의 judge 단계를 먼저 한다")
+    s.check_user_tree(ledger, rnd)
     cfg = s.cfg_for(ledger.source, Path(ledger.root))
     snap = s.snapshot_of(ledger)
     rd = s.round_dir(run_dir, rnd.no)
@@ -341,7 +402,7 @@ def cmd_adjudicate(args) -> int:
         print(warning)
     merged = s.read_json(rd / "results.json")
     verify = s.read_json(rd / "verify.json")
-    by_id = {f.id: f for f in s.findings_of(rnd)}
+    by_id = {f.id: f for f in s.prompt_findings(ledger, s.findings_of(rnd))}
     new_decisions = []
     for data in rnd.decisions:
         d = Decision.from_dict(data)
@@ -352,7 +413,7 @@ def cmd_adjudicate(args) -> int:
         wt = s.worktree(snap, f.id, "adjudicator")
         adj = s.pick(results, f.id, "adjudicator")
         adj.patch = extract(wt, s.base_of(ledger, rnd), cfg)
-        vadj = _adjudicate_verify(ledger, rnd, f, wt, adj.patch, snap, cfg)
+        vadj, vrecorded = _adjudicate_verify(ledger, rnd, f, wt, adj.patch, snap, cfg, rd)
         if ledger.mode == "code" and s.is_sensitive(changed_files(adj.patch), cfg) and REASON_SENSITIVE not in d.reasons:
             d.reasons.append(REASON_SENSITIVE)
         patches = {role: s.worker_from(merged, f.id, role).patch for role in ("a", "b", "writer")}
@@ -360,7 +421,7 @@ def cmd_adjudicate(args) -> int:
         if adj.patch.strip():
             s.patch_path(rd, f.id, "adjudicator").write_text(adj.patch, encoding="utf-8")
         merged[f"{f.id}:adjudicator"] = adj.to_dict()
-        verify.setdefault(f.id, {})["adjudicator"] = [r.to_dict() for r in vadj]
+        verify.setdefault(f.id, {})["adjudicator"] = [r.to_dict() for r in vrecorded]
         if new.outcome == OUTCOME_UNDECIDABLE:
             item = s.adj_input(ledger, f, merged, verify, wt, cfg, new.reasons)
             (rd / f"opinion-{f.id}.md").write_text(build_opinion_prompt(item, adj), encoding="utf-8")
@@ -394,15 +455,68 @@ def cmd_opinion(args) -> int:
     return 0
 
 
-def _final_suite(root: Path, cfg, mode: str, changed: list[str]) -> tuple[bool | None, str]:
+def _final_suite(root: Path, base_wt: Path | None, cfg, mode: str, changed: list[str]) -> dict:
     cfg, warning = s.final_suite_cfg(cfg, mode, root, changed)
     if warning:
         print(warning)
     if cfg is None or not cfg.full_tests:
-        return None, ""
+        return {"final_ok": None, "final_tail": ""}
+    if base_wt is not None and Path(base_wt).is_dir():
+        base = run_verifiers(base_wt, cfg, changed, "final")
+        if not all(r.ok for r in base):
+            tail = "\n".join(r.tail for r in base if not r.ok)[-FINAL_TAIL_CHARS:]
+            return {"final_ok": None, "final_tail": tail, "baseline_failed": True}
     results = run_verifiers(root, cfg, changed, "final")
     tail = "\n".join(r.tail for r in results if not r.ok)[-FINAL_TAIL_CHARS:]
-    return all(r.ok for r in results), tail
+    return {"final_ok": all(r.ok for r in results), "final_tail": tail}
+
+
+def _adopted_patches(rnd: RoundRecord, rd: Path) -> list[tuple[str, str]]:
+    patches = []
+    for d in rnd.decisions:
+        if s.is_adopted(d):
+            patches.append((d["finding_id"], s.read_text(s.patch_path(rd, d["finding_id"], d["patch_from"]))))
+    return patches
+
+
+def _record_apply(run_dir: Path, ledger: Ledger, rnd: RoundRecord, rd: Path, report: ApplyReport, data: dict) -> None:
+    for fid, tail in report.failed:
+        _set_decision(rnd, fid, OUTCOME_UNDECIDABLE, f"{REASON_APPLY_FAILED}: {s.first_line(tail)}")
+    rnd.adopted = list(report.applied)
+    s.write_json(rd / "apply.json", data)
+    s.write_json(rd / "decisions.json", rnd.decisions)
+    s.mark(rnd, "apply-patched", result_commit=rnd.result_commit)
+    s.save_ledger(run_dir, ledger)
+
+
+def _patch_dry_run(run_dir, ledger, rnd, rd, patches) -> Path:
+    snap = s.snapshot_of(ledger)
+    name = f"result-r{rnd.no}"
+    if name in snap.worktrees:
+        remove_worktree(snap, name)
+    wt = add_worktree(snap, name, s.base_of(ledger, rnd))
+    ledger.snapshot = snap.to_dict()
+    report = apply_all(wt, patches)
+    rnd.result_commit = commit_worktree(wt, f"cascade-fix {ledger.run_id} 회차 {rnd.no} 결과(dry-run)") or s.base_of(ledger, rnd)
+    data = {"dry_run": True, **report.to_dict(), "would_apply": list(report.applied), "result_worktree": str(wt)}
+    _record_apply(run_dir, ledger, rnd, rd, report, data)
+    print(f"dry-run: 작업 트리에는 적용하지 않고 {wt} 에 적용했다 (채택 {len(report.applied)}건, 실패 {len(report.failed)}건)")
+    return wt
+
+
+def _patch_user_tree(run_dir, ledger, rnd, rd, patches, root) -> None:
+    report = apply_all(root, patches, s.external_docs(ledger))
+    rnd.result_commit = snapshot_tree(s.snapshot_of(ledger), list(s.external_docs(ledger).values()))
+    _record_apply(run_dir, ledger, rnd, rd, report, report.to_dict())
+    print(f"적용 {len(report.applied)}건, 실패 {len(report.failed)}건")
+
+
+def _remove_round_worktrees(ledger: Ledger, rnd: RoundRecord) -> None:
+    snap = s.snapshot_of(ledger)
+    for name in s.round_worktree_names(rnd):
+        if name in snap.worktrees:
+            remove_worktree(snap, name)
+    ledger.snapshot = snap.to_dict()
 
 
 def cmd_apply(args) -> int:
@@ -417,44 +531,50 @@ def cmd_apply(args) -> int:
     root = Path(ledger.root)
     cfg = s.cfg_for(ledger.source, root)
     rd = s.round_dir(run_dir, rnd.no)
-    patches = []
-    for d in rnd.decisions:
-        if s.is_adopted(d):
-            path = s.patch_path(rd, d["finding_id"], d["patch_from"])
-            patches.append((d["finding_id"], s.read_text(path)))
-    if ledger.dry_run:
-        rnd.adopted = [fid for fid, _ in patches]
-        data = {"dry_run": True, "applied": [], "failed": [], "would_apply": rnd.adopted}
-        print(f"dry-run: 적용하지 않음 (채택 {len(patches)}건)")
+    recheck_repo = str(root)
+    if s.step_done(rnd, "apply-patched"):
+        print("패치는 이미 적용했다(apply-patched) — 적용을 건너뛰고 뒷단계만 한다")
+        data = s.read_json(rd / "apply.json")
+        if ledger.dry_run:
+            recheck_repo = data.get("result_worktree", recheck_repo)
     else:
-        report = apply_all(root, patches, s.external_docs(ledger))
-        for fid, tail in report.failed:
-            _set_decision(rnd, fid, OUTCOME_UNDECIDABLE, f"{REASON_APPLY_FAILED}: {s.first_line(tail)}")
-        texts = dict(patches)
-        changed = list(dict.fromkeys(p for fid in report.applied for p in changed_files(texts[fid])))
-        final_ok, final_tail = _final_suite(root, cfg, ledger.mode, changed) if report.applied else (None, "")
-        data = {**report.to_dict(), "final_ok": final_ok, "final_tail": final_tail}
-        rnd.adopted = list(report.applied)
-        if final_ok is False:
+        patches = _adopted_patches(rnd, rd)
+        if ledger.dry_run:
+            recheck_repo = str(_patch_dry_run(run_dir, ledger, rnd, rd, patches))
+        else:
+            _patch_user_tree(run_dir, ledger, rnd, rd, patches, root)
+        data = s.read_json(rd / "apply.json")
+    texts = {fid: s.read_text(s.patch_path(rd, fid, d["patch_from"]))
+             for d in rnd.decisions if s.is_adopted(d) for fid in [d["finding_id"]]}
+    applied = [fid for fid in data.get("applied", []) if fid in texts]
+    changed = list(dict.fromkeys(p for fid in applied for p in changed_files(texts[fid])))
+    if not ledger.dry_run:
+        _remove_round_worktrees(ledger, rnd)
+        base_wt = s.snapshot_of(ledger).worktrees.get(s.base_name(rnd))
+        final = _final_suite(root, base_wt, cfg, ledger.mode, changed) if applied else {"final_ok": None, "final_tail": ""}
+        data.update(final)
+        if final.get("baseline_failed"):
+            print("전체 테스트가 기준선(수정 전)부터 실패한다 — 간섭 판정을 하지 않는다")
+        elif final["final_ok"] is False:
             data["interference"] = True
-            for fid in report.applied:
+            for fid in applied:
                 _set_decision(rnd, fid, OUTCOME_UNDECIDABLE, REASON_INTERFERENCE)
             rnd.adopted = []
             print("전체 테스트가 깨졌다(간섭 의심). 적용한 패치는 작업 트리에 그대로 두었다 — 되돌릴지는 사람이 정한다")
-        print(f"적용 {len(report.applied)}건, 실패 {len(report.failed)}건")
-        rnd.result_commit = snapshot_tree(s.snapshot_of(ledger), list(s.external_docs(ledger).values()))
     s.write_json(rd / "apply.json", data)
     s.write_json(rd / "decisions.json", rnd.decisions)
     if s.recheck_needed(ledger, rnd):
-        texts = dict(patches)
         adopted = [f for f in s.findings_of(rnd) if f.id in rnd.adopted]
+        scope = list(dict.fromkeys(p for fid in rnd.adopted if fid in texts for p in changed_files(texts[fid])))
         if rnd.result_commit:
-            diff = s.range_diff(root, s.base_of(ledger, rnd), rnd.result_commit)
+            diff = s.range_diff(root, s.base_of(ledger, rnd), rnd.result_commit, scope)
         else:
             diff = "".join(texts[f.id] for f in adopted)
         (rd / "recheck-prompt.md").write_text(build_recheck_prompt(adopted, diff, ledger.mode), encoding="utf-8")
+        (rd / s.RECHECK_REPO_FILE).write_text(recheck_repo + "\n", encoding="utf-8")
+        s.write_json(rd / s.RECHECK_SCOPE_FILE, scope)
         rnd.recheck_opened = True
-        print(f"재검토 필요: {rd / 'recheck-prompt.md'}")
+        print(f"재검토 필요: {rd / 'recheck-prompt.md'} (--repo {recheck_repo})")
     else:
         ledger.status = STATUS_DONE
         print("재검토 없음: 종료")
@@ -464,7 +584,9 @@ def cmd_apply(args) -> int:
     return 0
 
 
-def _hold_reason(f, rnd: RoundRecord, max_reached: bool) -> str:
+def _hold_reason(f, rnd: RoundRecord, max_reached: bool, outside: set[str]) -> str:
+    if f.id in outside:
+        return REASON_OUT_OF_SCOPE
     if rnd.final:
         return "「지금 반영」 뒤 마지막 재검토: 회차를 열지 않음"
     if f.severity == "Suggestion":
@@ -496,10 +618,12 @@ def cmd_recheck(args) -> int:
     unresolved = [s.unresolved_copy(f) for f in adopted if resolved.get(f.id) is not True]
     combined = s.renumber(unresolved + new, rnd.no + 1, ledger.source)
     max_reached = s.rechecks_done(ledger) >= ledger.max_rechecks
-    next_round, hold, undecidable = classify_recheck(combined, rnd, max_reached, final=rnd.final)
+    in_scope = s.recheck_scope(ledger, rd, adopted, combined)
+    outside = {f.id for f in out_of_scope(combined, in_scope)}
+    next_round, hold, undecidable = classify_recheck(combined, rnd, max_reached, final=rnd.final, in_scope=in_scope)
     for f in hold:
         rnd.hold_findings.append(f.to_dict())
-        rnd.decisions.append(Decision(f.id, OUTCOME_HOLD, None, [_hold_reason(f, rnd, max_reached)]).to_dict())
+        rnd.decisions.append(Decision(f.id, OUTCOME_HOLD, None, [_hold_reason(f, rnd, max_reached, outside)]).to_dict())
     for f in undecidable:
         reason = "「지금 반영」 뒤 재검토의 Critical" if rnd.final else "같은 위치 Critical 두 회차 연속"
         rnd.hold_findings.append(f.to_dict())
@@ -507,7 +631,7 @@ def cmd_recheck(args) -> int:
     s.write_json(rd / "decisions.json", rnd.decisions)
     s.mark(rnd, "recheck")
     print(f"해소 {sum(1 for v in resolved.values() if v)}건, 해소 안 됨 {len(unresolved)}건, 새 지적 {len(new)}건")
-    print(f"다음 회차 {len(next_round)}건, 보류 후보 {len(hold)}건, 판단 불가 {len(undecidable)}건")
+    print(f"다음 회차 {len(next_round)}건, 보류 후보 {len(hold)}건(범위 밖 {len(outside)}건), 판단 불가 {len(undecidable)}건")
     if next_round:
         no = rnd.no + 1
         write_findings(s.round_dir(run_dir, no) / "findings.json", next_round)
@@ -580,6 +704,10 @@ def cmd_report(args) -> int:
     text = render(ledger, ledger.dry_run, run_dir) + _interference_note(ledger, run_dir)
     write_prepared(run_dir, ledger)
     (run_dir / "report.md").write_text(text, encoding="utf-8")
+    rnd = ledger.current_round()
+    if rnd is not None:
+        s.mark(rnd, "report", round=rnd.no)
+        s.save_ledger(run_dir, ledger)
     print(text)
     print(f"보고서: {run_dir / 'report.md'} · 준비됨: {run_dir / 'prepared'}")
     return 0
@@ -640,6 +768,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = add("judge", cmd_judge, round_no=True)
     p.add_argument("--results", required=True)
     p.add_argument("--checker-results")
+    p.add_argument("--allow-repro")
     p = add("adjudicate", cmd_adjudicate, round_no=True)
     p.add_argument("--results", required=True)
     p = add("opinion", cmd_opinion, round_no=True)

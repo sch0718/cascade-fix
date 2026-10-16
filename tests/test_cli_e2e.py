@@ -107,7 +107,7 @@ class CliTestBase(unittest.TestCase):
         self.run_dir = Path(line.split("=", 1)[1])
         return p
 
-    def run_to_apply(self, *init_extra):
+    def run_to_apply(self, *init_extra, before_apply=None):
         self.commits_before = git(self.repo, "rev-list", "--count", "HEAD")
         self.init(*init_extra)
         findings = json.loads((self.run_dir / "round-1" / "findings.json").read_text(encoding="utf-8"))
@@ -153,6 +153,8 @@ class CliTestBase(unittest.TestCase):
         self.assertEqual(decisions["r1-02"]["patch_from"], "adjudicator")
         self.assertTrue((self.run_dir / "round-1" / "patch-r1-02-adj.diff").is_file())
 
+        if before_apply is not None:
+            before_apply()
         return self.cli("apply", "--run-dir", str(self.run_dir), "--round", "1")
 
 
@@ -168,6 +170,11 @@ class CliEndToEndTest(CliTestBase):
         self.assertEqual(apply["applied"], ["r1-01", "r1-02"])
         self.assertTrue(apply["final_ok"])
         self.assertEqual(self.ledger().rounds[0].adopted, ["r1-01", "r1-02"])
+        self.assertEqual(set(self.ledger().snapshot["worktrees"]), {"base"})
+        self.assertFalse((self.run_dir / "wt" / "r1-01-a").exists())
+        self.assertFalse((self.run_dir / "wt" / "r1-02-adj").exists())
+        self.assertTrue((self.run_dir / "wt" / "base").is_dir())
+        self.assertEqual((self.run_dir / "round-1" / "recheck-repo.txt").read_text(encoding="utf-8").strip(), str(self.repo))
 
         p = self.cli("report", "--run-dir", str(self.run_dir))
         self.assertIn("| 1 | 2 | 1 | 1 | 0 | 0 |", p.stdout)
@@ -191,13 +198,16 @@ class CliEndToEndTest(CliTestBase):
         held = next(f for f in ledger.rounds[0].hold_findings if f["id"] == hold[0]["finding_id"])
         self.assertEqual(held["severity"], "Suggestion")
 
-        events = len(ledger.rounds[0].events)
+        p = self.cli("status", "--run-dir", str(self.run_dir))
+        self.assertIn("report --run-dir", p.stdout)
         p = self.cli("report", "--run-dir", str(self.run_dir))
         self.assertIn("ident에 타입 힌트가 없다", p.stdout)
         self.assertIn("| 1 | 2 | 1 | 1 | 0 | 1 |", p.stdout)
         self.assertIn("Suggestion, calc.py:5", p.stdout)
-        self.assertEqual(len(self.ledger().rounds[0].events), events)
+        reports = [e for e in self.ledger().rounds[0].events if e["step"] == "report"]
+        self.assertEqual([e["round"] for e in reports], [1, 1])
         p = self.cli("status", "--run-dir", str(self.run_dir))
+        self.assertNotIn("report --run-dir", p.stdout)
         self.assertIn("cleanup", p.stdout)
 
         self.cli("cleanup", "--run-dir", str(self.run_dir))
@@ -240,7 +250,7 @@ class CliEndToEndTest(CliTestBase):
     def test_broken_full_suite_marks_interference_and_keeps_tree(self):
         toml = write_repos_toml(self.tmp, {str(self.repo): {
             "tests": ["python3 -m unittest {files}"],
-            "full_tests": ["python3 -c 'import sys; sys.exit(3)'"],
+            "full_tests": ["python3 -c \"import sys; sys.exit(3 if 'a * b' in open('calc.py').read() else 0)\""],
         }})
         self.env["CASCADE_REPOS_TOML"] = str(toml)
         self.run_to_apply()
@@ -311,6 +321,9 @@ class CliEndToEndTest(CliTestBase):
         p = self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1))
         self.assertIn("r1-02:b 모델 ID가 비어 있다", p.stdout)
         d = {x["finding_id"]: x for x in self.ledger().rounds[0].decisions}
+        verify = json.loads((self.run_dir / "round-1" / "verify.json").read_text(encoding="utf-8"))
+        self.assertEqual(verify["r1-02"], {"a": [], "b": []})
+        self.assertTrue(verify["r1-01"]["a"])
         self.assertEqual((d["r1-01"]["outcome"], d["r1-01"]["patch_from"]), ("판가름", None))
         self.assertIn("패치 없음", d["r1-01"]["reasons"])
         adj_args = json.loads((self.run_dir / "round-1" / "adj-args.json").read_text(encoding="utf-8"))
@@ -345,7 +358,6 @@ class CliEndToEndTest(CliTestBase):
         stage1 = self.run_dir / "round-1" / "stage1.json"
         shutil.copyfile(FIXTURES / "workflow-stage1.json", stage1)
         self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1))
-        (self.repo / "calc.py").write_text(fix(CALC, "return a - b", "return b - a"), encoding="utf-8")
         adj = self.run_dir / "round-1" / "adj.json"
         adj.write_text(json.dumps({"results": [{"id": "r1-02:adjudicator", "output": None}]}), encoding="utf-8")
         self.cli("adjudicate", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(adj))
@@ -354,6 +366,7 @@ class CliEndToEndTest(CliTestBase):
         opinion.write_text("Opus와 같은 의견이다", encoding="utf-8")
         self.cli("opinion", "--run-dir", str(self.run_dir), "--round", "1", "--id", "r1-02", "--result", str(opinion))
         self.assertEqual(self.ledger().opinions["r1-02"], "Opus와 같은 의견이다")
+        (self.repo / "calc.py").write_text(fix(CALC, "return a - b", "return b - a"), encoding="utf-8")
         self.cli("apply", "--run-dir", str(self.run_dir), "--round", "1")
 
 
@@ -361,7 +374,7 @@ class CliDocModeTest(CliTestBase):
     PLAN = "# 계획\n\n1단계는 `calc.py`를 고친다.\n"
 
     def test_doc_mode_runs_checker_loop_and_applies_writer_patch(self):
-        plan = "# 계획\n\n1단계는 `calc.py`를 고친다.\n"
+        plan = "# 계획\n\n1단계는 `calc.py`를 고친다.\n\n예전 이름 `ghost.py`와 `~/.claude/x.md`는 지금 없다.\n"
         (self.repo / "plan.md").write_text(plan, encoding="utf-8")
         raw = self.tmp / "doc.final"
         raw.write_text("Warning\n1. 단계가 모호하다\n   위치: plan.md:3\n   근거: 무엇을 고치는지 없다\n", encoding="utf-8")
@@ -407,10 +420,17 @@ class CliDocModeTest(CliTestBase):
         raw.write_text(f"Warning\n1. 단계가 모호하다\n   위치: {location}:3\n   근거: 무엇을 고치는지 없다\n", encoding="utf-8")
         p = self.cli("init", "--source", "codex-doc", "--input", str(raw), "--doc", str(doc))
         self.run_dir = Path(next(x for x in p.stdout.splitlines() if x.startswith("run_dir=")).split("=", 1)[1])
-        self.assertEqual(self.ledger().docs, {location: str(doc.resolve())})
+        self.assertEqual(self.ledger().docs, {"외부/plan.md": str(doc.resolve())})
         self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1")
         wt = self.wt("r1-01-writer")
-        target = wt / location
+        target = wt / "외부/plan.md"
+        args = json.loads((self.run_dir / "round-1" / "stage1-args.json").read_text(encoding="utf-8"))
+        writer = next(j for j in args["jobs"] if j["id"] == "r1-01:writer")
+        prompt = Path(writer["promptPath"]).read_text(encoding="utf-8")
+        self.assertIn(f"- 위치: {target}:3", prompt)
+        self.assertIn(f"대상 문서: `{target}`", prompt)
+        self.assertIn("원본 경로(사용자 저장소의 파일이나 저장소 밖 원본)는 열지 않는다", prompt)
+        self.assertEqual(self.ledger().rounds[0].findings[0]["location"], f"{location}:3")
         target.write_text(target.read_text(encoding="utf-8").replace("고친다", "고쳐 add가 더하게 한다"), encoding="utf-8")
         commit_worktree(wt, "writer")
         stage1 = results_json(self.run_dir / "round-1" / "stage1.json", [
@@ -436,12 +456,17 @@ class CliDocModeTest(CliTestBase):
     def test_doc_outside_repo_is_fixed_in_place(self):
         outside = self.tmp / "outside"
         outside.mkdir()
-        self._run_doc_to_apply(outside / "plan.md", "외부/plan.md")
+        self._run_doc_to_apply(outside / "plan.md", "plan.md")
+
+    def test_doc_outside_repo_with_absolute_location(self):
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        self._run_doc_to_apply(outside / "plan.md", str(outside / "plan.md"))
 
     def test_gitignored_doc_in_repo_is_fixed_in_place(self):
         (self.repo / ".gitignore").write_text("__pycache__/\nnotes/\n", encoding="utf-8")
         (self.repo / "notes").mkdir()
-        self._run_doc_to_apply(self.repo / "notes" / "plan.md", "외부/plan.md")
+        self._run_doc_to_apply(self.repo / "notes" / "plan.md", "notes/plan.md")
 
 
 class CliPrCommentTest(CliTestBase):
@@ -457,6 +482,58 @@ class CliPrCommentTest(CliTestBase):
         self.assertEqual(ledger.mode, "code")
         self.assertEqual([f["location"].split(":")[0] for f in ledger.rounds[0].findings], ["src/b.py", "src/d.py"])
         self.assertTrue(all(f["thread_id"] for f in ledger.rounds[0].findings))
+
+    def test_pr_comment_init_warns_when_local_head_is_not_pr_head(self):
+        env = {**self.env, "CASCADE_GH": f"{sys.executable} {Path(__file__).resolve().parent / 'fake_gh.py'}",
+               "CASCADE_FAKE_GH_FILE": str(FIXTURES / "pr-threads.json"), "CASCADE_FAKE_GH_HEAD": "f" * 40}
+        p = run_cli(["init", "--source", "pr-comment", "--input", "7", "--pr-repo", "o/r", "--me", "sch0718"],
+                    cwd=self.repo, env=env)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("PR #7의 head(ffffffffffff)와 다르다", p.stdout)
+        env["CASCADE_FAKE_GH_HEAD"] = git(self.repo, "rev-parse", "HEAD")
+        p = run_cli(["init", "--source", "pr-comment", "--input", "7", "--pr-repo", "o/r", "--me", "sch0718"],
+                    cwd=self.repo, env=env)
+        self.assertNotIn("head", p.stdout)
+
+    def test_repro_commands_need_explicit_approval(self):
+        body = ("add가 뺀다\n\n**확인한 내용**: 재현\n```\n$ touch REPRO_RAN\nFAILED test_calc.py\n```\n")
+        items = self.tmp / "findings.json"
+        items.write_text(json.dumps([{"id": "r1-01", "severity": "Warning", "location": "calc.py:2", "body": body,
+                                      "thread_id": "T1"}], ensure_ascii=False), encoding="utf-8")
+        p = self.cli("init", "--source", "pr-comment", "--findings-json", str(items))
+        self.run_dir = Path(next(x for x in p.stdout.splitlines() if x.startswith("run_dir=")).split("=", 1)[1])
+        p = self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1")
+        listed = self.run_dir / "round-1" / "repro-cmds.json"
+        self.assertEqual(json.loads(listed.read_text(encoding="utf-8")), {"r1-01": ["touch REPRO_RAN"]})
+        self.assertIn("r1-01: touch REPRO_RAN", p.stdout)
+        self.assertNotIn("FAILED", listed.read_text(encoding="utf-8"))
+        p = self.cli("status", "--run-dir", str(self.run_dir))
+        self.assertIn("--allow-repro", p.stdout)
+        for name in ("r1-01-a", "r1-01-b"):
+            wt = self.wt(name)
+            (wt / "calc.py").write_text(fix(CALC, "return a - b", "return a + b"), encoding="utf-8")
+            commit_worktree(wt, name)
+        stage1 = results_json(self.run_dir / "round-1" / "stage1.json", [
+            ("r1-01:a", worker_output("사실", "claude-sonnet-5-5")),
+            ("r1-01:b", worker_output("사실", "claude-haiku-5-5")),
+        ])
+        base = self.wt("base")
+        p = self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1))
+        self.assertIn("재현 검증을 건너뛴다", p.stdout)
+        self.assertFalse((base / "REPRO_RAN").exists())
+        self.assertFalse((self.repo / "REPRO_RAN").exists())
+        wrong = self.tmp / "wrong.json"
+        wrong.write_text(json.dumps({"r1-01": ["rm -rf ~"]}), encoding="utf-8")
+        p = self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1), "--force",
+                     "--allow-repro", str(wrong), ok=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("repro-cmds.json 와 다르다", p.stdout)
+        approved = self.tmp / "approved.json"
+        approved.write_text(listed.read_text(encoding="utf-8"), encoding="utf-8")
+        self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1), "--force",
+                 "--allow-repro", str(approved))
+        self.assertTrue((base / "REPRO_RAN").exists())
+        self.assertFalse((self.repo / "REPRO_RAN").exists())
 
     def test_pr_comment_without_config_exits_4(self):
         p = run_cli(["init", "--source", "pr-comment", "--input", "7", "--pr-repo", "o/r"],
@@ -502,6 +579,157 @@ class CliInitTest(CliTestBase):
         self.assertEqual(ledger.mode, "doc")
         self.assertEqual(ledger.docs, {"외부/plan.md": str(doc)})
         self.assertIn("외부/plan.md", git(self.repo, "-c", "core.quotepath=false", "ls-tree", "-r", "--name-only", ledger.snapshot["commit"]))
+
+
+class CliSafetyTest(CliTestBase):
+    def test_judge_stops_when_user_tree_changes_after_jobs(self):
+        self.init()
+        self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1")
+        args = json.loads((self.run_dir / "round-1" / "stage1-args.json").read_text(encoding="utf-8"))
+        prompt = Path(args["jobs"][0]["promptPath"]).read_text(encoding="utf-8")
+        self.assertIn(f"- 위치: {self.wt('r1-01-a')}/calc.py:", prompt)
+        self.assertEqual(set(args["jobs"][0]), {"id", "label", "model", "effort", "kind", "promptPath"})
+        stage1 = self.run_dir / "round-1" / "stage1.json"
+        shutil.copyfile(FIXTURES / "workflow-stage1.json", stage1)
+        (self.repo / "calc.py").write_text(fix(CALC, "return a - b", "return a + b"), encoding="utf-8")
+        p = self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1), ok=False)
+        self.assertEqual(p.returncode, 6, p.stdout)
+        self.assertIn("작업 트리", p.stdout)
+        self.assertIn("git diff --stat", p.stdout)
+        self.assertIn("calc.py", p.stdout)
+        self.assertFalse(cli_steps.step_done(self.ledger().rounds[0], "judge"))
+
+        (self.repo / "calc.py").write_text(CALC, encoding="utf-8")
+        git(self.repo, "branch", "stray")
+        p = self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1), ok=False)
+        self.assertEqual(p.returncode, 6, p.stdout)
+        self.assertIn("+ refs/heads/stray", p.stdout)
+        git(self.repo, "branch", "-D", "stray")
+        self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1))
+
+    def test_baseline_failures_are_excluded_and_setup_runs_in_worktrees(self):
+        lint = "python3 -c 'import sys; sys.exit(1)'"
+        setup = ("python3 -c \"import sys, pathlib; pathlib.Path('__pycache__').mkdir(exist_ok=True); "
+                 "pathlib.Path('__pycache__/root.txt').write_text(sys.argv[1])\" {root}")
+        toml = write_repos_toml(self.tmp, {str(self.repo): {
+            "tests": ["python3 -m unittest {files}"],
+            "full_tests": ["python3 -m unittest discover -s ."],
+            "lint": [lint],
+            "setup": [setup, "ln -s {root} upstream"],
+        }})
+        self.env["CASCADE_REPOS_TOML"] = str(toml)
+        self.run_to_apply()
+        baseline = json.loads((self.run_dir / "round-1" / "baseline.json").read_text(encoding="utf-8"))
+        self.assertEqual(baseline["failed"], [lint])
+        verify = json.loads((self.run_dir / "round-1" / "verify.json").read_text(encoding="utf-8"))
+        self.assertTrue(any(r["cmd"].startswith("[기준선 실패·판정 제외] ") for r in verify["r1-01"]["a"]))
+        self.assertEqual((self.wt("base") / "__pycache__" / "root.txt").read_text(encoding="utf-8"), str(self.repo))
+        patch = (self.run_dir / "round-1" / "patch-r1-01-a.diff").read_text(encoding="utf-8")
+        self.assertNotIn("__pycache__", patch)
+        self.assertNotIn("upstream", patch)
+        self.assertTrue((self.wt("base") / "upstream").is_symlink())
+        apply = json.loads((self.run_dir / "round-1" / "apply.json").read_text(encoding="utf-8"))
+        self.assertEqual((apply["applied"], apply["failed"]), (["r1-01", "r1-02"], []))
+        self.assertFalse((self.repo / "upstream").exists())
+        p = self.cli("report", "--run-dir", str(self.run_dir))
+        self.assertIn("## 기준선 실패", p.stdout)
+        self.assertIn(lint, p.stdout)
+
+    def test_full_suite_failing_before_fix_is_not_interference(self):
+        toml = write_repos_toml(self.tmp, {str(self.repo): {
+            "tests": ["python3 -m unittest {files}"],
+            "full_tests": ["python3 -c 'import sys; sys.exit(3)'"],
+        }})
+        self.env["CASCADE_REPOS_TOML"] = str(toml)
+        p = self.run_to_apply()
+        self.assertIn("기준선(수정 전)부터 실패", p.stdout)
+        apply = json.loads((self.run_dir / "round-1" / "apply.json").read_text(encoding="utf-8"))
+        self.assertIs(apply["baseline_failed"], True)
+        self.assertIsNone(apply["final_ok"])
+        self.assertNotIn("interference", apply)
+        self.assertEqual(self.ledger().rounds[0].adopted, ["r1-01", "r1-02"])
+        self.assertTrue(all(d["outcome"] != "판단불가" for d in self.ledger().rounds[0].decisions))
+
+    def test_apply_rerun_after_patching_does_not_reapply(self):
+        self.run_to_apply()
+        ledger = self.ledger()
+        rnd = ledger.rounds[0]
+        rnd.events = [e for e in rnd.events if e["step"] != "apply"]
+        rnd.recheck_opened = False
+        ledger.status = "진행"
+        ledger.save(self.run_dir / "ledger.json")
+        p = self.cli("apply", "--run-dir", str(self.run_dir), "--round", "1")
+        self.assertIn("적용을 건너뛰고", p.stdout)
+        apply = json.loads((self.run_dir / "round-1" / "apply.json").read_text(encoding="utf-8"))
+        self.assertEqual((apply["applied"], apply["failed"]), (["r1-01", "r1-02"], []))
+        self.assertTrue(apply["final_ok"])
+        self.assertEqual(self.ledger().rounds[0].adopted, ["r1-01", "r1-02"])
+        self.assertEqual(sum(1 for e in self.ledger().rounds[0].events if e["step"] == "apply-patched"), 1)
+
+    def test_recheck_diff_excludes_test_artifacts_and_other_user_edits(self):
+        toml = write_repos_toml(self.tmp, {str(self.repo): {
+            "tests": ["python3 -m unittest {files}"],
+            "full_tests": ["python3 -m unittest discover -s . && python3 -c \"open('artifact.txt', 'w').write('x')\""],
+        }})
+        self.env["CASCADE_REPOS_TOML"] = str(toml)
+
+        def user_edit():
+            (self.repo / "test_calc.py").write_text(TEST_CALC + "# 사용자 메모\n", encoding="utf-8")
+
+        self.run_to_apply(before_apply=user_edit)
+        self.assertTrue((self.repo / "artifact.txt").exists())
+        result = self.ledger().rounds[0].result_commit
+        tree = git(self.repo, "ls-tree", "-r", "--name-only", result)
+        self.assertNotIn("artifact.txt", tree)
+        prompt = (self.run_dir / "round-1" / "recheck-prompt.md").read_text(encoding="utf-8")
+        self.assertIn("return a * b", prompt)
+        self.assertNotIn("artifact.txt", prompt)
+        self.assertNotIn("사용자 메모", prompt)
+        self.assertEqual(json.loads((self.run_dir / "round-1" / "recheck-scope.json").read_text(encoding="utf-8")), ["calc.py"])
+
+    def test_dry_run_rounds_build_on_result_worktree(self):
+        self.run_to_apply("--dry-run")
+        self.assertEqual((self.repo / "calc.py").read_text(encoding="utf-8"), CALC)
+        rnd = self.ledger().rounds[0]
+        self.assertTrue(rnd.result_commit)
+        self.assertNotEqual(rnd.result_commit, rnd.base_commit)
+        result_wt = Path((self.run_dir / "round-1" / "recheck-repo.txt").read_text(encoding="utf-8").strip())
+        self.assertEqual(result_wt, self.wt("result-r1"))
+        self.assertIn("return a * b", (result_wt / "calc.py").read_text(encoding="utf-8"))
+        p = self.cli("status", "--run-dir", str(self.run_dir))
+        self.assertIn(f"--repo {result_wt}", p.stdout)
+        self.assertIn("return a * b", (self.run_dir / "round-1" / "recheck-prompt.md").read_text(encoding="utf-8"))
+        result = self.tmp / "recheck.final"
+        result.write_text(
+            "## 해소 여부\n- r1-01: 해소됨 — 됐다\n- r1-02: 해소됨 — 됐다\n\n"
+            "Critical\n1. mul이 정수를 돌려주지 않는다\n   위치: calc.py:14\n   근거: 실수\n   제안: int\n\n"
+            "Warning\n없음.\n\nSuggestion\n없음.\n",
+            encoding="utf-8",
+        )
+        self.cli("recheck", "--run-dir", str(self.run_dir), "--round", "1", "--result", str(result))
+        self.assertEqual(self.ledger().rounds[1].base_commit, rnd.result_commit)
+        self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "2")
+        text = (self.wt("r2-01-a") / "calc.py").read_text(encoding="utf-8")
+        self.assertIn("return a + b\n\n\ndef ident", text)
+        self.assertIn("return a * b", text)
+        self.assertEqual(git(self.repo, "status", "--porcelain"), "")
+
+    def test_out_of_scope_recheck_finding_is_held(self):
+        self.run_to_apply()
+        result = self.tmp / "recheck.final"
+        result.write_text(
+            "## 해소 여부\n- **r1-01**: 해소됨 — 됐다\n- `r1-02`: 해소됨 — 됐다\n\n"
+            "Critical\n1. 다른 모듈이 깨져 있다\n   위치: other.py:3\n   근거: 본 적 있다\n   제안: 고친다\n\n"
+            "Warning\n없음.\n\nSuggestion\n없음.\n",
+            encoding="utf-8",
+        )
+        p = self.cli("recheck", "--run-dir", str(self.run_dir), "--round", "1", "--result", str(result))
+        self.assertIn("해소 2건", p.stdout)
+        ledger = self.ledger()
+        self.assertEqual((len(ledger.rounds), ledger.status), (1, "종료"))
+        held = [d for d in ledger.rounds[0].decisions if d["outcome"] == "보류후보"]
+        self.assertEqual(len(held), 1)
+        self.assertEqual(held[0]["reasons"], ["재검토 범위 밖"])
 
 
 class CliResumeTest(unittest.TestCase):
@@ -555,6 +783,16 @@ class CliStepsTest(unittest.TestCase):
     def test_adopted_warning_past_limit_does_not_recheck(self):
         ledger, rnd = self._ledger("Warning")
         self.assertFalse(cli_steps.recheck_needed(ledger, rnd))
+
+    def test_map_location_to_worktree_keys(self):
+        docs = {"외부/x.md": "/w/other/docs/plans/x.md", "docs/a.md": "/repo/docs/a.md"}
+        root = Path("/repo")
+        self.assertEqual(cli_steps.map_location("docs/plans/x.md:690", root, docs), "외부/x.md:690")
+        self.assertEqual(cli_steps.map_location("/w/other/docs/plans/x.md:5", root, docs), "외부/x.md:5")
+        self.assertEqual(cli_steps.map_location("docs/a.md:3", root, docs), "docs/a.md:3")
+        self.assertEqual(cli_steps.map_location("/repo/src/b.py:7", root, {}), "src/b.py:7")
+        self.assertEqual(cli_steps.map_location("src/b.py:7", root, docs), "src/b.py:7")
+        self.assertEqual(cli_steps.map_location("-", root, docs), "-")
 
     def test_next_step_paths_are_shell_quoted(self):
         self.assertIn("--run-dir '/a b/run'", cli_steps._cmd("report", Path("/a b/run")))

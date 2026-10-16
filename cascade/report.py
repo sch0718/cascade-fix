@@ -24,6 +24,8 @@ OPINION_MAX_LINES = 20
 COMMIT_SUBJECT_MAX = 60
 REBUTTAL_CHOICE = "선택: [ ] 동의 [ ] 그래도 고친다"
 HOLD_CHOICE = "선택: [ ] 지금 반영 [ ] 구현 때 테스트로 [ ] 보류"
+DRY_RUN_NOT_APPLIED = "적용 안 됨(dry-run)"
+UNTIMED_STEPS = ("report",)
 TABLE_FOOTNOTE = (
     "합의-아님은 합의 칸에 한 번 세고 사람이 볼 목록의 반박 칸에도 오른다. "
     "사람 칸은 설계결정·판단불가·보류후보와 판가름 뒤에도 채택하지 못한 지적이다."
@@ -281,7 +283,9 @@ def _prepared_section(ledger: Ledger, run_dir: Path | None) -> list[str]:
     failed = _failed_ids(ledger, run_dir)
     message = _commit_message(ledger, failed)
     out.extend([_fenced(message.rstrip("\n")) if message else "(채택된 지적 없음)", ""])
-    if ledger.source == SOURCE_PR_COMMENT:
+    if ledger.source == SOURCE_PR_COMMENT and ledger.dry_run:
+        out.extend(["### PR 답글 초안", "", DRY_RUN_NOT_APPLIED, "", "### resolve 대상", "", DRY_RUN_NOT_APPLIED, ""])
+    elif ledger.source == SOURCE_PR_COMMENT:
         out.extend(["### PR 답글 초안", ""])
         drafts = _reply_drafts(ledger, run_dir, failed)
         if not drafts:
@@ -313,7 +317,8 @@ def _parse_time(value: str) -> datetime | None:
 
 
 def _elapsed(rnd) -> str:
-    times = [t for t in (_parse_time(e.get("at", "")) for e in rnd.events) if t is not None]
+    times = [t for t in (_parse_time(e.get("at", "")) for e in rnd.events if e.get("step") not in UNTIMED_STEPS)
+             if t is not None]
     if len(times) < 2:
         return "-"
     try:
@@ -369,9 +374,24 @@ def render(ledger: Ledger, dry_run: bool, run_dir: Path | None = None) -> str:
     )
     for name, items in _bucketed(ledger).items():
         out.extend(_bucket_section(name, items, ledger, run_dir))
+    out.extend(_baseline_section(ledger, run_dir))
     out.extend(_prepared_section(ledger, run_dir))
     out.extend(_calls_section(ledger, run_dir))
     return "\n".join(out).rstrip("\n") + "\n"
+
+
+def _baseline_section(ledger: Ledger, run_dir: Path | None) -> list[str]:
+    if run_dir is None:
+        return []
+    lines = []
+    for rnd in ledger.rounds:
+        data = _read_json(Path(run_dir) / f"round-{rnd.no}" / "baseline.json")
+        failed = data.get("failed", []) if isinstance(data, dict) else []
+        if failed:
+            lines.append(f"- 회차 {rnd.no}: 수정 전부터 실패한 검증 명령(판정에서 제외): " + ", ".join(f"`{c}`" for c in failed))
+        if (_load_apply(run_dir, rnd.no) or {}).get("baseline_failed"):
+            lines.append(f"- 회차 {rnd.no}: 전체 테스트가 기준선(수정 전)부터 실패해 간섭 판정을 하지 않았다")
+    return ["## 기준선 실패", "", *lines, ""] if lines else []
 
 
 def write_prepared(run_dir: Path, ledger: Ledger) -> None:
@@ -379,10 +399,10 @@ def write_prepared(run_dir: Path, ledger: Ledger) -> None:
     prepared.mkdir(parents=True, exist_ok=True)
     failed = _failed_ids(ledger, Path(run_dir))
     (prepared / "commit-message.txt").write_text(_commit_message(ledger, failed), encoding="utf-8")
-    replies = _reply_drafts(ledger, Path(run_dir), failed) if ledger.source == SOURCE_PR_COMMENT else {}
+    pr = ledger.source == SOURCE_PR_COMMENT and not ledger.dry_run
+    replies = _reply_drafts(ledger, Path(run_dir), failed) if pr else {}
     (prepared / "replies.json").write_text(json.dumps(replies, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     (prepared / "resolve.json").write_text(
-        json.dumps(_resolve_targets(ledger, failed) if ledger.source == SOURCE_PR_COMMENT else [], ensure_ascii=False, indent=2)
-        + "\n",
+        json.dumps(_resolve_targets(ledger, failed) if pr else [], ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )

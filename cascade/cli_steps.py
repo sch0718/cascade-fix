@@ -6,10 +6,9 @@ import subprocess
 import tomllib
 from dataclasses import replace
 from datetime import datetime
-from fnmatch import fnmatch
 from pathlib import Path
 
-from cascade.config import ConfigError, ExitCodes, RepoConfig, detect_candidates, load_repo_config
+from cascade.config import ConfigError, ExitCodes, RepoConfig, detect_candidates, is_sensitive_path, load_repo_config
 from cascade.consensus import (
     OUTCOME_ADJUDICATE,
     OUTCOME_AGREED_FACT,
@@ -20,11 +19,18 @@ from cascade.consensus import (
     WorkerResult,
 )
 from cascade.findings import Finding
-from cascade.jobs import ROLES, AdjInput
-from cascade.patches import DIFF_FLAGS, changed_files
+from cascade.jobs import ROLES, AdjInput, location_file, split_location
+from cascade.patches import DIFF_FLAGS, changed_files, record_setup_paths
 from cascade.rounds import STATUS_DONE, Ledger, RoundRecord, ledger_path, needs_recheck
-from cascade.snapshot import Snapshot
-from cascade.verify import VerifyResult, check_doc_refs, check_snippets, related_tests
+from cascade.snapshot import Snapshot, add_worktree, tree_diff_stat, user_tree_fingerprint
+from cascade.verify import (
+    VerifyResult,
+    check_snippets,
+    new_broken_refs,
+    related_tests,
+    run_commands,
+    run_worker_verifiers,
+)
 
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 RUN_REVIEW = SKILL_ROOT.parent / "codex-review" / "scripts" / "run-review.sh"
@@ -36,6 +42,12 @@ SOURCE_PR = "pr-comment"
 EXTERNAL_PREFIX = "외부/"
 REASON_NO_PATCH = "패치 없음"
 CALL_FAILED = "호출 실패"
+BASELINE_TAG = "[기준선 실패·판정 제외] "
+REPRO_FILE = "repro-cmds.json"
+RECHECK_REPO_FILE = "recheck-repo.txt"
+RECHECK_SCOPE_FILE = "recheck-scope.json"
+BASELINE_FILE = "baseline.json"
+FINGERPRINT_PARTS = {"tree": "작업 트리", "head": "HEAD", "stash": "stash", "branches": "브랜치"}
 
 
 class CliError(Exception):
@@ -198,7 +210,7 @@ def model_warnings(results: dict[str, WorkerResult]) -> list[str]:
 
 
 def is_sensitive(paths: list[str], cfg: RepoConfig) -> bool:
-    return any(fnmatch(path, pat) for path in paths for pat in cfg.sensitive_paths)
+    return any(is_sensitive_path(path, cfg.sensitive_paths) for path in paths)
 
 
 def is_adopted(d: dict) -> bool:
@@ -210,7 +222,9 @@ def first_line(text: str) -> str:
     return lines[0].strip() if lines else "(출력 없음)"
 
 
-def doc_checks(wt: Path, patch: str, ledger: Ledger, cfg: RepoConfig) -> tuple[list[str], list[VerifyResult]]:
+def doc_checks(
+    wt: Path, base_wt: Path | None, patch: str, ledger: Ledger, cfg: RepoConfig
+) -> tuple[list[str], list[VerifyResult]]:
     changed = changed_files(patch)
     docs = [p for p in changed if p in ledger.docs] or [p for p in changed if p.endswith(DOC_SUFFIXES)]
     missing: list[str] = []
@@ -219,9 +233,145 @@ def doc_checks(wt: Path, patch: str, ledger: Ledger, cfg: RepoConfig) -> tuple[l
         path = Path(wt) / rel
         if not path.is_file():
             continue
-        missing += [m for m in check_doc_refs(wt, path) if m not in missing]
+        base_doc = Path(base_wt) / rel if base_wt is not None else None
+        missing += [m for m in new_broken_refs(base_wt, base_doc, wt, path) if m not in missing]
         snippets += check_snippets(wt, path, cfg)
     return missing, snippets
+
+
+def map_location(location: str, root: Path, docs: dict[str, str]) -> str:
+    path, line = split_location(location)
+    if not path or path in ("?", "-"):
+        return location
+    target = Path(path)
+    if target.is_absolute():
+        resolved = target.resolve()
+        for key, original in docs.items():
+            if Path(original).resolve() == resolved:
+                return f"{key}{line}"
+        root = Path(root).resolve()
+        return f"{resolved.relative_to(root).as_posix()}{line}" if resolved.is_relative_to(root) else location
+    if path in docs:
+        return location
+    parts = target.parts
+    matches = [key for key, original in docs.items() if Path(original).parts[-len(parts):] == parts]
+    return f"{matches[0]}{line}" if len(matches) == 1 else location
+
+
+def prompt_findings(ledger: Ledger, findings: list[Finding]) -> list[Finding]:
+    return [replace(f, location=map_location(f.location, Path(ledger.root), ledger.docs)) for f in findings]
+
+
+def new_worktree(snap: Snapshot, name: str, commit: str, cfg: RepoConfig | None) -> Path:
+    path = add_worktree(snap, name, commit)
+    for cmd in (cfg.setup if cfg else []):
+        result = run_commands(path, [cmd.replace("{root}", shlex.quote(str(snap.root)))])[0]
+        if not result.ok:
+            print(f"경고: {name} 워크트리의 setup 명령이 실패했다: {cmd} — {first_line(result.tail)}")
+    if cfg is not None and cfg.setup:
+        record_setup_paths(path)
+    return path
+
+
+def worker_verify(wt: Path, cfg: RepoConfig, changed: list[str], baseline: set[str]) -> tuple[list[VerifyResult], list[VerifyResult]]:
+    judged: list[VerifyResult] = []
+    recorded: list[VerifyResult] = []
+    for template, r in run_worker_verifiers(wt, cfg, changed):
+        if template in baseline:
+            recorded.append(VerifyResult(cmd=BASELINE_TAG + r.cmd, ok=r.ok, tail=r.tail))
+            continue
+        judged.append(r)
+        recorded.append(r)
+    return judged, recorded
+
+
+def baseline_failed(rd: Path) -> set[str]:
+    path = Path(rd) / BASELINE_FILE
+    if not path.is_file():
+        return set()
+    data = read_json(path)
+    return set(data.get("failed", [])) if isinstance(data, dict) else set()
+
+
+def write_baseline(rd: Path, base_wt: Path, cfg: RepoConfig, changed: list[str]) -> list[str]:
+    results = [(t, r) for t, r in run_worker_verifiers(base_wt, cfg, changed) if t not in cfg.format]
+    failed = sorted({t for t, r in results if not r.ok})
+    write_json(Path(rd) / BASELINE_FILE, {
+        "failed": failed,
+        "results": [{"template": t, **r.to_dict()} for t, r in results],
+    })
+    return failed
+
+
+def last_event(rnd: RoundRecord, step: str) -> dict | None:
+    return next((e for e in reversed(rnd.events) if e.get("step") == step), None)
+
+
+def check_user_tree(ledger: Ledger, rnd: RoundRecord) -> None:
+    event = last_event(rnd, "jobs")
+    before = (event or {}).get("fingerprint")
+    if not before:
+        return
+    snap = snapshot_of(ledger)
+    now = user_tree_fingerprint(snap.root, snap.run_dir)
+    changed = [k for k in FINGERPRINT_PARTS if before.get(k) != now.get(k)]
+    if not changed:
+        return
+    lines = [
+        "jobs 이후 사용자 저장소가 바뀌었다(작업자가 워크트리 밖을 건드렸을 수 있다): "
+        + ", ".join(FINGERPRINT_PARTS[k] for k in changed),
+    ]
+    if "tree" in changed:
+        lines += ["", f"git diff --stat {before['tree']} {now['tree']}", tree_diff_stat(snap.root, before["tree"], now["tree"])]
+    if "head" in changed:
+        lines.append(f"HEAD: {before['head']} → {now['head']}")
+    if "stash" in changed:
+        lines.append(f"refs/stash: {before['stash'] or '(없음)'} → {now['stash'] or '(없음)'}")
+    if "branches" in changed:
+        old, new = set(before.get("branches", [])), set(now.get("branches", []))
+        lines += [f"- {b}" for b in sorted(old - new)] + [f"+ {b}" for b in sorted(new - old)]
+    lines += ["", "사람이 확인한다. 의도한 변경이면 되돌리거나 jobs --force 로 다시 시작한다."]
+    raise CliError("\n".join(lines), ExitCodes.NEEDS_USER)
+
+
+def repro_listed(rd: Path) -> dict[str, list[str]]:
+    path = Path(rd) / REPRO_FILE
+    data = read_json(path) if path.is_file() else {}
+    return data if isinstance(data, dict) else {}
+
+
+def approved_repro(rd: Path, allow: str | None) -> dict[str, list[str]] | None:
+    listed = repro_listed(rd)
+    if not any(listed.values()):
+        return None
+    if allow is None:
+        print(f"경고: 재현 명령을 승인받지 않아 재현 검증을 건너뛴다. 목록 {Path(rd) / REPRO_FILE} 을 사용자에게 보이고 승인받으면 --allow-repro 로 넘긴다")
+        return None
+    if read_json(Path(allow)) != listed:
+        raise CliError(f"--allow-repro 내용이 {Path(rd) / REPRO_FILE} 와 다르다. 승인한 목록 그대로 넘긴다")
+    return listed
+
+
+def round_worktree_names(rnd: RoundRecord) -> list[str]:
+    return [wt_name(f["id"], role) for f in rnd.findings for role in ROLE_SUFFIX]
+
+
+def scope_files(rd: Path) -> set[str] | None:
+    path = Path(rd) / RECHECK_SCOPE_FILE
+    if not path.is_file():
+        return None
+    data = read_json(path)
+    return set(data) if isinstance(data, list) else None
+
+
+def recheck_scope(ledger: Ledger, rd: Path, adopted: list[Finding], combined: list[Finding]) -> set[str] | None:
+    scope = scope_files(rd)
+    if scope is None:
+        return None
+    root = Path(ledger.root)
+    mapped = lambda f: location_file(map_location(f.location, root, ledger.docs))  # noqa: E731
+    scope |= {m for f in adopted if (m := mapped(f))}
+    return scope | {location_file(f.location) for f in combined if mapped(f) in scope and location_file(f.location)}
 
 
 def doc_problems(missing: list[str], snippets: list[VerifyResult]) -> list[str]:
@@ -288,8 +438,9 @@ def external_docs(ledger: Ledger) -> dict[str, Path]:
     return {k: Path(v) for k, v in ledger.docs.items() if k.startswith(EXTERNAL_PREFIX)}
 
 
-def range_diff(root: Path, old: str, new: str) -> str:
-    p = subprocess.run(["git", "-c", "core.quotepath=false", "diff", *DIFF_FLAGS, old, new],
+def range_diff(root: Path, old: str, new: str, files: list[str] | None = None) -> str:
+    paths = ["--", *files] if files else []
+    p = subprocess.run(["git", "--literal-pathspecs", "-c", "core.quotepath=false", "diff", *DIFF_FLAGS, old, new, *paths],
                        cwd=root, capture_output=True)
     if p.returncode != 0:
         raise CliError(f"git diff 실패: {p.stderr.decode('utf-8', errors='replace').strip()}")
@@ -346,7 +497,9 @@ def next_steps(ledger: Ledger, run_dir: Path) -> list[str]:
         return ["회차가 없다"]
     if ledger.status == STATUS_DONE:
         steps = []
-        if not (Path(run_dir) / "report.md").is_file():
+        latest = next((e for e in reversed(rnd.events) if e.get("step") != "cleanup"), {})
+        reported = latest.get("step") == "report" and latest.get("round") == rnd.no
+        if not reported or not (Path(run_dir) / "report.md").is_file():
             steps.append(_cmd("report", run_dir))
         elif not any(step_done(r, "cleanup") for r in ledger.rounds):
             steps.append(_cmd("cleanup", run_dir))
@@ -365,10 +518,13 @@ def next_steps(ledger: Ledger, run_dir: Path) -> list[str]:
                 f"Workflow 실행: script=workflows/run-jobs.js 내용, args={rd / 'checker-args.json'} 내용 → 결과를 {rd / 'checker.json'} 에 저장",
                 _cmd("judge", run_dir, n, f"--results {_q(rd / 'stage1.json')}", f"--checker-results {_q(rd / 'checker.json')}"),
             ]
-        return [
+        steps = [
             f"Workflow 실행: script=workflows/run-jobs.js 내용, args={rd / 'stage1-args.json'} 내용 → 결과를 {rd / 'stage1.json'} 에 저장",
             _cmd("judge", run_dir, n, f"--results {_q(rd / 'stage1.json')}"),
         ]
+        if any(repro_listed(rd).values()):
+            steps.append(f"(재현 명령 {rd / REPRO_FILE} 을 사용자에게 보이고 승인받았으면 judge에 --allow-repro {_q(rd / REPRO_FILE)} 를 붙인다)")
+        return steps
     if (rd / "adj-args.json").is_file() and not step_done(rnd, "adjudicate"):
         return [
             f"Workflow 실행: script=workflows/run-jobs.js 내용, args={rd / 'adj-args.json'} 내용 → 결과를 {rd / 'adj.json'} 에 저장",
@@ -386,8 +542,10 @@ def next_steps(ledger: Ledger, run_dir: Path) -> list[str]:
         return [_cmd("apply", run_dir, n)]
     if rnd.recheck_opened and not step_done(rnd, "recheck"):
         out = rd / "recheck.out"
+        repo_file = rd / RECHECK_REPO_FILE
+        repo = repo_file.read_text(encoding="utf-8").strip() if repo_file.is_file() else ledger.root
         return [
-            run_review_cmd("recheck", rd / "recheck-prompt.md", ledger.root, out),
+            run_review_cmd("recheck", rd / "recheck-prompt.md", repo, out),
             _cmd("recheck", run_dir, n, f"--result {_q(str(out) + '.final')}"),
         ]
     return [_cmd("report", run_dir)]

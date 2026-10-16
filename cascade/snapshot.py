@@ -7,6 +7,7 @@ from pathlib import Path
 
 RUN_DIR_NAME = ".cascade-fix"
 EXCLUDE_LINE = f"{RUN_DIR_NAME}/"
+BRANCH_PREFIX = "cascade-fix/"
 EXTERNAL_PREFIX = "외부"
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 INHERITED_GIT_ENV = ("GIT_INDEX_FILE", "GIT_DIR", "GIT_WORK_TREE")
@@ -98,7 +99,7 @@ def create_snapshot(root: Path, run_id: str, extra_files: list[Path]) -> Snapsho
     no_hooks = _no_hooks(run_dir)
     commit = _git(root, *no_hooks, *COMMIT_IDENTITY, "commit-tree", tree, "-p", head,
                   "-m", f"cascade-fix 스냅샷 {run_id}")
-    branch = f"cascade-fix/{run_id}"
+    branch = f"{BRANCH_PREFIX}{run_id}"
     _git(root, *no_hooks, "branch", branch, commit)
     return Snapshot(root=root, run_id=run_id, branch=branch, commit=commit, run_dir=run_dir)
 
@@ -140,6 +141,37 @@ def add_worktree(snap: Snapshot, name: str, commit: str | None = None) -> Path:
     _git(snap.root, *_no_hooks(snap.run_dir), "worktree", "add", "--detach", str(path), commit or snap.commit)
     snap.worktrees[name] = path
     return path
+
+
+def remove_worktree(snap: Snapshot, name: str) -> None:
+    path = snap.worktrees.pop(name, None)
+    if path is not None and Path(path).exists():
+        _git(snap.root, *_no_hooks(snap.run_dir), "worktree", "remove", "--force", str(path))
+
+
+def user_tree_fingerprint(root: Path, run_dir: Path) -> dict:
+    root = Path(root)
+    head = _git(root, "rev-parse", "--verify", "-q", "HEAD^{commit}")
+    no_hooks = _no_hooks(run_dir)
+    env = {"GIT_INDEX_FILE": str(Path(run_dir) / "index.fingerprint")}
+    _git(root, *no_hooks, "read-tree", head, env=env)
+    _git(root, *no_hooks, "add", "-A", env=env)
+    tree = _git(root, *no_hooks, "write-tree", env=env)
+    (Path(run_dir) / "index.fingerprint").unlink(missing_ok=True)
+    try:
+        stash = _git(root, "rev-parse", "-q", "--verify", "refs/stash")
+    except RuntimeError:
+        stash = ""
+    refs = _git(root, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads")
+    branches = sorted(line for line in refs.splitlines() if not line.startswith(f"refs/heads/{BRANCH_PREFIX}"))
+    return {"tree": tree, "head": head, "stash": stash, "branches": branches}
+
+
+def tree_diff_stat(root: Path, old_tree: str, new_tree: str) -> str:
+    try:
+        return _git(Path(root), "diff", "--stat", old_tree, new_tree)
+    except RuntimeError as e:
+        return str(e)
 
 
 def commit_worktree(wt: Path, message: str) -> str | None:

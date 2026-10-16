@@ -380,6 +380,46 @@ class PreparedTest(unittest.TestCase):
         self.assertTrue(replies["T3"].startswith("확인 결과"))
         self.assertEqual(resolve, ["T1"])
 
+    def test_dry_run_pr_comment_writes_no_replies_or_resolve(self):
+        findings = [finding("F1", thread_id="T1"), finding("F3", thread_id="T3")]
+        decisions = [
+            decision("F1", OUTCOME_AGREED_FACT, "a", ["통과"]),
+            decision("F3", OUTCOME_AGREED_NO, None, ["a: 없음", "b: 없음"]),
+        ]
+        ledger = make_ledger(findings, decisions, source="pr-comment", dry_run=True)
+        text = report.render(ledger, True)
+        self.assertNotIn("반영했습니다", text)
+        self.assertIn("적용 안 됨(dry-run)", section(text, "### PR 답글 초안"))
+        self.assertIn("적용 안 됨(dry-run)", section(text, "### resolve 대상"))
+        self.assertNotIn("- T1", section(text, "### resolve 대상"))
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            report.write_prepared(run_dir, ledger)
+            self.assertEqual(json.loads((run_dir / "prepared" / "replies.json").read_text(encoding="utf-8")), {})
+            self.assertEqual(json.loads((run_dir / "prepared" / "resolve.json").read_text(encoding="utf-8")), [])
+
+
+class BaselineAndTimingTest(unittest.TestCase):
+    def test_baseline_section_lists_excluded_commands(self):
+        ledger = full_ledger()
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "round-1").mkdir()
+            (run_dir / "round-1" / "baseline.json").write_text(json.dumps({"failed": ["ruff check ."]}), encoding="utf-8")
+            (run_dir / "round-1" / "apply.json").write_text(json.dumps({"applied": [], "failed": [], "baseline_failed": True}),
+                                                            encoding="utf-8")
+            text = report.render(ledger, False, run_dir)
+        body = section(text, "## 기준선 실패")
+        self.assertIn("`ruff check .`", body)
+        self.assertIn("간섭 판정을 하지 않았다", body)
+        self.assertNotIn("## 기준선 실패", report.render(ledger, False))
+
+    def test_report_events_do_not_count_in_elapsed(self):
+        events = [{"step": "init", "at": "2026-10-17T10:00:00+09:00"}, {"step": "apply", "at": "2026-10-17T10:00:30+09:00"},
+                  {"step": "report", "at": "2026-10-17T12:00:00+09:00", "round": 1}]
+        ledger = make_ledger([finding("F1")], [decision("F1", OUTCOME_AGREED_FACT, "a")], events=events)
+        self.assertIn("| 1 | 30초 |", report.render(ledger, False))
+
 
 if __name__ == "__main__":
     unittest.main()
