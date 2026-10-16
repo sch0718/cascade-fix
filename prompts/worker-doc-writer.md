@@ -12,6 +12,7 @@
 ## 작업 위치
 
 - 워크트리: `{worktree}`
+{doc_target}
 
 ## 지적
 
