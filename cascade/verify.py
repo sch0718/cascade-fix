@@ -196,9 +196,8 @@ def _confirmed_paragraph(body: str) -> str | None:
     in_fence = False
     for line in lines[start:]:
         stripped = line.strip()
-        if not in_fence and collected:
-            if not stripped or stripped.startswith("**근거"):
-                break
+        if not in_fence and collected and stripped.startswith(("**근거", "답글(")):
+            break
         if stripped.startswith("```"):
             in_fence = not in_fence
         collected.append(line)

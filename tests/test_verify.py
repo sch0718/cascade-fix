@@ -125,6 +125,16 @@ class VerifyTest(unittest.TestCase):
         self.assertEqual(verify.repro_cmds(finding(body)), ["python3 -c 'print(1)'", "ls -la"])
         self.assertEqual(verify.repro_cmds(finding("```sh\nfoo\n```\n")), [])
 
+    def test_repro_cmds_spans_blank_line_until_evidence_or_reply(self):
+        body = (
+            "**확인한 내용**:\n\n"
+            "```sh\n$ python3 -c 'print(1)'\nls -la\n```\n\n"
+            "**근거**: 위\n\n```sh\nnot-this\n```\n"
+        )
+        self.assertEqual(verify.repro_cmds(finding(body)), ["python3 -c 'print(1)'", "ls -la"])
+        reply = "**확인한 내용**: 재현\n\n```sh\nfoo\n```\n\n답글(작성자):\n```sh\nnot-this\n```\n"
+        self.assertEqual(verify.repro_cmds(finding(reply)), ["foo"])
+
     def test_run_repro_requires_fail_before_and_pass_after(self):
         base = self.tmp / "base"
         fix = self.tmp / "fix"
