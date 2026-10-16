@@ -14,7 +14,10 @@ TIMEOUT = 600
 TAIL_CHARS = 2000
 REPRO_TAIL_CHARS = 500
 TIMEOUT_TAIL = "시간 초과(600초)"
-SKIP_DIRS = {"node_modules", ".git", ".cascade-fix"}
+SKIP_DIRS = {"node_modules", ".git", ".cascade-fix", ".venv", "venv"}
+INHERITED_GIT_ENV = ("GIT_INDEX_FILE", "GIT_DIR", "GIT_WORK_TREE")
+FILES = "{files}"
+SKIP_REF_CHARS = ("~", "<", "$", "{")
 TEST_DIRS = {"tests", "test"}
 TEST_NAME = re.compile(r"^(?:test_.+\.py|.+_test\.py|.+\.test\..+|.+\.spec\..+)$")
 JS_SUFFIXES = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}
@@ -68,7 +71,26 @@ def _result(cmd: str, cwd: Path) -> VerifyResult:
     return VerifyResult(cmd=cmd, ok=rc == 0, tail=output[-TAIL_CHARS:])
 
 
+def _git_files(root: Path) -> list[str] | None:
+    env = {k: v for k, v in os.environ.items() if k not in INHERITED_GIT_ENV}
+    try:
+        p = subprocess.run(["git", "ls-files", "-co", "--exclude-standard", "-z"], cwd=root, env=env,
+                           capture_output=True, check=False)
+    except OSError:
+        return None
+    if p.returncode != 0:
+        return None
+    return sorted({x for x in p.stdout.decode("utf-8", errors="replace").split("\0") if x})
+
+
 def _iter_files(root: Path):
+    listed = _git_files(root)
+    if listed is not None:
+        for rel in listed:
+            path = root / rel
+            if not SKIP_DIRS & set(Path(rel).parts[:-1]) and path.is_file():
+                yield path
+        return
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
         for name in sorted(filenames):
@@ -134,6 +156,31 @@ def related_tests(root: Path, changed: list[str]) -> list[str]:
     return sorted(found)
 
 
+def _quoted(files: list[str]) -> str:
+    return " ".join(shlex.quote(f) for f in files)
+
+
+def format_command(cmd: str, files: list[str]) -> str:
+    if FILES in cmd:
+        return cmd.replace(FILES, _quoted(files))
+    return f"{cmd} {_quoted(files)}" if files else cmd
+
+
+def existing(wt: Path, files: list[str]) -> list[str]:
+    return [f for f in files if (Path(wt) / f).is_file()]
+
+
+def worker_commands(wt: Path, cfg: RepoConfig, changed: list[str]) -> list[tuple[str, str]]:
+    wt = Path(wt)
+    tests = _quoted(related_tests(wt, changed))
+    commands = [(c, c.replace(FILES, tests).rstrip()) for c in cfg.tests]
+    commands += [(c, c) for c in (*cfg.build, *cfg.typecheck, *cfg.lint)]
+    targets = existing(wt, changed)
+    if targets:
+        commands += [(c, format_command(c, targets)) for c in cfg.format]
+    return commands
+
+
 def run_verifiers(
     wt: Path, cfg: RepoConfig, changed: list[str], stage: Literal["worker", "final"]
 ) -> list[VerifyResult]:
@@ -141,15 +188,24 @@ def run_verifiers(
     if stage == "final":
         commands = list(cfg.full_tests)
     else:
-        files = " ".join(shlex.quote(f) for f in related_tests(wt, changed))
-        commands = [c.replace("{files}", files) for c in cfg.tests]
-        commands += [*cfg.build, *cfg.typecheck, *cfg.lint, *cfg.format]
+        commands = [cmd for _, cmd in worker_commands(wt, cfg, changed)]
     return [_result(cmd, wt) for cmd in commands]
 
 
-def run_format(wt: Path, cfg: RepoConfig) -> None:
+def run_worker_verifiers(wt: Path, cfg: RepoConfig, changed: list[str]) -> list[tuple[str, VerifyResult]]:
+    return [(template, _result(cmd, Path(wt))) for template, cmd in worker_commands(wt, cfg, changed)]
+
+
+def run_format(wt: Path, cfg: RepoConfig, files: list[str]) -> None:
+    targets = existing(wt, files)
+    if not targets:
+        return
     for cmd in cfg.format:
-        _run(cmd, Path(wt))
+        _run(format_command(cmd, targets), Path(wt))
+
+
+def run_commands(wt: Path, commands: list[str]) -> list[VerifyResult]:
+    return [_result(cmd, Path(wt)) for cmd in commands]
 
 
 def _strip_fences(text: str) -> str:
@@ -170,7 +226,9 @@ def check_doc_refs(wt: Path, doc: Path) -> list[str]:
     for path in candidates:
         if not path or not _looks_like_path(path):
             continue
-        if path.startswith(("http://", "https://", EXTERNAL_PREFIX)) or "*" in path or "{" in path:
+        if path.startswith(("http://", "https://", EXTERNAL_PREFIX)) or "*" in path:
+            continue
+        if any(ch in path for ch in SKIP_REF_CHARS):
             continue
         target = (wt / path).resolve()
         if not target.is_relative_to(wt_root):
@@ -178,6 +236,14 @@ def check_doc_refs(wt: Path, doc: Path) -> list[str]:
         if not target.exists():
             missing.add(path)
     return sorted(missing)
+
+
+def new_broken_refs(base_wt: Path | None, base_doc: Path | None, wt: Path, doc: Path) -> list[str]:
+    after = check_doc_refs(wt, doc)
+    if base_wt is None or base_doc is None or not Path(base_doc).is_file():
+        return after
+    before = set(check_doc_refs(base_wt, base_doc))
+    return [m for m in after if m not in before]
 
 
 def check_snippets(wt: Path, doc: Path, cfg: RepoConfig) -> list[VerifyResult]:
@@ -223,12 +289,9 @@ def repro_cmds(finding: Finding) -> list[str]:
         return []
     cmds = []
     for match in FENCE.finditer(paragraph):
-        for line in match.group(2).splitlines():
-            line = line.strip()
-            if line.startswith("$ "):
-                line = line[2:].strip()
-            if line:
-                cmds.append(line)
+        lines = [line.strip() for line in match.group(2).splitlines()]
+        prompted = [line[2:].strip() for line in lines if line.startswith("$ ")]
+        cmds += [line for line in (prompted if prompted else lines) if line]
     return cmds
 
 

@@ -38,6 +38,28 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(rc.sensitive_paths, ["**/pay*"])
         self.assertEqual(rc.doc_snippet_check, {"python": "python -m py_compile {file}"})
 
+    def test_setup_field_loads(self):
+        cfg = write_repos_toml(self.tmp, {str(self.repo): {"tests": ["pytest"], "setup": ["ln -s {root}/node_modules node_modules"]}})
+        self.assertEqual(config.load_repo_config(self.repo, cfg).setup, ["ln -s {root}/node_modules node_modules"])
+
+    def test_string_instead_of_list_is_rejected(self):
+        cfg = write_repos_toml(self.tmp, {str(self.repo): {"tests": "pytest"}})
+        with self.assertRaises(config.ConfigError):
+            config.load_repo_config(self.repo, cfg)
+        p = run_cli(["init", "--source", "codex-code", "--input", str(cfg)], cwd=self.repo,
+                    env={"CASCADE_REPOS_TOML": str(cfg)})
+        self.assertEqual(p.returncode, 5, p.stdout)
+        self.assertIn("문자열 목록", p.stdout)
+
+    def test_sensitive_path_matches_root_and_case(self):
+        pats = config.DEFAULT_SENSITIVE_PATHS
+        for path in ("auth.py", "auth/handler.go", "migrations/0001.sql", "src/AuthService.ts", "SECURITY.md",
+                     "lib/user_delete.py", "src/author.py"):
+            self.assertTrue(config.is_sensitive_path(path, pats), path)
+        for path in ("src/calc.py", "docs/guide.md"):
+            self.assertFalse(config.is_sensitive_path(path, pats), path)
+        self.assertFalse(config.is_sensitive_path("src/author.py", ["**/auth/**", "auth.*", "**/auth.*"]))
+
     def test_returns_none_when_root_missing(self):
         cfg = write_repos_toml(self.tmp, {"/some/other/repo": {"tests": ["pytest"]}})
         self.assertIsNone(config.load_repo_config(self.repo, cfg))
@@ -59,7 +81,7 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(c["tests"], ["pytest {files}"])
         self.assertEqual(c["full_tests"], ["pytest"])
         self.assertEqual(c["lint"], ["ruff check ."])
-        self.assertEqual(c["format"], ["ruff format ."])
+        self.assertEqual(c["format"], ["ruff format {files}"])
         self.assertEqual(c["typecheck"], ["mypy ."])
 
     def test_detect_candidates_reads_makefile_targets(self):

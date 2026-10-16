@@ -2,11 +2,17 @@ import json
 import re
 import tomllib
 from dataclasses import dataclass, field, fields
+from fnmatch import fnmatch
 from pathlib import Path
 
 DEFAULT_SENSITIVE_PATHS = ["**/auth*", "**/security*", "**/*delete*", "**/migrations/**"]
 CANDIDATE_KEYS = ("tests", "full_tests", "build", "typecheck", "lint", "format")
-LIST_KEYS = CANDIDATE_KEYS
+LIST_KEYS = (*CANDIDATE_KEYS, "setup", "sensitive_paths")
+DICT_KEYS = ("doc_snippet_check",)
+
+
+class ConfigError(ValueError):
+    pass
 
 
 class ExitCodes:
@@ -23,6 +29,7 @@ class RepoConfig:
     typecheck: list[str] = field(default_factory=list)
     lint: list[str] = field(default_factory=list)
     format: list[str] = field(default_factory=list)
+    setup: list[str] = field(default_factory=list)
     doc_snippet_check: dict[str, str] = field(default_factory=dict)
     sensitive_paths: list[str] = field(default_factory=lambda: list(DEFAULT_SENSITIVE_PATHS))
 
@@ -37,7 +44,19 @@ def load_repo_config(root: Path, config_path: Path) -> RepoConfig | None:
     if entry is None:
         return None
     known = {f.name for f in fields(RepoConfig)}
-    return RepoConfig(**{k: v for k, v in entry.items() if k in known})
+    values = {k: v for k, v in entry.items() if k in known}
+    for key, value in values.items():
+        if key in LIST_KEYS and not (isinstance(value, list) and all(isinstance(v, str) for v in value)):
+            raise ConfigError(f"{key}는 문자열 목록이어야 한다(예: {key} = [\"...\"]): {value!r}")
+        if key in DICT_KEYS and not (isinstance(value, dict) and all(isinstance(v, str) for v in value.values())):
+            raise ConfigError(f"{key}는 언어별 명령 표여야 한다: {value!r}")
+    return RepoConfig(**values)
+
+
+def is_sensitive_path(path: str, patterns: list[str]) -> bool:
+    lowered = path.lower()
+    candidates = (lowered, "/" + lowered)
+    return any(fnmatch(c, pat.lower()) for pat in patterns for c in candidates)
 
 
 def _read_text(path: Path) -> str | None:
@@ -79,7 +98,7 @@ def detect_candidates(root: Path) -> dict[str, list[str]]:
             add("full_tests", "pytest")
         if "ruff" in tool:
             add("lint", "ruff check .")
-            add("format", "ruff format .")
+            add("format", "ruff format {files}")
         if "mypy" in tool:
             add("typecheck", "mypy .")
 

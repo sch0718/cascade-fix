@@ -15,6 +15,7 @@ DROPPED_PREFIXES = ("index ", "similarity index ", "dissimilarity index ")
 GIT_HEADER = "diff --git a/"
 DIFF_FLAGS = ["--no-color", "--src-prefix=a/", "--dst-prefix=b/", "--no-renames", "--no-ext-diff", "--no-textconv", "--binary"]
 HUNK_HEADER = re.compile(r"^(@@ -\S+ \+\S+ @@).*$")
+SETUP_PATHS = "cascade-setup-paths"
 
 
 @dataclass
@@ -42,12 +43,46 @@ def _git_checked(cwd: Path, *args: str) -> str:
     return _decode(p.stdout)
 
 
+def _z_list(out: str) -> list[str]:
+    return [x for x in out.split("\0") if x]
+
+
+def _setup_paths_file(wt: Path) -> Path:
+    return Path(_git_checked(wt, "rev-parse", "--absolute-git-dir").strip()) / SETUP_PATHS
+
+
+def record_setup_paths(wt: Path) -> list[str]:
+    paths = [p.rstrip("/") for p in _z_list(_git_checked(Path(wt), "ls-files", "--others", "--exclude-standard",
+                                                         "--directory", "-z"))]
+    _setup_paths_file(Path(wt)).write_text("\n".join(paths), encoding="utf-8")
+    return paths
+
+
+def _setup_paths(wt: Path) -> list[str]:
+    path = _setup_paths_file(wt)
+    return [p for p in path.read_text(encoding="utf-8").split("\n") if p] if path.is_file() else []
+
+
+def touched_files(wt: Path, snap_commit: str) -> list[str]:
+    wt = Path(wt)
+    tracked = _z_list(_git_checked(wt, "diff", "--name-only", "--no-renames", "-z", snap_commit))
+    untracked = _z_list(_git_checked(wt, "ls-files", "--others", "--exclude-standard", "-z"))
+    setup = _setup_paths(wt)
+    files = [f for f in dict.fromkeys([*tracked, *untracked])
+             if not any(f == p or f.startswith(p + "/") for p in setup)]
+    return files
+
+
 def extract(wt: Path, snap_commit: str, cfg: RepoConfig | None = None) -> str:
     wt = Path(wt)
+    files = touched_files(wt, snap_commit)
+    if not files:
+        return ""
     if cfg is not None:
-        run_format(wt, cfg)
+        run_format(wt, cfg, files)
     _git_checked(wt, *NO_HOOKS, "add", "-A")
-    return _git_checked(wt, "-c", "core.quotepath=false", "diff", "--cached", *DIFF_FLAGS, snap_commit)
+    return _git_checked(wt, "--literal-pathspecs", "-c", "core.quotepath=false", "diff", "--cached", *DIFF_FLAGS,
+                        snap_commit, "--", *files)
 
 
 def normalize(diff: str) -> str:

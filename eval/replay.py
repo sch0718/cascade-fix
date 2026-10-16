@@ -114,7 +114,9 @@ def run_item(item: dict, out: Path, repos_toml: Path, fake: Path | None) -> None
     env = base_env(base / "repos.toml")
     try:
         if not wt.exists():
-            git(repo, "worktree", "add", "--detach", str(wt), item["commit"])
+            no_hooks = base / "no-hooks"
+            no_hooks.mkdir(exist_ok=True)
+            git(repo, "-c", f"core.hooksPath={no_hooks}", "worktree", "add", "--detach", str(wt), item["commit"])
         else:
             head, wanted = git(wt, "rev-parse", "HEAD"), git(repo, "rev-parse", "--verify", f"{item['commit']}^{{commit}}")
             if head != wanted:

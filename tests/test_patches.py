@@ -152,6 +152,38 @@ class PatchesTest(unittest.TestCase):
         self.assertEqual(git(self.repo, "status", "--porcelain"), "")
 
 
+    def test_extract_formats_only_worker_files_and_leaves_unformatted_neighbours(self):
+        repo = make_repo(self.tmp / "fmt", {"a.py": BASE, "three.py": "z=0\n"})
+        snap = snapshot.create_snapshot(repo, "run1", [])
+        fmt = (
+            "python3 -c \"import sys, pathlib; "
+            "[pathlib.Path(p).write_text(pathlib.Path(p).read_text().replace('=', ' = ')) "
+            "for p in (sys.argv[1:] or [str(q) for q in pathlib.Path('.').glob('*.py')])]\""
+        )
+        cfg = RepoConfig(format=[fmt])
+        diffs = []
+        for name, line in (("w1", "x=1"), ("w2", "d=1")):
+            wt = snapshot.add_worktree(snap, name)
+            text = (wt / "a.py").read_text().replace("x=0" if name == "w1" else "d=0", line)
+            (wt / "a.py").write_text(text)
+            (wt / "new.py").write_text("n=1\n") if name == "w2" else None
+            diff = patches.extract(wt, snap.commit, cfg)
+            self.assertEqual((wt / "three.py").read_text(), "z=0\n")
+            self.assertNotIn("three.py", diff)
+            diffs.append(diff)
+        self.assertEqual(patches.changed_files(diffs[0]), ["a.py"])
+        self.assertEqual(sorted(patches.changed_files(diffs[1])), ["a.py", "new.py"])
+        self.assertIn("+n = 1", diffs[1])
+        rep = patches.apply_all(repo, [("f1", diffs[0])])
+        self.assertEqual(rep.failed, [])
+        self.assertEqual((repo / "three.py").read_text(), "z=0\n")
+
+    def test_extract_without_changes_is_empty(self):
+        snap = snapshot.create_snapshot(self.repo, "run1", [])
+        wt = snapshot.add_worktree(snap, "w1")
+        self.assertEqual(patches.extract(wt, snap.commit, RepoConfig(format=["touch junk.py"])), "")
+        self.assertFalse((wt / "junk.py").exists())
+
     def _external_patch(self, old, new):
         return (
             "diff --git a/외부/plan.md b/외부/plan.md\n"

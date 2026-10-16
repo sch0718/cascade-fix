@@ -83,8 +83,16 @@ class VerifyTest(unittest.TestCase):
     def test_run_format_ignores_exit_codes(self):
         repo = make_repo(self.tmp / "repo", {"a.py": "x=1\n"})
         cfg = RepoConfig(format=["false", "touch formatted.txt"])
-        self.assertIsNone(verify.run_format(repo, cfg))
+        self.assertIsNone(verify.run_format(repo, cfg, ["a.py"]))
         self.assertTrue((repo / "formatted.txt").exists())
+
+    def test_format_command_targets_only_given_files(self):
+        self.assertEqual(verify.format_command("ruff format {files}", ["a.py", "b c.py"]), "ruff format a.py 'b c.py'")
+        self.assertEqual(verify.format_command("prettier --write", ["x.ts"]), "prettier --write x.ts")
+        repo = make_repo(self.tmp / "repo", {"a.py": "x=1\n"})
+        cfg = RepoConfig(format=["touch formatted.txt"])
+        verify.run_format(repo, cfg, ["gone.py"])
+        self.assertFalse((repo / "formatted.txt").exists())
 
     def test_check_doc_refs_lists_missing_paths(self):
         repo = make_repo(self.tmp / "repo", {"app.py": "x=1\n", "docs/real.md": "r\n"})
@@ -122,18 +130,44 @@ class VerifyTest(unittest.TestCase):
             "```sh\n$ python3 -c 'print(1)'\n\nls -la\n```\n\n"
             "**근거**: 위\n```sh\nnot-this\n```\n"
         )
-        self.assertEqual(verify.repro_cmds(finding(body)), ["python3 -c 'print(1)'", "ls -la"])
+        self.assertEqual(verify.repro_cmds(finding(body)), ["python3 -c 'print(1)'"])
         self.assertEqual(verify.repro_cmds(finding("```sh\nfoo\n```\n")), [])
 
     def test_repro_cmds_spans_blank_line_until_evidence_or_reply(self):
         body = (
             "**확인한 내용**:\n\n"
-            "```sh\n$ python3 -c 'print(1)'\nls -la\n```\n\n"
+            "```sh\n$ python3 -c 'print(1)'\n$ ls -la\n```\n\n"
             "**근거**: 위\n\n```sh\nnot-this\n```\n"
         )
         self.assertEqual(verify.repro_cmds(finding(body)), ["python3 -c 'print(1)'", "ls -la"])
         reply = "**확인한 내용**: 재현\n\n```sh\nfoo\n```\n\n답글(작성자):\n```sh\nnot-this\n```\n"
         self.assertEqual(verify.repro_cmds(finding(reply)), ["foo"])
+
+    def test_repro_cmds_with_prompt_lines_skip_output_lines(self):
+        body = "**확인한 내용**: 재현\n```\n$ pytest tests/test_a.py\nFAILED tests/test_a.py::t - boom\n1 failed\n```\n"
+        self.assertEqual(verify.repro_cmds(finding(body)), ["pytest tests/test_a.py"])
+        bare = "**확인한 내용**: 재현\n```sh\npytest tests/test_a.py\n```\n"
+        self.assertEqual(verify.repro_cmds(finding(bare)), ["pytest tests/test_a.py"])
+
+    def test_new_broken_refs_ignores_refs_already_broken_in_base(self):
+        base = make_repo(self.tmp / "base", {"app.py": "x\n"})
+        wt = make_repo(self.tmp / "wt", {"app.py": "x\n"})
+        old = "`ghost.py` 는 예전부터 없다. `~/.claude/x.md`, `<경로>/a.py`, `$HOME/b.py`, `{root}/c.py`\n"
+        (base / "plan.md").write_text(old, encoding="utf-8")
+        (wt / "plan.md").write_text(old + "이제 `app.py` 를 고친다.\n", encoding="utf-8")
+        self.assertEqual(verify.check_doc_refs(wt, wt / "plan.md"), ["ghost.py"])
+        self.assertEqual(verify.new_broken_refs(base, base / "plan.md", wt, wt / "plan.md"), [])
+        (wt / "plan.md").write_text(old + "`ghost2.py` 를 본다.\n", encoding="utf-8")
+        self.assertEqual(verify.new_broken_refs(base, base / "plan.md", wt, wt / "plan.md"), ["ghost2.py"])
+        self.assertEqual(verify.new_broken_refs(None, None, wt, wt / "plan.md"), ["ghost.py", "ghost2.py"])
+
+    def test_related_tests_skips_untracked_ignored_dirs(self):
+        repo = make_repo(self.tmp / "repo", {"a.py": "x\n", "test_a.py": "pass\n", ".gitignore": "venvx/\n"})
+        (repo / ".venv" / "lib").mkdir(parents=True)
+        (repo / ".venv" / "lib" / "test_a.py").write_text("import a\n")
+        (repo / "venvx").mkdir()
+        (repo / "venvx" / "test_a.py").write_text("import a\n")
+        self.assertEqual(verify.related_tests(repo, ["a.py"]), ["test_a.py"])
 
     def test_related_tests_from_package_and_relative_imports(self):
         repo = make_repo(self.tmp / "repo", {

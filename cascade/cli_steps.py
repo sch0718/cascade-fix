@@ -9,7 +9,7 @@ from datetime import datetime
 from fnmatch import fnmatch
 from pathlib import Path
 
-from cascade.config import ExitCodes, RepoConfig, detect_candidates, load_repo_config
+from cascade.config import ConfigError, ExitCodes, RepoConfig, detect_candidates, load_repo_config
 from cascade.consensus import (
     OUTCOME_ADJUDICATE,
     OUTCOME_AGREED_FACT,
@@ -88,6 +88,8 @@ def load_cfg(root: Path) -> RepoConfig | None:
         return load_repo_config(root, path)
     except tomllib.TOMLDecodeError as e:
         raise CliError(f"저장소 설정 파일을 읽을 수 없다({path}): {e}", ExitCodes.PARSE_ERROR) from None
+    except ConfigError as e:
+        raise CliError(f"저장소 설정이 잘못됐다({path}): {e}", ExitCodes.PARSE_ERROR) from None
 
 
 def no_verify_message(root: Path) -> str:

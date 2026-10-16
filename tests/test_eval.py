@@ -221,6 +221,15 @@ class ReplayTest(unittest.TestCase):
         m = score.compute(self.out, score.load_sample(sample))
         self.assertEqual((m["agree"], m["judged"]), (1, 1))
 
+    def test_replay_worktree_add_skips_user_hooks(self):
+        marker = self.tmp / "hook-ran"
+        hook = self.repo / ".git" / "hooks" / "post-checkout"
+        hook.write_text(f"#!/bin/sh\ntouch '{marker}'\n", encoding="utf-8")
+        hook.chmod(0o755)
+        sample = self.write_sample([self.item("item-01")])
+        self.assertEqual(self.run_replay(sample, "--fake-results", str(self.write_fake("item-01"))), 0)
+        self.assertFalse(marker.exists())
+
     def test_replay_records_error_and_continues(self):
         sample = self.write_sample([self.item("bad", commit="deadbeef" * 5), self.item("item-02")])
         fake = self.write_fake("item-02")
