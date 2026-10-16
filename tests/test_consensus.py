@@ -1,0 +1,266 @@
+import sys
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from cascade import consensus  # noqa: E402
+from cascade.consensus import Decision, WorkerResult  # noqa: E402
+from cascade.verify import VerifyResult  # noqa: E402
+
+PATCH_X = (
+    "diff --git a/m.py b/m.py\n--- a/m.py\n+++ b/m.py\n@@ -1 +1 @@\n-x = 1\n+x = 2\n"
+)
+PATCH_Y = (
+    "diff --git a/m.py b/m.py\n--- a/m.py\n+++ b/m.py\n@@ -1 +1 @@\n-x = 1\n+x = 3\n"
+)
+
+
+def worker(role="a", verdict=consensus.VERDICT_FACT, design=False, reason="근거", patch="", checker_ok=None):
+    return WorkerResult(
+        finding_id="f1",
+        role=role,
+        verdict=verdict,
+        needs_design_decision=design,
+        reason=reason,
+        verify=[],
+        checker_ok=checker_ok,
+        model_id="m",
+        patch=patch,
+    )
+
+
+def ok(cmd="pytest"):
+    return VerifyResult(cmd=cmd, ok=True, tail="")
+
+
+def fail(cmd="pytest"):
+    return VerifyResult(cmd=cmd, ok=False, tail="실패")
+
+
+class DecideTest(unittest.TestCase):
+    def test_both_no(self):
+        a = worker("a", consensus.VERDICT_NO, reason="이미 처리됨")
+        b = worker("b", consensus.VERDICT_NO, reason="호출 경로 없음")
+        d = consensus.decide(a, b, [ok()], [ok()], "", "")
+        self.assertEqual(d.outcome, consensus.OUTCOME_AGREED_NO)
+        self.assertIsNone(d.patch_from)
+        self.assertIn("a: 이미 처리됨", d.reasons)
+        self.assertIn("b: 호출 경로 없음", d.reasons)
+
+    def test_both_yes_same_patch_pass(self):
+        d = consensus.decide(worker("a"), worker("b"), [ok()], [ok()], PATCH_X, PATCH_X)
+        self.assertEqual(d.outcome, consensus.OUTCOME_AGREED_FACT)
+        self.assertEqual(d.patch_from, "a")
+
+    def test_both_yes_diff_patch_pass_escalates(self):
+        d = consensus.decide(worker("a"), worker("b"), [ok()], [ok()], PATCH_X, PATCH_Y)
+        self.assertEqual(d.outcome, consensus.OUTCOME_ADJUDICATE)
+        self.assertIsNone(d.patch_from)
+        self.assertIn("패치가 다름", d.reasons)
+
+    def test_one_pass_escalates_with_candidate(self):
+        d = consensus.decide(worker("a"), worker("b"), [fail()], [ok()], PATCH_X, PATCH_X)
+        self.assertEqual(d.outcome, consensus.OUTCOME_ADJUDICATE)
+        self.assertEqual(d.patch_from, "b")
+        self.assertIn("한쪽만 검증 통과", d.reasons)
+        d = consensus.decide(worker("a"), worker("b"), [ok(), ok()], [ok(), fail()], PATCH_X, PATCH_X)
+        self.assertEqual(d.patch_from, "a")
+
+    def test_both_fail_escalates(self):
+        d = consensus.decide(worker("a"), worker("b"), [fail()], [fail()], PATCH_X, PATCH_X)
+        self.assertEqual(d.outcome, consensus.OUTCOME_ADJUDICATE)
+        self.assertIsNone(d.patch_from)
+        self.assertIn("둘 다 검증 실패", d.reasons)
+
+    def test_both_need_design_goes_human(self):
+        a = worker("a", design=True)
+        b = worker("b", design=True)
+        d = consensus.decide(a, b, [ok()], [ok()], PATCH_X, PATCH_Y)
+        self.assertEqual(d.outcome, consensus.OUTCOME_DESIGN)
+        self.assertIsNone(d.patch_from)
+
+    def test_split_verdict_escalates(self):
+        d = consensus.decide(
+            worker("a", consensus.VERDICT_FACT), worker("b", consensus.VERDICT_NO), [ok()], [], PATCH_X, ""
+        )
+        self.assertEqual(d.outcome, consensus.OUTCOME_ADJUDICATE)
+        self.assertIsNone(d.patch_from)
+        self.assertTrue(any(consensus.VERDICT_FACT in r and consensus.VERDICT_NO in r for r in d.reasons))
+        d = consensus.decide(
+            worker("a", consensus.VERDICT_UNREPRODUCIBLE), worker("b", consensus.VERDICT_UNDECIDED), [], [], "", ""
+        )
+        self.assertEqual(d.outcome, consensus.OUTCOME_ADJUDICATE)
+
+    def test_one_needs_design_escalates(self):
+        d = consensus.decide(worker("a", design=True), worker("b"), [ok()], [ok()], PATCH_X, PATCH_X)
+        self.assertEqual(d.outcome, consensus.OUTCOME_ADJUDICATE)
+        self.assertIn("설계 결정 필요 여부 갈림", d.reasons)
+
+    def test_both_unreproducible_escalates(self):
+        a = worker("a", consensus.VERDICT_UNREPRODUCIBLE)
+        b = worker("b", consensus.VERDICT_UNREPRODUCIBLE)
+        d = consensus.decide(a, b, [], [], "", "")
+        self.assertEqual(d.outcome, consensus.OUTCOME_ADJUDICATE)
+        self.assertIn("둘 다 재현 불가", d.reasons)
+
+    def test_both_undecided_is_human(self):
+        a = worker("a", consensus.VERDICT_UNDECIDED)
+        b = worker("b", consensus.VERDICT_UNDECIDED)
+        d = consensus.decide(a, b, [], [], "", "")
+        self.assertEqual(d.outcome, consensus.OUTCOME_UNDECIDABLE)
+        self.assertIn("호출 실패", d.reasons)
+
+    def test_sensitive_path_never_adopted(self):
+        d = consensus.decide(worker("a"), worker("b"), [ok()], [ok()], PATCH_X, PATCH_X, sensitive=True)
+        self.assertEqual(d.outcome, consensus.OUTCOME_UNDECIDABLE)
+        self.assertIsNone(d.patch_from)
+        self.assertIn("보안 경로", d.reasons)
+
+    def test_sensitive_path_keeps_non_adopting_outcome_with_reason(self):
+        a = worker("a", consensus.VERDICT_NO)
+        b = worker("b", consensus.VERDICT_NO)
+        d = consensus.decide(a, b, [], [], "", "", sensitive=True)
+        self.assertEqual(d.outcome, consensus.OUTCOME_AGREED_NO)
+        self.assertIn("보안 경로", d.reasons)
+        d = consensus.decide(worker("a"), worker("b"), [ok()], [ok()], PATCH_X, PATCH_Y, sensitive=True)
+        self.assertEqual(d.outcome, consensus.OUTCOME_ADJUDICATE)
+        self.assertIn("보안 경로", d.reasons)
+
+    def test_no_verifiers_adopts_with_note(self):
+        d = consensus.decide(worker("a"), worker("b"), [], [], PATCH_X, PATCH_X)
+        self.assertEqual(d.outcome, consensus.OUTCOME_AGREED_FACT)
+        self.assertEqual(d.patch_from, "a")
+        self.assertIn("검증기 없음", d.reasons)
+
+    def test_decision_carries_finding_id(self):
+        d = consensus.decide(worker("a"), worker("b"), [ok()], [ok()], PATCH_X, PATCH_X)
+        self.assertEqual(d.finding_id, "f1")
+
+
+class DecideDocTest(unittest.TestCase):
+    def judges(self, **kw):
+        return worker("a", **kw), worker("b", **kw)
+
+    def test_doc_agreed(self):
+        a, b = self.judges()
+        d = consensus.decide_doc(a, b, worker("checker", checker_ok=True), [])
+        self.assertEqual(d.outcome, consensus.OUTCOME_AGREED_FACT)
+        self.assertEqual(d.patch_from, "writer")
+
+    def test_doc_checker_no_escalates(self):
+        a, b = self.judges()
+        d = consensus.decide_doc(a, b, worker("checker", checker_ok=False), [])
+        self.assertEqual(d.outcome, consensus.OUTCOME_ADJUDICATE)
+        self.assertIsNone(d.patch_from)
+        self.assertIn("점검자 아니오", d.reasons)
+
+    def test_doc_no_checker_escalates(self):
+        a, b = self.judges()
+        d = consensus.decide_doc(a, b, None, [])
+        self.assertEqual(d.outcome, consensus.OUTCOME_ADJUDICATE)
+        self.assertIn("점검자 없음", d.reasons)
+
+    def test_doc_missing_refs_escalates(self):
+        a, b = self.judges()
+        d = consensus.decide_doc(a, b, worker("checker", checker_ok=True), ["docs/x.md", "y.py"])
+        self.assertEqual(d.outcome, consensus.OUTCOME_ADJUDICATE)
+        self.assertIn("참조 없음: docs/x.md, y.py", d.reasons)
+
+    def test_doc_verdict_rules_apply(self):
+        d = consensus.decide_doc(
+            worker("a", consensus.VERDICT_NO), worker("b", consensus.VERDICT_NO), None, ["x"]
+        )
+        self.assertEqual(d.outcome, consensus.OUTCOME_AGREED_NO)
+        a, b = self.judges(design=True)
+        self.assertEqual(consensus.decide_doc(a, b, None, []).outcome, consensus.OUTCOME_DESIGN)
+        d = consensus.decide_doc(worker("a", design=True), worker("b"), None, [])
+        self.assertIn("설계 결정 필요 여부 갈림", d.reasons)
+        d = consensus.decide_doc(worker("a"), worker("b", consensus.VERDICT_NO), None, [])
+        self.assertEqual(d.outcome, consensus.OUTCOME_ADJUDICATE)
+        a, b = self.judges(verdict=consensus.VERDICT_UNDECIDED)
+        self.assertEqual(consensus.decide_doc(a, b, None, []).outcome, consensus.OUTCOME_UNDECIDABLE)
+
+
+class AfterAdjudicationTest(unittest.TestCase):
+    def escalated(self, patch_from=None):
+        return Decision(
+            finding_id="f1", outcome=consensus.OUTCOME_ADJUDICATE, patch_from=patch_from, reasons=["패치가 다름"]
+        )
+
+    def test_adjudicator_undecided_goes_human(self):
+        adj = worker("adjudicator", consensus.VERDICT_UNDECIDED, reason="모름")
+        d = consensus.after_adjudication(self.escalated(), adj, [])
+        self.assertEqual(d.outcome, consensus.OUTCOME_UNDECIDABLE)
+        self.assertIn("판가름 못 정함", d.reasons)
+        self.assertIn("패치가 다름", d.reasons)
+        self.assertIn("판가름: 모름", d.reasons)
+
+    def test_adjudicator_patch_fail_goes_human(self):
+        adj = worker("adjudicator", patch=PATCH_X)
+        d = consensus.after_adjudication(self.escalated(), adj, [ok(), fail()])
+        self.assertEqual(d.outcome, consensus.OUTCOME_UNDECIDABLE)
+        self.assertIn("판가름 패치 검증 실패", d.reasons)
+        self.assertIsNone(d.patch_from)
+
+    def test_adjudicator_adopts_own_patch(self):
+        adj = worker("adjudicator", patch=PATCH_X, reason="a가 맞음")
+        d = consensus.after_adjudication(self.escalated(), adj, [ok()])
+        self.assertEqual(d.outcome, consensus.OUTCOME_ADJUDICATE)
+        self.assertEqual(d.patch_from, "adjudicator")
+        self.assertEqual(d.reasons[-1], "판가름: a가 맞음")
+
+    def test_after_adjudication_keeps_candidate_when_no_patch(self):
+        adj = worker("adjudicator", patch="")
+        d = consensus.after_adjudication(self.escalated("b"), adj, [ok()])
+        self.assertEqual(d.outcome, consensus.OUTCOME_ADJUDICATE)
+        self.assertEqual(d.patch_from, "b")
+
+    def test_adjudicator_no_is_rebuttal(self):
+        adj = worker("adjudicator", consensus.VERDICT_NO, reason="문제 아님")
+        d = consensus.after_adjudication(self.escalated("a"), adj, [])
+        self.assertEqual(d.outcome, consensus.OUTCOME_ADJUDICATE)
+        self.assertIsNone(d.patch_from)
+        self.assertIn("판가름: 아님", d.reasons)
+        self.assertIn("판가름: 문제 아님", d.reasons)
+
+    def test_adjudicator_needs_design(self):
+        adj = worker("adjudicator", design=True)
+        d = consensus.after_adjudication(self.escalated(), adj, [])
+        self.assertEqual(d.outcome, consensus.OUTCOME_DESIGN)
+        self.assertIsNone(d.patch_from)
+
+    def test_adjudicator_unreproducible_goes_human(self):
+        adj = worker("adjudicator", consensus.VERDICT_UNREPRODUCIBLE)
+        d = consensus.after_adjudication(self.escalated(), adj, [])
+        self.assertEqual(d.outcome, consensus.OUTCOME_UNDECIDABLE)
+
+    def test_only_for_adjudicate_outcome(self):
+        d = Decision(finding_id="f1", outcome=consensus.OUTCOME_AGREED_NO, patch_from=None, reasons=[])
+        with self.assertRaises(ValueError):
+            consensus.after_adjudication(d, worker("adjudicator"), [])
+
+    def test_does_not_mutate_input(self):
+        original = self.escalated()
+        consensus.after_adjudication(original, worker("adjudicator", patch=PATCH_X), [ok()])
+        self.assertEqual(original.reasons, ["패치가 다름"])
+
+
+class RoundtripTest(unittest.TestCase):
+    def test_roundtrip_dicts(self):
+        w = WorkerResult(
+            finding_id="f1", role="checker", verdict=consensus.VERDICT_FACT, needs_design_decision=False,
+            reason="r", verify=[{"cmd": "pytest", "ok": True}], checker_ok=True, model_id="m", patch=PATCH_X,
+        )
+        self.assertEqual(WorkerResult.from_dict(w.to_dict()), w)
+        d = Decision(finding_id="f1", outcome=consensus.OUTCOME_ADJUDICATE, patch_from="a", reasons=["x"])
+        self.assertEqual(Decision.from_dict(d.to_dict()), d)
+
+    def test_worker_from_dict_defaults_patch(self):
+        data = worker().to_dict()
+        del data["patch"]
+        self.assertEqual(WorkerResult.from_dict(data).patch, "")
+
+
+if __name__ == "__main__":
+    unittest.main()
