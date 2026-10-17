@@ -99,7 +99,7 @@ PYTHONPATH=~/.claude/skills/cascade-fix python3 -m cascade.cli
 
 `report` 출력을 기준으로 사용자에게 다음을 보고한다.
 
-1. 회차별 표(지적·합의·판가름·Codex 검토·사람 건수)와 dry-run 여부.
+1. 회차별 표(지적·합의·판가름 회부·판가름 채택·Codex 검토·사람 건수)와 dry-run 여부.
 2. 사람이 볼 목록 네 칸 — **반박**(동의 / 그래도 고친다), **설계 결정**, **판단 불가**(Opus·Codex 의견, 패치 경로), **보류 후보**(지금 반영 / 구현 때 테스트로 / 보류). 칸마다 사람이 고를 것을 묻는다.
 3. 「간섭 의심」 절이 있으면(기준선도 실패한 경우 포함) 작업 트리에 패치가 남아 있다는 사실과 되돌릴지 사람이 정해야 한다는 것.
 4. **준비됨** — 커밋 메시지 초안(`prepared/commit-message.txt`), PR이면 답글 초안(`prepared/replies.json`)과 resolve 대상(`prepared/resolve.json`). 누르는 것은 사람이다.

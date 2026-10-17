@@ -19,6 +19,7 @@ BUCKET_UNDECIDABLE = "판단 불가"
 BUCKET_HOLD = "보류 후보"
 BUCKETS = (BUCKET_REBUTTAL, BUCKET_DESIGN, BUCKET_UNDECIDABLE, BUCKET_HOLD)
 ADJUDICATED_NO = "판가름: 아님"
+ADJUDICATION_MARK = "판가름"
 WORKER_ROLES = ("a", "b", "writer", "checker", "adjudicator")
 OPINION_MAX_LINES = 20
 COMMIT_SUBJECT_MAX = 60
@@ -28,6 +29,7 @@ DRY_RUN_NOT_APPLIED = "적용 안 됨(dry-run)"
 UNTIMED_STEPS = ("report",)
 TABLE_FOOTNOTE = (
     "합의-아님은 합의 칸에 한 번 세고 사람이 볼 목록의 반박 칸에도 오른다. "
+    "판가름 회부는 판가름에 들어간 지적 전부이고, 판가름 채택은 그 가운데 패치를 채택한 지적이다. "
     "사람 칸은 설계결정·판단불가·보류후보와 판가름 뒤에도 채택하지 못한 지적이다."
 )
 
@@ -47,6 +49,12 @@ def _is_adjudicated_rebuttal(decision: dict) -> bool:
         decision.get("outcome") == OUTCOME_ADJUDICATE
         and decision.get("patch_from") is None
         and any(ADJUDICATED_NO in reason for reason in decision.get("reasons", []))
+    )
+
+
+def _was_adjudicated(decision: dict) -> bool:
+    return decision.get("outcome") == OUTCOME_ADJUDICATE or any(
+        reason.startswith(ADJUDICATION_MARK) for reason in decision.get("reasons", [])
     )
 
 
@@ -202,6 +210,7 @@ def _bucket_section(name: str, items: list[tuple[int, dict, dict]], ledger: Ledg
 
 def _round_row(rnd, ledger: Ledger) -> str:
     consensus = sum(1 for d in rnd.decisions if d["outcome"] in (OUTCOME_AGREED_FACT, OUTCOME_AGREED_NO))
+    sent = sum(1 for d in rnd.decisions if _was_adjudicated(d))
     adjudicated = sum(1 for d in rnd.decisions if d["outcome"] == OUTCOME_ADJUDICATE and d.get("patch_from") is not None)
     codex = sum(1 for f in rnd.findings if f.get("id") in ledger.opinions)
     human = sum(
@@ -210,7 +219,7 @@ def _round_row(rnd, ledger: Ledger) -> str:
         if d["outcome"] in (OUTCOME_DESIGN, OUTCOME_UNDECIDABLE, OUTCOME_HOLD)
         or (d["outcome"] == OUTCOME_ADJUDICATE and d.get("patch_from") is None)
     )
-    return f"| {rnd.no} | {len(rnd.findings)} | {consensus} | {adjudicated} | {codex} | {human} |"
+    return f"| {rnd.no} | {len(rnd.findings)} | {consensus} | {sent} | {adjudicated} | {codex} | {human} |"
 
 
 def _adopted_pairs(ledger: Ledger, failed: dict[str, str]) -> list[tuple[dict, dict]]:
@@ -362,8 +371,8 @@ def render(ledger: Ledger, dry_run: bool, run_dir: Path | None = None) -> str:
         [
             "## 회차별 지적과 채택 경로",
             "",
-            "| 회차 | 지적 | 합의 | 판가름 | Codex 검토 | 사람 |",
-            "| --- | ---: | ---: | ---: | ---: | ---: |",
+            "| 회차 | 지적 | 합의 | 판가름 회부 | 판가름 채택 | Codex 검토 | 사람 |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
             *[_round_row(rnd, ledger) for rnd in ledger.rounds],
             "",
             TABLE_FOOTNOTE,

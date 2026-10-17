@@ -177,7 +177,7 @@ class CliEndToEndTest(CliTestBase):
         self.assertEqual((self.run_dir / "round-1" / "recheck-repo.txt").read_text(encoding="utf-8").strip(), str(self.repo))
 
         p = self.cli("report", "--run-dir", str(self.run_dir))
-        self.assertIn("| 1 | 2 | 1 | 1 | 0 | 0 |", p.stdout)
+        self.assertIn("| 1 | 2 | 1 | 1 | 1 | 0 | 0 |", p.stdout)
         self.assertNotIn("적용하지 않음(dry-run)", p.stdout)
         self.assertTrue((self.run_dir / "prepared" / "commit-message.txt").read_text(encoding="utf-8").startswith("fix: 2건"))
 
@@ -202,7 +202,7 @@ class CliEndToEndTest(CliTestBase):
         self.assertIn("report --run-dir", p.stdout)
         p = self.cli("report", "--run-dir", str(self.run_dir))
         self.assertIn("ident에 타입 힌트가 없다", p.stdout)
-        self.assertIn("| 1 | 2 | 1 | 1 | 0 | 1 |", p.stdout)
+        self.assertIn("| 1 | 2 | 1 | 1 | 1 | 0 | 1 |", p.stdout)
         self.assertIn("Suggestion, calc.py:5", p.stdout)
         reports = [e for e in self.ledger().rounds[0].events if e["step"] == "report"]
         self.assertEqual([e["round"] for e in reports], [1, 1])
@@ -222,7 +222,7 @@ class CliEndToEndTest(CliTestBase):
         self.assertEqual(self.ledger().rounds[0].adopted, ["r1-01", "r1-02"])
         p = self.cli("report", "--run-dir", str(self.run_dir))
         self.assertIn("**적용하지 않음(dry-run)**", p.stdout)
-        self.assertIn("| 1 | 2 | 1 | 1 | 0 | 0 |", p.stdout)
+        self.assertIn("| 1 | 2 | 1 | 1 | 1 | 0 | 0 |", p.stdout)
 
     def test_completed_step_is_refused_without_force(self):
         self.init()

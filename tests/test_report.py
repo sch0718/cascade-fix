@@ -109,8 +109,8 @@ class RenderTest(unittest.TestCase):
     def test_render_separates_consensus_and_adjudicated(self):
         text = report.render(full_ledger(), dry_run=False)
         table = section(text, "## 회차별 지적과 채택 경로")
-        self.assertIn("| 회차 | 지적 | 합의 | 판가름 | Codex 검토 | 사람 |", table)
-        self.assertIn("| 1 | 7 | 2 | 1 | 1 | 4 |", table)
+        self.assertIn("| 회차 | 지적 | 합의 | 판가름 회부 | 판가름 채택 | Codex 검토 | 사람 |", table)
+        self.assertIn("| 1 | 7 | 2 | 2 | 1 | 1 | 4 |", table)
         self.assertIn("합의-아님", table)
         commit = section(text, "### 커밋 메시지 초안")
         self.assertIn("- F2 b.py:2: 판가름 채택", commit)
@@ -118,6 +118,17 @@ class RenderTest(unittest.TestCase):
         self.assertIn("**F3**", rebuttal)
         self.assertIn("**F7**", rebuttal)
         self.assertIn("판가름", rebuttal)
+
+    def test_adjudication_sent_counts_findings_rewritten_after_adjudication(self):
+        findings = [finding("R1"), finding("R2"), finding("R3")]
+        decisions = [
+            decision("R1", OUTCOME_UNDECIDABLE, None, ["판정이 갈림: a=사실, b=못 정함", "판가름 못 정함", "판가름: 원문 없음"]),
+            decision("R2", OUTCOME_ADJUDICATE, None, ["판정이 갈림: a=아님, b=사실", "판가름: 아님", "판가름: 원문 그대로"]),
+            decision("R3", OUTCOME_DESIGN, None, ["설계 결정 필요 여부 갈림", "판가름: 작성자가 정한다"]),
+        ]
+        text = report.render(make_ledger(findings, decisions, opinions={"R1": "의견"}), dry_run=True)
+        table = section(text, "## 회차별 지적과 채택 경로")
+        self.assertIn("| 1 | 3 | 0 | 3 | 0 | 1 | 3 |", table)
 
     def test_four_buckets_present_with_reasons(self):
         text = report.render(full_ledger(), dry_run=False)
