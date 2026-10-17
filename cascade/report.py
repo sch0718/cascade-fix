@@ -10,6 +10,7 @@ from cascade.consensus import (
     OUTCOME_HOLD,
     OUTCOME_UNDECIDABLE,
 )
+from cascade.review import CLAUDE_SOURCES
 from cascade.review import label as reviewer_label
 from cascade.rounds import Ledger
 
@@ -369,7 +370,9 @@ def _calls_section(ledger: Ledger, run_dir: Path | None) -> list[str]:
     for role in WORKER_ROLES:
         out.append(f"| {role} | {counts[role] if found else '-'} |")
     name = reviewer_label(ledger.reviewer)
-    out.append(f"| {name} 검토 | {len(ledger.opinions)} |")
+    if ledger.source in CLAUDE_SOURCES:
+        out.append(f"| {name} 첫 검토 | 1 |")
+    out.append(f"| {name} 의견 | {len(ledger.opinions)} |")
     out.append(f"| {name} 재검토 | {sum(1 for r in ledger.rounds if r.recheck_opened)} |")
     out.extend(["", "| 회차 | 소요 |", "| --- | ---: |"])
     out.extend(f"| {rnd.no} | {_elapsed(rnd)} |" for rnd in ledger.rounds)

@@ -333,6 +333,13 @@ class RenderTest(unittest.TestCase):
         self.assertIn("b: 이미 처리됨", rebuttal)
         self.assertNotIn("B 근거", rebuttal)
 
+    def test_claude_first_review_counted_in_calls(self):
+        ledger = make_ledger([finding("F1")], [decision("F1", OUTCOME_AGREED_FACT, "a")], source="claude-code")
+        ledger.reviewer = "claude"
+        calls = section(report.render(ledger, False), "## 호출 수와 시간")
+        self.assertIn("| Claude 첫 검토 | 1 |", calls)
+        self.assertIn("| Claude 의견 | 0 |", calls)
+
     def test_single_commit_subject_when_body_first_line_empty(self):
         ledger = make_ledger([finding("F1", body="")], [decision("F1", OUTCOME_AGREED_FACT, "a")])
         block = section(report.render(ledger, False), "### 커밋 메시지 초안")
@@ -360,7 +367,8 @@ class RenderTest(unittest.TestCase):
         self.assertIn("| writer | 1 |", calls)
         self.assertIn("| checker | 1 |", calls)
         self.assertIn("| adjudicator | 0 |", calls)
-        self.assertIn("| Codex 검토 | 1 |", calls)
+        self.assertIn("| Codex 의견 | 1 |", calls)
+        self.assertNotIn("첫 검토", calls)
         self.assertIn("| Codex 재검토 | 1 |", calls)
         self.assertIn("| 1 | 1분 5초 |", calls)
 

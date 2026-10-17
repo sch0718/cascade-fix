@@ -225,6 +225,7 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
     flags = "" if reviewer_choice == REVIEWER_AUTO else f" --reviewer {reviewer_choice}"
     if not blockers and rec["source"]:
         if rec["source"].startswith("claude-") and input_path is None:
+            rec["first_review"] = 1
             steps.append(f"{cli} review --kind {rec['mode']} {rec['review_args']}")
             steps.append("Workflow(첫 검토) → review.json 저장 → review 출력의 init 명령")
         elif rec["source"] == "pr-comment":
@@ -270,7 +271,8 @@ def render(result: dict) -> str:
         lines.append(f"규모: 에이전트 {e['min']}~{e['max']}개(1회차 기준)")
     elif rec["source"]:
         e = estimate(1, rec["mode"], result["reviewer"])
-        lines.append(f"규모: 지적 1건당 에이전트 {e['stage1']}~{e['max'] - e['recheck']}개"
+        first = f"첫 검토 {rec['first_review']}개 + " if rec.get("first_review") else ""
+        lines.append(f"규모: {first}지적 1건당 에이전트 {e['stage1']}~{e['max'] - e['recheck']}개"
                      + (f" + 재검토 회차당 {e['recheck']}개" if e["recheck"] else "") + " (지적 수는 첫 검토 뒤에 정해진다)")
     candidates = result["config"].get("candidates") or {}
     for a in result["approvals"]:

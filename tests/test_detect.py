@@ -109,7 +109,7 @@ class DetectCliTest(unittest.TestCase):
         (self.repo / "calc.py").write_text("x = 2\n", encoding="utf-8")
         p = run_cli(["detect", "--no-gh"], cwd=self.repo, env=self.env)
         self.assertIn("추천: --source claude-code", p.stdout)
-        self.assertIn("지적 1건당 에이전트 2~4개", p.stdout)
+        self.assertIn("규모: 첫 검토 1개 + 지적 1건당 에이전트 2~4개", p.stdout)
         self.assertIn("ok=예", p.stdout)
 
 
