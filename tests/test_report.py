@@ -190,6 +190,28 @@ class RenderTest(unittest.TestCase):
         self.assertIn("b: B 근거 상세", section(text, "### 반박"))
         self.assertIn("Opus가 못 정함", section(text, "### 판단 불가"))
 
+    def test_design_bucket_shows_judges_and_writer_options(self):
+        ledger = make_ledger([finding("D1", location="docs/spec.md:12", body="저장 형식을 정하지 않았다")],
+                             [decision("D1", OUTCOME_DESIGN, None, ["a: 짧은 근거", "b: 짧은 근거"])])
+        ledger.mode = "doc"
+        options = "1) JSON — 표준 라이브러리 / 주석 없음\n2) TOML — 주석 가능 / 3.11 이상"
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "round-1").mkdir()
+            results = {
+                "D1:a": worker("D1", "a", "A 상세: 형식이 없다"),
+                "D1:b": worker("D1", "b", "B 상세: 12행에 형식이 없다"),
+                "D1:writer": worker("D1", "writer", options),
+            }
+            (run_dir / "round-1" / "results.json").write_text(json.dumps(results, ensure_ascii=False), encoding="utf-8")
+            text = report.render(ledger, dry_run=False, run_dir=run_dir)
+        design = section(text, "### 설계 결정")
+        self.assertIn("  - a: A 상세: 형식이 없다", design)
+        self.assertIn("  - b: B 상세: 12행에 형식이 없다", design)
+        self.assertNotIn("짧은 근거", design)
+        self.assertIn("  - 작성자 선택지:\n    1) JSON — 표준 라이브러리 / 주석 없음\n    2) TOML", design)
+        self.assertIn("선택: [ ] 선택지 ___ [ ] 직접 정함 [ ] 보류", design)
+
     def test_adjudicator_reason_shown_once_when_already_in_reasons(self):
         ledger = full_ledger()
         ledger.rounds[0].decisions[4]["reasons"] = ["패치가 다름", "판가름 패치 검증 실패", "판가름: Opus가 고친 패치도 깨진다"]

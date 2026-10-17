@@ -309,7 +309,8 @@ def cmd_detect(args) -> int:
         raise s.CliError(f"알 수 없는 검토자: {args.reviewer} ({' / '.join(REVIEWER_CHOICES)}, CASCADE_REVIEWER 확인)")
     result = detect(root, repos_toml=s.repos_toml(), run_review=s.RUN_REVIEW, cli=s.CLI, gh=gh,
                     input_path=Path(args.input).resolve() if args.input else None, pr=args.pr,
-                    reviewer_choice=args.reviewer, root_flag=_root_flag(args, root))
+                    reviewer_choice=args.reviewer, root_flag=_root_flag(args, root),
+                    docs=[Path(d).resolve() for d in args.doc or []], cwd=Path.cwd())
     print(json.dumps(result, ensure_ascii=False, indent=2) if args.json else render_detect(result))
     return 0 if result["ok"] else ExitCodes.NEEDS_USER
 
@@ -970,6 +971,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--severity", help="이번 실행에서 처리할 등급(쉼표 구분, 예: Critical,Warning). 나머지는 보류 후보")
     p = add("detect", cmd_detect, run_dir=False, force=False)
     p.add_argument("--input")
+    p.add_argument("--doc", action="append", help="검토할 문서(설계·계획 문서). 변경으로 잡히지 않는 커밋한 문서도 지정한다")
     p.add_argument("--pr")
     p.add_argument("--root")
     p.add_argument("--no-gh", action="store_true")

@@ -202,7 +202,7 @@ def _config(root: Path, repos_toml: Path) -> tuple[RepoConfig | None, str | None
 
 def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list[str] | None,
            input_path: Path | None = None, pr: str | None = None, reviewer_choice: str = REVIEWER_AUTO,
-           root_flag: str = "") -> dict:
+           root_flag: str = "", docs: list[Path] | None = None, cwd: Path | None = None) -> dict:
     root = Path(root)
     branch = current_branch(root)
     base = default_base(root)
@@ -211,12 +211,16 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
     notes: list[str] = []
     blockers: list[str] = []
     pr_data = None
-    if gh is not None and (pr or not input_path):
+    if gh is not None and (pr or not (input_path or docs)):
         pr_data, why = pr_info(root, gh, pr)
         if why and (pr or pr_data):
             notes.append(why)
 
     q = shlex.quote
+    # review 는 --doc 을 현재 디렉터리 기준으로 읽는다. --root 로 다른 저장소를 가리켰거나
+    # 저장소 하위 디렉터리에서 돌렸으면 저장소 상대 경로가 어긋나므로 절대 경로를 준다
+    at_root = cwd is None or Path(cwd).resolve() == root.resolve()
+    doc_arg = lambda p: q(str(root / p) if root_flag or not at_root else p)  # noqa: E731
     rec: dict = {"source": None, "mode": None, "steps": [], "reasons": []}
     found = None
     if input_path is not None:
@@ -226,6 +230,15 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
         else:
             rec.update(source=source, mode="doc" if source.endswith("doc") else "code")
             rec["reasons"].append(f"결과 파일이 {source} 형식이다" + (f"(지적 {found}건)" if found >= 0 else ""))
+    elif docs:
+        # 설계 단계: 커밋한 스펙처럼 변경으로 잡히지 않는 문서도 지정해서 검토한다
+        names = [d.relative_to(root).as_posix() if d.is_relative_to(root) else None for d in docs]
+        missing = [n or str(d) for d, n in zip(docs, names) if not d.is_file()]
+        if missing:
+            blockers.append("문서가 없다: " + ", ".join(missing))
+        rec.update(source="claude-doc", mode="doc")
+        rec["reasons"].append(f"문서를 직접 지정했다({len(docs)}개) — 문서 모드")
+        rec["review_args"] = " ".join(f"--doc {doc_arg(n) if n else q(str(d))}" for d, n in zip(docs, names))
     elif pr_data and pr_data.get("unresolved"):
         found = pr_data["unresolved"]
         rec.update(source="pr-comment", mode="code")
@@ -241,17 +254,22 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
             rng, why = f"--base {q(base)}", f"{base}보다 커밋 {commits}개 앞섬({len(ahead)}파일)"
         rec["reasons"].append(why + (" — 모두 문서라 문서 모드" if doc_only else ""))
         if doc_only:
-            # 지운 문서는 review --doc 이 읽을 수 없다. --root 로 다른 저장소를 가리키면 절대 경로를 준다
-            docs = [p for p in changed if (root / p).is_file()]
-            if not docs:
+            # 지운 문서는 review --doc 이 읽을 수 없다
+            changed_docs = [p for p in changed if (root / p).is_file()]
+            if not changed_docs:
                 blockers.append("바뀐 문서가 모두 삭제라 문서 검토할 파일이 없다: " + ", ".join(changed[:5]))
-            rec["review_args"] = " ".join(f"--doc {q(str(root / p) if root_flag else p)}" for p in docs)
+            rec["review_args"] = " ".join(f"--doc {doc_arg(p)}" for p in changed_docs)
         else:
             rec["review_args"] = rng
+            changed_docs = [p for p in changed if p.endswith(DOC_SUFFIXES) and (root / p).is_file()]
+            if changed_docs:
+                notes.append(f"문서도 {len(changed_docs)}개 바뀌었다. 코드 검토는 설계 문서로 보지 않으니 문서만 따로 보려면 "
+                             f"{cli} detect " + " ".join(f"--doc {doc_arg(p)}" for p in changed_docs) + root_flag)
         if len(changed) > LARGE_CHANGE_FILES:
             notes.append(f"바뀐 파일이 {len(changed)}개다. 지적이 많으면 --severity 로 나눠 돌린다")
     else:
-        blockers.append("처리할 것이 없다: 결과 파일·PR 리뷰 스레드·커밋하지 않은 변경·앞선 커밋이 모두 없다")
+        blockers.append("처리할 것이 없다: 결과 파일·PR 리뷰 스레드·커밋하지 않은 변경·앞선 커밋이 모두 없다"
+                        " (이미 커밋한 문서는 --doc <문서> 로 지정한다)")
 
     reviewer = resolve(reviewer_choice, rec["source"] or "", run_review)
     cfg, cfg_error = _config(root, repos_toml)

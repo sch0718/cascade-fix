@@ -74,11 +74,12 @@ class DecideTest(unittest.TestCase):
         self.assertIn("둘 다 검증 실패", d.reasons)
 
     def test_both_need_design_goes_human(self):
-        a = worker("a", design=True)
-        b = worker("b", design=True)
+        a = worker("a", design=True, reason="저장 형식을 정해야 한다")
+        b = worker("b", design=True, reason="JSON인지 TOML인지 문서에 없다")
         d = consensus.decide(a, b, [ok()], [ok()], PATCH_X, PATCH_Y)
         self.assertEqual(d.outcome, consensus.OUTCOME_DESIGN)
         self.assertIsNone(d.patch_from)
+        self.assertEqual(d.reasons, ["a: 저장 형식을 정해야 한다", "b: JSON인지 TOML인지 문서에 없다"])
 
     def test_split_verdict_escalates(self):
         d = consensus.decide(

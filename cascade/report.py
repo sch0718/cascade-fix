@@ -27,6 +27,7 @@ OPINION_MAX_LINES = 20
 COMMIT_SUBJECT_MAX = 60
 REBUTTAL_CHOICE = "선택: [ ] 동의 [ ] 그래도 고친다"
 HOLD_CHOICE = "선택: [ ] 지금 반영 [ ] 구현 때 테스트로 [ ] 보류"
+DESIGN_CHOICE = "선택: [ ] 선택지 ___ [ ] 직접 정함 [ ] 보류"
 DRY_RUN_NOT_APPLIED = "적용 안 됨(dry-run)"
 UNTIMED_STEPS = ("report",)
 TABLE_FOOTNOTE = (
@@ -164,7 +165,7 @@ def _item_line(finding: dict, decision: dict) -> str:
     )
 
 
-def _rebuttal_lines(decision: dict, results: dict | None) -> list[str]:
+def _judge_lines(decision: dict, results: dict | None) -> list[str]:
     fid = decision["finding_id"]
     a = _worker_reason(results, fid, "a")
     b = _worker_reason(results, fid, "b")
@@ -194,10 +195,15 @@ def _bucket_section(name: str, items: list[tuple[int, dict, dict]], ledger: Ledg
         if name == BUCKET_REBUTTAL:
             label = "판가름" if decision["outcome"] == OUTCOME_ADJUDICATE else "합의"
             out.append(f"  - 경로: {label}")
-            out.extend(_indent_reasons(_rebuttal_lines(decision, results)))
+            out.extend(_indent_reasons(_judge_lines(decision, results)))
             out.append(f"  - {REBUTTAL_CHOICE}")
         elif name == BUCKET_DESIGN:
-            out.extend(_indent_reasons(decision.get("reasons", [])))
+            out.extend(_indent_reasons(_judge_lines(decision, results)))
+            options = _worker_reason(results, fid, "writer") if ledger.mode == "doc" else None
+            if options:
+                out.append("  - 작성자 선택지:")
+                out.extend(f"    {line}" for line in options.splitlines() if line.strip())
+            out.append(f"  - {DESIGN_CHOICE}")
         elif name == BUCKET_UNDECIDABLE:
             reasons = decision.get("reasons", [])
             out.extend(_indent_reasons(reasons))
@@ -286,7 +292,7 @@ def _reply_drafts(ledger: Ledger, run_dir: Path | None, failed: dict[str, str]) 
             elif _is_adopted(d):
                 drafts[thread_id] = " ".join(["반영했습니다.", *reasons[:1]]).strip()
             elif _bucket_of(d) == BUCKET_REBUTTAL:
-                lines = _rebuttal_lines(d, _load_results(run_dir, round_no))
+                lines = _judge_lines(d, _load_results(run_dir, round_no))
                 drafts[thread_id] = " ".join(["확인 결과", " / ".join(lines)]).strip()
             else:
                 drafts[thread_id] = f"검토 중입니다. {d['outcome']}"

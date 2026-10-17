@@ -85,7 +85,7 @@ def _agree_on_verdict(a: WorkerResult, b: WorkerResult) -> Decision | None:
     if a.verdict == VERDICT_UNREPRODUCIBLE:
         return _decision(a, OUTCOME_ADJUDICATE, ["둘 다 재현 불가"])
     if a.needs_design_decision and b.needs_design_decision:
-        return _decision(a, OUTCOME_DESIGN, [])
+        return _decision(a, OUTCOME_DESIGN, [f"a: {a.reason}", f"b: {b.reason}"])
     if a.needs_design_decision != b.needs_design_decision:
         return _decision(a, OUTCOME_ADJUDICATE, ["설계 결정 필요 여부 갈림"])
     return None
