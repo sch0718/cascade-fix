@@ -18,11 +18,13 @@
 
 ## 무엇을 고칠 수 있나
 
-| 입력 | 설명 |
-| --- | --- |
-| Claude 리뷰 | 커밋하지 않은 변경, 브랜치 diff, 특정 커밋, 설계·계획 문서를 Claude가 먼저 검토하고 그 지적을 고칩니다. Codex 없이 돕니다. 설계 단계에서는 스펙·계획서 초안을 구현 전에 검토하는 데 씁니다([설계 단계에서 쓰기](#설계-단계에서-쓰기)). |
-| PR 리뷰 코멘트 | 해결 안 된 리뷰 스레드를 지적으로 읽고 고칩니다. 답글 초안과 resolve 대상도 만듭니다. `gh` CLI가 필요합니다. |
-| Codex 리뷰 결과 | `codex-review` 스킬의 `run-review.sh` 결과 파일(`*.final`)을 받아 고칩니다. |
+| 입력 | `--source` | 설명 |
+| --- | --- | --- |
+| Claude 리뷰 | `claude-code` · `claude-doc` | 커밋하지 않은 변경, 브랜치 diff, 특정 커밋, 설계·계획 문서를 Claude가 먼저 검토하고 그 지적을 고칩니다. Codex 없이 돕니다. 설계 단계에서는 스펙·계획서 초안을 구현 전에 검토하는 데 씁니다([설계 단계에서 쓰기](#설계-단계에서-쓰기)). |
+| PR 리뷰 코멘트 | `pr-comment` | 해결 안 된 리뷰 스레드를 지적으로 읽고 고칩니다. 답글 초안과 resolve 대상도 만듭니다. 재검토 회차는 열지 않습니다. `gh` CLI가 필요합니다. |
+| Codex 리뷰 결과 | `codex-code` · `codex-doc` | `codex-review` 스킬의 `run-review.sh` 결과 파일(`*.final`)을 받아 고칩니다. |
+
+`*-code`와 `pr-comment`는 코드 모드라 저장소 검증 명령(`tests`)이 등록되어 있어야 합니다. `*-doc`은 문서 모드라 검증 명령 없이 돕니다. 코드 모드는 지적마다 작업자 둘이, 문서 모드는 작성자 하나와 판정자 둘이 붙습니다.
 
 적합하지 않은 일도 있습니다.
 - 문서를 처음부터 새로 쓰는 일(초안 작성). 초안이 나온 뒤의 검토-수정은 맡길 수 있습니다.
@@ -38,11 +40,13 @@
 - Python 3.11 이상. 외부 패키지는 필요 없습니다.
 - git
 - (PR 모드) 로그인된 `gh` CLI
-- (선택) Codex를 검토자로 쓰려면 `codex-review` 스킬
+- (선택) Codex를 검토자로 쓰려면 `codex-review` 스킬과 `codex` CLI. 이 스킬은 `run-review.sh`의 `--opinion`·`--recheck` 모드를 씁니다. 원래 `codex-review`에는 없는 모드라 [docs/codex-review-changes/](docs/codex-review-changes/README.md)의 diff를 먼저 적용해야 합니다. 없으면 검토자는 자동으로 Claude가 됩니다.
 
 ## 설치
 
 설치 방법은 둘 중 하나만 고릅니다. 둘 다 설치하면 같은 이름의 스킬이 겹칩니다.
+
+이 저장소는 비공개입니다. 어느 방법이든 저장소에 접근할 수 있는 GitHub 계정으로 git 인증(예: `gh auth login`)이 되어 있어야 합니다.
 
 ### 1. 플러그인 마켓플레이스로 설치 (권장)
 
@@ -137,6 +141,8 @@ Codex 검토 결과(review.final) 반영해줘
    바뀐 파일이 모두 문서면 문서 모드로 갑니다. 코드와 문서가 섞였으면 코드 모드로 가고, 문서만 따로 볼 명령을 함께 알려 줍니다. 테스트가 없거나 처리할 것이 없으면 여기서 멈춥니다.
 2. **계획 확인 한 번**: 입력·모드·검토자와 예상 에이전트 수를 보여 줍니다. 「진행 / Critical·Warning만 / dry-run」 중에서 고릅니다. 검증 명령 등록이 필요하면 이때 함께 확인합니다.
 3. **끝까지 진행**: 리뷰, 작업자 2명, 검증, 판가름, 적용, 재검토를 차례로 돕니다. 단계마다 다시 묻지 않습니다.
+   - 적용 뒤 재검토에서 새 지적이 나오면 다음 회차를 엽니다. 재검토는 실행당 최대 2회입니다(`--max-rechecks`).
+   - 앞 패치와 같은 파일을 고쳐 적용하지 못한 지적은 다음 회차에서 바뀐 코드로 다시 고칩니다.
 4. **보고**: 회차별 표와 사람이 볼 목록 네 칸을 보여 줍니다.
    - 반박
    - 설계 결정: 판정자 근거와, 문서 모드면 작성자가 낸 선택지·장단점(작성자가 안 하나를 골라 고쳤으면 그 수정안과 패치 경로)
@@ -218,14 +224,24 @@ PYTHONPATH=<스킬 경로> python3 -m cascade.cli <명령> [옵션]
 
 | 명령 | 하는 일 |
 | --- | --- |
-| `detect [--input F] [--doc F…] [--pr N] [--json]` | 상황을 판정하고 추천·규모·멈춤 사유를 보여 줍니다. 읽기만 합니다. `--doc`은 커밋한 문서도 검토 대상으로 지정합니다. |
-| `review --kind code\|doc (--base B \| --uncommitted \| --commit SHA \| --doc F…)` | Claude 첫 검토용 Workflow 입력을 만듭니다. |
-| `init --source S --input X [--severity …] [--dry-run] [--reviewer …]` | 실행을 시작하고 지적을 읽습니다. |
-| `jobs` / `judge` / `adjudicate` / `opinion` / `apply` / `recheck` | 회차 단계 |
-| `resume --choices F` | 보류 후보 선택(「지금 반영」이면 회차를 엽니다). |
+| `detect [--input F] [--doc F…] [--pr N] [--no-gh] [--reviewer R] [--json]` | 상황을 판정하고 추천·규모·멈춤 사유를 보여 줍니다. 읽기만 합니다. `--doc`은 커밋한 문서도 검토 대상으로 지정합니다. `--no-gh`면 PR을 조회하지 않습니다. |
+| `review --kind code\|doc (--base B \| --uncommitted \| --commit SHA \| --doc F…) [--focus 관점] [--review-model M] [--review-effort E]` | Claude 첫 검토용 Workflow 입력을 만듭니다. |
+| `init --source S --input X [--doc F…] [--severity …] [--dry-run] [--max-rechecks N] [--reviewer R] [--review-model M] [--review-effort E]` | 실행을 시작하고 지적을 읽습니다. PR이면 `--input`에 PR 번호를 주고 `--pr-repo owner/name`·`--me <내 로그인>`을 붙일 수 있습니다. `--input` 대신 `--findings-json F`로 정규화한 지적 목록(`id`·`severity`·`location`·`body`)을 바로 줄 수도 있습니다. |
+| `jobs` / `judge` / `adjudicate` / `opinion` / `apply` / `recheck` | 회차 단계(`--run-dir`·`--round`) |
+| `resume --choices F` | 보류 후보마다 「지금 반영 / 구현 때 테스트로 / 보류」를 받습니다. 「지금 반영」이 있으면 회차를 엽니다. |
 | `report` / `status` / `cleanup` | 보고서, 다음 할 일, 정리 |
 
-각 명령은 끝에 「다음:」으로 다음에 할 명령을 출력합니다. 단계 상세는 [SKILL.md](SKILL.md)를 보세요.
+- `detect`·`review`·`init`은 `--root`로 대상 저장소 루트를 받습니다. 없으면 현재 디렉터리의 저장소입니다. 나머지 명령은 `init`이 출력한 `--run-dir`로 실행을 찾습니다.
+- 회차 단계는 이미 한 단계를 다시 하지 않습니다. 다시 하려면 `--force`를 붙입니다.
+- 각 명령은 끝에 「다음:」으로 다음에 할 명령을 출력합니다. 단계 상세는 [SKILL.md](SKILL.md)를 보세요.
+
+종료 코드:
+
+| 코드 | 뜻 |
+| --- | --- |
+| 4 | 저장소 검증 설정이 없습니다. 후보 명령을 함께 출력합니다. |
+| 5 | 리뷰 결과·설정 파일을 해석하지 못했습니다. |
+| 6 | 사람이 봐야 합니다. `detect`가 멈출 사유를 냈거나, 작업 중 사용자 저장소(작업 트리·HEAD·stash·브랜치)가 바뀌었습니다. |
 
 환경 변수:
 
@@ -242,7 +258,9 @@ PYTHONPATH=<스킬 경로> python3 -m cascade.cli <명령> [옵션]
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-- `codex-review` 스킬이 없으면 그 스크립트를 쓰는 테스트 10개는 건너뜁니다.
+- 테스트는 314개입니다. `codex-review` 스킬이 없으면 그 스크립트를 쓰는 테스트 10개는 건너뜁니다.
+- 디렉터리: `cascade/`(CLI와 단계 로직), `prompts/`(작업자·판정자·판가름·검토자 프롬프트), `scripts/run-jobs.js`(Workflow 스크립트), `eval/`(측정 도구), `docs/`(설계 검토 기록과 `codex-review` 변경 diff)
+- 측정: `eval/replay.py`가 과거 지적 표본을 그 커밋에서 다시 돌리고, `eval/score.py`가 판정 일치율·채택 경로·Opus 호출 절감을 채점합니다. 표본 형식과 순서는 [eval/sample-format.md](eval/sample-format.md)에 있습니다.
 - 출력 스키마를 바꾸면 `cascade/jobs.py`의 `SCHEMAS`와 `scripts/run-jobs.js`의 `SCHEMAS` 블록을 같이 고칩니다(테스트가 두 쪽이 같은지 확인합니다).
 - 배포할 때는 `.claude-plugin/plugin.json`의 `version`을 올립니다. 버전이 같으면 설치한 사람에게 업데이트로 보이지 않습니다.
 - 매니페스트 검사: `claude plugin validate .`
