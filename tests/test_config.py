@@ -158,6 +158,21 @@ class RepoTomlLocationTest(unittest.TestCase):
         found = config.detect_candidates(repo)
         self.assertEqual((found["tests"], found["full_tests"]), (["pytest {files}"], ["pytest"]))
 
+    def test_test_class_on_plain_base_gets_pytest_candidate(self):
+        repo = make_repo(Path(self._td.name) / "based", {
+            "tests/test_a.py": "import unittest\n\n\nclass T(unittest.TestCase):\n    def test_ok(self):\n        pass\n",
+            "tests/test_b.py": "class Base:\n    pass\n\n\nclass TestBroken(Base):\n    def test_x(self):\n        assert False\n",
+        })
+        self.assertEqual(config.detect_candidates(repo)["tests"], ["pytest {files}"])
+
+    def test_testcase_through_local_base_keeps_unittest_candidate(self):
+        repo = make_repo(Path(self._td.name) / "local", {
+            "tests/test_a.py": "import unittest\n\n\nclass Base(unittest.TestCase):\n    pass\n\n\n"
+                               "class TestX(Base):\n    def test_ok(self):\n        pass\n",
+            "tests/test_helpers.py": "VALUE = 1\n",
+        })
+        self.assertIn("python3 -m unittest discover -s tests -p 'test_*.py'", config.detect_candidates(repo)["tests"])
+
     def test_mixed_or_mock_using_pytest_tests_get_pytest_candidate(self):
         mixed = make_repo(Path(self._td.name) / "mixed", {
             "tests/test_a.py": "import unittest\n\n\nclass T(unittest.TestCase):\n    def test_ok(self):\n        pass\n",

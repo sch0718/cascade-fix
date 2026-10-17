@@ -1,3 +1,4 @@
+import ast
 import json
 import re
 import tomllib
@@ -66,19 +67,55 @@ def _read_text(path: Path) -> str | None:
         return None
 
 
-_PYTEST_STYLE = re.compile(r"^(?:async\s+)?def test_|^class Test\w*\s*(?:\(\s*\))?\s*:", re.MULTILINE)
-_UNITTEST_CASE = re.compile(r"\bTestCase\b")
+def _base_name(node: ast.expr) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return ""
+
+
+def _unittest_only(text: str) -> bool | None:
+    """파일의 테스트가 모두 unittest로 돌아가면 True, pytest만 모으는 테스트가 있으면 False, 테스트가 없으면 None.
+
+    Test* 클래스는 기반 클래스를 같은 파일 안에서 따라가 이름이 *TestCase 인 클래스에 닿아야 TestCase로 본다.
+    다른 모듈에서 가져온 기반 클래스처럼 확인할 수 없으면 TestCase가 아닌 것으로 본다(pytest는 둘 다 돌린다).
+    """
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return False
+    classes = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
+
+    def is_case(name: str, seen: frozenset[str] = frozenset()) -> bool:
+        if name.endswith("TestCase"):
+            return True
+        node = classes.get(name)
+        if node is None or name in seen:
+            return False
+        return any(is_case(_base_name(b), seen | {name}) for b in node.bases)
+
+    if any(isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("test")
+           for n in tree.body):
+        return False
+    tests = [n for n in classes if n.startswith("Test") or is_case(n)]
+    if not tests:
+        return None
+    return all(is_case(n) for n in tests)
 
 
 def _test_runner(files: list[Path]) -> str | None:
-    """test_*.py 들을 돌릴 러너. 모듈 수준 test_ 함수나 TestCase를 상속하지 않는 Test 클래스가 하나라도
-    있으면 pytest(TestCase도 함께 돈다), TestCase만 있으면 unittest다. unittest.mock import 만으로는 고르지 않는다."""
-    texts = [_read_text(f) or "" for f in files]
-    if any(_PYTEST_STYLE.search(t) for t in texts):
+    """test_*.py 들을 돌릴 러너. 모든 테스트가 TestCase일 때만 unittest, 아니면 pytest(TestCase도 함께 돈다).
+
+    unittest discover는 pytest 함수·일반 Test 클래스를 세지 않아, 고르면 그 실패가 검증에서 빠진다.
+    pytest를 잘못 고르는 쪽은 pytest가 없을 때 검증이 실패로 드러나므로 애매하면 pytest다.
+    """
+    if not files:
+        return None
+    verdicts = [_unittest_only(_read_text(f) or "") for f in files]
+    if any(v is False for v in verdicts) or not any(verdicts):
         return "pytest"
-    if any(_UNITTEST_CASE.search(t) for t in texts):
-        return "unittest"
-    return "pytest" if files else None
+    return "unittest"
 
 
 def detect_candidates(root: Path) -> dict[str, list[str]]:
