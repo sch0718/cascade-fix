@@ -130,6 +130,20 @@ class RenderTest(unittest.TestCase):
         table = section(text, "## 회차별 지적과 채택 경로")
         self.assertIn("| 1 | 3 | 0 | 3 | 0 | 1 | 3 |", table)
 
+    def test_table_counts_decision_path_even_after_apply_failed(self):
+        findings = [finding("A1"), finding("A2"), finding("A3")]
+        decisions = [
+            decision("A1", OUTCOME_AGREED_FACT, "a"),
+            {**decision("A2", OUTCOME_UNDECIDABLE, None, ["패치 적용 실패: error: patch failed"]),
+             "adopted_as": OUTCOME_AGREED_FACT},
+            {**decision("A3", OUTCOME_UNDECIDABLE, None, ["한쪽만 검증 통과", "판가름: 고친다", "패치 적용 실패: x"]),
+             "adopted_as": OUTCOME_ADJUDICATE},
+        ]
+        text = report.render(make_ledger(findings, decisions), dry_run=False)
+        table = section(text, "## 회차별 지적과 채택 경로")
+        self.assertIn("| 1 | 3 | 2 | 1 | 1 | 0 | 2 |", table)
+        self.assertIn("판정 때 값", table)
+
     def test_four_buckets_present_with_reasons(self):
         text = report.render(full_ledger(), dry_run=False)
         people = section(text, "## 사람이 볼 목록")
@@ -176,6 +190,20 @@ class RenderTest(unittest.TestCase):
         self.assertIn("b: B 근거 상세", section(text, "### 반박"))
         self.assertIn("Opus가 못 정함", section(text, "### 판단 불가"))
 
+    def test_adjudicator_reason_shown_once_when_already_in_reasons(self):
+        ledger = full_ledger()
+        ledger.rounds[0].decisions[4]["reasons"] = ["패치가 다름", "판가름 패치 검증 실패", "판가름: Opus가 고친 패치도 깨진다"]
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "round-1").mkdir()
+            results = {"F5:adjudicator": worker("F5", "adjudicator", "Opus가 고친 패치도 깨진다\n")}
+            (run_dir / "round-1" / "results.json").write_text(json.dumps(results, ensure_ascii=False), encoding="utf-8")
+            text = report.render(ledger, dry_run=False, run_dir=run_dir)
+        undecidable = section(text, "### 판단 불가")
+        self.assertEqual(undecidable.count("Opus가 고친 패치도 깨진다"), 1)
+        self.assertIn("  - 판가름: Opus가 고친 패치도 깨진다", undecidable)
+        self.assertNotIn("Opus: ", undecidable)
+
     def test_dry_run_banner(self):
         ledger = full_ledger()
         text = report.render(ledger, dry_run=True)
@@ -187,7 +215,7 @@ class RenderTest(unittest.TestCase):
 
     def test_header_line(self):
         text = report.render(full_ledger(), dry_run=False)
-        self.assertIn("출처: local · 모드: code · 상태: 진행", text)
+        self.assertIn("출처: local · 모드: code · 검토자: Codex · 상태: 진행", text)
 
     def test_commit_message_single_and_multiple(self):
         one = make_ledger(
@@ -217,6 +245,21 @@ class RenderTest(unittest.TestCase):
         self.assertIn("F1", apply_section)
         self.assertIn("F2", apply_section)
         self.assertIn("충돌 꼬리", apply_section)
+
+    def test_carried_finding_not_listed_as_failure(self):
+        ledger = full_ledger()
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "round-1").mkdir()
+            (run_dir / "round-1" / "apply.json").write_text(json.dumps(
+                {"applied": ["F1"], "failed": [["F2", "겹침 꼬리"], ["F5", "진짜 실패"]], "carried": ["F2"]},
+                ensure_ascii=False), encoding="utf-8")
+            text = report.render(ledger, False, run_dir=run_dir)
+        apply_section = section(text, "### 적용 결과")
+        self.assertIn("- 회차 1 다음 회차로 넘김(앞 패치와 겹침): F2", apply_section)
+        self.assertNotIn("실패 **F2**", apply_section)
+        self.assertNotIn("겹침 꼬리", apply_section)
+        self.assertIn("실패 **F5**", apply_section)
 
     def test_pr_comment_replies_and_resolve(self):
         findings = [
@@ -305,6 +348,13 @@ class RenderTest(unittest.TestCase):
         self.assertIn("b: 이미 처리됨", rebuttal)
         self.assertNotIn("B 근거", rebuttal)
 
+    def test_claude_first_review_counted_in_calls(self):
+        ledger = make_ledger([finding("F1")], [decision("F1", OUTCOME_AGREED_FACT, "a")], source="claude-code")
+        ledger.reviewer = "claude"
+        calls = section(report.render(ledger, False), "## 호출 수와 시간")
+        self.assertIn("| Claude 첫 검토 | 1 |", calls)
+        self.assertIn("| Claude 의견 | 0 |", calls)
+
     def test_single_commit_subject_when_body_first_line_empty(self):
         ledger = make_ledger([finding("F1", body="")], [decision("F1", OUTCOME_AGREED_FACT, "a")])
         block = section(report.render(ledger, False), "### 커밋 메시지 초안")
@@ -332,7 +382,8 @@ class RenderTest(unittest.TestCase):
         self.assertIn("| writer | 1 |", calls)
         self.assertIn("| checker | 1 |", calls)
         self.assertIn("| adjudicator | 0 |", calls)
-        self.assertIn("| Codex 검토 | 1 |", calls)
+        self.assertIn("| Codex 의견 | 1 |", calls)
+        self.assertNotIn("첫 검토", calls)
         self.assertIn("| Codex 재검토 | 1 |", calls)
         self.assertIn("| 1 | 1분 5초 |", calls)
 

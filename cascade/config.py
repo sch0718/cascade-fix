@@ -1,3 +1,4 @@
+import ast
 import json
 import re
 import tomllib
@@ -66,6 +67,62 @@ def _read_text(path: Path) -> str | None:
         return None
 
 
+def _base_name(node: ast.expr) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return ""
+
+
+def _unittest_only(text: str) -> bool | None:
+    """파일의 테스트가 모두 unittest로 돌아가면 True, pytest만 모으는 테스트가 있으면 False, 테스트가 없으면 None.
+
+    클래스 자신의 이름은 보지 않고 기반 클래스만 본다. 같은 파일 안의 기반 클래스는 따라가고, 다른 모듈에서
+    가져온 기반 클래스는 이름이 *TestCase(unittest.TestCase, IsolatedAsyncioTestCase 등)일 때만 TestCase로 본다.
+    그 밖에는 TestCase가 아닌 것으로 본다(pytest는 둘 다 돌린다).
+    """
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return False
+    classes = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
+
+    def is_case(name: str, seen: frozenset[str] = frozenset()) -> bool:
+        node = classes.get(name)
+        if node is None or name in seen:
+            return False
+        return any(base_is_case(b, seen | {name}) for b in node.bases)
+
+    def base_is_case(base: ast.expr, seen: frozenset[str]) -> bool:
+        # 같은 파일의 클래스는 이름(ast.Name)으로만 가리킨다. unittest.TestCase 같은 속성 접근은 가져온 것이다
+        if isinstance(base, ast.Name) and base.id in classes:
+            return is_case(base.id, seen)
+        return _base_name(base).endswith("TestCase")
+
+    if any(isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("test")
+           for n in tree.body):
+        return False
+    tests = [n for n in classes if n.startswith("Test") or is_case(n)]
+    if not tests:
+        return None
+    return all(is_case(n) for n in tests)
+
+
+def _test_runner(files: list[Path]) -> str | None:
+    """test_*.py 들을 돌릴 러너. 모든 테스트가 TestCase일 때만 unittest, 아니면 pytest(TestCase도 함께 돈다).
+
+    unittest discover는 pytest 함수·일반 Test 클래스를 세지 않아, 고르면 그 실패가 검증에서 빠진다.
+    pytest를 잘못 고르는 쪽은 pytest가 없을 때 검증이 실패로 드러나므로 애매하면 pytest다.
+    """
+    if not files:
+        return None
+    verdicts = [_unittest_only(_read_text(f) or "") for f in files]
+    if any(v is False for v in verdicts) or not any(verdicts):
+        return "pytest"
+    return "unittest"
+
+
 def detect_candidates(root: Path) -> dict[str, list[str]]:
     root = Path(root)
     found: dict[str, list[str]] = {k: [] for k in CANDIDATE_KEYS}
@@ -109,5 +166,20 @@ def detect_candidates(root: Path) -> dict[str, list[str]]:
                 add(key, f"make {target}")
                 if key == "tests":
                     add("full_tests", f"make {target}")
+
+    if not found["tests"]:
+        tests_dir = next((d for d in ("tests", "test") if (root / d).is_dir()), None)
+        test_files = sorted((root / tests_dir).glob("test_*.py")) if tests_dir else []
+        runner = _test_runner(test_files)
+        if runner == "unittest":
+            # {files}를 넣지 않는다: 파일 경로로 넘기면 discover -s 와 달리 tests_dir가 sys.path에 안 들어가
+            # 테스트 안의 형제 모듈 import가 깨지고, 관련 테스트가 없으면 0건 실행(3.12부터 실패)이 된다
+            add("tests", f"python3 -m unittest discover -s {tests_dir} -p 'test_*.py'")
+            add("full_tests", f"python3 -m unittest discover -s {tests_dir} -p 'test_*.py'")
+        elif runner == "pytest":
+            # unittest discover는 pytest 함수 테스트를 세지 않는다(섞여 있으면 빠지고, 그것만 있으면
+            # 0건이 3.11까지 성공으로 끝난다). 실패하는 코드가 검증을 통과하지 않게 pytest를 낸다
+            add("tests", "pytest {files}")
+            add("full_tests", "pytest")
 
     return found

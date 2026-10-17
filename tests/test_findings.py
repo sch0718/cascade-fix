@@ -166,7 +166,7 @@ class FindingJsonTest(unittest.TestCase):
         f = findings.Finding(id="r1-01", source="codex-doc", severity="Warning", location="a.md:1",
                              body="본문", evidence="근거", thread_id=None, outdated=False)
         self.assertEqual(findings.Finding.from_dict(json.loads(json.dumps(f.to_dict()))), f)
-        self.assertEqual(set(f.to_dict()), {"id", "source", "severity", "location", "body", "evidence", "thread_id", "outdated"})
+        self.assertEqual(set(f.to_dict()), {"id", "source", "severity", "location", "body", "evidence", "thread_id", "outdated", "carried_from", "carried_after"})
 
     def test_write_and_read_findings(self):
         items = findings.parse_codex_doc(FIX_DOC, 1) + pr_findings()

@@ -30,6 +30,7 @@ exit 0
 """
 
 
+@unittest.skipUnless(SCRIPT.is_file(), f"codex-review 스킬이 없다: {SCRIPT}")
 class RunReviewModesTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

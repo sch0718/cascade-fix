@@ -64,6 +64,9 @@ class Ledger:
     hold_choices: dict[str, str] = field(default_factory=dict)
     opinions: dict[str, str] = field(default_factory=dict)
     docs: dict[str, str] = field(default_factory=dict)
+    reviewer: str = "codex"
+    review_model: str = ""
+    review_effort: str = ""
 
     def current_round(self) -> RoundRecord | None:
         return self.rounds[-1] if self.rounds else None

@@ -127,6 +127,30 @@ class Stage1CodeTest(unittest.TestCase):
             for j in args["jobs"]:
                 self.assertIsNone(PLACEHOLDER.search(j["prompt"]), f"{j['id']}: {PLACEHOLDER.search(j['prompt'])}")
 
+    def test_carried_finding_prompts_explain_changed_baseline(self):
+        from dataclasses import replace
+        carried = replace(F1, id="r2-01", carried_from="r1-03", carried_after=["r1-01 m.py:2 — median이 정렬하지 않는다"])
+        item = adj_input()
+        item.finding = carried
+        built = [
+            jobs.build_stage1_jobs([carried], CFG, wts_for(carried), "code"),
+            jobs.build_stage1_jobs([carried], CFG, wts_for(carried), "doc"),
+            jobs.build_checker_jobs([carried], wts_for(carried), {"r2-01": PATCH_A}),
+            jobs.build_adjudicator_jobs([item]),
+        ]
+        for args in built:
+            for j in args["jobs"]:
+                p = j["prompt"]
+                self.assertIn("## 앞 회차에서 넘어온 지적", p, j["id"])
+                self.assertIn("앞 회차의 r1-03", p)
+                self.assertIn("- r1-01 m.py:2 — median이 정렬하지 않는다", p)
+                self.assertIn("적용 전 코드를 기준으로", p)
+                self.assertIn("기준선이 바뀌었다", p)
+                self.assertIsNone(PLACEHOLDER.search(p))
+        plain = by_id(jobs.build_stage1_jobs([F1], CFG, wts_for(F1), "code"))["r1-01:a"]["prompt"]
+        self.assertNotIn("앞 회차", plain)
+        self.assertIn("<<<근거 끝>>>\n\n## 검증 명령", plain)
+
     def test_braces_in_finding_are_kept_literally(self):
         f = Finding(id="r1-03", source="pr-comment", severity="Warning", location="a.py:1",
                     body="dict는 {key} 형식이고 f\"{x}\"도 있다 {", evidence="{worktree}")

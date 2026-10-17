@@ -109,3 +109,90 @@ class ConfigTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RepoTomlLocationTest(unittest.TestCase):
+    def setUp(self):
+        from cascade import cli_steps
+        self.s = cli_steps
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        base = Path(self._td.name)
+        self.user, self.legacy = base / "user" / "repos.toml", base / "skill" / "repos.toml"
+        self.legacy.parent.mkdir(parents=True)
+        self.saved = (cli_steps.USER_REPOS_TOML, cli_steps.LEGACY_REPOS_TOML, os.environ.pop("CASCADE_REPOS_TOML", None))
+        cli_steps.USER_REPOS_TOML, cli_steps.LEGACY_REPOS_TOML = self.user, self.legacy
+
+    def tearDown(self):
+        self.s.USER_REPOS_TOML, self.s.LEGACY_REPOS_TOML, env = self.saved
+        if env is not None:
+            os.environ["CASCADE_REPOS_TOML"] = env
+
+    def test_order_env_user_legacy(self):
+        self.legacy.write_text("[repos]\n", encoding="utf-8")
+        self.assertEqual(self.s.repos_toml(), self.user)  # 견본(항목 없음)은 건너뛴다
+        self.legacy.write_text('[repos."/x"]\ntests = ["t"]\n', encoding="utf-8")
+        self.assertEqual(self.s.repos_toml(), self.legacy)  # 예전 위치에 항목이 있으면 그대로 쓴다
+        self.user.parent.mkdir(parents=True)
+        self.user.write_text("[repos]\n", encoding="utf-8")
+        self.assertEqual(self.s.repos_toml(), self.user)
+        os.environ["CASCADE_REPOS_TOML"] = "/tmp/other.toml"
+        try:
+            self.assertEqual(self.s.repos_toml(), Path("/tmp/other.toml"))
+        finally:
+            del os.environ["CASCADE_REPOS_TOML"]
+
+    def test_run_review_env_override(self):
+        os.environ["CASCADE_RUN_REVIEW"] = "/opt/rr.sh"
+        try:
+            self.assertEqual(self.s.find_run_review(), Path("/opt/rr.sh"))
+        finally:
+            del os.environ["CASCADE_RUN_REVIEW"]
+
+    def test_unittest_candidate(self):
+        repo = make_repo(Path(self._td.name) / "r", {"tests/test_a.py": "import unittest\n\n\nclass T(unittest.TestCase):\n    def test_ok(self):\n        pass\n"})
+        self.assertIn("python3 -m unittest discover -s tests -p 'test_*.py'", config.detect_candidates(repo)["tests"])
+
+    def test_pytest_style_tests_get_pytest_candidate(self):
+        repo = make_repo(Path(self._td.name) / "r", {"tests/test_app.py": "def test_broken():\n    assert False\n"})
+        found = config.detect_candidates(repo)
+        self.assertEqual((found["tests"], found["full_tests"]), (["pytest {files}"], ["pytest"]))
+
+    def test_test_class_on_plain_base_gets_pytest_candidate(self):
+        repo = make_repo(Path(self._td.name) / "based", {
+            "tests/test_a.py": "import unittest\n\n\nclass T(unittest.TestCase):\n    def test_ok(self):\n        pass\n",
+            "tests/test_b.py": "class Base:\n    pass\n\n\nclass TestBroken(Base):\n    def test_x(self):\n        assert False\n",
+        })
+        self.assertEqual(config.detect_candidates(repo)["tests"], ["pytest {files}"])
+
+    def test_class_named_testcase_without_base_gets_pytest_candidate(self):
+        for name, files in {
+            "named": {"tests/test_a.py": "import unittest\n\n\nclass T(unittest.TestCase):\n    def test_ok(self):\n        pass\n",
+                       "tests/test_b.py": "class TestPaymentTestCase:\n    def test_bad(self):\n        assert False\n"},
+            "only": {"tests/test_b.py": "class TestCase:\n    def test_bad(self):\n        assert False\n"},
+            "local-base": {"tests/test_a.py": "import unittest\n\n\nclass T(unittest.TestCase):\n    def test_ok(self):\n        pass\n",
+                            "tests/test_b.py": "class BaseTestCase:\n    pass\n\n\n"
+                                               "class TestX(BaseTestCase):\n    def test_bad(self):\n        assert False\n"},
+        }.items():
+            with self.subTest(name):
+                repo = make_repo(Path(self._td.name) / name, files)
+                self.assertEqual(config.detect_candidates(repo)["tests"], ["pytest {files}"])
+
+    def test_testcase_through_local_base_keeps_unittest_candidate(self):
+        repo = make_repo(Path(self._td.name) / "local", {
+            "tests/test_a.py": "import unittest\n\n\nclass Base(unittest.TestCase):\n    pass\n\n\n"
+                               "class TestX(Base):\n    def test_ok(self):\n        pass\n",
+            "tests/test_helpers.py": "VALUE = 1\n",
+        })
+        self.assertIn("python3 -m unittest discover -s tests -p 'test_*.py'", config.detect_candidates(repo)["tests"])
+
+    def test_mixed_or_mock_using_pytest_tests_get_pytest_candidate(self):
+        mixed = make_repo(Path(self._td.name) / "mixed", {
+            "tests/test_a.py": "import unittest\n\n\nclass T(unittest.TestCase):\n    def test_ok(self):\n        pass\n",
+            "tests/test_b.py": "def test_broken():\n    assert False\n",
+        })
+        self.assertEqual(config.detect_candidates(mixed)["tests"], ["pytest {files}"])
+        mock = make_repo(Path(self._td.name) / "mock", {
+            "tests/test_c.py": "from unittest import mock\n\n\ndef test_m():\n    assert mock.Mock()\n",
+        })
+        self.assertEqual(config.detect_candidates(mock)["tests"], ["pytest {files}"])

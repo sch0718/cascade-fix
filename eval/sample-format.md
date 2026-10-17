@@ -11,7 +11,7 @@
 | `id` | 표본 항목 이름. 폴더 이름으로 쓰므로 영문·숫자·`.`·`_`·`-`만 쓴다 |
 | `repo` | 지적을 처리한 저장소의 절대 경로 |
 | `commit` | 지적이 나온 시점의 커밋. 그 커밋에서 다시 돌린다 |
-| `source` | `codex-doc` · `codex-code` · `pr-comment` |
+| `source` | `codex-doc` · `codex-code` · `claude-doc` · `claude-code` · `pr-comment` |
 | `doc` | 문서 모드면 문서 경로(저장소 안 절대·상대 경로), 아니면 `null` |
 | `finding` | 정규화한 지적(`id`, `source`, `severity`, `location`, `body`, `evidence`, `thread_id`, `outdated`). `id`는 `^[A-Za-z0-9][A-Za-z0-9._-]*$` |
 | `truth.verdict` | 그때의 Opus 판정 중 사람이 받아들인 것: `사실` · `아님` · `재현 불가` |

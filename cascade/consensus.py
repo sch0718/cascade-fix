@@ -14,6 +14,7 @@ OUTCOME_ADJUDICATE = "판가름"
 OUTCOME_DESIGN = "설계결정"
 OUTCOME_UNDECIDABLE = "판단불가"
 OUTCOME_HOLD = "보류후보"
+OUTCOME_CARRIED = "다음 회차"
 
 REASON_SENSITIVE = "보안 경로"
 REASON_NO_VERIFIER = "검증기 없음"
@@ -48,6 +49,7 @@ class Decision:
     outcome: str
     patch_from: str | None = None
     reasons: list[str] = field(default_factory=list)
+    adopted_as: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)

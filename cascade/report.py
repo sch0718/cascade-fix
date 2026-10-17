@@ -10,6 +10,8 @@ from cascade.consensus import (
     OUTCOME_HOLD,
     OUTCOME_UNDECIDABLE,
 )
+from cascade.review import CLAUDE_SOURCES
+from cascade.review import label as reviewer_label
 from cascade.rounds import Ledger
 
 SOURCE_PR_COMMENT = "pr-comment"
@@ -30,7 +32,9 @@ UNTIMED_STEPS = ("report",)
 TABLE_FOOTNOTE = (
     "합의-아님은 합의 칸에 한 번 세고 사람이 볼 목록의 반박 칸에도 오른다. "
     "판가름 회부는 판가름에 들어간 지적 전부이고, 판가름 채택은 그 가운데 패치를 채택한 지적이다. "
-    "사람 칸은 설계결정·판단불가·보류후보와 판가름 뒤에도 채택하지 못한 지적이다."
+    "합의·판가름 채택은 판정 때 값이라 적용 실패나 전체 테스트 실패로 판단 불가가 된 지적도 그대로 센다. "
+    "사람 칸은 설계결정·판단불가·보류후보와 판가름 뒤에도 채택하지 못한 지적이다(적용 단계에서 판단 불가가 된 지적 포함). "
+    "앞 패치와 겹쳐 적용하지 못하고 다음 회차로 넘긴 지적은 사람 칸에 세지 않고 다음 회차 지적에 다시 센다."
 )
 
 
@@ -114,9 +118,10 @@ def _load_apply(run_dir: Path | None, round_no: int) -> dict | None:
 
 
 def _failed_items(apply: dict | None) -> list[tuple[str, str]]:
+    carried = set((apply or {}).get("carried", []) or [])
     items = []
     for entry in (apply or {}).get("failed", []) or []:
-        if isinstance(entry, (list, tuple)) and len(entry) == 2:
+        if isinstance(entry, (list, tuple)) and len(entry) == 2 and str(entry[0]) not in carried:
             items.append((str(entry[0]), str(entry[1])))
     return items
 
@@ -152,9 +157,10 @@ def _fenced(text: str) -> str:
 
 
 def _item_line(finding: dict, decision: dict) -> str:
+    carried = f" (회차를 넘어옴: {finding['carried_from']})" if finding.get("carried_from") else ""
     return (
         f"- **{finding.get('id', decision['finding_id'])}** "
-        f"({finding.get('severity', '-')}, {finding.get('location', '-')}) — {_first_line(finding.get('body', ''))}"
+        f"({finding.get('severity', '-')}, {finding.get('location', '-')}) — {_first_line(finding.get('body', ''))}{carried}"
     )
 
 
@@ -166,6 +172,11 @@ def _rebuttal_lines(decision: dict, results: dict | None) -> list[str]:
         extra = [r for r in decision.get("reasons", []) if not r.startswith(("a:", "b:"))]
         return [f"a: {a}", f"b: {b}", *extra]
     return list(decision.get("reasons", []))
+
+
+def _has_adjudication_note(reasons: list[str], opus: str) -> bool:
+    prefix = f"{ADJUDICATION_MARK}:"
+    return any(r.startswith(prefix) and r[len(prefix):].strip() == opus for r in reasons)
 
 
 def _indent_reasons(lines: list[str]) -> list[str]:
@@ -188,13 +199,14 @@ def _bucket_section(name: str, items: list[tuple[int, dict, dict]], ledger: Ledg
         elif name == BUCKET_DESIGN:
             out.extend(_indent_reasons(decision.get("reasons", [])))
         elif name == BUCKET_UNDECIDABLE:
-            out.extend(_indent_reasons(decision.get("reasons", [])))
+            reasons = decision.get("reasons", [])
+            out.extend(_indent_reasons(reasons))
             opus = _worker_reason(results, fid, "adjudicator")
-            if opus:
+            if opus and not _has_adjudication_note(reasons, opus):
                 out.append(f"  - Opus: {opus}")
             opinion = ledger.opinions.get(fid)
             if opinion:
-                out.append("  - Codex 의견:")
+                out.append(f"  - {reviewer_label(ledger.reviewer)} 의견:")
                 out.extend(f"    > {line}" for line in opinion.splitlines()[:OPINION_MAX_LINES])
             out.append(f"  - 패치 a: round-{round_no}/patch-{fid}-a.diff")
             out.append(f"  - 패치 b: round-{round_no}/patch-{fid}-b.diff")
@@ -209,9 +221,12 @@ def _bucket_section(name: str, items: list[tuple[int, dict, dict]], ledger: Ledg
 
 
 def _round_row(rnd, ledger: Ledger) -> str:
-    consensus = sum(1 for d in rnd.decisions if d["outcome"] in (OUTCOME_AGREED_FACT, OUTCOME_AGREED_NO))
+    consensus = sum(1 for d in rnd.decisions
+                    if d["outcome"] in (OUTCOME_AGREED_FACT, OUTCOME_AGREED_NO) or d.get("adopted_as") == OUTCOME_AGREED_FACT)
     sent = sum(1 for d in rnd.decisions if _was_adjudicated(d))
-    adjudicated = sum(1 for d in rnd.decisions if d["outcome"] == OUTCOME_ADJUDICATE and d.get("patch_from") is not None)
+    adjudicated = sum(1 for d in rnd.decisions
+                      if (d["outcome"] == OUTCOME_ADJUDICATE and d.get("patch_from") is not None)
+                      or d.get("adopted_as") == OUTCOME_ADJUDICATE)
     codex = sum(1 for f in rnd.findings if f.get("id") in ledger.opinions)
     human = sum(
         1
@@ -311,6 +326,8 @@ def _prepared_section(ledger: Ledger, run_dir: Path | None) -> list[str]:
         if applied is None:
             continue
         apply_lines.append(f"- 회차 {rnd.no} 적용: {', '.join(applied.get('applied', [])) or '없음'}")
+        if applied.get("carried"):
+            apply_lines.append(f"- 회차 {rnd.no} 다음 회차로 넘김(앞 패치와 겹침): {', '.join(applied['carried'])}")
         for fid, tail in _failed_items(applied):
             apply_lines.extend([f"- 회차 {rnd.no} 실패 **{fid}**:", "", _fenced(str(tail)), ""])
     if apply_lines:
@@ -353,8 +370,11 @@ def _calls_section(ledger: Ledger, run_dir: Path | None) -> list[str]:
     out = ["## 호출 수와 시간", "", "| 역할 | 호출 수 |", "| --- | ---: |"]
     for role in WORKER_ROLES:
         out.append(f"| {role} | {counts[role] if found else '-'} |")
-    out.append(f"| Codex 검토 | {len(ledger.opinions)} |")
-    out.append(f"| Codex 재검토 | {sum(1 for r in ledger.rounds if r.recheck_opened)} |")
+    name = reviewer_label(ledger.reviewer)
+    if ledger.source in CLAUDE_SOURCES:
+        out.append(f"| {name} 첫 검토 | 1 |")
+    out.append(f"| {name} 의견 | {len(ledger.opinions)} |")
+    out.append(f"| {name} 재검토 | {sum(1 for r in ledger.rounds if r.recheck_opened)} |")
     out.extend(["", "| 회차 | 소요 |", "| --- | ---: |"])
     out.extend(f"| {rnd.no} | {_elapsed(rnd)} |" for rnd in ledger.rounds)
     out.append("")
@@ -366,12 +386,12 @@ def render(ledger: Ledger, dry_run: bool, run_dir: Path | None = None) -> str:
     out = [f"# cascade-fix 보고서 {ledger.run_id}", ""]
     if dry_run:
         out.extend(["**적용하지 않음(dry-run)**", ""])
-    out.extend([f"출처: {ledger.source} · 모드: {ledger.mode} · 상태: {ledger.status}", ""])
+    out.extend([f"출처: {ledger.source} · 모드: {ledger.mode} · 검토자: {reviewer_label(ledger.reviewer)} · 상태: {ledger.status}", ""])
     out.extend(
         [
             "## 회차별 지적과 채택 경로",
             "",
-            "| 회차 | 지적 | 합의 | 판가름 회부 | 판가름 채택 | Codex 검토 | 사람 |",
+            f"| 회차 | 지적 | 합의 | 판가름 회부 | 판가름 채택 | {reviewer_label(ledger.reviewer)} 검토 | 사람 |",
             "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
             *[_round_row(rnd, ledger) for rnd in ledger.rounds],
             "",

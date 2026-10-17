@@ -1,10 +1,12 @@
 import argparse
+import json
 import os
 import re
 import shlex
 import subprocess
 import sys
 from collections import Counter
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -12,6 +14,7 @@ from cascade import cli_steps as s
 from cascade.config import ExitCodes
 from cascade.consensus import (
     OUTCOME_ADJUDICATE,
+    OUTCOME_CARRIED,
     OUTCOME_HOLD,
     OUTCOME_UNDECIDABLE,
     REASON_SENSITIVE,
@@ -21,7 +24,10 @@ from cascade.consensus import (
     decide,
     decide_doc,
 )
+from cascade.detect import detect, estimate_line
+from cascade.detect import render as render_detect
 from cascade.findings import (
+    SEVERITIES,
     Finding,
     ParseError,
     fetch_pr_findings,
@@ -39,6 +45,25 @@ from cascade.jobs import (
 )
 from cascade.patches import ApplyReport, apply_all, changed_files, extract
 from cascade.report import render, write_prepared
+from cascade.review import (
+    CALL_FAILED_NOTE,
+    CLAUDE_SOURCES,
+    DEFAULT_EFFORT,
+    DEFAULT_MODEL,
+    EFFORTS,
+    REVIEW_JOB,
+    REVIEWER_AUTO,
+    REVIEWER_CHOICES,
+    REVIEWER_CLAUDE,
+    build_review_prompt,
+    claude_prompt,
+    label,
+    load_text,
+    model_warning,
+    read_review_results,
+    resolve,
+    review_job,
+)
 from cascade.rounds import (
     RESOLUTION_HEADER,
     STATUS_DONE,
@@ -64,13 +89,15 @@ from cascade.snapshot import (
 )
 from cascade.verify import repro_cmds, run_repro, run_verifiers
 
-SOURCES = ("codex-doc", "codex-code", "pr-comment")
+SOURCES = ("codex-doc", "codex-code", "claude-doc", "claude-code", "pr-comment")
 HOLD_CHOICES = ("지금 반영", "구현 때 테스트로", "보류")
 CHOICE_NOW = "지금 반영"
 REASON_APPLY_FAILED = "패치 적용 실패"
+REASON_CARRIED = "앞서 적용한 패치와 겹쳐 다음 회차에서 바뀐 코드로 다시 고친다"
 REASON_INTERFERENCE = "전체 테스트 실패(간섭 의심)"
 REASON_FINAL_BASELINE_FAILED = "전체 테스트 실패(기준선도 실패)"
 REASON_OUT_OF_SCOPE = "재검토 범위 밖"
+REASON_SEVERITY_DEFERRED = "등급 선택(--severity)으로 이번 실행에서 뺌"
 RAW_PREVIEW_LINES = 5
 FINAL_TAIL_CHARS = 2000
 
@@ -84,6 +111,8 @@ def _print_next(ledger: Ledger, run_dir: Path) -> None:
 def _set_decision(rnd: RoundRecord, fid: str, outcome: str, reason: str) -> None:
     for d in rnd.decisions:
         if d["finding_id"] == fid:
+            if s.is_adopted(d) and not d.get("adopted_as"):
+                d["adopted_as"] = d["outcome"]
             d.update(outcome=outcome, patch_from=None, reasons=[*d.get("reasons", []), reason])
 
 
@@ -169,6 +198,8 @@ def _parse_input(args, root: Path):
             raise s.CliError(f"pr-comment의 --input은 PR 번호다: {args.input}")
         _warn_pr_head(root, gh, owner, name, args.input)
         return fetch_pr_findings(owner, name, int(args.input), me, gh, 1), ""
+    if args.source in CLAUDE_SOURCES:
+        return _parse_claude_review(args)
     raw = s.read_text(Path(args.input))
     parser = parse_codex_doc if args.source == "codex-doc" else parse_codex_code
     try:
@@ -177,9 +208,29 @@ def _parse_input(args, root: Path):
         raise s.CliError(str(e), ExitCodes.PARSE_ERROR) from None
 
 
+def _parse_claude_review(args):
+    path = Path(args.input)
+    if not path.is_file():
+        raise s.CliError(f"파일이 없다: {path}")
+    raw, model_id = load_text(path, REVIEW_JOB if path.suffix == ".json" else None)
+    if not raw.strip():
+        raise s.CliError(f"Claude 검토 결과가 비어 있다(Workflow 호출 실패일 수 있다): {path}", ExitCodes.PARSE_ERROR)
+    warning = model_warning(REVIEW_JOB, model_id, args.review_model or DEFAULT_MODEL)
+    if warning:
+        print(warning)
+    try:
+        findings = parse_codex_doc(raw, 1)
+    except ParseError as e:
+        raise s.CliError(str(e), ExitCodes.PARSE_ERROR) from None
+    return [replace(f, source=args.source) for f in findings], raw
+
+
 def cmd_init(args) -> int:
     root = Path(args.root).resolve() if args.root else s.git_toplevel(Path.cwd())
     s.cfg_for(args.source, root)
+    if args.reviewer not in REVIEWER_CHOICES:
+        raise s.CliError(f"알 수 없는 검토자: {args.reviewer} ({' / '.join(REVIEWER_CHOICES)}, CASCADE_REVIEWER 확인)")
+    reviewer = resolve(args.reviewer, args.source, s.RUN_REVIEW)
     findings, raw = _parse_input(args, root)
     if not findings:
         print("지적 0건 — 원문을 확인하라")
@@ -189,6 +240,11 @@ def cmd_init(args) -> int:
             print("경고: 원문에 「[P」가 있다. 파서가 항목을 놓쳤을 수 있다")
         print(f"status={STATUS_DONE}")
         return 0
+    keep = _severity_filter(args.severity)
+    deferred = [f for f in findings if f.severity not in keep]
+    findings = [f for f in findings if f.severity in keep]
+    if not findings:
+        raise s.CliError(f"--severity {args.severity} 에 맞는 지적이 없다(전체 {len(deferred)}건). 등급을 넓힌다")
     docs, external = _split_docs(root, args.doc or [])
     ensure_excluded(root)
     snap = create_snapshot(root, _new_run_id(root), external)
@@ -196,15 +252,19 @@ def cmd_init(args) -> int:
     ledger = Ledger(
         run_id=snap.run_id,
         source=args.source,
-        mode="doc" if args.source == "codex-doc" else "code",
+        mode="doc" if args.source in s.DOC_SOURCES else "code",
         root=str(root),
         snapshot=snap.to_dict(),
         dry_run=args.dry_run,
         max_rechecks=args.max_rechecks,
-        rounds=[RoundRecord(no=1, findings=[f.to_dict() for f in findings], decisions=[], adopted=[],
-                            recheck_opened=False, started_at=stamp, events=[{"step": "init", "at": stamp}],
-                            base_commit=snap.commit)],
+        rounds=[RoundRecord(no=1, findings=[f.to_dict() for f in findings],
+                            decisions=[Decision(f.id, OUTCOME_HOLD, None, [REASON_SEVERITY_DEFERRED]).to_dict() for f in deferred],
+                            adopted=[], recheck_opened=False, started_at=stamp, events=[{"step": "init", "at": stamp}],
+                            base_commit=snap.commit, hold_findings=[f.to_dict() for f in deferred])],
         docs=docs,
+        reviewer=reviewer,
+        review_model=(args.review_model or DEFAULT_MODEL) if reviewer == REVIEWER_CLAUDE else "",
+        review_effort=(args.review_effort or DEFAULT_EFFORT) if reviewer == REVIEWER_CLAUDE else "",
     )
     write_findings(s.round_dir(snap.run_dir, 1) / "findings.json", findings)
     s.save_ledger(snap.run_dir, ledger)
@@ -212,9 +272,85 @@ def cmd_init(args) -> int:
     print(f"run_dir={snap.run_dir}")
     print(f"status={STATUS_RUNNING}")
     print(f"지적 {len(findings)}건: " + ", ".join(f"{k} {v}" for k, v in counts.items()))
+    if deferred:
+        print(f"등급 선택으로 뺀 지적 {len(deferred)}건은 보류 후보로 둔다(나중에 resume 「지금 반영」으로 돌릴 수 있다)")
+    print(f"규모: {estimate_line(len(findings), ledger.mode, reviewer)}")
     if args.dry_run:
         print("dry-run: 채택 패치를 작업 트리에 적용하지 않는다")
+    if reviewer == REVIEWER_CLAUDE:
+        print(f"의견·재검토: Claude 단독({ledger.review_model}, {ledger.review_effort}) — 외부 전송 없음")
+    else:
+        print(f"의견·재검토: Codex({s.RUN_REVIEW})")
+        if not s.RUN_REVIEW.is_file():
+            print("경고: codex-review 스킬이 없다. Claude 단독으로 돌리려면 --reviewer claude 로 다시 init 한다")
     _print_next(ledger, snap.run_dir)
+    return 0
+
+
+def _severity_filter(raw: str | None) -> set[str]:
+    if not raw:
+        return set(SEVERITIES)
+    chosen = {x.strip().capitalize() for x in raw.split(",") if x.strip()}
+    unknown = chosen - set(SEVERITIES)
+    if unknown or not chosen:
+        raise s.CliError(f"--severity 는 {', '.join(SEVERITIES)} 중에서 쉼표로 고른다: {raw}")
+    return chosen
+
+
+def _root_flag(args, root: Path) -> str:
+    """--root 로 다른 저장소를 가리켰으면 다음 명령에도 붙인다(빼면 현재 디렉터리의 저장소가 대상이 된다)."""
+    return f" --root {shlex.quote(str(root))}" if args.root else ""
+
+
+def cmd_detect(args) -> int:
+    root = Path(args.root).resolve() if args.root else s.git_toplevel(Path.cwd())
+    gh = None if args.no_gh else shlex.split(os.environ.get("CASCADE_GH", "gh"))
+    if args.reviewer not in REVIEWER_CHOICES:
+        raise s.CliError(f"알 수 없는 검토자: {args.reviewer} ({' / '.join(REVIEWER_CHOICES)}, CASCADE_REVIEWER 확인)")
+    result = detect(root, repos_toml=s.repos_toml(), run_review=s.RUN_REVIEW, cli=s.CLI, gh=gh,
+                    input_path=Path(args.input).resolve() if args.input else None, pr=args.pr,
+                    reviewer_choice=args.reviewer, root_flag=_root_flag(args, root))
+    print(json.dumps(result, ensure_ascii=False, indent=2) if args.json else render_detect(result))
+    return 0 if result["ok"] else ExitCodes.NEEDS_USER
+
+
+def cmd_review(args) -> int:
+    root = Path(args.root).resolve() if args.root else s.git_toplevel(Path.cwd())
+    if args.kind == "doc":
+        if not args.doc:
+            raise s.CliError("문서 검토는 --doc <문서> 를 하나 이상 준다")
+        docs = []
+        for raw in args.doc:
+            path = Path(raw).resolve()
+            if not path.is_file():
+                raise s.CliError(f"문서가 없다: {raw}")
+            docs.append(path.relative_to(root).as_posix() if path.is_relative_to(root) else str(path))
+        prompt = build_review_prompt("doc", root, docs=docs, focus=args.focus or "")
+    else:
+        if sum(bool(x) for x in (args.base, args.uncommitted, args.commit)) != 1:
+            raise s.CliError("코드 검토는 --base <브랜치> / --uncommitted / --commit <SHA> 중 하나를 준다")
+        prompt = build_review_prompt("code", root, base=args.base, uncommitted=args.uncommitted,
+                                     commit=args.commit, focus=args.focus or "")
+    ensure_excluded(root)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    out_dir, n = root / RUN_DIR_NAME / f"review-{stamp}", 2
+    while out_dir.exists():
+        out_dir, n = root / RUN_DIR_NAME / f"review-{stamp}-{n}", n + 1
+    model, effort = args.review_model or DEFAULT_MODEL, args.review_effort or DEFAULT_EFFORT
+    job = review_job(REVIEW_JOB, f"{args.kind} review", claude_prompt(prompt, root), model, effort)
+    args_path = out_dir / "review-args.json"
+    s.write_json(args_path, write_job_args({"jobs": [job]}, out_dir / "prompts"))
+    result = out_dir / "review.json"
+    source = "claude-doc" if args.kind == "doc" else "claude-code"
+    docs_args = "".join(f" --doc {shlex.quote(str(Path(d).resolve()))}" for d in args.doc or [])
+    print(f"review_dir={out_dir}")
+    print(f"검토자: Claude({model}, {effort})")
+    print("다음:")
+    print(f"  {s.workflow_step(args_path, result)}")
+    print(f"  {s.CLI} init --source {source} --input {shlex.quote(str(result))}{docs_args}"
+          + (f" --review-model {shlex.quote(model)}" if args.review_model else "")
+          + (f" --review-effort {effort}" if args.review_effort else "")
+          + _root_flag(args, root))
     return 0
 
 
@@ -362,7 +498,8 @@ def cmd_judge(args) -> int:
             adj_items.append(s.adj_input(ledger, by_id[d.finding_id], merged, verify, wt, cfg, d.reasons))
     if adj_items:
         s.write_json(rd / "adj-args.json", write_job_args(build_adjudicator_jobs(adj_items), rd / "prompts"))
-    rnd.decisions = [d.to_dict() for d in decisions]
+    held = {f["id"] for f in rnd.hold_findings}
+    rnd.decisions = [d for d in rnd.decisions if d["finding_id"] in held] + [d.to_dict() for d in decisions]
     s.write_json(rd / "decisions.json", rnd.decisions)
     ledger.snapshot = snap.to_dict()
     rnd.approved_repro = dict(repro or {})
@@ -405,6 +542,7 @@ def cmd_adjudicate(args) -> int:
     verify = s.read_json(rd / "verify.json")
     by_id = {f.id: f for f in s.prompt_findings(ledger, s.findings_of(rnd))}
     new_decisions = []
+    opinion_jobs = []
     for data in rnd.decisions:
         d = Decision.from_dict(data)
         if d.outcome != OUTCOME_ADJUDICATE:
@@ -425,9 +563,14 @@ def cmd_adjudicate(args) -> int:
         verify.setdefault(f.id, {})["adjudicator"] = [r.to_dict() for r in vrecorded]
         if new.outcome == OUTCOME_UNDECIDABLE:
             item = s.adj_input(ledger, f, merged, verify, wt, cfg, new.reasons)
-            (rd / f"opinion-{f.id}.md").write_text(build_opinion_prompt(item, adj), encoding="utf-8")
+            prompt = build_opinion_prompt(item, adj)
+            (rd / f"opinion-{f.id}.md").write_text(prompt, encoding="utf-8")
+            opinion_jobs.append((s.opinion_job_id(f.id), f"{f.id} opinion", prompt,
+                                 snap.worktrees.get(s.base_name(rnd)) or ledger.root))
         new_decisions.append(new.to_dict())
     rnd.decisions = new_decisions
+    if opinion_jobs and s.is_claude(ledger):
+        s.write_review_args(rd, s.OPINION_ARGS, ledger, opinion_jobs)
     s.write_json(rd / "results.json", merged)
     s.write_json(rd / "verify.json", verify)
     s.write_json(rd / "decisions.json", rnd.decisions)
@@ -438,10 +581,37 @@ def cmd_adjudicate(args) -> int:
     return 0
 
 
+def _claude_opinions(args, run_dir: Path, ledger: Ledger, rnd: RoundRecord) -> int:
+    rd = s.round_dir(run_dir, rnd.no)
+    pending = s.pending_opinions(ledger, rd) if not args.force else [
+        p.stem[len("opinion-"):] for p in sorted(rd.glob("opinion-*.md"))]
+    if not pending:
+        raise s.CliError(f"회차 {rnd.no}에 붙일 의견이 없다. 다시 붙이려면 --force")
+    results = read_review_results(s.read_json(Path(args.results)))
+    for fid in pending:
+        text, model_id = results.get(s.opinion_job_id(fid), ("", None))
+        warning = model_warning(s.opinion_job_id(fid), model_id, ledger.review_model)
+        if warning:
+            print(warning)
+        if not text.strip():
+            print(f"경고: {fid} Claude 의견이 없다(호출 실패). 「{CALL_FAILED_NOTE}」로 적고 넘어간다")
+            text = CALL_FAILED_NOTE
+        ledger.opinions[fid] = text.strip()
+        s.mark(rnd, f"opinion:{fid}")
+    s.save_ledger(run_dir, ledger)
+    print(f"Claude 의견 {len(pending)}건을 원장에 붙였다(자동 채택하지 않는다)")
+    _print_next(ledger, run_dir)
+    return 0
+
+
 def cmd_opinion(args) -> int:
     run_dir = Path(args.run_dir)
     ledger = s.load_ledger(run_dir)
     rnd = s.get_round(ledger, args.round)
+    if args.results:
+        return _claude_opinions(args, run_dir, ledger, rnd)
+    if not args.id or not args.result:
+        raise s.CliError("--id 와 --result 를 함께 주거나(Codex), --results 하나만 준다(Claude Workflow 결과)")
     s.guard(rnd, f"opinion:{args.id}", args.force)
     if args.id not in {d["finding_id"] for d in rnd.decisions}:
         raise s.CliError(f"회차 {rnd.no}에 {args.id} 판정이 없다")
@@ -451,7 +621,7 @@ def cmd_opinion(args) -> int:
     ledger.opinions[args.id] = text
     s.mark(rnd, f"opinion:{args.id}")
     s.save_ledger(run_dir, ledger)
-    print(f"{args.id} Codex 의견을 원장에 붙였다(자동 채택하지 않는다)")
+    print(f"{args.id} {label(ledger.reviewer)} 의견을 원장에 붙였다(자동 채택하지 않는다)")
     _print_next(ledger, run_dir)
     return 0
 
@@ -478,9 +648,16 @@ def _adopted_patches(rnd: RoundRecord, rd: Path) -> list[tuple[str, str]]:
     return patches
 
 
-def _record_apply(run_dir: Path, ledger: Ledger, rnd: RoundRecord, rd: Path, report: ApplyReport, data: dict) -> None:
+def _record_apply(run_dir: Path, ledger: Ledger, rnd: RoundRecord, rd: Path, report: ApplyReport, data: dict,
+                  patches: list[tuple[str, str]]) -> None:
+    carried = s.carried_ids(rnd, report.applied, [fid for fid, _ in report.failed], dict(patches))
     for fid, tail in report.failed:
-        _set_decision(rnd, fid, OUTCOME_UNDECIDABLE, f"{REASON_APPLY_FAILED}: {s.first_line(tail)}")
+        reason = f"{REASON_APPLY_FAILED}: {s.first_line(tail)}"
+        if fid in carried:
+            _set_decision(rnd, fid, OUTCOME_CARRIED, f"{reason} — {REASON_CARRIED}")
+        else:
+            _set_decision(rnd, fid, OUTCOME_UNDECIDABLE, reason)
+    data["carried"] = [fid for fid, _ in report.failed if fid in carried]
     rnd.adopted = list(report.applied)
     s.write_json(rd / "apply.json", data)
     s.write_json(rd / "decisions.json", rnd.decisions)
@@ -498,7 +675,7 @@ def _patch_dry_run(run_dir, ledger, rnd, rd, patches) -> Path:
     report = apply_all(wt, patches)
     rnd.result_commit = commit_worktree(wt, f"cascade-fix {ledger.run_id} 회차 {rnd.no} 결과(dry-run)") or s.base_of(ledger, rnd)
     data = {"dry_run": True, **report.to_dict(), "would_apply": list(report.applied), "result_worktree": str(wt)}
-    _record_apply(run_dir, ledger, rnd, rd, report, data)
+    _record_apply(run_dir, ledger, rnd, rd, report, data, patches)
     print(f"dry-run: 작업 트리에는 적용하지 않고 {wt} 에 적용했다 (채택 {len(report.applied)}건, 실패 {len(report.failed)}건)")
     return wt
 
@@ -506,7 +683,7 @@ def _patch_dry_run(run_dir, ledger, rnd, rd, patches) -> Path:
 def _patch_user_tree(run_dir, ledger, rnd, rd, patches, root) -> None:
     report = apply_all(root, patches, s.external_docs(ledger))
     rnd.result_commit = snapshot_tree(s.snapshot_of(ledger), list(s.external_docs(ledger).values()))
-    _record_apply(run_dir, ledger, rnd, rd, report, report.to_dict())
+    _record_apply(run_dir, ledger, rnd, rd, report, report.to_dict(), patches)
     print(f"적용 {len(report.applied)}건, 실패 {len(report.failed)}건")
 
 
@@ -555,8 +732,9 @@ def cmd_apply(args) -> int:
         if final["final_ok"] is False:
             data["interference"] = True
             reason = REASON_FINAL_BASELINE_FAILED if final.get("baseline_failed") else REASON_INTERFERENCE
-            for fid in applied:
+            for fid in [*applied, *data.get("carried", [])]:
                 _set_decision(rnd, fid, OUTCOME_UNDECIDABLE, reason)
+            data["carried"] = []
             rnd.adopted = []
             print(f"{reason}. 적용한 패치는 작업 트리에 그대로 두었다 — 되돌릴지는 사람이 정한다")
     s.write_json(rd / "apply.json", data)
@@ -568,11 +746,17 @@ def cmd_apply(args) -> int:
             diff = s.range_diff(root, s.base_of(ledger, rnd), rnd.result_commit, scope)
         else:
             diff = "".join(texts[f.id] for f in adopted)
-        (rd / "recheck-prompt.md").write_text(build_recheck_prompt(adopted, diff, ledger.mode), encoding="utf-8")
+        prompt = build_recheck_prompt(adopted, diff, ledger.mode)
+        (rd / "recheck-prompt.md").write_text(prompt, encoding="utf-8")
         (rd / s.RECHECK_REPO_FILE).write_text(recheck_repo + "\n", encoding="utf-8")
+        if s.is_claude(ledger):
+            s.write_review_args(rd, s.RECHECK_ARGS, ledger, [(s.recheck_job_id(rnd.no), f"회차 {rnd.no} recheck", prompt, recheck_repo)])
         s.write_json(rd / s.RECHECK_SCOPE_FILE, scope)
         rnd.recheck_opened = True
         print(f"재검토 필요: {rd / 'recheck-prompt.md'} (--repo {recheck_repo})")
+    elif s.carried_findings(rnd):
+        nxt = _open_round(run_dir, ledger, rnd, s.renumber(s.carried_findings(rnd), rnd.no + 1, ledger.source))
+        print(f"재검토 없음: 적용하지 못한 {len(nxt.findings)}건으로 회차 {nxt.no}을 연다")
     else:
         ledger.status = STATUS_DONE
         print("재검토 없음: 종료")
@@ -580,6 +764,15 @@ def cmd_apply(args) -> int:
     s.save_ledger(run_dir, ledger)
     _print_next(ledger, run_dir)
     return 0
+
+
+def _open_round(run_dir: Path, ledger: Ledger, rnd: RoundRecord, findings: list[Finding]) -> RoundRecord:
+    no = rnd.no + 1
+    write_findings(s.round_dir(run_dir, no) / "findings.json", findings)
+    nxt = RoundRecord(no=no, findings=[f.to_dict() for f in findings], decisions=[], adopted=[], recheck_opened=False,
+                      started_at=s.now(), base_commit=rnd.result_commit or s.base_of(ledger, rnd))
+    ledger.rounds.append(nxt)
+    return nxt
 
 
 def _hold_reason(f, rnd: RoundRecord, max_reached: bool, outside: set[str]) -> str:
@@ -599,7 +792,14 @@ def cmd_recheck(args) -> int:
     s.guard(rnd, "recheck", args.force)
     if not rnd.recheck_opened:
         raise s.CliError(f"회차 {rnd.no}은 재검토를 열지 않았다")
-    text = s.read_text(Path(args.result))
+    if not Path(args.result).is_file():
+        raise s.CliError(f"파일이 없다: {args.result}")
+    text, model_id = load_text(Path(args.result), s.recheck_job_id(rnd.no) if args.result.endswith(".json") else None)
+    if not text.strip():
+        raise s.CliError(f"재검토 결과가 비어 있다(Workflow 호출 실패일 수 있다). 재검토 Workflow를 다시 돌린다: {args.result}")
+    warning = model_warning(s.recheck_job_id(rnd.no), model_id, ledger.review_model)
+    if warning:
+        print(warning)
     rd = s.round_dir(run_dir, rnd.no)
     (rd / "recheck-result.md").write_text(text, encoding="utf-8")
     try:
@@ -614,7 +814,8 @@ def cmd_recheck(args) -> int:
     if resolved and missing:
         print(f"경고: 해소 여부가 없는 지적은 해소 안 됨으로 본다: {', '.join(missing)}")
     unresolved = [s.unresolved_copy(f) for f in adopted if resolved.get(f.id) is not True]
-    combined = s.renumber(unresolved + new, rnd.no + 1, ledger.source)
+    numbered = s.renumber(unresolved + new + s.carried_findings(rnd), rnd.no + 1, ledger.source)
+    combined, carried = numbered[:len(unresolved) + len(new)], numbered[len(unresolved) + len(new):]
     max_reached = s.rechecks_done(ledger) >= ledger.max_rechecks
     in_scope = s.recheck_scope(ledger, rd, adopted, combined)
     outside = {f.id for f in out_of_scope(combined, in_scope)}
@@ -629,13 +830,11 @@ def cmd_recheck(args) -> int:
     s.write_json(rd / "decisions.json", rnd.decisions)
     s.mark(rnd, "recheck")
     print(f"해소 {sum(1 for v in resolved.values() if v)}건, 해소 안 됨 {len(unresolved)}건, 새 지적 {len(new)}건")
-    print(f"다음 회차 {len(next_round)}건, 보류 후보 {len(hold)}건(범위 밖 {len(outside)}건), 판단 불가 {len(undecidable)}건")
+    next_round += carried
+    print(f"다음 회차 {len(next_round)}건(적용 못 해 넘긴 {len(carried)}건 포함), "
+          f"보류 후보 {len(hold)}건(범위 밖 {len(outside)}건), 판단 불가 {len(undecidable)}건")
     if next_round:
-        no = rnd.no + 1
-        write_findings(s.round_dir(run_dir, no) / "findings.json", next_round)
-        ledger.rounds.append(RoundRecord(no=no, findings=[f.to_dict() for f in next_round], decisions=[],
-                                         adopted=[], recheck_opened=False, started_at=s.now(),
-                                         base_commit=rnd.result_commit or s.base_of(ledger, rnd)))
+        _open_round(run_dir, ledger, rnd, next_round)
     else:
         ledger.status = STATUS_DONE
     print(f"status={ledger.status}")
@@ -763,6 +962,29 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--max-rechecks", type=int, default=2)
     p.add_argument("--root")
+    p.add_argument("--reviewer", choices=REVIEWER_CHOICES, default=os.environ.get("CASCADE_REVIEWER") or REVIEWER_AUTO,
+                   help="판가름 뒤 의견·재검토를 맡을 검토자(기본: 환경 변수 CASCADE_REVIEWER, 없으면 auto). "
+                        "auto: claude-* 입력이거나 codex-review 스킬이 없으면 claude")
+    p.add_argument("--review-model", help=f"Claude 검토자 모델(기본 {DEFAULT_MODEL})")
+    p.add_argument("--review-effort", choices=EFFORTS, help=f"Claude 검토자 effort(기본 {DEFAULT_EFFORT})")
+    p.add_argument("--severity", help="이번 실행에서 처리할 등급(쉼표 구분, 예: Critical,Warning). 나머지는 보류 후보")
+    p = add("detect", cmd_detect, run_dir=False, force=False)
+    p.add_argument("--input")
+    p.add_argument("--pr")
+    p.add_argument("--root")
+    p.add_argument("--no-gh", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--reviewer", choices=REVIEWER_CHOICES, default=os.environ.get("CASCADE_REVIEWER") or REVIEWER_AUTO)
+    p = add("review", cmd_review, run_dir=False, force=False)
+    p.add_argument("--kind", choices=("code", "doc"), required=True)
+    p.add_argument("--base")
+    p.add_argument("--uncommitted", action="store_true")
+    p.add_argument("--commit")
+    p.add_argument("--doc", action="append")
+    p.add_argument("--focus")
+    p.add_argument("--root")
+    p.add_argument("--review-model")
+    p.add_argument("--review-effort", choices=EFFORTS)
     add("jobs", cmd_jobs, round_no=True)
     p = add("judge", cmd_judge, round_no=True)
     p.add_argument("--results", required=True)
@@ -771,8 +993,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = add("adjudicate", cmd_adjudicate, round_no=True)
     p.add_argument("--results", required=True)
     p = add("opinion", cmd_opinion, round_no=True)
-    p.add_argument("--id", required=True)
-    p.add_argument("--result", required=True)
+    p.add_argument("--id")
+    p.add_argument("--result")
+    p.add_argument("--results", help="Claude 검토자 Workflow 결과(opinion.json). --id/--result 대신 쓴다")
     add("apply", cmd_apply, round_no=True)
     p = add("recheck", cmd_recheck, round_no=True)
     p.add_argument("--result", required=True)
