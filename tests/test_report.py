@@ -176,6 +176,20 @@ class RenderTest(unittest.TestCase):
         self.assertIn("b: B 근거 상세", section(text, "### 반박"))
         self.assertIn("Opus가 못 정함", section(text, "### 판단 불가"))
 
+    def test_adjudicator_reason_shown_once_when_already_in_reasons(self):
+        ledger = full_ledger()
+        ledger.rounds[0].decisions[4]["reasons"] = ["패치가 다름", "판가름 패치 검증 실패", "판가름: Opus가 고친 패치도 깨진다"]
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "round-1").mkdir()
+            results = {"F5:adjudicator": worker("F5", "adjudicator", "Opus가 고친 패치도 깨진다\n")}
+            (run_dir / "round-1" / "results.json").write_text(json.dumps(results, ensure_ascii=False), encoding="utf-8")
+            text = report.render(ledger, dry_run=False, run_dir=run_dir)
+        undecidable = section(text, "### 판단 불가")
+        self.assertEqual(undecidable.count("Opus가 고친 패치도 깨진다"), 1)
+        self.assertIn("  - 판가름: Opus가 고친 패치도 깨진다", undecidable)
+        self.assertNotIn("Opus: ", undecidable)
+
     def test_dry_run_banner(self):
         ledger = full_ledger()
         text = report.render(ledger, dry_run=True)

@@ -169,6 +169,11 @@ def _rebuttal_lines(decision: dict, results: dict | None) -> list[str]:
     return list(decision.get("reasons", []))
 
 
+def _has_adjudication_note(reasons: list[str], opus: str) -> bool:
+    prefix = f"{ADJUDICATION_MARK}:"
+    return any(r.startswith(prefix) and r[len(prefix):].strip() == opus for r in reasons)
+
+
 def _indent_reasons(lines: list[str]) -> list[str]:
     return [f"  - {line}" for line in lines]
 
@@ -189,9 +194,10 @@ def _bucket_section(name: str, items: list[tuple[int, dict, dict]], ledger: Ledg
         elif name == BUCKET_DESIGN:
             out.extend(_indent_reasons(decision.get("reasons", [])))
         elif name == BUCKET_UNDECIDABLE:
-            out.extend(_indent_reasons(decision.get("reasons", [])))
+            reasons = decision.get("reasons", [])
+            out.extend(_indent_reasons(reasons))
             opus = _worker_reason(results, fid, "adjudicator")
-            if opus:
+            if opus and not _has_adjudication_note(reasons, opus):
                 out.append(f"  - Opus: {opus}")
             opinion = ledger.opinions.get(fid)
             if opinion:
