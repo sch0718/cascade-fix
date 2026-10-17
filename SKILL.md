@@ -67,7 +67,7 @@ PYTHONPATH="${CLAUDE_SKILL_DIR}" python3 -m cascade.cli
    - 코드: `CF review --kind code (--base <브랜치> | --uncommitted | --commit <SHA>) [--focus <관점>] [--review-model M] [--review-effort E]`
    - 문서: `CF review --kind doc --doc <문서> [--doc <문서>…] [--focus <관점>]`
    - 출력의 `review_dir=<경로>` 아래에 `review-args.json`이 생긴다. 검토자는 읽기만 하고, 결과는 `Critical`/`Warning`/`Suggestion` 형식(`위치:`/`근거:`/`제안:`)이다.
-2. **Workflow(첫 검토)** — 절차 3과 같은 방식으로 `RJ`를 `review-args.json`으로 돌려 반환값을 `<review_dir>/review.json`에 저장한다.
+2. **Workflow(첫 검토)** — 절차 3과 같은 방식으로 `RJ`를 `review-args.json`으로 돌려 반환값(완료 알림의 output 파일의 `.result`)을 `<review_dir>/review.json`에 저장한다.
 3. **init** — `CF init --source claude-code --input <review_dir>/review.json`(문서면 `--source claude-doc … --doc <문서>`). `review`가 출력한 명령을 그대로 쓴다. 결과가 비었으면(호출 실패) 종료 코드 5로 멈춘다 — Workflow를 다시 돌린다.
 
 ## 사용 조건
@@ -113,7 +113,7 @@ PYTHONPATH="${CLAUDE_SKILL_DIR}" python3 -m cascade.cli
    - 「지적 0건 — 원문을 확인하라」가 나오면 출력된 원문 앞부분을 사용자에게 보이고 끝낸다.
 2. **jobs** — `CF jobs --run-dir <run_dir> --round N` → `round-N/stage1-args.json`. 기준선(수정 전 base 워크트리)에서 build·typecheck·lint 명령을 한 번 돌려 이미 실패하는 명령을 `round-N/baseline.json`에 적는다(판정에서 제외). `tests` 명령은 기준선에서 실패해도 제외하지 않는다(지적이 곧 실패하는 테스트면 수정이 통과시켜야 한다).
    - `pr-comment`이면 코멘트에서 뽑은 재현 명령을 `round-N/repro-cmds.json`에 쓰고 출력한다. 이 명령은 사용자 셸에서 돈다. 사용자에게 명령 목록을 보이고 승인받은 뒤 `judge`에 `--allow-repro <run_dir>/round-N/repro-cmds.json`으로 넘긴다. 승인이 없으면 재현 검증을 건너뛴다(경고만 낸다).
-3. **Workflow(1단계)** — `RJ`(`scripts/run-jobs.js`, 「다음:」 줄에 절대 경로가 나온다)를 Read로 읽어 그 내용을 Workflow 도구의 `script` 입력으로 통째로 넘긴다(`scriptPath`는 작업 디렉터리 밖이라 거부된다). `args`는 `stage1-args.json`의 내용(JSON 객체)이다. 작업마다 `{id, label, model, effort, kind, promptPath}`만 있고 프롬프트 본문은 `round-N/prompts/`의 파일에 있다. 프롬프트를 읽어 옮겨 적지 않는다. 반환값 `{results: [...]}`를 그대로 `round-N/stage1.json`에 저장한다.
+3. **Workflow(1단계)** — `RJ`(`scripts/run-jobs.js`, 「다음:」 줄에 절대 경로가 나온다)를 Read로 읽어 그 내용을 Workflow 도구의 `script` 입력으로 통째로 넘긴다(`RJ` 경로를 `scriptPath`로 주면 작업 디렉터리 밖이라 거부된다). 첫 실행 결과에 나오는 `Script file:` 경로(Workflow가 저장해 둔 사본)는 `scriptPath`로 받으므로, 이 세션의 둘째 Workflow부터는 그 경로를 `scriptPath`로 넘긴다. `args`는 `stage1-args.json`의 내용(JSON 객체)이다. 작업마다 `{id, label, model, effort, kind, promptPath}`만 있고 프롬프트 본문은 `round-N/prompts/`의 파일에 있다. 프롬프트를 읽어 옮겨 적지 않는다. 반환값 `{results: [...]}`는 완료 알림의 `<output-file>` JSON에서 `.result`를 꺼내 그대로 `round-N/stage1.json`에 저장한다(예: `python3 -c 'import json,sys; json.dump(json.load(open(sys.argv[1]))["result"], open(sys.argv[2], "w"), ensure_ascii=False)' <output-file> <저장 경로>`). 알림 본문의 `<result>`는 `<`·`>`가 `&lt;`·`&gt;`로 바뀌어 보이므로 옮겨 적지 않는다.
 4. **judge** — `CF judge --run-dir <run_dir> --round N --results <run_dir>/round-N/stage1.json [--allow-repro <승인한 목록>]`
    - 종료 코드 6: jobs 뒤 사용자 저장소(작업 트리·HEAD·stash·브랜치)가 바뀌었다. 작업자가 워크트리 밖을 건드렸을 수 있다. 출력된 `git diff --stat`을 사용자에게 보이고 멈춘다. `adjudicate`도 같은 검사를 한다.
    - 문서 모드에서 `checker-args.json`이 나오면 같은 방식으로 Workflow를 돌려 `round-N/checker.json`에 저장하고, `CF judge … --results …/stage1.json --checker-results …/checker.json`으로 다시 부른다.
