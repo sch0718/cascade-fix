@@ -78,8 +78,9 @@ def _base_name(node: ast.expr) -> str:
 def _unittest_only(text: str) -> bool | None:
     """파일의 테스트가 모두 unittest로 돌아가면 True, pytest만 모으는 테스트가 있으면 False, 테스트가 없으면 None.
 
-    Test* 클래스는 기반 클래스를 같은 파일 안에서 따라가 이름이 *TestCase 인 클래스에 닿아야 TestCase로 본다.
-    다른 모듈에서 가져온 기반 클래스처럼 확인할 수 없으면 TestCase가 아닌 것으로 본다(pytest는 둘 다 돌린다).
+    클래스 자신의 이름은 보지 않고 기반 클래스만 본다. 같은 파일 안의 기반 클래스는 따라가고, 다른 모듈에서
+    가져온 기반 클래스는 이름이 *TestCase(unittest.TestCase, IsolatedAsyncioTestCase 등)일 때만 TestCase로 본다.
+    그 밖에는 TestCase가 아닌 것으로 본다(pytest는 둘 다 돌린다).
     """
     try:
         tree = ast.parse(text)
@@ -88,12 +89,16 @@ def _unittest_only(text: str) -> bool | None:
     classes = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
 
     def is_case(name: str, seen: frozenset[str] = frozenset()) -> bool:
-        if name.endswith("TestCase"):
-            return True
         node = classes.get(name)
         if node is None or name in seen:
             return False
-        return any(is_case(_base_name(b), seen | {name}) for b in node.bases)
+        return any(base_is_case(b, seen | {name}) for b in node.bases)
+
+    def base_is_case(base: ast.expr, seen: frozenset[str]) -> bool:
+        # 같은 파일의 클래스는 이름(ast.Name)으로만 가리킨다. unittest.TestCase 같은 속성 접근은 가져온 것이다
+        if isinstance(base, ast.Name) and base.id in classes:
+            return is_case(base.id, seen)
+        return _base_name(base).endswith("TestCase")
 
     if any(isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("test")
            for n in tree.body):

@@ -165,6 +165,19 @@ class RepoTomlLocationTest(unittest.TestCase):
         })
         self.assertEqual(config.detect_candidates(repo)["tests"], ["pytest {files}"])
 
+    def test_class_named_testcase_without_base_gets_pytest_candidate(self):
+        for name, files in {
+            "named": {"tests/test_a.py": "import unittest\n\n\nclass T(unittest.TestCase):\n    def test_ok(self):\n        pass\n",
+                       "tests/test_b.py": "class TestPaymentTestCase:\n    def test_bad(self):\n        assert False\n"},
+            "only": {"tests/test_b.py": "class TestCase:\n    def test_bad(self):\n        assert False\n"},
+            "local-base": {"tests/test_a.py": "import unittest\n\n\nclass T(unittest.TestCase):\n    def test_ok(self):\n        pass\n",
+                            "tests/test_b.py": "class BaseTestCase:\n    pass\n\n\n"
+                                               "class TestX(BaseTestCase):\n    def test_bad(self):\n        assert False\n"},
+        }.items():
+            with self.subTest(name):
+                repo = make_repo(Path(self._td.name) / name, files)
+                self.assertEqual(config.detect_candidates(repo)["tests"], ["pytest {files}"])
+
     def test_testcase_through_local_base_keeps_unittest_candidate(self):
         repo = make_repo(Path(self._td.name) / "local", {
             "tests/test_a.py": "import unittest\n\n\nclass Base(unittest.TestCase):\n    pass\n\n\n"
