@@ -190,27 +190,46 @@ class RenderTest(unittest.TestCase):
         self.assertIn("b: B 근거 상세", section(text, "### 반박"))
         self.assertIn("Opus가 못 정함", section(text, "### 판단 불가"))
 
-    def test_design_bucket_shows_judges_and_writer_options(self):
+    def _design_report(self, writer_item):
         ledger = make_ledger([finding("D1", location="docs/spec.md:12", body="저장 형식을 정하지 않았다")],
                              [decision("D1", OUTCOME_DESIGN, None, ["a: 짧은 근거", "b: 짧은 근거"])])
         ledger.mode = "doc"
-        options = "1) JSON — 표준 라이브러리 / 주석 없음\n2) TOML — 주석 가능 / 3.11 이상"
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)
             (run_dir / "round-1").mkdir()
             results = {
                 "D1:a": worker("D1", "a", "A 상세: 형식이 없다"),
                 "D1:b": worker("D1", "b", "B 상세: 12행에 형식이 없다"),
-                "D1:writer": worker("D1", "writer", options),
             }
+            if writer_item is not None:
+                results["D1:writer"] = writer_item
             (run_dir / "round-1" / "results.json").write_text(json.dumps(results, ensure_ascii=False), encoding="utf-8")
-            text = report.render(ledger, dry_run=False, run_dir=run_dir)
-        design = section(text, "### 설계 결정")
+            return section(report.render(ledger, dry_run=False, run_dir=run_dir), "### 설계 결정")
+
+    def test_design_bucket_shows_judges_and_writer_options(self):
+        options = "1) JSON — 표준 라이브러리 / 주석 없음\n2) TOML — 주석 가능 / 3.11 이상"
+        design = self._design_report({**worker("D1", "writer", options), "needs_design_decision": True})
         self.assertIn("  - a: A 상세: 형식이 없다", design)
         self.assertIn("  - b: B 상세: 12행에 형식이 없다", design)
         self.assertNotIn("짧은 근거", design)
         self.assertIn("  - 작성자 선택지:\n    1) JSON — 표준 라이브러리 / 주석 없음\n    2) TOML", design)
         self.assertIn("선택: [ ] 선택지 ___ [ ] 직접 정함 [ ] 보류", design)
+        self.assertNotIn("작성자 안 채택", design)
+        self.assertNotIn("patch-D1-writer.diff", design)
+
+    def test_design_bucket_offers_writer_patch_when_writer_fixed_it(self):
+        item = {**worker("D1", "writer", "JSON으로 정하고 3행을 고쳤다"), "patch": "--- a/x\n+++ b/x\n"}
+        design = self._design_report(item)
+        self.assertIn("  - 작성자 수정안(채택 안 함):\n    JSON으로 정하고 3행을 고쳤다", design)
+        self.assertIn("  - 패치: round-1/patch-D1-writer.diff", design)
+        self.assertIn("선택: [ ] 작성자 안 채택(패치 직접 적용) [ ] 직접 정함 [ ] 보류", design)
+        self.assertNotIn("작성자 선택지", design)
+
+    def test_design_bucket_without_writer_options_or_patch(self):
+        design = self._design_report({**worker("D1", "writer", "지적이 아니다"), "verdict": "아님"})
+        self.assertIn("  - 작성자: 지적이 아니다", design)
+        self.assertIn("선택: [ ] 직접 정함 [ ] 보류", design)
+        self.assertIn("선택: [ ] 직접 정함 [ ] 보류", self._design_report(None))
 
     def test_adjudicator_reason_shown_once_when_already_in_reasons(self):
         ledger = full_ledger()

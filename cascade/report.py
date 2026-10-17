@@ -27,7 +27,9 @@ OPINION_MAX_LINES = 20
 COMMIT_SUBJECT_MAX = 60
 REBUTTAL_CHOICE = "선택: [ ] 동의 [ ] 그래도 고친다"
 HOLD_CHOICE = "선택: [ ] 지금 반영 [ ] 구현 때 테스트로 [ ] 보류"
-DESIGN_CHOICE = "선택: [ ] 선택지 ___ [ ] 직접 정함 [ ] 보류"
+DESIGN_CHOICE = "선택: [ ] 직접 정함 [ ] 보류"
+DESIGN_CHOICE_WITH_OPTIONS = "선택: [ ] 선택지 ___ [ ] 직접 정함 [ ] 보류"
+DESIGN_CHOICE_WITH_PATCH = "선택: [ ] 작성자 안 채택(패치 직접 적용) [ ] 직접 정함 [ ] 보류"
 DRY_RUN_NOT_APPLIED = "적용 안 됨(dry-run)"
 UNTIMED_STEPS = ("report",)
 TABLE_FOOTNOTE = (
@@ -175,6 +177,20 @@ def _judge_lines(decision: dict, results: dict | None) -> list[str]:
     return list(decision.get("reasons", []))
 
 
+def _design_lines(ledger: Ledger, results: dict | None, round_no: int, fid: str) -> list[str]:
+    """설계 결정 칸의 작성자 결과. 작성자가 설계 결정으로 봤으면 선택지를, 고쳤으면 채택하지 않은 수정안과 패치 경로를 붙인다."""
+    item = (results or {}).get(f"{fid}:writer") if ledger.mode == "doc" else None
+    if not isinstance(item, dict):
+        return [f"  - {DESIGN_CHOICE}"]
+    reason = [line for line in str(item.get("reason", "")).splitlines() if line.strip()]
+    if item.get("needs_design_decision"):
+        return ["  - 작성자 선택지:", *(f"    {line}" for line in reason), f"  - {DESIGN_CHOICE_WITH_OPTIONS}"]
+    if str(item.get("patch", "")).strip():
+        return ["  - 작성자 수정안(채택 안 함):", *(f"    {line}" for line in reason),
+                f"  - 패치: round-{round_no}/patch-{fid}-writer.diff", f"  - {DESIGN_CHOICE_WITH_PATCH}"]
+    return [*([f"  - 작성자: {' '.join(reason)}"] if reason else []), f"  - {DESIGN_CHOICE}"]
+
+
 def _has_adjudication_note(reasons: list[str], opus: str) -> bool:
     prefix = f"{ADJUDICATION_MARK}:"
     return any(r.startswith(prefix) and r[len(prefix):].strip() == opus for r in reasons)
@@ -199,11 +215,7 @@ def _bucket_section(name: str, items: list[tuple[int, dict, dict]], ledger: Ledg
             out.append(f"  - {REBUTTAL_CHOICE}")
         elif name == BUCKET_DESIGN:
             out.extend(_indent_reasons(_judge_lines(decision, results)))
-            options = _worker_reason(results, fid, "writer") if ledger.mode == "doc" else None
-            if options:
-                out.append("  - 작성자 선택지:")
-                out.extend(f"    {line}" for line in options.splitlines() if line.strip())
-            out.append(f"  - {DESIGN_CHOICE}")
+            out.extend(_design_lines(ledger, results, round_no, fid))
         elif name == BUCKET_UNDECIDABLE:
             reasons = decision.get("reasons", [])
             out.extend(_indent_reasons(reasons))
