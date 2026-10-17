@@ -21,7 +21,7 @@ when_to_use: 사용자가 리뷰에서 나온 지적을 고치게 할 때 쓴다
 PYTHONPATH="${CLAUDE_SKILL_DIR}" python3 -m cascade.cli
 ```
 
-`${CLAUDE_SKILL_DIR}`는 이 `SKILL.md`가 있는 디렉터리로 바뀌어 보인다. 글자 그대로 보이면 스킬 디렉터리를 직접 넣는다: 플러그인으로 설치했으면 `${CLAUDE_PLUGIN_ROOT}`, 개인 스킬이면 `~/.claude/skills/cascade-fix`. 각 명령이 출력하는 「다음:」 줄에는 절대 경로가 들어 있으니 그다음부터는 그 줄을 그대로 쓴다. `RJ`는 `${CLAUDE_SKILL_DIR}/scripts/run-jobs.js`다.
+위 `PYTHONPATH` 값은 스킬을 불러올 때 이 `SKILL.md`가 있는 디렉터리의 절대 경로로 채워진다. 달러 기호와 중괄호로 된 변수 이름이 그대로 남아 있으면 스킬 디렉터리를 직접 넣는다: 플러그인으로 설치했으면 `~/.claude/plugins/cache/sch0718/cascade-fix/<버전>`, 개인 스킬이면 `~/.claude/skills/cascade-fix`. 각 명령이 출력하는 「다음:」 줄에는 절대 경로가 들어 있으니 그다음부터는 그 줄을 그대로 쓴다. `RJ`는 `${CLAUDE_SKILL_DIR}/scripts/run-jobs.js`다.
 
 `RR`은 `codex-review` 스킬의 `run-review.sh`다(Codex 검토자일 때만 쓴다. 찾는 순서: 환경 변수 `CASCADE_RUN_REVIEW`, 이 스킬 옆의 `codex-review/`, `~/.claude/skills/codex-review/`). `init`이 쓰는 경로를 출력한다.
 
