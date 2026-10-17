@@ -66,6 +66,11 @@ def _read_text(path: Path) -> str | None:
         return None
 
 
+def _uses_unittest(path: Path) -> bool:
+    text = _read_text(path) or ""
+    return bool(re.search(r"^\s*(?:import unittest|from unittest\b)", text, re.MULTILINE))
+
+
 def detect_candidates(root: Path) -> dict[str, list[str]]:
     root = Path(root)
     found: dict[str, list[str]] = {k: [] for k in CANDIDATE_KEYS}
@@ -112,10 +117,16 @@ def detect_candidates(root: Path) -> dict[str, list[str]]:
 
     if not found["tests"]:
         tests_dir = next((d for d in ("tests", "test") if (root / d).is_dir()), None)
-        if tests_dir and any((root / tests_dir).glob("test_*.py")):
+        test_files = sorted((root / tests_dir).glob("test_*.py")) if tests_dir else []
+        if any(_uses_unittest(f) for f in test_files):
             # {files}를 넣지 않는다: 파일 경로로 넘기면 discover -s 와 달리 tests_dir가 sys.path에 안 들어가
             # 테스트 안의 형제 모듈 import가 깨지고, 관련 테스트가 없으면 0건 실행(3.12부터 실패)이 된다
             add("tests", f"python3 -m unittest discover -s {tests_dir} -p 'test_*.py'")
             add("full_tests", f"python3 -m unittest discover -s {tests_dir} -p 'test_*.py'")
+        elif test_files:
+            # unittest를 쓰지 않는 test_*.py는 pytest 함수 테스트로 본다. unittest discover는 이를 0건으로
+            # 세고 3.11까지는 성공(종료 코드 0)으로 끝내 실패하는 코드도 검증을 통과시킨다
+            add("tests", "pytest {files}")
+            add("full_tests", "pytest")
 
     return found

@@ -8,10 +8,11 @@ from pathlib import Path
 
 from cascade.config import ConfigError, RepoConfig, detect_candidates, is_sensitive_path, load_repo_config
 from cascade.findings import ParseError, fetch_pr_findings, parse_codex_code, parse_codex_doc
-from cascade.review import REVIEWER_AUTO, REVIEWER_CLAUDE, label, resolve
+from cascade.review import REVIEWER_AUTO, REVIEWER_CLAUDE, label, read_review_results, resolve
 from cascade.snapshot import RUN_DIR_NAME
 
 DOC_SUFFIXES = (".md", ".markdown", ".txt", ".rst")
+_LOCATION_FILE = re.compile(r"^(.+?):\d+")
 LARGE_CHANGE_FILES = 30
 SEVERITY_SPLIT_JOBS = 10  # 1단계 작업이 이보다 많으면 등급별로 나눠 돌리는 안을 낸다
 REGISTER_APPROVAL = "검증 명령 등록"
@@ -94,22 +95,42 @@ def pr_info(root: Path, gh: list[str], number: str | None = None) -> tuple[dict 
             "unresolved": len(findings), "me": me}, None
 
 
+def _sectioned(raw: str) -> tuple[int, bool] | None:
+    """Critical/Warning/Suggestion 형식을 읽어 (지적 수, 위치가 모두 문서 파일인가)를 낸다. 형식이 아니면 None."""
+    try:
+        findings = parse_codex_doc(raw, 1)
+    except ParseError:
+        return None
+    paths = [m.group(1) if (m := _LOCATION_FILE.match(f.location)) else f.location for f in findings]
+    return len(findings), bool(paths) and all(p.lower().endswith(DOC_SUFFIXES) for p in paths)
+
+
 def classify_input(path: Path) -> tuple[str | None, int]:
-    """결과 파일이 어떤 --source 인지와 지적 수를 추정한다."""
+    """결과 파일이 어떤 --source 인지와 지적 수를 추정한다.
+
+    Claude 검토 결과와 codex-doc 결과는 같은 Critical/Warning/Suggestion 형식이라 형식으로는 못 가른다.
+    지적 위치가 모두 문서 파일이면 문서 모드, 코드 파일이 하나라도 있으면 코드 모드로 본다.
+    """
     raw = path.read_text(encoding="utf-8")
     try:
         data = json.loads(raw)
     except ValueError:
         data = None
     if isinstance(data, dict) and "results" in data:
-        return "claude-code", -1
+        texts = [text for text, _ in read_review_results(data).values()]
+        found = _sectioned(texts[0]) if texts else None
+        if found is None or not found[0]:
+            return "claude-code", -1
+        return ("claude-doc" if found[1] else "claude-code"), found[0]
     code = parse_codex_code(raw, 1)
     if code:
         return "codex-code", len(code)
-    try:
-        return "codex-doc", len(parse_codex_doc(raw, 1))
-    except ParseError:
+    found = _sectioned(raw)
+    if found is None:
         return None, 0
+    if found[0] and not found[1]:
+        return "claude-code", found[0]
+    return "codex-doc", found[0]
 
 
 def estimate(findings: int, mode: str, reviewer: str) -> dict:
@@ -148,7 +169,8 @@ def _config(root: Path, repos_toml: Path) -> tuple[RepoConfig | None, str | None
 
 
 def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list[str] | None,
-           input_path: Path | None = None, pr: str | None = None, reviewer_choice: str = REVIEWER_AUTO) -> dict:
+           input_path: Path | None = None, pr: str | None = None, reviewer_choice: str = REVIEWER_AUTO,
+           root_flag: str = "") -> dict:
     root = Path(root)
     branch = current_branch(root)
     base = default_base(root)
@@ -187,7 +209,11 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
             rng, why = f"--base {q(base)}", f"{base}보다 커밋 {commits}개 앞섬({len(ahead)}파일)"
         rec["reasons"].append(why + (" — 모두 문서라 문서 모드" if doc_only else ""))
         if doc_only:
-            rec["review_args"] = " ".join(f"--doc {q(p)}" for p in changed)
+            # 지운 문서는 review --doc 이 읽을 수 없다. --root 로 다른 저장소를 가리키면 절대 경로를 준다
+            docs = [p for p in changed if (root / p).is_file()]
+            if not docs:
+                blockers.append("바뀐 문서가 모두 삭제라 문서 검토할 파일이 없다: " + ", ".join(changed[:5]))
+            rec["review_args"] = " ".join(f"--doc {q(str(root / p) if root_flag else p)}" for p in docs)
         else:
             rec["review_args"] = rng
         if len(changed) > LARGE_CHANGE_FILES:
@@ -222,11 +248,11 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
         notes.append("커밋하지 않은 변경이 있다. 채택 패치가 작업 트리에 섞이지 않게 하려면 --dry-run 을 쓴다")
 
     steps = rec["steps"]
-    flags = "" if reviewer_choice == REVIEWER_AUTO else f" --reviewer {reviewer_choice}"
+    flags = ("" if reviewer_choice == REVIEWER_AUTO else f" --reviewer {reviewer_choice}") + root_flag
     if not blockers and rec["source"]:
         if rec["source"].startswith("claude-") and input_path is None:
             rec["first_review"] = 1
-            steps.append(f"{cli} review --kind {rec['mode']} {rec['review_args']}")
+            steps.append(f"{cli} review --kind {rec['mode']} {rec['review_args']}{root_flag}")
             steps.append("Workflow(첫 검토) → review.json 저장 → review 출력의 init 명령")
         elif rec["source"] == "pr-comment":
             steps.append(f"{cli} init --source pr-comment --input {pr_data['number']} --pr-repo {q(pr_data['repo'])}"

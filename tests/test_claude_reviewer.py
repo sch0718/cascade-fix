@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from cascade import review  # noqa: E402
 from cascade.snapshot import commit_worktree  # noqa: E402
-from helpers import git  # noqa: E402
+from helpers import git, make_repo, run_cli  # noqa: E402
 from test_cli_e2e import CALC, FIXTURES, RECHECK_RESULT, CliTestBase, fix  # noqa: E402
 
 MODEL = review.DEFAULT_MODEL
@@ -82,6 +82,20 @@ class ClaudeReviewCommandTest(CliTestBase):
         self.assertIn(str(self.repo), prompt)
         self.assertIn("init --source claude-code", p.stdout)
         self.assertIn(".cascade-fix/", git(self.repo, "status", "--porcelain", "--ignored"))
+
+    def test_review_with_root_keeps_target_in_init(self):
+        caller = make_repo(self.tmp / "caller", {"x.py": "x = 1\n"})
+        (self.repo / "calc.py").write_text(CALC + "\n", encoding="utf-8")
+        p = run_cli(["review", "--kind", "code", "--uncommitted", "--root", str(self.repo)], cwd=caller, env=self.env)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        init_line = next(x for x in p.stdout.splitlines() if " init --source " in x)
+        self.assertIn(f"--root {self.repo}", init_line)
+        result = review_results(self.review_dir(p) / "review.json", review.REVIEW_JOB, CLAUDE_REVIEW)
+        p = run_cli(["init", "--source", "claude-code", "--input", str(result), "--root", str(self.repo)],
+                    cwd=caller, env=self.env)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.run_dir = Path(next(x for x in p.stdout.splitlines() if x.startswith("run_dir=")).split("=", 1)[1])
+        self.assertEqual(Path(self.ledger().root), self.repo)
 
     def test_review_needs_exactly_one_range(self):
         p = self.cli("review", "--kind", "code", ok=False)

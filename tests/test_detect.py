@@ -24,12 +24,43 @@ class EstimateTest(unittest.TestCase):
         self.assertIn("점검자 최대 2", detect.estimate_line(2, "doc", "codex"))
 
 
+SECTIONED = "Critical\n없음.\n\nWarning\n1. {title}\n   위치: {loc}\n   근거: 확인했다\n   제안: 고친다\n\nSuggestion\n없음.\n"
+
+
+class ClassifyInputTest(unittest.TestCase):
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.tmp = Path(self._td.name)
+
+    def write(self, name, text, as_results=False):
+        if as_results:
+            text = json.dumps({"results": [{"id": "review:reviewer", "output": {"text": text, "model_id": "m"}}]})
+        path = self.tmp / name
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_claude_results_follow_finding_locations(self):
+        doc = self.write("doc.json", SECTIONED.format(title="모호하다", loc="README.md:3"), as_results=True)
+        self.assertEqual(detect.classify_input(doc), ("claude-doc", 1))
+        code = self.write("code.json", SECTIONED.format(title="틀렸다", loc="app.py:1"), as_results=True)
+        self.assertEqual(detect.classify_input(code), ("claude-code", 1))
+        failed = self.write("failed.json", json.dumps({"results": [{"id": "review:reviewer", "output": None}]}))
+        self.assertEqual(detect.classify_input(failed), ("claude-code", -1))
+
+    def test_sectioned_text_with_code_location_is_code_mode(self):
+        code = self.write("code.txt", SECTIONED.format(title="틀렸다", loc="app.py:1"))
+        self.assertEqual(detect.classify_input(code), ("claude-code", 1))
+        doc = self.write("doc.final", SECTIONED.format(title="모호하다", loc="plan.md:3"))
+        self.assertEqual(detect.classify_input(doc), ("codex-doc", 1))
+
+
 class DetectCliTest(unittest.TestCase):
     def setUp(self):
         self._td = tempfile.TemporaryDirectory()
         self.addCleanup(self._td.cleanup)
         self.tmp = Path(self._td.name).resolve()
-        self.repo = make_repo(self.tmp / "repo", {"calc.py": "x = 1\n", "README.md": "# r\n", "tests/test_calc.py": "\n"})
+        self.repo = make_repo(self.tmp / "repo", {"calc.py": "x = 1\n", "README.md": "# r\n", "tests/test_calc.py": "import unittest\n"})
         self.toml = write_repos_toml(self.tmp, {str(self.repo): {"tests": ["python3 -m unittest {files}"]}})
         self.env = {"CASCADE_REPOS_TOML": str(self.toml), "CASCADE_REVIEWER": "auto"}
 
@@ -62,6 +93,25 @@ class DetectCliTest(unittest.TestCase):
         self.assertEqual((rec["source"], rec["mode"]), ("claude-doc", "doc"))
         self.assertEqual(r["ahead"]["commits"], 1)
         self.assertIn("--doc README.md", rec["steps"][0])
+
+    def test_root_from_other_repo_is_kept_in_next_steps(self):
+        caller = make_repo(self.tmp / "caller", {"x.py": "x = 1\n"})
+        (self.repo / "README.md").write_text("# 바꿈\n", encoding="utf-8")
+        p = run_cli(["detect", "--json", "--no-gh", "--root", str(self.repo)], cwd=caller, env=self.env)
+        rec = json.loads(p.stdout)["recommendation"]
+        self.assertIn(f"--doc {self.repo / 'README.md'}", rec["steps"][0])
+        self.assertTrue(rec["steps"][0].endswith(f"--root {self.repo}"))
+
+    def test_deleted_docs_only_blocks_doc_review(self):
+        git(self.repo, "rm", "-q", "README.md")
+        code, r = self.detect()
+        self.assertEqual(code, 6)
+        self.assertIn("모두 삭제", r["blockers"][0])
+        (self.repo / "NOTES.md").write_text("# 새 문서\n", encoding="utf-8")
+        code, r = self.detect()
+        self.assertEqual(code, 0)
+        self.assertNotIn("README.md", r["recommendation"]["review_args"])
+        self.assertIn("--doc NOTES.md", r["recommendation"]["review_args"])
 
     def test_missing_config_offers_unittest_candidate(self):
         self.env["CASCADE_REPOS_TOML"] = str(self.tmp / "none.toml")

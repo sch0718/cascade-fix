@@ -297,6 +297,11 @@ def _severity_filter(raw: str | None) -> set[str]:
     return chosen
 
 
+def _root_flag(args, root: Path) -> str:
+    """--root 로 다른 저장소를 가리켰으면 다음 명령에도 붙인다(빼면 현재 디렉터리의 저장소가 대상이 된다)."""
+    return f" --root {shlex.quote(str(root))}" if args.root else ""
+
+
 def cmd_detect(args) -> int:
     root = Path(args.root).resolve() if args.root else s.git_toplevel(Path.cwd())
     gh = None if args.no_gh else shlex.split(os.environ.get("CASCADE_GH", "gh"))
@@ -304,7 +309,7 @@ def cmd_detect(args) -> int:
         raise s.CliError(f"알 수 없는 검토자: {args.reviewer} ({' / '.join(REVIEWER_CHOICES)}, CASCADE_REVIEWER 확인)")
     result = detect(root, repos_toml=s.repos_toml(), run_review=s.RUN_REVIEW, cli=s.CLI, gh=gh,
                     input_path=Path(args.input).resolve() if args.input else None, pr=args.pr,
-                    reviewer_choice=args.reviewer)
+                    reviewer_choice=args.reviewer, root_flag=_root_flag(args, root))
     print(json.dumps(result, ensure_ascii=False, indent=2) if args.json else render_detect(result))
     return 0 if result["ok"] else ExitCodes.NEEDS_USER
 
@@ -344,7 +349,8 @@ def cmd_review(args) -> int:
     print(f"  {s.workflow_step(args_path, result)}")
     print(f"  {s.CLI} init --source {source} --input {shlex.quote(str(result))}{docs_args}"
           + (f" --review-model {shlex.quote(model)}" if args.review_model else "")
-          + (f" --review-effort {effort}" if args.review_effort else ""))
+          + (f" --review-effort {effort}" if args.review_effort else "")
+          + _root_flag(args, root))
     return 0
 
 

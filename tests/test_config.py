@@ -150,5 +150,10 @@ class RepoTomlLocationTest(unittest.TestCase):
             del os.environ["CASCADE_RUN_REVIEW"]
 
     def test_unittest_candidate(self):
-        repo = make_repo(Path(self._td.name) / "r", {"tests/test_a.py": "\n"})
+        repo = make_repo(Path(self._td.name) / "r", {"tests/test_a.py": "import unittest\n"})
         self.assertIn("python3 -m unittest discover -s tests -p 'test_*.py'", config.detect_candidates(repo)["tests"])
+
+    def test_pytest_style_tests_get_pytest_candidate(self):
+        repo = make_repo(Path(self._td.name) / "r", {"tests/test_app.py": "def test_broken():\n    assert False\n"})
+        found = config.detect_candidates(repo)
+        self.assertEqual((found["tests"], found["full_tests"]), (["pytest {files}"], ["pytest"]))
