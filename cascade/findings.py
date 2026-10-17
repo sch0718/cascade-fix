@@ -1,7 +1,7 @@
 import json
 import re
 import subprocess
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 SEVERITY_MAP = {"P0": "Critical", "P1": "Critical", "P2": "Warning", "P3": "Suggestion"}
@@ -40,6 +40,7 @@ class Finding:
     thread_id: str | None = None
     outdated: bool = False
     carried_from: str | None = None
+    carried_after: list[str] = field(default_factory=list)
 
     def to_dict(self):
         return asdict(self)

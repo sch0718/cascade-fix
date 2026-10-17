@@ -360,7 +360,13 @@ class CliEndToEndTest(CliTestBase):
         self.assertEqual(ledger.rounds[1].base_commit, ledger.rounds[0].result_commit)
         self.assertEqual([(f["id"], f["carried_from"]) for f in ledger.rounds[1].findings], [("r2-01", "r1-02")])
 
+        self.assertEqual(ledger.rounds[1].findings[0]["carried_after"], ["r1-01 calc.py:2 — add가 빼기를 한다"])
+
         self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "2")
+        args = json.loads((self.run_dir / "round-2" / "stage1-args.json").read_text(encoding="utf-8"))
+        prompt = Path(args["jobs"][0]["promptPath"]).read_text(encoding="utf-8")
+        self.assertIn("앞 회차의 r1-02", prompt)
+        self.assertIn("- r1-01 calc.py:2 — add가 빼기를 한다", prompt)
         for name in ("r2-01-a", "r2-01-b"):
             wt = self.wt(name)
             text = (wt / "calc.py").read_text(encoding="utf-8")

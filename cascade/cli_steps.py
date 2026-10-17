@@ -527,7 +527,8 @@ def carried_ids(rnd: RoundRecord, applied: list[str], failed: list[str], patches
 
 def carried_findings(rnd: RoundRecord) -> list[Finding]:
     ids = {d["finding_id"] for d in rnd.decisions if d["outcome"] == OUTCOME_CARRIED}
-    return [replace(f, carried_from=f.id) for f in findings_of(rnd) if f.id in ids]
+    applied = [f"{f.id} {f.location} — {first_line(f.body)}" for f in findings_of(rnd) if f.id in rnd.adopted]
+    return [replace(f, carried_from=f.id, carried_after=applied) for f in findings_of(rnd) if f.id in ids]
 
 
 def is_claude(ledger: Ledger) -> bool:

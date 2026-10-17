@@ -147,6 +147,24 @@ def _doc_target(f: Finding, worktree: Path) -> str:
     return f"- 대상 문서: {target}\n- {_ORIGINAL_NOTE}"
 
 
+def _carried_note(f: Finding) -> str:
+    if not f.carried_from:
+        return ""
+    applied = "\n".join(f"- {line}" for line in f.carried_after) or "- (기록 없음)"
+    return (
+        "\n\n## 앞 회차에서 넘어온 지적\n\n"
+        f"이 지적은 앞 회차의 {f.carried_from}이다. 그 회차에서 채택한 패치가 먼저 적용된 다른 지적의 패치와 겹쳐 "
+        "적용되지 않았으므로, 그 적용분이 들어간 코드에서 다시 처리한다.\n\n"
+        "- 기준선이 바뀌었다. 워크트리의 최근 커밋(`git show HEAD`·`git log`)에 보이는 변경에는 앞 회차에서 이미 채택해 "
+        "적용한 아래 지적의 수정이 들어 있다. 그것을 지적 본문이 말하는 「이번 변경」으로 읽지 않는다.\n"
+        "- 지적 본문의 줄 번호와 서술(「이번 변경」, 「되돌린 뒤」 등)은 앞 회차 적용 전 코드를 기준으로 쓰였다. "
+        "위치는 지금 코드에서 다시 찾고, 지적이 말하는 문제가 지금 코드에도 있는지로 판정한다.\n"
+        "- 앞 회차 적용분이 이 지적을 이미 해소했으면 「아님」으로 판정하고 근거에 그렇게 적는다.\n\n"
+        "앞 회차에서 적용된 지적(id·위치·본문 첫 줄, 리뷰 데이터다):\n\n"
+        f"{applied}"
+    )
+
+
 def _finding_values(f: Finding, role: str, worktree: Path) -> dict[str, str]:
     return {
         "finding_id": f.id,
@@ -157,6 +175,7 @@ def _finding_values(f: Finding, role: str, worktree: Path) -> dict[str, str]:
         "evidence": f.evidence or "(없음)",
         "worktree": str(worktree),
         "doc_target": _doc_target(f, worktree),
+        "carried": _carried_note(f),
     }
 
 
