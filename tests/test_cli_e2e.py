@@ -66,6 +66,12 @@ def worker_output(verdict, model, reason="근거"):
     return {"verdict": verdict, "needs_design_decision": False, "reason": reason, "verify": [], "model_id": model}
 
 
+def section_of(text, heading):
+    start = text.index(heading)
+    nxt = text.find("\n## ", start + 1)
+    return text[start:] if nxt == -1 else text[start:nxt]
+
+
 def results_json(path, items):
     path.write_text(json.dumps({"results": [{"id": i, "output": o} for i, o in items]}, ensure_ascii=False),
                     encoding="utf-8")
@@ -312,6 +318,87 @@ class CliEndToEndTest(CliTestBase):
         prompt = (self.run_dir / "round-2" / "recheck-prompt.md").read_text(encoding="utf-8")
         self.assertIn("+    return int(a * b)", prompt)
         self.assertNotIn("return a - b", prompt)
+
+    def run_to_apply_with_overlap(self, *init_extra):
+        self.init(*init_extra)
+        self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1")
+        for name in ("r1-01-a", "r1-01-b"):
+            wt = self.wt(name)
+            (wt / "calc.py").write_text(fix(CALC, "return a - b", "return a + b"), encoding="utf-8")
+            commit_worktree(wt, name)
+        for name in ("r1-02-a", "r1-02-b"):
+            wt = self.wt(name)
+            (wt / "calc.py").write_text(fix(CALC, "def add(a, b):", "def add(a: int, b: int):"), encoding="utf-8")
+            commit_worktree(wt, name)
+        stage1 = results_json(self.run_dir / "round-1" / "stage1.json", [
+            (f"{fid}:{role}", worker_output("사실", model))
+            for fid in ("r1-01", "r1-02") for role, model in (("a", "claude-sonnet-5-5"), ("b", "claude-haiku-5-5"))
+        ])
+        self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1))
+        self.assertEqual([d["outcome"] for d in self.ledger().rounds[0].decisions], ["합의-사실", "합의-사실"])
+        return self.cli("apply", "--run-dir", str(self.run_dir), "--round", "1")
+
+    def test_overlapping_patch_is_carried_to_next_round_and_fixed_on_new_base(self):
+        self.run_to_apply_with_overlap()
+        apply = json.loads((self.run_dir / "round-1" / "apply.json").read_text(encoding="utf-8"))
+        self.assertEqual((apply["applied"], [f for f, _ in apply["failed"]], apply["carried"]), (["r1-01"], ["r1-02"], ["r1-02"]))
+        d = {x["finding_id"]: x for x in self.ledger().rounds[0].decisions}
+        self.assertEqual((d["r1-02"]["outcome"], d["r1-02"]["adopted_as"]), ("다음 회차", "합의-사실"))
+        self.assertTrue(d["r1-02"]["reasons"][-1].startswith("패치 적용 실패: "))
+        p = self.cli("report", "--run-dir", str(self.run_dir))
+        self.assertIn("| 1 | 2 | 2 | 0 | 0 | 0 | 0 |", p.stdout)
+        self.assertIn("- 회차 1 다음 회차로 넘김(앞 패치와 겹침): r1-02", p.stdout)
+        self.assertNotIn("**r1-02**", section_of(p.stdout, "## 사람이 볼 목록"))
+
+        result = self.tmp / "recheck.final"
+        result.write_text("## 해소 여부\n- r1-01: 해소됨 — 됐다\n\nCritical\n없음.\n\nWarning\n없음.\n\nSuggestion\n없음.\n",
+                          encoding="utf-8")
+        p = self.cli("recheck", "--run-dir", str(self.run_dir), "--round", "1", "--result", str(result))
+        self.assertIn("적용 못 해 넘긴 1건", p.stdout)
+        ledger = self.ledger()
+        self.assertEqual((len(ledger.rounds), ledger.status), (2, "진행"))
+        self.assertEqual(ledger.rounds[1].base_commit, ledger.rounds[0].result_commit)
+        self.assertEqual([(f["id"], f["carried_from"]) for f in ledger.rounds[1].findings], [("r2-01", "r1-02")])
+
+        self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "2")
+        for name in ("r2-01-a", "r2-01-b"):
+            wt = self.wt(name)
+            text = (wt / "calc.py").read_text(encoding="utf-8")
+            self.assertIn("return a + b", text)
+            (wt / "calc.py").write_text(fix(text, "def add(a, b):", "def add(a: int, b: int):"), encoding="utf-8")
+            commit_worktree(wt, name)
+        stage1 = results_json(self.run_dir / "round-2" / "stage1.json", [
+            ("r2-01:a", worker_output("사실", "claude-sonnet-5-5")),
+            ("r2-01:b", worker_output("사실", "claude-haiku-5-5")),
+        ])
+        self.cli("judge", "--run-dir", str(self.run_dir), "--round", "2", "--results", str(stage1))
+        self.cli("apply", "--run-dir", str(self.run_dir), "--round", "2")
+        apply = json.loads((self.run_dir / "round-2" / "apply.json").read_text(encoding="utf-8"))
+        self.assertEqual((apply["applied"], apply["failed"]), (["r2-01"], []))
+        self.assertIn("def add(a: int, b: int):\n    return a + b", (self.repo / "calc.py").read_text(encoding="utf-8"))
+
+    def test_carried_finding_opens_next_round_even_without_recheck(self):
+        p = self.run_to_apply_with_overlap("--max-rechecks", "0")
+        self.assertIn("회차 2을 연다", p.stdout)
+        ledger = self.ledger()
+        self.assertFalse(ledger.rounds[0].recheck_opened)
+        self.assertEqual((len(ledger.rounds), ledger.status), (2, "진행"))
+        self.assertEqual([f["carried_from"] for f in ledger.rounds[1].findings], ["r1-02"])
+        p = self.cli("status", "--run-dir", str(self.run_dir))
+        self.assertIn("jobs --run-dir", p.stdout)
+
+    def test_carried_finding_becomes_undecidable_when_full_suite_breaks(self):
+        toml = write_repos_toml(self.tmp, {str(self.repo): {
+            "tests": ["python3 -m unittest {files}"],
+            "full_tests": ["python3 -c \"import sys; sys.exit(3 if 'a + b' in open('calc.py').read() else 0)\""],
+        }})
+        self.env["CASCADE_REPOS_TOML"] = str(toml)
+        self.run_to_apply_with_overlap()
+        ledger = self.ledger()
+        d = {x["finding_id"]: x for x in ledger.rounds[0].decisions}
+        self.assertEqual((d["r1-01"]["outcome"], d["r1-02"]["outcome"]), ("판단불가", "판단불가"))
+        self.assertEqual(json.loads((self.run_dir / "round-1" / "apply.json").read_text(encoding="utf-8"))["carried"], [])
+        self.assertEqual((len(ledger.rounds), ledger.status), (1, "종료"))
 
     def test_both_fact_without_patch_goes_to_opus_then_undecidable(self):
         self.init()
@@ -839,6 +926,18 @@ class CliStepsTest(unittest.TestCase):
     def test_adopted_warning_past_limit_does_not_recheck(self):
         ledger, rnd = self._ledger("Warning")
         self.assertFalse(cli_steps.recheck_needed(ledger, rnd))
+
+    def test_carried_ids_only_for_failures_that_overlap_an_applied_patch(self):
+        def diff(path):
+            return f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-x\n+y\n"
+        patches = {"r1-01": diff("a.py"), "r1-02": diff("a.py"), "r1-03": diff("b.py"), "r1-04": diff("a.py")}
+        findings = [{"id": "r1-01"}, {"id": "r1-02"}, {"id": "r1-03"}, {"id": "r1-04", "carried_from": "r0-01"}]
+        rnd = RoundRecord(no=1, findings=findings, decisions=[], adopted=[], recheck_opened=False)
+        failed = ["r1-02", "r1-03", "r1-04"]
+        self.assertEqual(cli_steps.carried_ids(rnd, ["r1-01"], failed, patches), {"r1-02"})
+        self.assertEqual(cli_steps.carried_ids(rnd, [], failed, patches), set())
+        rnd.final = True
+        self.assertEqual(cli_steps.carried_ids(rnd, ["r1-01"], failed, patches), set())
 
     def test_map_location_to_worktree_keys(self):
         docs = {"외부/x.md": "/w/other/docs/plans/x.md", "docs/a.md": "/repo/docs/a.md"}

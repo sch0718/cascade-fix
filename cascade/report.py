@@ -32,7 +32,8 @@ TABLE_FOOTNOTE = (
     "합의-아님은 합의 칸에 한 번 세고 사람이 볼 목록의 반박 칸에도 오른다. "
     "판가름 회부는 판가름에 들어간 지적 전부이고, 판가름 채택은 그 가운데 패치를 채택한 지적이다. "
     "합의·판가름 채택은 판정 때 값이라 적용 실패나 전체 테스트 실패로 판단 불가가 된 지적도 그대로 센다. "
-    "사람 칸은 설계결정·판단불가·보류후보와 판가름 뒤에도 채택하지 못한 지적이다(적용 단계에서 판단 불가가 된 지적 포함)."
+    "사람 칸은 설계결정·판단불가·보류후보와 판가름 뒤에도 채택하지 못한 지적이다(적용 단계에서 판단 불가가 된 지적 포함). "
+    "앞 패치와 겹쳐 적용하지 못하고 다음 회차로 넘긴 지적은 사람 칸에 세지 않고 다음 회차 지적에 다시 센다."
 )
 
 
@@ -154,9 +155,10 @@ def _fenced(text: str) -> str:
 
 
 def _item_line(finding: dict, decision: dict) -> str:
+    carried = f" (회차를 넘어옴: {finding['carried_from']})" if finding.get("carried_from") else ""
     return (
         f"- **{finding.get('id', decision['finding_id'])}** "
-        f"({finding.get('severity', '-')}, {finding.get('location', '-')}) — {_first_line(finding.get('body', ''))}"
+        f"({finding.get('severity', '-')}, {finding.get('location', '-')}) — {_first_line(finding.get('body', ''))}{carried}"
     )
 
 
@@ -322,6 +324,8 @@ def _prepared_section(ledger: Ledger, run_dir: Path | None) -> list[str]:
         if applied is None:
             continue
         apply_lines.append(f"- 회차 {rnd.no} 적용: {', '.join(applied.get('applied', [])) or '없음'}")
+        if applied.get("carried"):
+            apply_lines.append(f"- 회차 {rnd.no} 다음 회차로 넘김(앞 패치와 겹침): {', '.join(applied['carried'])}")
         for fid, tail in _failed_items(applied):
             apply_lines.extend([f"- 회차 {rnd.no} 실패 **{fid}**:", "", _fenced(str(tail)), ""])
     if apply_lines:

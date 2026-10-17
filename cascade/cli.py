@@ -14,6 +14,7 @@ from cascade import cli_steps as s
 from cascade.config import ExitCodes
 from cascade.consensus import (
     OUTCOME_ADJUDICATE,
+    OUTCOME_CARRIED,
     OUTCOME_HOLD,
     OUTCOME_UNDECIDABLE,
     REASON_SENSITIVE,
@@ -92,6 +93,7 @@ SOURCES = ("codex-doc", "codex-code", "claude-doc", "claude-code", "pr-comment")
 HOLD_CHOICES = ("지금 반영", "구현 때 테스트로", "보류")
 CHOICE_NOW = "지금 반영"
 REASON_APPLY_FAILED = "패치 적용 실패"
+REASON_CARRIED = "앞서 적용한 패치와 겹쳐 다음 회차에서 바뀐 코드로 다시 고친다"
 REASON_INTERFERENCE = "전체 테스트 실패(간섭 의심)"
 REASON_FINAL_BASELINE_FAILED = "전체 테스트 실패(기준선도 실패)"
 REASON_OUT_OF_SCOPE = "재검토 범위 밖"
@@ -640,9 +642,16 @@ def _adopted_patches(rnd: RoundRecord, rd: Path) -> list[tuple[str, str]]:
     return patches
 
 
-def _record_apply(run_dir: Path, ledger: Ledger, rnd: RoundRecord, rd: Path, report: ApplyReport, data: dict) -> None:
+def _record_apply(run_dir: Path, ledger: Ledger, rnd: RoundRecord, rd: Path, report: ApplyReport, data: dict,
+                  patches: list[tuple[str, str]]) -> None:
+    carried = s.carried_ids(rnd, report.applied, [fid for fid, _ in report.failed], dict(patches))
     for fid, tail in report.failed:
-        _set_decision(rnd, fid, OUTCOME_UNDECIDABLE, f"{REASON_APPLY_FAILED}: {s.first_line(tail)}")
+        reason = f"{REASON_APPLY_FAILED}: {s.first_line(tail)}"
+        if fid in carried:
+            _set_decision(rnd, fid, OUTCOME_CARRIED, f"{reason} — {REASON_CARRIED}")
+        else:
+            _set_decision(rnd, fid, OUTCOME_UNDECIDABLE, reason)
+    data["carried"] = [fid for fid, _ in report.failed if fid in carried]
     rnd.adopted = list(report.applied)
     s.write_json(rd / "apply.json", data)
     s.write_json(rd / "decisions.json", rnd.decisions)
@@ -660,7 +669,7 @@ def _patch_dry_run(run_dir, ledger, rnd, rd, patches) -> Path:
     report = apply_all(wt, patches)
     rnd.result_commit = commit_worktree(wt, f"cascade-fix {ledger.run_id} 회차 {rnd.no} 결과(dry-run)") or s.base_of(ledger, rnd)
     data = {"dry_run": True, **report.to_dict(), "would_apply": list(report.applied), "result_worktree": str(wt)}
-    _record_apply(run_dir, ledger, rnd, rd, report, data)
+    _record_apply(run_dir, ledger, rnd, rd, report, data, patches)
     print(f"dry-run: 작업 트리에는 적용하지 않고 {wt} 에 적용했다 (채택 {len(report.applied)}건, 실패 {len(report.failed)}건)")
     return wt
 
@@ -668,7 +677,7 @@ def _patch_dry_run(run_dir, ledger, rnd, rd, patches) -> Path:
 def _patch_user_tree(run_dir, ledger, rnd, rd, patches, root) -> None:
     report = apply_all(root, patches, s.external_docs(ledger))
     rnd.result_commit = snapshot_tree(s.snapshot_of(ledger), list(s.external_docs(ledger).values()))
-    _record_apply(run_dir, ledger, rnd, rd, report, report.to_dict())
+    _record_apply(run_dir, ledger, rnd, rd, report, report.to_dict(), patches)
     print(f"적용 {len(report.applied)}건, 실패 {len(report.failed)}건")
 
 
@@ -717,8 +726,9 @@ def cmd_apply(args) -> int:
         if final["final_ok"] is False:
             data["interference"] = True
             reason = REASON_FINAL_BASELINE_FAILED if final.get("baseline_failed") else REASON_INTERFERENCE
-            for fid in applied:
+            for fid in [*applied, *data.get("carried", [])]:
                 _set_decision(rnd, fid, OUTCOME_UNDECIDABLE, reason)
+            data["carried"] = []
             rnd.adopted = []
             print(f"{reason}. 적용한 패치는 작업 트리에 그대로 두었다 — 되돌릴지는 사람이 정한다")
     s.write_json(rd / "apply.json", data)
@@ -738,6 +748,9 @@ def cmd_apply(args) -> int:
         s.write_json(rd / s.RECHECK_SCOPE_FILE, scope)
         rnd.recheck_opened = True
         print(f"재검토 필요: {rd / 'recheck-prompt.md'} (--repo {recheck_repo})")
+    elif s.carried_findings(rnd):
+        nxt = _open_round(run_dir, ledger, rnd, s.renumber(s.carried_findings(rnd), rnd.no + 1, ledger.source))
+        print(f"재검토 없음: 적용하지 못한 {len(nxt.findings)}건으로 회차 {nxt.no}을 연다")
     else:
         ledger.status = STATUS_DONE
         print("재검토 없음: 종료")
@@ -745,6 +758,15 @@ def cmd_apply(args) -> int:
     s.save_ledger(run_dir, ledger)
     _print_next(ledger, run_dir)
     return 0
+
+
+def _open_round(run_dir: Path, ledger: Ledger, rnd: RoundRecord, findings: list[Finding]) -> RoundRecord:
+    no = rnd.no + 1
+    write_findings(s.round_dir(run_dir, no) / "findings.json", findings)
+    nxt = RoundRecord(no=no, findings=[f.to_dict() for f in findings], decisions=[], adopted=[], recheck_opened=False,
+                      started_at=s.now(), base_commit=rnd.result_commit or s.base_of(ledger, rnd))
+    ledger.rounds.append(nxt)
+    return nxt
 
 
 def _hold_reason(f, rnd: RoundRecord, max_reached: bool, outside: set[str]) -> str:
@@ -786,7 +808,8 @@ def cmd_recheck(args) -> int:
     if resolved and missing:
         print(f"경고: 해소 여부가 없는 지적은 해소 안 됨으로 본다: {', '.join(missing)}")
     unresolved = [s.unresolved_copy(f) for f in adopted if resolved.get(f.id) is not True]
-    combined = s.renumber(unresolved + new, rnd.no + 1, ledger.source)
+    numbered = s.renumber(unresolved + new + s.carried_findings(rnd), rnd.no + 1, ledger.source)
+    combined, carried = numbered[:len(unresolved) + len(new)], numbered[len(unresolved) + len(new):]
     max_reached = s.rechecks_done(ledger) >= ledger.max_rechecks
     in_scope = s.recheck_scope(ledger, rd, adopted, combined)
     outside = {f.id for f in out_of_scope(combined, in_scope)}
@@ -801,13 +824,11 @@ def cmd_recheck(args) -> int:
     s.write_json(rd / "decisions.json", rnd.decisions)
     s.mark(rnd, "recheck")
     print(f"해소 {sum(1 for v in resolved.values() if v)}건, 해소 안 됨 {len(unresolved)}건, 새 지적 {len(new)}건")
-    print(f"다음 회차 {len(next_round)}건, 보류 후보 {len(hold)}건(범위 밖 {len(outside)}건), 판단 불가 {len(undecidable)}건")
+    next_round += carried
+    print(f"다음 회차 {len(next_round)}건(적용 못 해 넘긴 {len(carried)}건 포함), "
+          f"보류 후보 {len(hold)}건(범위 밖 {len(outside)}건), 판단 불가 {len(undecidable)}건")
     if next_round:
-        no = rnd.no + 1
-        write_findings(s.round_dir(run_dir, no) / "findings.json", next_round)
-        ledger.rounds.append(RoundRecord(no=no, findings=[f.to_dict() for f in next_round], decisions=[],
-                                         adopted=[], recheck_opened=False, started_at=s.now(),
-                                         base_commit=rnd.result_commit or s.base_of(ledger, rnd)))
+        _open_round(run_dir, ledger, rnd, next_round)
     else:
         ledger.status = STATUS_DONE
     print(f"status={ledger.status}")

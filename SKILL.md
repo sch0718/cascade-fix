@@ -126,7 +126,7 @@ PYTHONPATH="${CLAUDE_SKILL_DIR}" python3 -m cascade.cli
 8. **opinion** — 의견은 자동 채택하지 않고 사람 목록에 붙기만 한다.
    - Codex: `CF opinion --run-dir <run_dir> --round N --id <id> --result <run_dir>/round-N/opinion-<id>.out.final`.
    - Claude: `CF opinion --run-dir <run_dir> --round N --results <run_dir>/round-N/opinion.json`. 호출이 실패한 지적은 「호출 실패 — 의견 없음」으로 적고 넘어간다(다시 돌리려면 Workflow 뒤 `--force`).
-9. **apply** — `CF apply --run-dir <run_dir> --round N`. 채택 패치를 작업 트리에 하나씩 적용하고, 그 회차의 작업자·판가름 워크트리를 지운 뒤 전체 테스트를 한 번 돌린다. 적용 실패와 전체 테스트 실패는 판단 불가로 간다. 전체 테스트가 실패하면 기준선(base 워크트리)에서도 돌려 사유를 「전체 테스트 실패(기준선도 실패)」와 「전체 테스트 실패(간섭 의심)」로 나눈다. 작업 트리는 되돌리지 않는다. 적용이 끝난 뒤 중단됐다가 다시 돌리면 적용은 건너뛰고 뒷단계만 한다.
+9. **apply** — `CF apply --run-dir <run_dir> --round N`. 채택 패치를 작업 트리에 하나씩 적용하고, 그 회차의 작업자·판가름 워크트리를 지운 뒤 전체 테스트를 한 번 돌린다. 앞서 적용한 패치와 같은 파일을 고쳐 적용에 실패한 지적은 「다음 회차」로 넘겨 바뀐 코드에서 작업자가 다시 고친다(지적마다 한 번만, 재검토를 열지 않아도 회차를 연다, 「지금 반영」 회차에서는 넘기지 않는다). 그 밖의 적용 실패와 전체 테스트 실패는 판단 불가로 간다(전체 테스트가 실패하면 넘기려던 지적도 판단 불가). 전체 테스트가 실패하면 기준선(base 워크트리)에서도 돌려 사유를 「전체 테스트 실패(기준선도 실패)」와 「전체 테스트 실패(간섭 의심)」로 나눈다. 작업 트리는 되돌리지 않는다. 적용이 끝난 뒤 중단됐다가 다시 돌리면 적용은 건너뛰고 뒷단계만 한다.
    - dry-run이면 작업 트리 대신 `result-rN` 워크트리에 적용·커밋해 다음 회차의 기준으로 삼는다.
 10. **재검토** — `round-N/recheck-prompt.md`가 생겼으면 돌린다. `recheck-repo.txt`는 보통 저장소 루트이고 dry-run이면 `result-rN` 워크트리다. 재검토가 바꾼 파일 밖을 지적하면 「재검토 범위 밖」 보류 후보로 간다.
     - Codex: `RR --recheck <run_dir>/round-N/recheck-prompt.md --repo <round-N/recheck-repo.txt의 경로> --out <run_dir>/round-N/recheck.out`.

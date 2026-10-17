@@ -39,6 +39,7 @@ class Finding:
     evidence: str
     thread_id: str | None = None
     outdated: bool = False
+    carried_from: str | None = None
 
     def to_dict(self):
         return asdict(self)

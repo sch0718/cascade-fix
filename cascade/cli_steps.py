@@ -12,6 +12,7 @@ from cascade.config import ConfigError, ExitCodes, RepoConfig, detect_candidates
 from cascade.consensus import (
     OUTCOME_ADJUDICATE,
     OUTCOME_AGREED_FACT,
+    OUTCOME_CARRIED,
     OUTCOME_UNDECIDABLE,
     VERDICT_FACT,
     VERDICT_UNDECIDED,
@@ -513,6 +514,20 @@ def renumber(items: list[Finding], round_no: int, source: str) -> list[Finding]:
 
 def unresolved_copy(f: Finding) -> Finding:
     return replace(f, body=f"[재검토: {f.id} 해소 안 됨]\n{f.body}")
+
+
+def carried_ids(rnd: RoundRecord, applied: list[str], failed: list[str], patches: dict[str, str]) -> set[str]:
+    if rnd.final:
+        return set()
+    carried_before = {f["id"] for f in rnd.findings if f.get("carried_from")}
+    applied_files = {p for fid in applied for p in changed_files(patches.get(fid, ""))}
+    return {fid for fid in failed
+            if fid not in carried_before and applied_files & set(changed_files(patches.get(fid, "")))}
+
+
+def carried_findings(rnd: RoundRecord) -> list[Finding]:
+    ids = {d["finding_id"] for d in rnd.decisions if d["outcome"] == OUTCOME_CARRIED}
+    return [replace(f, carried_from=f.id) for f in findings_of(rnd) if f.id in ids]
 
 
 def is_claude(ledger: Ledger) -> bool:
