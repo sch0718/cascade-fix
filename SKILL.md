@@ -95,9 +95,9 @@ PYTHONPATH="${CLAUDE_SKILL_DIR}" python3 -m cascade.cli
 ## 실행 전 확인
 
 1. **Codex 전송 동의(검토자가 `codex`일 때만).** 판가름 뒤 의견(`--opinion`)과 재검토(`--recheck`)는 코드·문서를 OpenAI로 보낸다. 저장소마다 한 번 사용자에게 묻는다(폐쇄망 내용, 사내규정 원문, 시크릿이 섞이지 않았는지). 같은 세션에서 같은 저장소에 이미 승인받았으면 다시 묻지 않는다. 검토자가 `claude`면 묻지 않는다(init 출력에 「Claude 단독」이 찍힌다).
-2. **저장소 검증 설정.** `codex-code`·`claude-code`·`pr-comment`는 저장소 검증 설정 파일에 저장소 루트 절대 경로 항목이 있어야 한다. 파일은 `~/.claude/cascade-fix/repos.toml`이다(환경 변수 `CASCADE_REPOS_TOML`이 우선하고, 이 파일이 없으면 예전 위치인 스킬 디렉터리의 `repos.toml`에 항목이 있을 때 그것을 쓴다). 없으면 `init`이 종료 코드 4로 멈추고 후보를 보여 준다. `CF detect --json`의 `config.candidates`에도 후보가 나온다.
+2. **저장소 검증 설정.** `codex-code`·`claude-code`·`pr-comment`는 저장소 검증 설정 파일에 저장소 루트 절대 경로 항목이 있어야 한다. 파일은 `~/.claude/cascade-fix/repos.toml`이다(환경 변수 `CASCADE_REPOS_TOML`이 우선하고, 이 파일이 없으면 예전 위치인 스킬 디렉터리의 `repos.toml`에 항목이 있을 때 그것을 쓴다). 없으면 `init`이 종료 코드 4로 멈추고 후보를 보여 준다. `CF detect` 출력의 「확인 필요: 검증 명령 등록」 아래(`--json`이면 `config.candidates`)에도 후보가 나온다.
 
-   후보를 사용자에게 보이고 쓸 명령을 확인받은 뒤 항목을 적는다. 형식은 `repos.toml` 머리 주석에 있다. `tests`에는 `{files}`(관련 테스트 파일 목록) 자리표시자를 쓴다. `format`은 작업자가 바꾼 파일에만 돈다(`ruff format {files}`처럼 쓴다).
+   후보를 사용자에게 보이고 쓸 명령을 확인받은 뒤 항목을 적는다. 형식은 `repos.toml` 머리 주석에 있다. `tests`에는 `{files}`(관련 테스트 파일 목록) 자리표시자를 쓴다. unittest 후보(`discover -s tests`)에는 `{files}`가 없어 지적마다 전체 테스트를 돈다. 파일 경로로 넘기면 `tests`가 `sys.path`에 안 들어가 형제 모듈 import가 깨질 수 있어서다. `format`은 작업자가 바꾼 파일에만 돈다(`ruff format {files}`처럼 쓴다).
 3. **워크트리 준비.** 워크트리는 대상 저장소의 `.cascade-fix/` 아래에 생기고 `node_modules`·`.venv`가 없다. 필요하면 `setup`(예: `ln -s {root}/node_modules node_modules`)을 적는다. jest·vitest·eslint는 `.cascade-fix`를 제외 설정에 넣으라고 사용자에게 알린다.
 
 ## 절차

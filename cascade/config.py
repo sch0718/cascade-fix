@@ -113,6 +113,8 @@ def detect_candidates(root: Path) -> dict[str, list[str]]:
     if not found["tests"]:
         tests_dir = next((d for d in ("tests", "test") if (root / d).is_dir()), None)
         if tests_dir and any((root / tests_dir).glob("test_*.py")):
+            # {files}를 넣지 않는다: 파일 경로로 넘기면 discover -s 와 달리 tests_dir가 sys.path에 안 들어가
+            # 테스트 안의 형제 모듈 import가 깨지고, 관련 테스트가 없으면 0건 실행(3.12부터 실패)이 된다
             add("tests", f"python3 -m unittest discover -s {tests_dir} -p 'test_*.py'")
             add("full_tests", f"python3 -m unittest discover -s {tests_dir} -p 'test_*.py'")
 

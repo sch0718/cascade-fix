@@ -14,6 +14,7 @@ from cascade.snapshot import RUN_DIR_NAME
 DOC_SUFFIXES = (".md", ".markdown", ".txt", ".rst")
 LARGE_CHANGE_FILES = 30
 SEVERITY_SPLIT_JOBS = 10  # 1단계 작업이 이보다 많으면 등급별로 나눠 돌리는 안을 낸다
+REGISTER_APPROVAL = "검증 명령 등록"
 _PR_URL = re.compile(r"github\.com/([^/]+)/([^/]+)/pull/(\d+)")
 
 
@@ -204,7 +205,7 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
         candidates = detect_candidates(root)
         config["candidates"] = candidates
         if candidates.get("tests"):
-            approvals.append(f"검증 명령 등록: {repos_toml} 에 [repos.\"{root}\"] 항목을 후보로 적는다(사용자 확인)")
+            approvals.append(f"{REGISTER_APPROVAL}: {repos_toml} 에 [repos.\"{root}\"] 항목을 후보로 적는다(사용자 확인)")
         else:
             blockers.append("코드 모드인데 테스트 명령을 찾지 못했다. 테스트 없는 저장소의 코드 수정은 이 스킬로 하지 않는다")
     if reviewer != REVIEWER_CLAUDE:
@@ -271,8 +272,11 @@ def render(result: dict) -> str:
         e = estimate(1, rec["mode"], result["reviewer"])
         lines.append(f"규모: 지적 1건당 에이전트 {e['stage1']}~{e['max'] - e['recheck']}개"
                      + (f" + 재검토 회차당 {e['recheck']}개" if e["recheck"] else "") + " (지적 수는 첫 검토 뒤에 정해진다)")
+    candidates = result["config"].get("candidates") or {}
     for a in result["approvals"]:
         lines.append(f"확인 필요: {a}")
+        if a.startswith(REGISTER_APPROVAL):
+            lines.extend(f"  후보 {key}: {' / '.join(cmds)}" for key, cmds in candidates.items() if cmds)
     for n in result["notes"]:
         lines.append(f"참고: {n}")
     for b in result["blockers"]:

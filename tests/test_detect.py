@@ -70,6 +70,8 @@ class DetectCliTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("discover -s tests", r["config"]["candidates"]["tests"][0])
         self.assertTrue(any("검증 명령 등록" in a for a in r["approvals"]))
+        p = run_cli(["detect", "--no-gh"], cwd=self.repo, env=self.env)
+        self.assertIn("  후보 tests: python3 -m unittest discover -s tests -p 'test_*.py'", p.stdout)
 
     def test_no_tests_blocks_code_mode(self):
         self.env["CASCADE_REPOS_TOML"] = str(self.tmp / "none.toml")
