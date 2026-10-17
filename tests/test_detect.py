@@ -127,6 +127,27 @@ class DetectCliTest(unittest.TestCase):
         self.assertEqual(r["recommendation"]["mode"], "code")
         self.assertTrue(any("detect --doc README.md" in n for n in r["notes"]))
 
+    def test_doc_flag_from_subdirectory_gives_runnable_review_command(self):
+        (self.repo / "docs").mkdir()
+        (self.repo / "docs/spec.md").write_text("# 스펙\n", encoding="utf-8")
+        sub = self.repo / "docs"
+        p = run_cli(["detect", "--json", "--no-gh", "--doc", "spec.md"], cwd=sub, env=self.env)
+        step = json.loads(p.stdout)["recommendation"]["steps"][0]
+        self.assertIn(f"--doc {self.repo / 'docs/spec.md'}", step)
+        review = run_cli(shlex.split(step.split("cascade.cli ", 1)[1]), cwd=sub, env=self.env)
+        self.assertEqual(review.returncode, 0, review.stdout + review.stderr)
+
+    def test_mixed_changes_note_lists_every_doc(self):
+        (self.repo / "calc.py").write_text("x = 2\n", encoding="utf-8")
+        (self.repo / "docs").mkdir()
+        for i in range(1, 7):
+            (self.repo / f"docs/spec{i}.md").write_text(f"# {i}\n", encoding="utf-8")
+        _, r = self.detect()
+        note = next(n for n in r["notes"] if "detect --doc" in n)
+        self.assertIn("문서도 6개", note)
+        for i in range(1, 7):
+            self.assertIn(f"--doc docs/spec{i}.md", note)
+
     def test_root_from_other_repo_is_kept_in_next_steps(self):
         caller = make_repo(self.tmp / "caller", {"x.py": "x = 1\n"})
         (self.repo / "README.md").write_text("# 바꿈\n", encoding="utf-8")

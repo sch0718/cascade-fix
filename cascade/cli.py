@@ -310,7 +310,7 @@ def cmd_detect(args) -> int:
     result = detect(root, repos_toml=s.repos_toml(), run_review=s.RUN_REVIEW, cli=s.CLI, gh=gh,
                     input_path=Path(args.input).resolve() if args.input else None, pr=args.pr,
                     reviewer_choice=args.reviewer, root_flag=_root_flag(args, root),
-                    docs=[Path(d).resolve() for d in args.doc or []])
+                    docs=[Path(d).resolve() for d in args.doc or []], cwd=Path.cwd())
     print(json.dumps(result, ensure_ascii=False, indent=2) if args.json else render_detect(result))
     return 0 if result["ok"] else ExitCodes.NEEDS_USER
 

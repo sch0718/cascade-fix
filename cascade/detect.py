@@ -202,7 +202,7 @@ def _config(root: Path, repos_toml: Path) -> tuple[RepoConfig | None, str | None
 
 def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list[str] | None,
            input_path: Path | None = None, pr: str | None = None, reviewer_choice: str = REVIEWER_AUTO,
-           root_flag: str = "", docs: list[Path] | None = None) -> dict:
+           root_flag: str = "", docs: list[Path] | None = None, cwd: Path | None = None) -> dict:
     root = Path(root)
     branch = current_branch(root)
     base = default_base(root)
@@ -217,8 +217,10 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
             notes.append(why)
 
     q = shlex.quote
-    # --root 로 다른 저장소를 가리키면 절대 경로를 준다(review 는 현재 디렉터리 기준으로 읽는다)
-    doc_arg = lambda p: q(str(root / p) if root_flag else p)  # noqa: E731
+    # review 는 --doc 을 현재 디렉터리 기준으로 읽는다. --root 로 다른 저장소를 가리켰거나
+    # 저장소 하위 디렉터리에서 돌렸으면 저장소 상대 경로가 어긋나므로 절대 경로를 준다
+    at_root = cwd is None or Path(cwd).resolve() == root.resolve()
+    doc_arg = lambda p: q(str(root / p) if root_flag or not at_root else p)  # noqa: E731
     rec: dict = {"source": None, "mode": None, "steps": [], "reasons": []}
     found = None
     if input_path is not None:
@@ -262,7 +264,7 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
             changed_docs = [p for p in changed if p.endswith(DOC_SUFFIXES) and (root / p).is_file()]
             if changed_docs:
                 notes.append(f"문서도 {len(changed_docs)}개 바뀌었다. 코드 검토는 설계 문서로 보지 않으니 문서만 따로 보려면 "
-                             f"{cli} detect " + " ".join(f"--doc {doc_arg(p)}" for p in changed_docs[:5]) + root_flag)
+                             f"{cli} detect " + " ".join(f"--doc {doc_arg(p)}" for p in changed_docs) + root_flag)
         if len(changed) > LARGE_CHANGE_FILES:
             notes.append(f"바뀐 파일이 {len(changed)}개다. 지적이 많으면 --severity 로 나눠 돌린다")
     else:
