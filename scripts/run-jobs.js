@@ -1,11 +1,12 @@
 export const meta = {
   name: 'cascade-fix-jobs',
-  description: '지적별 작업자·판가름 호출',
+  description: '지적별 작업자·판가름·Claude 검토자 호출',
   phases: [{ title: 'Jobs' }],
 }
 
 // args: {jobs: [{id, label, model, effort, kind, promptPath}]}
-// kind: worker | checker | adjudicator — 아래 SCHEMAS에서 출력 스키마를 고른다
+// kind: worker | checker | adjudicator | review — 아래 SCHEMAS에서 출력 스키마를 고른다
+// review는 Claude 검토자(첫 검토·의견·재검토)다. 출력은 {text, model_id}
 // 반환: {results: [{id, output}]} — output은 schema를 만족하는 객체, 실패·건너뜀이면 null
 
 // SCHEMAS 시작 (cascade/jobs.py의 SCHEMAS와 같아야 한다)
@@ -141,6 +142,22 @@ const SCHEMAS = {
       "needs_design_decision",
       "reason",
       "verify",
+      "model_id"
+    ]
+  },
+  "review": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "text": {
+        "type": "string"
+      },
+      "model_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "text",
       "model_id"
     ]
   }

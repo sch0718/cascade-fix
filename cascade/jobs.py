@@ -17,6 +17,7 @@ ROLES = {
     "writer": ("claude-sonnet-5-5", "low"),
     "checker": ("claude-haiku-5-5", "low"),
     "adjudicator": ("claude-opus-5-5", "high"),
+    "reviewer": ("claude-fable-5-1", "high"),
 }
 
 _COMMIT_RULE = (
@@ -71,10 +72,17 @@ def _schema(**extra: dict) -> dict:
 WORKER_SCHEMA = _schema(verify={"type": "array", "items": _VERIFY_ITEM})
 CHECKER_SCHEMA = _schema(checker_ok={"type": "boolean"})
 ADJ_SCHEMA = _schema(verify={"type": "array", "items": _VERIFY_ITEM})
+REVIEW_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {"text": {"type": "string"}, "model_id": {"type": "string"}},
+    "required": ["text", "model_id"],
+}
 KIND_WORKER = "worker"
 KIND_CHECKER = "checker"
 KIND_ADJUDICATOR = "adjudicator"
-SCHEMAS = {KIND_WORKER: WORKER_SCHEMA, KIND_CHECKER: CHECKER_SCHEMA, KIND_ADJUDICATOR: ADJ_SCHEMA}
+KIND_REVIEW = "review"
+SCHEMAS = {KIND_WORKER: WORKER_SCHEMA, KIND_CHECKER: CHECKER_SCHEMA, KIND_ADJUDICATOR: ADJ_SCHEMA, KIND_REVIEW: REVIEW_SCHEMA}
 _ROLE_KINDS = {"checker": KIND_CHECKER, "adjudicator": KIND_ADJUDICATOR}
 _LOCATION = re.compile(r"^(?P<path>.+?)(?P<line>:(?:\d+(?:-\d+)?|\?))?$")
 

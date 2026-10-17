@@ -8,8 +8,15 @@ import tomllib
 from pathlib import Path
 
 SKILL_ROOT = Path(__file__).resolve().parent.parent
+
+
+def default_repos_toml() -> Path:
+    sys.path.insert(0, str(SKILL_ROOT))
+    from cascade.cli_steps import repos_toml
+
+    return repos_toml()
 REQUIRED = ("id", "repo", "commit", "source", "finding", "truth", "baseline_opus_calls")
-SOURCES = ("codex-doc", "codex-code", "pr-comment")
+SOURCES = ("codex-doc", "codex-code", "claude-doc", "claude-code", "pr-comment")
 ROUND = "1"
 
 
@@ -188,7 +195,7 @@ def main(argv=None) -> int:
     parser.add_argument("--out", required=True)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--fake-results", help="<id>/stage1.json(·adj.json·checker.json)을 두는 폴더. 모델을 부르지 않는다")
-    parser.add_argument("--repos-toml", default=os.environ.get("CASCADE_REPOS_TOML") or str(SKILL_ROOT / "repos.toml"))
+    parser.add_argument("--repos-toml", default=str(default_repos_toml()))
     parser.add_argument("--collect", action="store_true", help="모델을 부르는 실제 실행이 끝난 항목의 원장을 모으고 정리한다")
     args = parser.parse_args(argv)
     items = load_sample(args.sample)[: args.limit]

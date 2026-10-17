@@ -110,4 +110,10 @@ def detect_candidates(root: Path) -> dict[str, list[str]]:
                 if key == "tests":
                     add("full_tests", f"make {target}")
 
+    if not found["tests"]:
+        tests_dir = next((d for d in ("tests", "test") if (root / d).is_dir()), None)
+        if tests_dir and any((root / tests_dir).glob("test_*.py")):
+            add("tests", f"python3 -m unittest discover -s {tests_dir} -p 'test_*.py'")
+            add("full_tests", f"python3 -m unittest discover -s {tests_dir} -p 'test_*.py'")
+
     return found

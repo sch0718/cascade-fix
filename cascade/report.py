@@ -10,6 +10,7 @@ from cascade.consensus import (
     OUTCOME_HOLD,
     OUTCOME_UNDECIDABLE,
 )
+from cascade.review import label as reviewer_label
 from cascade.rounds import Ledger
 
 SOURCE_PR_COMMENT = "pr-comment"
@@ -194,7 +195,7 @@ def _bucket_section(name: str, items: list[tuple[int, dict, dict]], ledger: Ledg
                 out.append(f"  - Opus: {opus}")
             opinion = ledger.opinions.get(fid)
             if opinion:
-                out.append("  - Codex 의견:")
+                out.append(f"  - {reviewer_label(ledger.reviewer)} 의견:")
                 out.extend(f"    > {line}" for line in opinion.splitlines()[:OPINION_MAX_LINES])
             out.append(f"  - 패치 a: round-{round_no}/patch-{fid}-a.diff")
             out.append(f"  - 패치 b: round-{round_no}/patch-{fid}-b.diff")
@@ -353,8 +354,9 @@ def _calls_section(ledger: Ledger, run_dir: Path | None) -> list[str]:
     out = ["## 호출 수와 시간", "", "| 역할 | 호출 수 |", "| --- | ---: |"]
     for role in WORKER_ROLES:
         out.append(f"| {role} | {counts[role] if found else '-'} |")
-    out.append(f"| Codex 검토 | {len(ledger.opinions)} |")
-    out.append(f"| Codex 재검토 | {sum(1 for r in ledger.rounds if r.recheck_opened)} |")
+    name = reviewer_label(ledger.reviewer)
+    out.append(f"| {name} 검토 | {len(ledger.opinions)} |")
+    out.append(f"| {name} 재검토 | {sum(1 for r in ledger.rounds if r.recheck_opened)} |")
     out.extend(["", "| 회차 | 소요 |", "| --- | ---: |"])
     out.extend(f"| {rnd.no} | {_elapsed(rnd)} |" for rnd in ledger.rounds)
     out.append("")
@@ -366,12 +368,12 @@ def render(ledger: Ledger, dry_run: bool, run_dir: Path | None = None) -> str:
     out = [f"# cascade-fix 보고서 {ledger.run_id}", ""]
     if dry_run:
         out.extend(["**적용하지 않음(dry-run)**", ""])
-    out.extend([f"출처: {ledger.source} · 모드: {ledger.mode} · 상태: {ledger.status}", ""])
+    out.extend([f"출처: {ledger.source} · 모드: {ledger.mode} · 검토자: {reviewer_label(ledger.reviewer)} · 상태: {ledger.status}", ""])
     out.extend(
         [
             "## 회차별 지적과 채택 경로",
             "",
-            "| 회차 | 지적 | 합의 | 판가름 회부 | 판가름 채택 | Codex 검토 | 사람 |",
+            f"| 회차 | 지적 | 합의 | 판가름 회부 | 판가름 채택 | {reviewer_label(ledger.reviewer)} 검토 | 사람 |",
             "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
             *[_round_row(rnd, ledger) for rnd in ledger.rounds],
             "",

@@ -187,7 +187,7 @@ class RenderTest(unittest.TestCase):
 
     def test_header_line(self):
         text = report.render(full_ledger(), dry_run=False)
-        self.assertIn("출처: local · 모드: code · 상태: 진행", text)
+        self.assertIn("출처: local · 모드: code · 검토자: Codex · 상태: 진행", text)
 
     def test_commit_message_single_and_multiple(self):
         one = make_ledger(

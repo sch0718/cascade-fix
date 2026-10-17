@@ -19,8 +19,9 @@ from cascade.consensus import (
     WorkerResult,
 )
 from cascade.findings import Finding
-from cascade.jobs import ROLES, AdjInput, location_file, split_location
+from cascade.jobs import ROLES, AdjInput, location_file, split_location, write_job_args
 from cascade.patches import DIFF_FLAGS, changed_files, record_setup_paths
+from cascade.review import REVIEWER_CLAUDE, claude_prompt, review_job
 from cascade.rounds import STATUS_DONE, Ledger, RoundRecord, ledger_path, needs_recheck
 from cascade.snapshot import Snapshot, add_worktree, tree_diff_stat, user_tree_fingerprint
 from cascade.verify import (
@@ -33,11 +34,28 @@ from cascade.verify import (
 )
 
 SKILL_ROOT = Path(__file__).resolve().parent.parent
-RUN_REVIEW = SKILL_ROOT.parent / "codex-review" / "scripts" / "run-review.sh"
+RUN_JOBS = SKILL_ROOT / "scripts" / "run-jobs.js"
+USER_REPOS_TOML = Path.home() / ".claude" / "cascade-fix" / "repos.toml"
+LEGACY_REPOS_TOML = SKILL_ROOT / "repos.toml"
+
+
+def find_run_review() -> Path:
+    """codex-review 스킬의 run-review.sh. 플러그인 캐시에 설치돼도 개인 스킬 위치를 찾는다."""
+    if os.environ.get("CASCADE_RUN_REVIEW"):
+        return Path(os.environ["CASCADE_RUN_REVIEW"])
+    candidates = [
+        SKILL_ROOT.parent / "codex-review" / "scripts" / "run-review.sh",
+        Path.home() / ".claude" / "skills" / "codex-review" / "scripts" / "run-review.sh",
+    ]
+    return next((c for c in candidates if c.is_file()), candidates[-1])
+
+
+RUN_REVIEW = find_run_review()
 CLI = f"PYTHONPATH={shlex.quote(str(SKILL_ROOT))} python3 -m cascade.cli"
 ROLE_SUFFIX = {"a": "a", "b": "b", "writer": "writer", "adjudicator": "adj"}
 DOC_SUFFIXES = (".md", ".markdown", ".txt", ".rst")
 SOURCE_DOC = "codex-doc"
+DOC_SOURCES = (SOURCE_DOC, "claude-doc")
 SOURCE_PR = "pr-comment"
 EXTERNAL_PREFIX = "외부/"
 REASON_NO_PATCH = "패치 없음"
@@ -47,6 +65,10 @@ REPRO_FILE = "repro-cmds.json"
 RECHECK_REPO_FILE = "recheck-repo.txt"
 RECHECK_SCOPE_FILE = "recheck-scope.json"
 BASELINE_FILE = "baseline.json"
+OPINION_ARGS = "opinion-args.json"
+OPINION_RESULTS = "opinion.json"
+RECHECK_ARGS = "recheck-args.json"
+RECHECK_RESULTS = "recheck.json"
 FINGERPRINT_PARTS = {"tree": "작업 트리", "head": "HEAD", "stash": "stash", "branches": "브랜치"}
 
 
@@ -90,8 +112,24 @@ def git_toplevel(cwd: Path) -> Path:
     return Path(p.stdout.strip()).resolve()
 
 
+def _has_repos(path: Path) -> bool:
+    try:
+        return bool(tomllib.loads(path.read_text(encoding="utf-8")).get("repos"))
+    except tomllib.TOMLDecodeError:
+        return True  # 잘못된 파일이면 그대로 골라 오류를 보인다
+    except OSError:
+        return False
+
+
 def repos_toml() -> Path:
-    return Path(os.environ.get("CASCADE_REPOS_TOML") or SKILL_ROOT / "repos.toml")
+    """저장소 검증 설정 파일. 환경 변수 > ~/.claude/cascade-fix/repos.toml > 스킬 폴더의 repos.toml(예전 위치, 항목이 있을 때만)."""
+    if os.environ.get("CASCADE_REPOS_TOML"):
+        return Path(os.environ["CASCADE_REPOS_TOML"])
+    if USER_REPOS_TOML.is_file():
+        return USER_REPOS_TOML
+    if LEGACY_REPOS_TOML.is_file() and _has_repos(LEGACY_REPOS_TOML):
+        return LEGACY_REPOS_TOML
+    return USER_REPOS_TOML
 
 
 def load_cfg(root: Path) -> RepoConfig | None:
@@ -115,7 +153,7 @@ def no_verify_message(root: Path) -> str:
 
 def cfg_for(source: str, root: Path) -> RepoConfig:
     cfg = load_cfg(root)
-    if source == SOURCE_DOC:
+    if source in DOC_SOURCES:
         return cfg or RepoConfig()
     if cfg is None or not cfg.tests:
         raise CliError(no_verify_message(root), ExitCodes.NO_VERIFY_CONFIG)
@@ -477,6 +515,35 @@ def unresolved_copy(f: Finding) -> Finding:
     return replace(f, body=f"[재검토: {f.id} 해소 안 됨]\n{f.body}")
 
 
+def is_claude(ledger: Ledger) -> bool:
+    return ledger.reviewer == REVIEWER_CLAUDE
+
+
+def opinion_job_id(fid: str) -> str:
+    return f"{fid}:opinion"
+
+
+def recheck_job_id(no: int) -> str:
+    return f"round-{no}:recheck"
+
+
+def write_review_args(rd: Path, name: str, ledger: Ledger, items: list[tuple[str, str, str, str]]) -> Path:
+    """items: (job id, 표시 이름, 프롬프트, 참고 저장소). Claude 검토자 Workflow 입력을 rd/name 에 쓴다."""
+    jobs = [review_job(job_id, text, claude_prompt(prompt, repo), ledger.review_model, ledger.review_effort)
+            for job_id, text, prompt, repo in items]
+    out = Path(rd) / name
+    write_json(out, write_job_args({"jobs": jobs}, Path(rd) / "prompts"))
+    return out
+
+
+def pending_opinions(ledger: Ledger, rd: Path) -> list[str]:
+    return [fid for p in sorted(Path(rd).glob("opinion-*.md")) if (fid := p.stem[len("opinion-"):]) not in ledger.opinions]
+
+
+def workflow_step(args: Path, out: Path) -> str:
+    return f"Workflow 실행: script={RUN_JOBS} 내용, args={args} 내용 → 결과를 {out} 에 저장"
+
+
 def parse_remote(url: str) -> tuple[str, str]:
     m = re.search(r"[:/]([^/:]+)/([^/]+?)(?:\.git)?/?$", url.strip())
     if not m:
@@ -520,11 +587,11 @@ def next_steps(ledger: Ledger, run_dir: Path) -> list[str]:
     if not step_done(rnd, "judge"):
         if step_done(rnd, "judge-checker") and (rd / "checker-args.json").is_file():
             return [
-                f"Workflow 실행: script=workflows/run-jobs.js 내용, args={rd / 'checker-args.json'} 내용 → 결과를 {rd / 'checker.json'} 에 저장",
+                workflow_step(rd / "checker-args.json", rd / "checker.json"),
                 _cmd("judge", run_dir, n, f"--results {_q(rd / 'stage1.json')}", f"--checker-results {_q(rd / 'checker.json')}"),
             ]
         steps = [
-            f"Workflow 실행: script=workflows/run-jobs.js 내용, args={rd / 'stage1-args.json'} 내용 → 결과를 {rd / 'stage1.json'} 에 저장",
+            workflow_step(rd / "stage1-args.json", rd / "stage1.json"),
             _cmd("judge", run_dir, n, f"--results {_q(rd / 'stage1.json')}"),
         ]
         if any(repro_listed(rd).values()):
@@ -532,19 +599,29 @@ def next_steps(ledger: Ledger, run_dir: Path) -> list[str]:
         return steps
     if (rd / "adj-args.json").is_file() and not step_done(rnd, "adjudicate"):
         return [
-            f"Workflow 실행: script=workflows/run-jobs.js 내용, args={rd / 'adj-args.json'} 내용 → 결과를 {rd / 'adj.json'} 에 저장",
+            workflow_step(rd / "adj-args.json", rd / "adj.json"),
             _cmd("adjudicate", run_dir, n, f"--results {_q(rd / 'adj.json')}"),
         ]
-    for prompt in sorted(rd.glob("opinion-*.md")):
-        fid = prompt.stem[len("opinion-"):]
-        if fid not in ledger.opinions:
-            out = rd / f"opinion-{fid}.out"
-            return [
-                run_review_cmd("opinion", prompt, ledger.root, out),
-                _cmd("opinion", run_dir, n, f"--id {fid}", f"--result {_q(str(out) + '.final')}"),
-            ]
+    pending = pending_opinions(ledger, rd)
+    if pending and is_claude(ledger):
+        return [
+            workflow_step(rd / OPINION_ARGS, rd / OPINION_RESULTS),
+            _cmd("opinion", run_dir, n, f"--results {_q(rd / OPINION_RESULTS)}"),
+        ]
+    if pending:
+        fid = pending[0]
+        out = rd / f"opinion-{fid}.out"
+        return [
+            run_review_cmd("opinion", rd / f"opinion-{fid}.md", ledger.root, out),
+            _cmd("opinion", run_dir, n, f"--id {fid}", f"--result {_q(str(out) + '.final')}"),
+        ]
     if not step_done(rnd, "apply"):
         return [_cmd("apply", run_dir, n)]
+    if rnd.recheck_opened and not step_done(rnd, "recheck") and is_claude(ledger):
+        return [
+            workflow_step(rd / RECHECK_ARGS, rd / RECHECK_RESULTS),
+            _cmd("recheck", run_dir, n, f"--result {_q(rd / RECHECK_RESULTS)}"),
+        ]
     if rnd.recheck_opened and not step_done(rnd, "recheck"):
         out = rd / "recheck.out"
         repo_file = rd / RECHECK_REPO_FILE

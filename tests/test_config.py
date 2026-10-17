@@ -109,3 +109,46 @@ class ConfigTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RepoTomlLocationTest(unittest.TestCase):
+    def setUp(self):
+        from cascade import cli_steps
+        self.s = cli_steps
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        base = Path(self._td.name)
+        self.user, self.legacy = base / "user" / "repos.toml", base / "skill" / "repos.toml"
+        self.legacy.parent.mkdir(parents=True)
+        self.saved = (cli_steps.USER_REPOS_TOML, cli_steps.LEGACY_REPOS_TOML, os.environ.pop("CASCADE_REPOS_TOML", None))
+        cli_steps.USER_REPOS_TOML, cli_steps.LEGACY_REPOS_TOML = self.user, self.legacy
+
+    def tearDown(self):
+        self.s.USER_REPOS_TOML, self.s.LEGACY_REPOS_TOML, env = self.saved
+        if env is not None:
+            os.environ["CASCADE_REPOS_TOML"] = env
+
+    def test_order_env_user_legacy(self):
+        self.legacy.write_text("[repos]\n", encoding="utf-8")
+        self.assertEqual(self.s.repos_toml(), self.user)  # 견본(항목 없음)은 건너뛴다
+        self.legacy.write_text('[repos."/x"]\ntests = ["t"]\n', encoding="utf-8")
+        self.assertEqual(self.s.repos_toml(), self.legacy)  # 예전 위치에 항목이 있으면 그대로 쓴다
+        self.user.parent.mkdir(parents=True)
+        self.user.write_text("[repos]\n", encoding="utf-8")
+        self.assertEqual(self.s.repos_toml(), self.user)
+        os.environ["CASCADE_REPOS_TOML"] = "/tmp/other.toml"
+        try:
+            self.assertEqual(self.s.repos_toml(), Path("/tmp/other.toml"))
+        finally:
+            del os.environ["CASCADE_REPOS_TOML"]
+
+    def test_run_review_env_override(self):
+        os.environ["CASCADE_RUN_REVIEW"] = "/opt/rr.sh"
+        try:
+            self.assertEqual(self.s.find_run_review(), Path("/opt/rr.sh"))
+        finally:
+            del os.environ["CASCADE_RUN_REVIEW"]
+
+    def test_unittest_candidate(self):
+        repo = make_repo(Path(self._td.name) / "r", {"tests/test_a.py": "\n"})
+        self.assertIn("python3 -m unittest discover -s tests -p 'test_*.py'", config.detect_candidates(repo)["tests"])
