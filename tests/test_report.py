@@ -130,6 +130,20 @@ class RenderTest(unittest.TestCase):
         table = section(text, "## 회차별 지적과 채택 경로")
         self.assertIn("| 1 | 3 | 0 | 3 | 0 | 1 | 3 |", table)
 
+    def test_table_counts_decision_path_even_after_apply_failed(self):
+        findings = [finding("A1"), finding("A2"), finding("A3")]
+        decisions = [
+            decision("A1", OUTCOME_AGREED_FACT, "a"),
+            {**decision("A2", OUTCOME_UNDECIDABLE, None, ["패치 적용 실패: error: patch failed"]),
+             "adopted_as": OUTCOME_AGREED_FACT},
+            {**decision("A3", OUTCOME_UNDECIDABLE, None, ["한쪽만 검증 통과", "판가름: 고친다", "패치 적용 실패: x"]),
+             "adopted_as": OUTCOME_ADJUDICATE},
+        ]
+        text = report.render(make_ledger(findings, decisions), dry_run=False)
+        table = section(text, "## 회차별 지적과 채택 경로")
+        self.assertIn("| 1 | 3 | 2 | 1 | 1 | 0 | 2 |", table)
+        self.assertIn("판정 때 값", table)
+
     def test_four_buckets_present_with_reasons(self):
         text = report.render(full_ledger(), dry_run=False)
         people = section(text, "## 사람이 볼 목록")

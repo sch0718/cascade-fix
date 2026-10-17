@@ -48,6 +48,7 @@ class Decision:
     outcome: str
     patch_from: str | None = None
     reasons: list[str] = field(default_factory=list)
+    adopted_as: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)

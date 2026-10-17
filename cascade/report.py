@@ -31,7 +31,8 @@ UNTIMED_STEPS = ("report",)
 TABLE_FOOTNOTE = (
     "합의-아님은 합의 칸에 한 번 세고 사람이 볼 목록의 반박 칸에도 오른다. "
     "판가름 회부는 판가름에 들어간 지적 전부이고, 판가름 채택은 그 가운데 패치를 채택한 지적이다. "
-    "사람 칸은 설계결정·판단불가·보류후보와 판가름 뒤에도 채택하지 못한 지적이다."
+    "합의·판가름 채택은 판정 때 값이라 적용 실패나 전체 테스트 실패로 판단 불가가 된 지적도 그대로 센다. "
+    "사람 칸은 설계결정·판단불가·보류후보와 판가름 뒤에도 채택하지 못한 지적이다(적용 단계에서 판단 불가가 된 지적 포함)."
 )
 
 
@@ -216,9 +217,12 @@ def _bucket_section(name: str, items: list[tuple[int, dict, dict]], ledger: Ledg
 
 
 def _round_row(rnd, ledger: Ledger) -> str:
-    consensus = sum(1 for d in rnd.decisions if d["outcome"] in (OUTCOME_AGREED_FACT, OUTCOME_AGREED_NO))
+    consensus = sum(1 for d in rnd.decisions
+                    if d["outcome"] in (OUTCOME_AGREED_FACT, OUTCOME_AGREED_NO) or d.get("adopted_as") == OUTCOME_AGREED_FACT)
     sent = sum(1 for d in rnd.decisions if _was_adjudicated(d))
-    adjudicated = sum(1 for d in rnd.decisions if d["outcome"] == OUTCOME_ADJUDICATE and d.get("patch_from") is not None)
+    adjudicated = sum(1 for d in rnd.decisions
+                      if (d["outcome"] == OUTCOME_ADJUDICATE and d.get("patch_from") is not None)
+                      or d.get("adopted_as") == OUTCOME_ADJUDICATE)
     codex = sum(1 for f in rnd.findings if f.get("id") in ledger.opinions)
     human = sum(
         1

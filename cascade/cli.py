@@ -109,6 +109,8 @@ def _print_next(ledger: Ledger, run_dir: Path) -> None:
 def _set_decision(rnd: RoundRecord, fid: str, outcome: str, reason: str) -> None:
     for d in rnd.decisions:
         if d["finding_id"] == fid:
+            if s.is_adopted(d) and not d.get("adopted_as"):
+                d["adopted_as"] = d["outcome"]
             d.update(outcome=outcome, patch_from=None, reasons=[*d.get("reasons", []), reason])
 
 

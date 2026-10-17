@@ -246,6 +246,9 @@ class CliEndToEndTest(CliTestBase):
         self.assertEqual(decisions["r1-01"]["outcome"], "판단불가")
         self.assertTrue(any(r.startswith("패치 적용 실패: ") for r in decisions["r1-01"]["reasons"]))
         self.assertNotIn("r1-01", self.ledger().rounds[0].adopted)
+        self.assertEqual(decisions["r1-01"]["adopted_as"], "합의-사실")
+        p = self.cli("report", "--run-dir", str(self.run_dir))
+        self.assertIn("| 1 | 2 | 1 | 1 | 0 | 1 | 2 |", p.stdout)
 
     def test_broken_full_suite_marks_interference_and_keeps_tree(self):
         toml = write_repos_toml(self.tmp, {str(self.repo): {
@@ -267,6 +270,7 @@ class CliEndToEndTest(CliTestBase):
         self.assertIn("return a * b", (self.repo / "calc.py").read_text(encoding="utf-8"))
         p = self.cli("report", "--run-dir", str(self.run_dir))
         self.assertIn("## 간섭 의심", p.stdout)
+        self.assertIn("| 1 | 2 | 1 | 1 | 1 | 0 | 2 |", p.stdout)
         self.assertIn("되돌리지 않았다", p.stdout)
         self.assertEqual((self.run_dir / "prepared" / "commit-message.txt").read_text(encoding="utf-8"), "")
 
