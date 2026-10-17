@@ -348,6 +348,7 @@ class CliEndToEndTest(CliTestBase):
         p = self.cli("report", "--run-dir", str(self.run_dir))
         self.assertIn("| 1 | 2 | 2 | 0 | 0 | 0 | 0 |", p.stdout)
         self.assertIn("- 회차 1 다음 회차로 넘김(앞 패치와 겹침): r1-02", p.stdout)
+        self.assertNotIn("실패 **r1-02**", p.stdout)
         self.assertNotIn("**r1-02**", section_of(p.stdout, "## 사람이 볼 목록"))
 
         result = self.tmp / "recheck.final"

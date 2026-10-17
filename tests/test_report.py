@@ -246,6 +246,21 @@ class RenderTest(unittest.TestCase):
         self.assertIn("F2", apply_section)
         self.assertIn("충돌 꼬리", apply_section)
 
+    def test_carried_finding_not_listed_as_failure(self):
+        ledger = full_ledger()
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "round-1").mkdir()
+            (run_dir / "round-1" / "apply.json").write_text(json.dumps(
+                {"applied": ["F1"], "failed": [["F2", "겹침 꼬리"], ["F5", "진짜 실패"]], "carried": ["F2"]},
+                ensure_ascii=False), encoding="utf-8")
+            text = report.render(ledger, False, run_dir=run_dir)
+        apply_section = section(text, "### 적용 결과")
+        self.assertIn("- 회차 1 다음 회차로 넘김(앞 패치와 겹침): F2", apply_section)
+        self.assertNotIn("실패 **F2**", apply_section)
+        self.assertNotIn("겹침 꼬리", apply_section)
+        self.assertIn("실패 **F5**", apply_section)
+
     def test_pr_comment_replies_and_resolve(self):
         findings = [
             finding("F1", thread_id="T1", body="고칠 것"),

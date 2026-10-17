@@ -118,9 +118,10 @@ def _load_apply(run_dir: Path | None, round_no: int) -> dict | None:
 
 
 def _failed_items(apply: dict | None) -> list[tuple[str, str]]:
+    carried = set((apply or {}).get("carried", []) or [])
     items = []
     for entry in (apply or {}).get("failed", []) or []:
-        if isinstance(entry, (list, tuple)) and len(entry) == 2:
+        if isinstance(entry, (list, tuple)) and len(entry) == 2 and str(entry[0]) not in carried:
             items.append((str(entry[0]), str(entry[1])))
     return items
 
