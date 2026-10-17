@@ -66,9 +66,19 @@ def _read_text(path: Path) -> str | None:
         return None
 
 
-def _uses_unittest(path: Path) -> bool:
-    text = _read_text(path) or ""
-    return bool(re.search(r"^\s*(?:import unittest|from unittest\b)", text, re.MULTILINE))
+_PYTEST_STYLE = re.compile(r"^(?:async\s+)?def test_|^class Test\w*\s*(?:\(\s*\))?\s*:", re.MULTILINE)
+_UNITTEST_CASE = re.compile(r"\bTestCase\b")
+
+
+def _test_runner(files: list[Path]) -> str | None:
+    """test_*.py 들을 돌릴 러너. 모듈 수준 test_ 함수나 TestCase를 상속하지 않는 Test 클래스가 하나라도
+    있으면 pytest(TestCase도 함께 돈다), TestCase만 있으면 unittest다. unittest.mock import 만으로는 고르지 않는다."""
+    texts = [_read_text(f) or "" for f in files]
+    if any(_PYTEST_STYLE.search(t) for t in texts):
+        return "pytest"
+    if any(_UNITTEST_CASE.search(t) for t in texts):
+        return "unittest"
+    return "pytest" if files else None
 
 
 def detect_candidates(root: Path) -> dict[str, list[str]]:
@@ -118,14 +128,15 @@ def detect_candidates(root: Path) -> dict[str, list[str]]:
     if not found["tests"]:
         tests_dir = next((d for d in ("tests", "test") if (root / d).is_dir()), None)
         test_files = sorted((root / tests_dir).glob("test_*.py")) if tests_dir else []
-        if any(_uses_unittest(f) for f in test_files):
+        runner = _test_runner(test_files)
+        if runner == "unittest":
             # {files}를 넣지 않는다: 파일 경로로 넘기면 discover -s 와 달리 tests_dir가 sys.path에 안 들어가
             # 테스트 안의 형제 모듈 import가 깨지고, 관련 테스트가 없으면 0건 실행(3.12부터 실패)이 된다
             add("tests", f"python3 -m unittest discover -s {tests_dir} -p 'test_*.py'")
             add("full_tests", f"python3 -m unittest discover -s {tests_dir} -p 'test_*.py'")
-        elif test_files:
-            # unittest를 쓰지 않는 test_*.py는 pytest 함수 테스트로 본다. unittest discover는 이를 0건으로
-            # 세고 3.11까지는 성공(종료 코드 0)으로 끝내 실패하는 코드도 검증을 통과시킨다
+        elif runner == "pytest":
+            # unittest discover는 pytest 함수 테스트를 세지 않는다(섞여 있으면 빠지고, 그것만 있으면
+            # 0건이 3.11까지 성공으로 끝난다). 실패하는 코드가 검증을 통과하지 않게 pytest를 낸다
             add("tests", "pytest {files}")
             add("full_tests", "pytest")
 

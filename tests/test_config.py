@@ -150,10 +150,21 @@ class RepoTomlLocationTest(unittest.TestCase):
             del os.environ["CASCADE_RUN_REVIEW"]
 
     def test_unittest_candidate(self):
-        repo = make_repo(Path(self._td.name) / "r", {"tests/test_a.py": "import unittest\n"})
+        repo = make_repo(Path(self._td.name) / "r", {"tests/test_a.py": "import unittest\n\n\nclass T(unittest.TestCase):\n    def test_ok(self):\n        pass\n"})
         self.assertIn("python3 -m unittest discover -s tests -p 'test_*.py'", config.detect_candidates(repo)["tests"])
 
     def test_pytest_style_tests_get_pytest_candidate(self):
         repo = make_repo(Path(self._td.name) / "r", {"tests/test_app.py": "def test_broken():\n    assert False\n"})
         found = config.detect_candidates(repo)
         self.assertEqual((found["tests"], found["full_tests"]), (["pytest {files}"], ["pytest"]))
+
+    def test_mixed_or_mock_using_pytest_tests_get_pytest_candidate(self):
+        mixed = make_repo(Path(self._td.name) / "mixed", {
+            "tests/test_a.py": "import unittest\n\n\nclass T(unittest.TestCase):\n    def test_ok(self):\n        pass\n",
+            "tests/test_b.py": "def test_broken():\n    assert False\n",
+        })
+        self.assertEqual(config.detect_candidates(mixed)["tests"], ["pytest {files}"])
+        mock = make_repo(Path(self._td.name) / "mock", {
+            "tests/test_c.py": "from unittest import mock\n\n\ndef test_m():\n    assert mock.Mock()\n",
+        })
+        self.assertEqual(config.detect_candidates(mock)["tests"], ["pytest {files}"])

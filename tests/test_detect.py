@@ -1,4 +1,5 @@
 import json
+import shlex
 import sys
 import tempfile
 import unittest
@@ -60,7 +61,7 @@ class DetectCliTest(unittest.TestCase):
         self._td = tempfile.TemporaryDirectory()
         self.addCleanup(self._td.cleanup)
         self.tmp = Path(self._td.name).resolve()
-        self.repo = make_repo(self.tmp / "repo", {"calc.py": "x = 1\n", "README.md": "# r\n", "tests/test_calc.py": "import unittest\n"})
+        self.repo = make_repo(self.tmp / "repo", {"calc.py": "x = 1\n", "README.md": "# r\n", "tests/test_calc.py": "import unittest\n\n\nclass T(unittest.TestCase):\n    def test_ok(self):\n        pass\n"})
         self.toml = write_repos_toml(self.tmp, {str(self.repo): {"tests": ["python3 -m unittest {files}"]}})
         self.env = {"CASCADE_REPOS_TOML": str(self.toml), "CASCADE_REVIEWER": "auto"}
 
@@ -143,6 +144,27 @@ class DetectCliTest(unittest.TestCase):
         self.assertEqual((rec["source"], rec["estimate"]["stage1"]), ("codex-code", 4))
         self.assertIn("--reviewer codex", rec["steps"][0])
         self.assertTrue(any("Codex 전송 동의" in a for a in r["approvals"]))
+
+    def test_external_doc_result_passes_doc_to_init(self):
+        ext = self.tmp / "outside" / "external-plan.md"
+        ext.parent.mkdir()
+        ext.write_text("# 계획\n\n1단계\n", encoding="utf-8")
+        text = SECTIONED.format(title="단계가 모호하다", loc=f"{ext}:3")
+        result = self.tmp / "review.json"
+        result.write_text(json.dumps({"results": [{"id": "review:reviewer", "output": {"text": text, "model_id": "m"}}]},
+                                     ensure_ascii=False), encoding="utf-8")
+        code, r = self.detect("--input", str(result))
+        self.assertEqual(code, 0)
+        rec = r["recommendation"]
+        self.assertEqual((rec["source"], rec["mode"]), ("claude-doc", "doc"))
+        self.assertIn(f"--doc {ext}", rec["steps"][0])
+        words = shlex.split(rec["steps"][0])
+        init = words[words.index("init"):]
+        p = run_cli(init, cwd=self.repo, env=self.env)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        run_dir = Path(next(x for x in p.stdout.splitlines() if x.startswith("run_dir=")).split("=", 1)[1])
+        docs = json.loads((run_dir / "ledger.json").read_text(encoding="utf-8"))["docs"]
+        self.assertEqual(list(docs.values()), [str(ext)])
 
     def test_pr_with_unresolved_threads_recommends_pr_comment(self):
         env = {**self.env, "CASCADE_GH": FAKE_GH, "CASCADE_FAKE_GH_PR_URL": "https://github.com/o/r/pull/7",

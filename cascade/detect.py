@@ -95,14 +95,46 @@ def pr_info(root: Path, gh: list[str], number: str | None = None) -> tuple[dict 
             "unresolved": len(findings), "me": me}, None
 
 
-def _sectioned(raw: str) -> tuple[int, bool] | None:
-    """Critical/Warning/Suggestion 형식을 읽어 (지적 수, 위치가 모두 문서 파일인가)를 낸다. 형식이 아니면 None."""
+def _location_paths(raw: str) -> list[str] | None:
+    """Critical/Warning/Suggestion 형식의 지적 위치에서 파일 경로만 낸다. 형식이 아니면 None."""
     try:
         findings = parse_codex_doc(raw, 1)
     except ParseError:
         return None
-    paths = [m.group(1) if (m := _LOCATION_FILE.match(f.location)) else f.location for f in findings]
-    return len(findings), bool(paths) and all(p.lower().endswith(DOC_SUFFIXES) for p in paths)
+    return [m.group(1) if (m := _LOCATION_FILE.match(f.location)) else f.location for f in findings]
+
+
+def _review_text(raw: str) -> str:
+    """Workflow 결과 JSON이면 검토 본문을, 아니면 원문을 낸다."""
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return raw
+    if isinstance(data, dict) and "results" in data:
+        texts = [text for text, _ in read_review_results(data).values()]
+        return texts[0] if texts else ""
+    return raw
+
+
+def _sectioned(raw: str) -> tuple[int, bool] | None:
+    """(지적 수, 위치가 모두 문서 파일인가). 형식이 아니면 None."""
+    paths = _location_paths(raw)
+    if paths is None:
+        return None
+    return len(paths), bool(paths) and all(p.lower().endswith(DOC_SUFFIXES) for p in paths)
+
+
+def doc_targets(path: Path, root: Path) -> list[Path]:
+    """문서 모드 결과 파일이 가리키는 문서 중 실제로 있는 것. init --doc 으로 넘겨 원장에 등록한다
+    (저장소 밖 문서는 --doc 이 없으면 수정용 워크트리에 복사되지 않는다)."""
+    out: list[Path] = []
+    for p in _location_paths(_review_text(path.read_text(encoding="utf-8"))) or []:
+        if not p.lower().endswith(DOC_SUFFIXES):
+            continue
+        target = (Path(p).expanduser() if Path(p).expanduser().is_absolute() else root / p).resolve()
+        if target.is_file() and target not in out:
+            out.append(target)
+    return out
 
 
 def classify_input(path: Path) -> tuple[str | None, int]:
@@ -258,7 +290,9 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
             steps.append(f"{cli} init --source pr-comment --input {pr_data['number']} --pr-repo {q(pr_data['repo'])}"
                          + (f" --me {q(pr_data['me'])}" if pr_data.get("me") else "") + flags)
         else:
-            steps.append(f"{cli} init --source {rec['source']} --input {q(str(input_path))}{flags}")
+            docs = doc_targets(input_path, root) if rec["mode"] == "doc" else []
+            doc_flags = "".join(f" --doc {q(str(d))}" for d in docs)
+            steps.append(f"{cli} init --source {rec['source']} --input {q(str(input_path))}{doc_flags}{flags}")
     if found is not None and found > 0 and rec["mode"]:
         rec["estimate"] = estimate(found, rec["mode"], reviewer)
         if rec["estimate"]["stage1"] > SEVERITY_SPLIT_JOBS:
