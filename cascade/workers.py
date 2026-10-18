@@ -1,17 +1,36 @@
 from pathlib import Path
 
 from cascade.jobs import ROLES, RUNNER_CLAUDE
-from cascade.runners import RUNNER_CODEX, RUNNER_CURSOR, codex_available, codex_model, cursor_available
+from cascade.runners import (
+    DEFAULT_MODEL_NAME,
+    RUNNER_CODEX,
+    RUNNER_CURSOR,
+    STATUS_AUTH,
+    STATUS_ERROR,
+    STATUS_INVALID,
+    STATUS_LIMIT,
+    STATUS_SKIPPED,
+    STATUS_TIMEOUT,
+    Outcome,
+    codex_available,
+    codex_model,
+    cursor_available,
+)
 
 WORKERS_CLAUDE, WORKERS_EXTERNAL = "claude", "external"
 WORKERS_CHOICES = (WORKERS_CLAUDE, WORKERS_EXTERNAL)
 DEFAULT_CURSOR_MODEL = "composer-2.5"
 WORKER_ROLES = ("a", "b", "writer", "checker")
-DEFAULT_MODEL_NAME = "default"
 
 _SEATS = {"A·writer": ("a", "writer"), "B·checker": ("b", "checker")}
 _LABELS = {RUNNER_CLAUDE: "Claude", RUNNER_CODEX: "Codex", RUNNER_CURSOR: "Cursor"}
 _RECIPIENTS = {RUNNER_CODEX: "OpenAI", RUNNER_CURSOR: "Cursor(팀 프라이버시 모드)"}
+FALLBACK_LABELS = {
+    STATUS_LIMIT: "한도", STATUS_INVALID: "무효", STATUS_AUTH: "로그인",
+    STATUS_TIMEOUT: "시간 초과", STATUS_ERROR: "오류", STATUS_SKIPPED: "건너뜀",
+}
+LOGIN_COMMANDS = {RUNNER_CODEX: "codex login", RUNNER_CURSOR: "cursor-agent login"}
+_USAGE_KEYS = {"input": "input_tokens", "output": "output_tokens", "cache_read": "cached_input_tokens"}
 
 
 def _claude(role: str) -> dict:
@@ -67,3 +86,18 @@ def consent_line(workers: dict[str, dict] | None) -> str:
     used = {spec["runner"] for spec in (workers or {}).values()}
     targets = [_RECIPIENTS[r] for r in (RUNNER_CODEX, RUNNER_CURSOR) if r in used]
     return f"작업자 전송 동의: 워크트리의 코드·문서를 {', '.join(targets)}로 보낸다" if targets else ""
+
+
+def fallback_counts(counts: dict[str, int]) -> tuple[int, str]:
+    """상태별 건수에서 대체 실행 건수와 사유별 내역(「한도 1, 무효 2」)을 뽑는다."""
+    reasons = {label: counts[status] for status, label in FALLBACK_LABELS.items() if counts.get(status)}
+    return sum(reasons.values()), ", ".join(f"{label} {n}" for label, n in reasons.items())
+
+
+def usage_totals(outcomes: list[Outcome]) -> dict[str, dict[str, int]]:
+    totals: dict[str, dict[str, int]] = {}
+    for outcome in outcomes:
+        total = totals.setdefault(outcome.runner, dict.fromkeys(_USAGE_KEYS, 0))
+        for name, key in _USAGE_KEYS.items():
+            total[name] += outcome.usage.get(key, 0)
+    return totals

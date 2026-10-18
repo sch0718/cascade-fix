@@ -80,6 +80,17 @@ from cascade.rounds import (
     out_of_scope,
     parse_recheck,
 )
+from cascade.runners import (
+    RUNNER_CODEX,
+    RUNNER_CURSOR,
+    STATUS_OK,
+    CliJob,
+    CodexRunner,
+    CursorRunner,
+    find_codex,
+    find_cursor_agent,
+    run_all,
+)
 from cascade.sandbox_check import ensure as ensure_sandbox
 from cascade.snapshot import (
     RUN_DIR_NAME,
@@ -101,7 +112,9 @@ from cascade.workers import (
     assign_available,
     consent_line,
     describe,
+    fallback_counts,
     has_external,
+    usage_totals,
 )
 
 SOURCES = ("codex-doc", "codex-code", "claude-doc", "claude-code", "cursor-doc", "cursor-code", "pr-comment")
@@ -451,6 +464,59 @@ def cmd_jobs(args) -> int:
     return 0
 
 
+def _cli_job(entry: dict) -> CliJob:
+    return CliJob(entry["id"], entry["role"], entry["kind"], entry["runner"], entry["model"], entry["effort"],
+                  Path(entry["promptPath"]), Path(entry["worktree"]), entry["writable"])
+
+
+_CLI_MAKERS = {RUNNER_CODEX: (find_codex, CodexRunner), RUNNER_CURSOR: (find_cursor_agent, CursorRunner)}
+
+
+def _cli_runners(jobs: list[CliJob]) -> dict[str, object]:
+    runners = {}
+    for name in {job.runner for job in jobs} & _CLI_MAKERS.keys():
+        find, make = _CLI_MAKERS[name]
+        exe = find()
+        if exe:
+            runners[name] = make(exe)
+    return runners
+
+
+def cmd_workers(args) -> int:
+    run_dir = Path(args.run_dir)
+    ledger = s.load_ledger(run_dir)
+    rnd = s.get_round(ledger, args.round)
+    step = f"workers-{args.stage}"
+    s.guard(rnd, step, args.force)
+    rd = s.round_dir(run_dir, rnd.no)
+    cli_args = rd / f"{args.stage}-cli-args.json"
+    if not cli_args.is_file():
+        raise s.CliError(f"CLI 작업이 없다: {cli_args.name} 가 없다(jobs 단계가 CLI 작업을 만든 회차에서만 쓴다)")
+    entries = s.read_json(cli_args)["jobs"]
+    jobs = [_cli_job(e) for e in entries]
+    outcomes = run_all(jobs, _cli_runners(jobs))
+    out = rd / f"{args.stage}-cli.json"
+    s.write_json(out, {"results": [{"id": o.id, "output": o.output} for o in outcomes],
+                       "outcomes": [o.to_dict() for o in outcomes]})
+    failed = [o.id for o in outcomes if o.status != STATUS_OK]
+    fallback_args = rd / f"{args.stage}-fallback-args.json"
+    (rd / f"{args.stage}-fallback.json").unlink(missing_ok=True)
+    if failed:
+        s.write_json(fallback_args, {"jobs": [s.fallback_job(e) for e in entries if e["id"] in failed]})
+    else:
+        fallback_args.unlink(missing_ok=True)
+    counts = dict(Counter(o.status for o in outcomes))
+    ledger = s.load_ledger(run_dir)
+    rnd = s.get_round(ledger, args.round)
+    s.mark(rnd, step, counts=counts, usage=usage_totals(outcomes), fallback=failed)
+    s.save_ledger(run_dir, ledger)
+    n, reasons = fallback_counts(counts)
+    print(f"CLI 작업 {len(outcomes)}건: 성공 {counts.get(STATUS_OK, 0)}, 대체 실행 {n}" + (f"({reasons})" if n else ""))
+    print(f"결과: {out}")
+    _print_next(ledger, run_dir)
+    return 0
+
+
 def _judge_code(ledger, rnd, f, results, snap, cfg, baseline, repro):
     wt_a, wt_b = s.worktree(snap, f.id, "a"), s.worktree(snap, f.id, "b")
     a, b = s.pick(results, f.id, "a"), s.pick(results, f.id, "b")
@@ -493,12 +559,17 @@ def cmd_judge(args) -> int:
     cfg = s.cfg_for(ledger.source, Path(ledger.root))
     snap = s.snapshot_of(ledger)
     rd = s.round_dir(run_dir, rnd.no)
-    results = read_results(s.read_json(args.results))
-    checker_results = read_results(s.read_json(args.checker_results)) if args.checker_results else None
+    stage1_json, loaded_ids = s.stage_inputs(run_dir, rnd, rd, s.STAGE1, args.results, "--results")
+    results = read_results(stage1_json)
+    checker_results = None
+    if args.checker_results or (ledger.mode == "doc" and s.step_done(rnd, "judge-checker")):
+        checker_json, checker_ids = s.stage_inputs(run_dir, rnd, rd, s.STAGE_CHECKER, args.checker_results, "--checker-results")
+        checker_results = read_results(checker_json)
+        loaded_ids |= checker_ids
     baseline = s.baseline_failed(rd)
     repro = s.approved_repro(rd, args.allow_repro) if ledger.source == s.SOURCE_PR else None
     judged = {**results, **(checker_results or {})}
-    for warning in s.model_warnings(judged, s.expected_model_ids(ledger, judged)):
+    for warning in s.model_warnings(judged, {**s.expected_model_ids(ledger, judged), **loaded_ids}):
         print(warning)
     findings = s.findings_of(rnd)
     merged: dict[str, dict] = {}
@@ -1089,8 +1160,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--review-model")
     p.add_argument("--review-effort", choices=EFFORTS)
     add("jobs", cmd_jobs, round_no=True)
+    p = add("workers", cmd_workers, round_no=True)
+    p.add_argument("--stage", choices=(s.STAGE1, s.STAGE_CHECKER), required=True)
     p = add("judge", cmd_judge, round_no=True)
-    p.add_argument("--results", required=True)
+    p.add_argument("--results")
     p.add_argument("--checker-results")
     p.add_argument("--allow-repro")
     p = add("adjudicate", cmd_adjudicate, round_no=True)

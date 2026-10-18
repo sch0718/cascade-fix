@@ -111,7 +111,7 @@ class EstimateTest(unittest.TestCase):
         self.assertIn("작업자 4,", detect.estimate_line(2, "code", "claude", {}))
 
 
-class InitWorkersTest(CliTestBase):
+class ExternalWorkersBase(CliTestBase):
     def setUp(self):
         super().setUp()
         self.home = self.tmp / "home"
@@ -130,6 +130,8 @@ class InitWorkersTest(CliTestBase):
     def use_fakes(self):
         self.env.update({"CASCADE_CODEX": str(self.codex), "CASCADE_CURSOR_AGENT": str(self.cursor)})
 
+
+class InitWorkersTest(ExternalWorkersBase):
     def test_init_external_records_assignment_and_prints_it(self):
         self.use_fakes()
         p = self.init("--workers", "external", "--reviewer", "claude")

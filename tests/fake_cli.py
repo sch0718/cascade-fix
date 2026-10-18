@@ -36,6 +36,12 @@ def mutate(root):
         target = Path(root) / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content)
+    for key, files in json.loads(os.environ.get("FAKE_MUTATE_WT", "{}")).items():
+        if key in Path(root).name:
+            for rel, content in files.items():
+                target = Path(root) / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content)
 '''
 
 CODEX_BODY = _COMMON + r'''
@@ -96,9 +102,12 @@ if config.is_file():
 sleep = float(os.environ.get("FAKE_CURSOR_SLEEP", "0"))
 if sleep:
     time.sleep(sleep)
-mutate(sys.argv[sys.argv.index("--workspace") + 1])
+workspace = sys.argv[sys.argv.index("--workspace") + 1]
+mutate(workspace)
 responses = json.loads(os.environ.get("FAKE_CURSOR_RESULTS", '[""]'))
-entry = responses[min(n, len(responses)) - 1]
+matched = [e for e in responses if isinstance(e, dict) and e.get("match") and e["match"] in workspace]
+plain = [e for e in responses if not (isinstance(e, dict) and "match" in e)] or [""]
+entry = matched[0] if matched else plain[min(n, len(plain)) - 1]
 if isinstance(entry, str):
     entry = {"result": entry}
 if "stdout" in entry:

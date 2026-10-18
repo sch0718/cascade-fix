@@ -21,6 +21,7 @@ from cascade.patches import NO_HOOKS, _git_checked
 STATUS_OK, STATUS_INVALID, STATUS_LIMIT, STATUS_AUTH, STATUS_TIMEOUT, STATUS_ERROR, STATUS_SKIPPED = (
     "ok", "invalid", "limit", "auth", "timeout", "error", "skipped")
 RUNNER_CODEX, RUNNER_CURSOR = "codex", "cursor"
+DEFAULT_MODEL_NAME = "default"
 JOB_TIMEOUT = 900
 MAX_PARALLEL = 4
 STATUS_COMMAND_TIMEOUT = 30
@@ -268,7 +269,7 @@ def _failure(job: CliJob, run: _Run, usage: dict, timeout: float) -> Outcome | N
 def _check_output(job: CliJob, output: dict | None) -> dict | None:
     if output is None:
         return None
-    candidate = {**output, "model_id": f"{job.runner}:{job.model}"}
+    candidate = {**output, "model_id": f"{job.runner}:{job.model or DEFAULT_MODEL_NAME}"}
     return candidate if valid_output(candidate, job.role) else None
 
 

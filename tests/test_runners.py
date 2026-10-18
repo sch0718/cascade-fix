@@ -105,6 +105,12 @@ class CodexRunnerTest(RunnerTestBase):
         self.assertEqual(out.usage["input_tokens"], 11)
         self.assertIn("지적을 재현하라", self.log_text("codex", "stdin"))
 
+    def test_empty_model_omits_flag_and_reports_default_model_id(self):
+        out = self.run_codex(self.job(model=""))
+        self.assertEqual(out.status, STATUS_OK)
+        self.assertNotIn("-m", self.log_args("codex"))
+        self.assertEqual(out.output["model_id"], "codex:default")
+
     def test_readonly_role_uses_read_only_sandbox(self):
         out = self.run_codex(self.job(role="checker", kind="checker", writable=False))
         args = self.log_args("codex")

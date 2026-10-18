@@ -24,7 +24,7 @@ from cascade.jobs import ROLES, AdjInput, location_file, split_location, write_j
 from cascade.patches import DIFF_FLAGS, changed_files, record_setup_paths
 from cascade.review import REVIEWER_CLAUDE, REVIEWER_CURSOR, claude_prompt, review_job
 from cascade.rounds import STATUS_DONE, Ledger, RoundRecord, ledger_path, needs_recheck
-from cascade.runners import cursor_available
+from cascade.runners import STATUS_OK, cursor_available
 from cascade.snapshot import Snapshot, add_worktree, tree_diff_stat, user_tree_fingerprint
 from cascade.verify import (
     VerifyResult,
@@ -84,6 +84,9 @@ OPINION_ARGS = "opinion-args.json"
 OPINION_RESULTS = "opinion.json"
 RECHECK_ARGS = "recheck-args.json"
 RECHECK_RESULTS = "recheck.json"
+STAGE1, STAGE_CHECKER = "stage1", "checker"
+STAGE_ARGS = {STAGE1: "stage1-args.json", STAGE_CHECKER: "checker-args.json"}
+STAGE_OUTPUTS = {STAGE1: "stage1.json", STAGE_CHECKER: "checker.json"}
 FINGERPRINT_PARTS = {"tree": "작업 트리", "head": "HEAD", "stash": "stash", "branches": "브랜치"}
 
 
@@ -264,6 +267,53 @@ def model_warnings(results: dict[str, WorkerResult], expected_ids: dict[str, str
 
 def expected_model_ids(ledger: Ledger, results: dict[str, WorkerResult]) -> dict[str, str]:
     return {key: expected_model_id(ledger.workers[r.role]) for key, r in results.items() if r.role in ledger.workers}
+
+
+def has_jobs(path: Path) -> bool:
+    return Path(path).is_file() and bool(read_json(path).get("jobs"))
+
+
+def fallback_job(entry: dict) -> dict:
+    model, effort = ROLES[entry["role"]]
+    return {"id": entry["id"], "label": entry["id"].replace(":", " "), "model": model, "effort": effort,
+            "kind": entry["kind"], "promptPath": entry["promptPath"]}
+
+
+def _role_of(job_id: str) -> str:
+    return job_id.rpartition(":")[2]
+
+
+def load_stage_results(rd: Path, stage: str, claude: Path | None) -> tuple[dict, dict[str, str]]:
+    """Claude 결과 → 성공한 CLI 결과 → 대체 실행 결과 순으로 합친다. 같은 id는 뒤가 앞을 덮는다."""
+    rd = Path(rd)
+    merged: dict[str, dict] = {}
+    expected: dict[str, str] = {}
+    if claude is not None:
+        merged.update({item["id"]: item for item in read_json(claude).get("results", [])})
+    cli, cli_args, fallback = rd / f"{stage}-cli.json", rd / f"{stage}-cli-args.json", rd / f"{stage}-fallback.json"
+    if cli.is_file():
+        data = read_json(cli)
+        ok = {o["id"] for o in data.get("outcomes", []) if o.get("status") == STATUS_OK}
+        merged.update({item["id"]: item for item in data.get("results", []) if item["id"] in ok})
+        expected.update({job["id"]: expected_model_id(job) for job in read_json(cli_args)["jobs"] if job["id"] in ok})
+    if fallback.is_file():
+        items = read_json(fallback).get("results", [])
+        merged.update({item["id"]: item for item in items})
+        expected.update({item["id"]: ROLES[_role_of(item["id"])][0] for item in items if _role_of(item["id"]) in ROLES})
+    return {"results": list(merged.values())}, expected
+
+
+def stage_inputs(run_dir: Path, rnd: RoundRecord, rd: Path, stage: str, claude: str | None, option: str) -> tuple[dict, dict[str, str]]:
+    rd = Path(rd)
+    if (rd / f"{stage}-cli-args.json").is_file() and not step_done(rnd, f"workers-{stage}"):
+        raise CliError(f"회차 {rnd.no}의 {stage} CLI 작업이 남았다. workers 단계를 먼저 한다: "
+                       + _cmd("workers", run_dir, f"--round {rnd.no}", f"--stage {stage}"))
+    fallback_args, fallback_out = rd / f"{stage}-fallback-args.json", rd / f"{stage}-fallback.json"
+    if fallback_args.is_file() and not fallback_out.is_file():
+        raise CliError(f"{stage} 대체 실행 결과({fallback_out.name})가 없다. 먼저 한다: " + workflow_step(fallback_args, fallback_out))
+    if claude is None and has_jobs(rd / STAGE_ARGS[stage]):
+        raise CliError(f"{option} 가 필요하다: {STAGE_ARGS[stage]} 에 Claude 작업이 있다")
+    return load_stage_results(rd, stage, Path(claude) if claude else None)
 
 
 def is_sensitive(paths: list[str], cfg: RepoConfig) -> bool:
@@ -605,6 +655,29 @@ def _cmd(name: str, run_dir: Path, *rest: str) -> str:
     return " ".join([CLI, name, "--run-dir", _q(run_dir), *rest])
 
 
+def _judge_cmd(run_dir: Path, rd: Path, no: int, stage: str) -> str:
+    rest = [f"--results {_q(rd / STAGE_OUTPUTS[STAGE1])}"] if has_jobs(rd / STAGE_ARGS[STAGE1]) else []
+    if stage == STAGE_CHECKER and has_jobs(rd / STAGE_ARGS[STAGE_CHECKER]):
+        rest.append(f"--checker-results {_q(rd / STAGE_OUTPUTS[STAGE_CHECKER])}")
+    return _cmd("judge", run_dir, f"--round {no}", *rest)
+
+
+def _judge_ready(rnd: RoundRecord, rd: Path, stage: str) -> bool:
+    return not (Path(rd) / f"{stage}-cli-args.json").is_file() or step_done(rnd, f"workers-{stage}")
+
+
+def _stage_steps(rnd: RoundRecord, run_dir: Path, rd: Path, stage: str) -> list[str]:
+    claude = [workflow_step(rd / STAGE_ARGS[stage], rd / STAGE_OUTPUTS[stage])] if has_jobs(rd / STAGE_ARGS[stage]) else []
+    if not (rd / f"{stage}-cli-args.json").is_file():
+        return [*claude, _judge_cmd(run_dir, rd, rnd.no, stage)]
+    if not step_done(rnd, f"workers-{stage}"):
+        workers = f"(백그라운드로) {_cmd('workers', run_dir, f'--round {rnd.no}', f'--stage {stage}')}"
+        return [workers, *claude, *(["Workflow와 workers는 서로 기다리지 않으므로 두 단계를 동시에 띄운다"] if claude else [])]
+    fallback_args, fallback_out = rd / f"{stage}-fallback-args.json", rd / f"{stage}-fallback.json"
+    fallback = [workflow_step(fallback_args, fallback_out)] if fallback_args.is_file() and not fallback_out.is_file() else []
+    return [*fallback, _judge_cmd(run_dir, rd, rnd.no, stage)]
+
+
 def next_steps(ledger: Ledger, run_dir: Path) -> list[str]:
     rnd = ledger.current_round()
     if rnd is None:
@@ -627,16 +700,10 @@ def next_steps(ledger: Ledger, run_dir: Path) -> list[str]:
     if not step_done(rnd, "jobs"):
         return [_cmd("jobs", run_dir, n)]
     if not step_done(rnd, "judge"):
-        if step_done(rnd, "judge-checker") and (rd / "checker-args.json").is_file():
-            return [
-                workflow_step(rd / "checker-args.json", rd / "checker.json"),
-                _cmd("judge", run_dir, n, f"--results {_q(rd / 'stage1.json')}", f"--checker-results {_q(rd / 'checker.json')}"),
-            ]
-        steps = [
-            workflow_step(rd / "stage1-args.json", rd / "stage1.json"),
-            _cmd("judge", run_dir, n, f"--results {_q(rd / 'stage1.json')}"),
-        ]
-        if any(repro_listed(rd).values()):
+        if step_done(rnd, "judge-checker") and (rd / STAGE_ARGS[STAGE_CHECKER]).is_file():
+            return _stage_steps(rnd, run_dir, rd, STAGE_CHECKER)
+        steps = _stage_steps(rnd, run_dir, rd, STAGE1)
+        if _judge_ready(rnd, rd, STAGE1) and any(repro_listed(rd).values()):
             steps.append(f"(재현 명령 {rd / REPRO_FILE} 을 사용자에게 보이고 승인받았으면 judge에 --allow-repro {_q(rd / REPRO_FILE)} 를 붙인다)")
         return steps
     if (rd / "adj-args.json").is_file() and not step_done(rnd, "adjudicate"):

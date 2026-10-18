@@ -1,0 +1,318 @@
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from cascade import cli_steps  # noqa: E402
+from fake_cli import fenced, result_json  # noqa: E402
+from test_cli_e2e import CALC, FIXTURES, fix, results_json, section_of, worker_output  # noqa: E402
+from test_workers import ExternalWorkersBase  # noqa: E402
+
+LIMIT_ENTRY = {"is_error": True, "result": "You've hit your usage limit", "exit": 1}
+CODE_FIXES = {
+    "r1-01-": {"calc.py": fix(CALC, "return a - b", "return a + b")},
+    "r1-02-": {"calc.py": fix(CALC, "return a + b", "return a * b")},
+}
+PLAN = "# 계획\n\n1단계는 `calc.py`를 고친다.\n"
+CHECKER_RESULT = json.dumps({"verdict": "사실", "needs_design_decision": False, "reason": "해소한다",
+                             "checker_ok": True, "model_id": "x"}, ensure_ascii=False)
+
+
+class WorkersTestBase(ExternalWorkersBase):
+    def setUp(self):
+        super().setUp()
+        reply = json.loads(self.env["FAKE_CURSOR_RESULTS"])[0]
+        self.sandbox_reply = reply
+        self.env.update({"FAKE_CODEX_RESULT": result_json(), "FAKE_MUTATE_WT": json.dumps(CODE_FIXES, ensure_ascii=False)})
+        self.cursor_results([])
+
+    def cursor_results(self, extra):
+        self.env["FAKE_CURSOR_RESULTS"] = json.dumps(
+            [self.sandbox_reply, {"result": fenced(result_json())}, *extra], ensure_ascii=False)
+
+    def rd(self):
+        return self.run_dir / "round-1"
+
+    def read(self, name):
+        return json.loads((self.rd() / name).read_text(encoding="utf-8"))
+
+    def args(self, command, *extra, ok=True):
+        return self.cli(command, "--run-dir", str(self.run_dir), "--round", "1", *extra, ok=ok)
+
+    def start(self, *init_extra):
+        self.use_fakes()
+        self.init("--workers", "external", "--reviewer", "claude", *init_extra)
+        self.args("jobs")
+
+    def workers(self, stage="stage1", ok=True):
+        return self.args("workers", "--stage", stage, ok=ok)
+
+    def event(self, step):
+        return next(e for e in self.ledger().rounds[0].events if e["step"] == step)
+
+
+class WorkersCommandTest(WorkersTestBase):
+    def test_external_run_reaches_report_without_claude_stage1(self):
+        self.start()
+        p = self.workers()
+        self.assertIn("CLI 작업 4건: 성공 4, 대체 실행 0", p.stdout)
+        cli = self.read("stage1-cli.json")
+        self.assertEqual([o["status"] for o in cli["outcomes"]], ["ok"] * 4)
+        self.assertEqual([r["id"] for r in cli["results"]], ["r1-01:a", "r1-01:b", "r1-02:a", "r1-02:b"])
+        self.assertEqual(cli["results"][0]["output"]["model_id"], "codex:gpt-test")
+        self.assertFalse((self.rd() / "stage1-fallback-args.json").exists())
+
+        status = self.cli("status", "--run-dir", str(self.run_dir)).stdout
+        judge_line = next(line for line in status.splitlines() if " judge " in line)
+        self.assertNotIn("--results", judge_line)
+
+        p = self.args("judge")
+        self.assertNotIn("경고", p.stdout)
+        outcomes = {d["finding_id"]: d["outcome"] for d in self.read("decisions.json")}
+        self.assertEqual(outcomes, {"r1-01": "합의-사실", "r1-02": "합의-사실"})
+        self.assertEqual(self.read("stage1-args.json")["jobs"], [])
+
+        self.args("apply")
+        calc = (self.repo / "calc.py").read_text(encoding="utf-8")
+        self.assertIn("return a + b\n\n\ndef ident", calc)
+        self.assertIn("return a * b", calc)
+        report = self.cli("report", "--run-dir", str(self.run_dir)).stdout
+        self.assertIn("## 외부 작업자", report)
+
+    def test_empty_codex_model_reports_default_model_id_without_warning(self):
+        (self.home / ".codex" / "config.toml").write_text("", encoding="utf-8")
+        self.start()
+        self.assertEqual(self.ledger().workers["a"]["model"], "")
+        self.workers()
+        self.assertEqual(self.read("stage1-cli.json")["results"][0]["output"]["model_id"], "codex:default")
+        p = self.args("judge")
+        self.assertNotIn("경고", p.stdout)
+        self.assertEqual(self.read("results.json")["r1-01:a"]["model_id"], "codex:default")
+
+    def test_failed_cli_job_goes_to_fallback_and_judge_merges(self):
+        self.cursor_results([dict(LIMIT_ENTRY, match="r1-02-b")])
+        self.start()
+        p = self.workers()
+        self.assertIn("CLI 작업 4건: 성공 3, 대체 실행 1(한도 1)", p.stdout)
+        fallback = self.read("stage1-fallback-args.json")
+        self.assertEqual(len(fallback["jobs"]), 1)
+        job = fallback["jobs"][0]
+        self.assertEqual((job["id"], job["model"], job["effort"], job["kind"]), ("r1-02:b", "claude-haiku-5-5", "low", "worker"))
+        self.assertEqual(job["label"], "r1-02 b")
+        self.assertIn("r1-02-b", Path(job["promptPath"]).read_text(encoding="utf-8"))
+        self.assertNotIn("runner", job)
+        cli = self.read("stage1-cli.json")
+        self.assertEqual({o["id"]: o["status"] for o in cli["outcomes"]}["r1-02:b"], "limit")
+        event = self.event("workers-stage1")
+        self.assertEqual((event["counts"], event["fallback"]), ({"ok": 3, "limit": 1}, ["r1-02:b"]))
+        self.assertEqual(event["usage"]["codex"], {"input": 22, "output": 14, "cache_read": 6})
+        self.assertEqual(event["usage"]["cursor"], {"input": 200, "output": 40, "cache_read": 10})
+
+        status = self.cli("status", "--run-dir", str(self.run_dir)).stdout
+        self.assertIn("stage1-fallback-args.json", status)
+        self.assertIn("stage1-fallback.json", status)
+
+        results_json(self.rd() / "stage1-fallback.json", [("r1-02:b", worker_output("사실", "claude-haiku-5-5"))])
+        p = self.args("judge")
+        self.assertNotIn("경고", p.stdout)
+        merged = self.read("results.json")
+        self.assertEqual(merged["r1-02:b"]["model_id"], "claude-haiku-5-5")
+        self.assertEqual(merged["r1-02:a"]["model_id"], "codex:gpt-test")
+        self.assertEqual(merged["r1-01:b"]["model_id"], "cursor:composer-2.5")
+
+    def test_fallback_result_with_wrong_model_warns(self):
+        self.cursor_results([dict(LIMIT_ENTRY, match="r1-02-b")])
+        self.start()
+        self.workers()
+        results_json(self.rd() / "stage1-fallback.json", [("r1-02:b", worker_output("사실", "cursor:composer-2.5"))])
+        p = self.args("judge")
+        self.assertIn("r1-02:b 모델 ID가 cursor:composer-2.5 이다(기대값 claude-haiku-5-5)", p.stdout)
+
+    def test_workers_command_is_refused_twice_without_force(self):
+        self.start()
+        self.workers()
+        p = self.workers(ok=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("--force", p.stdout)
+        self.args("workers", "--stage", "stage1", "--force")
+
+    def test_workers_without_cli_jobs_is_error(self):
+        self.init("--reviewer", "claude")
+        self.args("jobs")
+        p = self.workers(ok=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("CLI 작업이 없다", p.stdout)
+
+    def test_missing_executable_sends_every_job_to_fallback(self):
+        self.start()
+        self.env["CASCADE_CODEX"] = str(self.tmp / "no-such-codex")
+        p = self.workers()
+        self.assertIn("CLI 작업 4건: 성공 2, 대체 실행 2(오류 2)", p.stdout)
+        self.assertEqual([j["id"] for j in self.read("stage1-fallback-args.json")["jobs"]], ["r1-01:a", "r1-02:a"])
+        self.assertEqual([j["model"] for j in self.read("stage1-fallback-args.json")["jobs"]], ["claude-sonnet-5-5"] * 2)
+
+    def test_judge_refuses_before_workers_done(self):
+        self.start()
+        p = self.args("judge", ok=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("workers 단계를 먼저", p.stdout)
+
+    def test_judge_refuses_when_fallback_result_missing(self):
+        self.cursor_results([dict(LIMIT_ENTRY, match="r1-02-b")])
+        self.start()
+        self.workers()
+        p = self.args("judge", ok=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("stage1-fallback.json", p.stdout)
+
+    def test_judge_requires_results_when_claude_jobs_exist(self):
+        self.use_fakes()
+        del self.env["CASCADE_CURSOR_AGENT"]
+        self.init("--workers", "external", "--reviewer", "claude")
+        self.args("jobs")
+        self.workers()
+        p = self.args("judge", ok=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("--results", p.stdout)
+
+    def test_next_steps_run_workers_and_workflow_together(self):
+        self.use_fakes()
+        del self.env["CASCADE_CURSOR_AGENT"]
+        self.init("--workers", "external", "--reviewer", "claude")
+        p = self.args("jobs")
+        lines = p.stdout.splitlines()
+        workers_line = next(line for line in lines if "(백그라운드로)" in line)
+        self.assertIn(" workers ", workers_line)
+        self.assertIn("--stage stage1", workers_line)
+        self.assertTrue(any("Workflow" in line and "stage1-args.json" in line for line in lines))
+        self.assertTrue(any("동시에" in line for line in lines))
+        self.assertFalse(any(" judge " in line for line in lines))
+
+        self.workers()
+        status = self.cli("status", "--run-dir", str(self.run_dir)).stdout
+        self.assertNotIn("(백그라운드로)", status)
+        judge_line = next(line for line in status.splitlines() if " judge " in line)
+        self.assertIn("--results", judge_line)
+
+    def test_next_steps_without_cli_jobs_are_unchanged(self):
+        self.init("--reviewer", "claude")
+        p = self.args("jobs")
+        self.assertNotIn(" workers ", p.stdout)
+        self.assertNotIn("동시에", p.stdout)
+        self.assertIn("--results", p.stdout)
+
+
+class DocWorkersTest(WorkersTestBase):
+    def setUp(self):
+        super().setUp()
+        plan = self.repo / "plan.md"
+        plan.write_text(PLAN, encoding="utf-8")
+        raw = self.tmp / "doc.final"
+        raw.write_text("Warning\n1. 단계가 모호하다\n   위치: plan.md:3\n   근거: 무엇을 고치는지 없다\n", encoding="utf-8")
+        self.doc_args = ["--source", "codex-doc", "--input", str(raw), "--doc", str(plan)]
+        self.env["FAKE_MUTATE_WT"] = json.dumps(
+            {"writer": {"plan.md": PLAN.replace("고친다", "고쳐 add가 더하게 한다")}}, ensure_ascii=False)
+        self.cursor_results([
+            {"match": "r1-01-b", "result": fenced(result_json())},
+            {"match": "r1-01-writer", "result": fenced(CHECKER_RESULT)},
+        ])
+
+    def test_doc_mode_checker_stage_uses_cli(self):
+        self.use_fakes()
+        p = self.cli("init", *self.doc_args, "--workers", "external", "--reviewer", "claude")
+        self.run_dir = Path(next(x for x in p.stdout.splitlines() if x.startswith("run_dir=")).split("=", 1)[1])
+        self.args("jobs")
+        stage1 = self.read("stage1-cli-args.json")["jobs"]
+        self.assertEqual([(j["id"], j["runner"], j["writable"]) for j in stage1],
+                         [("r1-01:a", "codex", False), ("r1-01:b", "cursor", False), ("r1-01:writer", "codex", True)])
+        p = self.workers()
+        self.assertIn("CLI 작업 3건: 성공 3, 대체 실행 0", p.stdout)
+
+        p = self.args("judge")
+        self.assertFalse((self.rd() / "decisions.json").exists())
+        self.assertEqual(self.read("checker-args.json")["jobs"], [])
+        checker = self.read("checker-cli-args.json")["jobs"]
+        self.assertEqual([(j["id"], j["runner"], j["writable"]) for j in checker], [("r1-01:checker", "cursor", False)])
+        self.assertIn("--stage checker", p.stdout)
+        self.assertNotIn("Workflow", p.stdout)
+
+        p = self.args("judge", ok=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("workers 단계를 먼저", p.stdout)
+
+        p = self.workers("checker")
+        self.assertIn("CLI 작업 1건: 성공 1, 대체 실행 0", p.stdout)
+        self.assertEqual(self.read("checker-cli.json")["results"][0]["output"]["model_id"], "cursor:composer-2.5")
+        p = self.args("judge")
+        self.assertNotIn("경고", p.stdout)
+        decisions = self.ledger().rounds[0].decisions
+        self.assertEqual([(d["outcome"], d["patch_from"]) for d in decisions], [("합의-사실", "writer")])
+        self.args("apply")
+        self.assertIn("add가 더하게", (self.repo / "plan.md").read_text(encoding="utf-8"))
+
+
+class ReportWorkersTest(WorkersTestBase):
+    def section(self):
+        report = self.cli("report", "--run-dir", str(self.run_dir)).stdout
+        return section_of(report, "## 외부 작업자")
+
+    def test_report_shows_fallback_and_usage(self):
+        self.cursor_results([dict(LIMIT_ENTRY, match="r1-02-b")])
+        self.start()
+        self.workers()
+        section = self.section()
+        self.assertIn("A·writer=Codex(gpt-test), B·checker=Cursor(composer-2.5)", section)
+        self.assertIn("대체 실행 1건(한도 1)", section)
+        self.assertIn("| codex | 22 | 14 | 6 |", section)
+        self.assertIn("| cursor | 200 | 40 | 10 |", section)
+        self.assertNotIn("login", section)
+
+    def test_report_points_to_login_when_auth_is_missing(self):
+        self.start()
+        (self.home / ".codex" / "auth.json").unlink()
+        self.workers()
+        section = self.section()
+        self.assertIn("대체 실행 2건(로그인 1, 건너뜀 1)", section)
+        self.assertIn("codex login", section)
+        self.assertNotIn("cursor-agent login", section)
+
+    def test_report_without_external_workers_has_no_section(self):
+        self.init("--reviewer", "claude")
+        report = self.cli("report", "--run-dir", str(self.run_dir)).stdout
+        self.assertNotIn("외부 작업자", report)
+
+
+class StageResultsTest(unittest.TestCase):
+    def test_merge_order_is_claude_then_cli_ok_then_fallback(self):
+        with tempfile.TemporaryDirectory() as td:
+            rd = Path(td)
+            claude = results_json(rd / "stage1.json", [("f:a", worker_output("사실", "claude-sonnet-5-5")),
+                                                       ("f:b", worker_output("아님", "claude-haiku-5-5"))])
+            (rd / "stage1-cli-args.json").write_text(json.dumps({"jobs": [
+                {"id": "f:a", "runner": "codex", "model": ""}, {"id": "g:a", "runner": "codex", "model": "gpt-x"},
+                {"id": "g:b", "runner": "cursor", "model": "composer-2.5"}]}), encoding="utf-8")
+            (rd / "stage1-cli.json").write_text(json.dumps({
+                "results": [{"id": "f:a", "output": worker_output("사실", "codex:default")},
+                            {"id": "g:a", "output": worker_output("사실", "codex:gpt-x")},
+                            {"id": "g:b", "output": None}],
+                "outcomes": [{"id": "f:a", "status": "ok"}, {"id": "g:a", "status": "ok"}, {"id": "g:b", "status": "limit"}],
+            }), encoding="utf-8")
+            results_json(rd / "stage1-fallback.json", [("g:b", worker_output("사실", "claude-haiku-5-5"))])
+            merged, expected = cli_steps.load_stage_results(rd, "stage1", claude)
+        by_id = {item["id"]: item["output"] for item in merged["results"]}
+        self.assertEqual(sorted(by_id), ["f:a", "f:b", "g:a", "g:b"])
+        self.assertEqual(by_id["f:a"]["model_id"], "codex:default")
+        self.assertEqual(by_id["g:b"]["model_id"], "claude-haiku-5-5")
+        self.assertEqual(expected, {"f:a": "codex:default", "g:a": "codex:gpt-x", "g:b": "claude-haiku-5-5"})
+
+    def test_without_any_file_is_empty(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(cli_steps.load_stage_results(Path(td), "checker", None), ({"results": []}, {}))
+
+
+if __name__ == "__main__":
+    unittest.main()
