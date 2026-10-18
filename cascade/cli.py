@@ -448,11 +448,15 @@ def cmd_jobs(args) -> int:
         build_stage1_jobs(findings, cfg, wts, ledger.mode, ledger.workers or None), rd / "prompts")
     s.write_json(out, claude_args)
     cli_out = rd / "stage1-cli-args.json"
+    had_cli = cli_out.is_file()
     if cli_args["jobs"]:
         s.write_json(cli_out, cli_args)
     else:
         cli_out.unlink(missing_ok=True)
     s.clear_cli_outputs(rd, s.STAGE1, s.STAGE_CHECKER)
+    if cli_args["jobs"] or had_cli:
+        for stage in (s.STAGE1, s.STAGE_CHECKER):
+            (rd / s.STAGE_OUTPUTS[stage]).unlink(missing_ok=True)
     ledger.snapshot = snap.to_dict()
     fingerprint = user_tree_fingerprint(snap.root, snap.run_dir)
     s.mark(rnd, "jobs", worktrees={fid: {r: str(p) for r, p in m.items()} for fid, m in wts.items()},

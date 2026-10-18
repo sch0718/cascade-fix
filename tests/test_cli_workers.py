@@ -238,6 +238,25 @@ class WorkersCommandTest(WorkersTestBase):
         status = self.cli("status", "--run-dir", str(self.run_dir)).stdout
         self.assertNotIn("Workflow", status)
 
+    def test_jobs_force_discards_stale_claude_results_in_mixed_assignment(self):
+        self.use_fakes()
+        del self.env["CASCADE_CURSOR_AGENT"]
+        self.init("--workers", "external", "--reviewer", "claude")
+        self.args("jobs")
+        self.workers()
+        stage1 = results_json(self.rd() / "stage1.json", [("r1-01:b", worker_output("사실", "claude-haiku-5-5"))])
+        checker = self.rd() / "checker.json"
+        checker.write_text("{}", encoding="utf-8")
+        self.args("jobs", "--force")
+        self.assertFalse(stage1.exists())
+        self.assertFalse(checker.exists())
+        self.workers()
+        status = self.cli("status", "--run-dir", str(self.run_dir)).stdout
+        lines = status.splitlines()
+        workflow = next(i for i, line in enumerate(lines) if "Workflow" in line and "stage1-args.json" in line)
+        judge = next(i for i, line in enumerate(lines) if " judge " in line)
+        self.assertLess(workflow, judge)
+
     def test_next_steps_without_cli_jobs_are_unchanged(self):
         self.init("--reviewer", "claude")
         p = self.args("jobs")
