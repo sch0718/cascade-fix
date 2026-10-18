@@ -16,6 +16,8 @@
                                                                           └─ 판단 불가 → 검토자 의견 + 사람 목록
 ```
 
+작업자 자리(A·B, 문서 모드의 writer·checker)는 옵션으로 Codex·Cursor CLI에 맡길 수 있습니다(`--workers external`). 기본값은 Claude 작업자이고, [측정 계획](docs/2026-10-18-workers-measurement-plan.md)의 기준을 통과하기 전까지는 옵션으로만 둡니다. 판가름(Opus)과 Claude 검토자는 그대로 Claude입니다. 자세한 내용은 [외부 작업자](#외부-작업자-옵션)에 있습니다.
+
 ## 무엇을 고칠 수 있나
 
 | 입력 | `--source` | 설명 |
@@ -23,6 +25,7 @@
 | Claude 리뷰 | `claude-code` · `claude-doc` | 커밋하지 않은 변경, 브랜치 diff, 특정 커밋, 설계·계획 문서를 Claude가 먼저 검토하고 그 지적을 고칩니다. Codex 없이 돕니다. 설계 단계에서는 스펙·계획서 초안을 구현 전에 검토하는 데 씁니다([설계 단계에서 쓰기](#설계-단계에서-쓰기)). |
 | PR 리뷰 코멘트 | `pr-comment` | 해결 안 된 리뷰 스레드를 지적으로 읽고 고칩니다. 답글 초안과 resolve 대상도 만듭니다. 재검토 회차는 열지 않습니다. `gh` CLI가 필요합니다. |
 | Codex 리뷰 결과 | `codex-code` · `codex-doc` | `codex-review` 스킬의 `run-review.sh` 결과 파일(`*.final`)을 받아 고칩니다. |
+| Cursor 리뷰 결과 | `cursor-code` · `cursor-doc` | `cursor-review` 스킬의 `run-review.sh` 결과 파일(`*.final`)을 받아 고칩니다. 형식은 `codex-doc`과 같은 Critical/Warning/Suggestion입니다. |
 
 `*-code`와 `pr-comment`는 코드 모드라 저장소 검증 명령(`tests`)이 등록되어 있어야 합니다. `*-doc`은 문서 모드라 검증 명령 없이 돕니다. 코드 모드는 지적마다 작업자 둘이, 문서 모드는 작성자 하나와 판정자 둘이 붙습니다.
 
@@ -41,6 +44,7 @@
 - git
 - (PR 모드) 로그인된 `gh` CLI
 - (선택) Codex를 검토자로 쓰려면 `codex-review` 스킬과 `codex` CLI. 이 스킬은 `run-review.sh`의 `--opinion`·`--recheck` 모드를 씁니다. 원래 `codex-review`에는 없는 모드라 [docs/codex-review-changes/](docs/codex-review-changes/README.md)에 보관한 `run-review.sh`로 바꿔야 합니다. 이 스크립트는 임시 CODEX_HOME에서 스킬 목록을 꺼 Codex 프롬프트도 줄입니다. 없으면 검토자는 자동으로 Claude가 됩니다.
+- (선택) Cursor를 검토자나 작업자로 쓰려면 `cursor-review` 스킬(`~/.claude/skills/cursor-review/`, 사본은 [docs/cursor-review/](docs/cursor-review/README.md))과 로그인된 `cursor-agent` CLI(`cursor-agent login`). Codex를 작업자로 쓰려면 `codex` CLI와 로그인이 필요합니다.
 
 ## 설치
 
@@ -173,19 +177,40 @@ Codex 검토 결과(review.final) 반영해줘
 - 플러그인으로 설치했으면 `/cascade-fix:cascade-fix`, 개인 스킬이면 `/cascade-fix`로 부릅니다.
 - 옵션을 함께 말하면("Critical만, dry-run으로, 묻지 말고 진행") 계획 확인을 건너뜁니다.
 
-### 검토자: Codex 또는 Claude 단독
+### 검토자: Codex, Cursor, Claude
 
 판가름 뒤 「의견」과 적용 뒤 「재검토」를 누가 맡을지 고릅니다.
 
 | 설정 | 동작 |
 | --- | --- |
-| `auto` (기본) | Claude 리뷰로 시작했거나 `codex-review` 스킬이 없으면 Claude, 아니면 Codex |
-| `claude` | 의견·재검토를 Claude 에이전트가 맡습니다. 외부(OpenAI) 전송이 없습니다. |
+| `auto` (기본) | 차례로 봅니다. Claude 리뷰로 시작했으면 Claude. 아니면 `codex-review` 스킬이 있으면 Codex. 아니면 `cursor-review` 스킬이 있고 `cursor-agent`가 로그인돼 있으면 Cursor. 모두 아니면 Claude |
+| `claude` | 의견·재검토를 Claude 에이전트가 맡습니다. 외부 전송이 없습니다. |
 | `codex` | `run-review.sh --opinion/--recheck`로 Codex에 보냅니다. 저장소마다 전송 동의를 받습니다. 호출은 한 번에 하나씩 돌립니다(동시에 토큰을 갱신하면 로그인이 풀릴 수 있습니다). 결과가 없으면 실행 로그와 인증 실패 여부를 보여 주고 멈춥니다. |
+| `cursor` | `cursor-review`의 `run-review.sh --opinion/--recheck`로 Cursor(팀 프라이버시 모드)에 보냅니다. 읽기 전용이고 모델은 `composer-2.5`입니다. 저장소마다 전송 동의를 받고 호출은 한 번에 하나씩 돌립니다. 결과가 없으면 실행 로그와 인증·한도 여부를 보여 주고 멈춥니다. 종료 코드 75는 이용 한도, 77은 로그인 필요(`cursor-agent login`)입니다. |
 
 - 기본값은 환경 변수 `CASCADE_REVIEWER`로 바꿉니다.
+- `cursor-review`의 `run-review.sh`는 환경 변수 `CASCADE_CURSOR_REVIEW`, 이 스킬 옆의 `cursor-review/`, `~/.claude/skills/cursor-review/` 순으로 찾습니다.
 - Claude 검토자의 기본 모델은 `claude-fable-5-1`(effort `high`)입니다. 판가름을 맡는 Opus와 다른 모델을 써서 같은 판단을 되풀이하지 않게 하려는 것입니다.
 - 모델은 `--review-model`, effort는 `--review-effort`로 바꿉니다.
+
+### 외부 작업자 (옵션)
+
+`--workers external`(또는 환경 변수 `CASCADE_WORKERS=external`)을 주면 쓸 수 있는 Codex·Cursor CLI에 작업자 자리를 배정합니다. 기본값은 `claude`입니다.
+
+| 쓸 수 있는 것 | A(코드)·writer(문서) | B(코드)·checker(문서) |
+| --- | --- | --- |
+| Codex와 Cursor | Codex | Cursor |
+| Codex만 | Codex | Claude Haiku |
+| Cursor만 | Cursor | Claude Haiku |
+| 둘 다 없음 | Claude Sonnet | Claude Haiku |
+
+- Cursor 모델은 `--cursor-model`로 바꿉니다(기본 `composer-2.5`, 호출당 약 $0.01). Auto·grok-4.7-high는 호출당 약 85배 비싸 쓰지 않습니다. Claude·GPT 계열 Cursor 모델도 쓰지 않습니다.
+- 작업자 CLI는 워크트리 전체를 읽습니다. 코드·문서가 OpenAI(Codex)와 Cursor(팀 프라이버시 모드)로 나가므로 저장소마다 한 번 전송 동의를 받습니다. 사내규정 원문이 든 저장소는 동의하지 않으면 Claude로 돕니다.
+- 코드 모드에서 저장소마다 처음 한 번, 검증 명령을 각 CLI의 샌드박스 안에서 돌려 봅니다. 결과는 `~/.claude/cascade-fix/sandbox-check.json`에 남습니다. 샌드박스 안에서만 실패하는 CLI는 그 저장소에서 쓰지 않고 Claude로 돕니다. 샌드박스 밖에서도 실패하는 명령은 샌드박스 탓으로 보지 않습니다.
+- CLI 작업은 `workers` 명령이 한 번에 돌리고 Claude 작업의 Workflow와 동시에 진행합니다. 메인 세션이 읽는 출력은 요약 몇 줄입니다.
+- 한도 초과·로그인 풀림·시간 초과(작업당 900초)·실행 오류·무효 결과가 나면 그 작업만 원래 Claude 모델로 다시 돕니다(대체 실행). 보고서의 「외부 작업자」 절에 사유별 건수와 CLI별 토큰이 남습니다.
+- 진짜 `codex`·`cursor-agent`로 하는 실측은 아직 하지 않았습니다. Cursor 임시 HOME 격리가 로그인을 유지하고 MCP·Web·홈 민감 경로 읽기를 막는지, `codex sandbox`가 `exec -s workspace-write`와 같은 정책인지는 실측 전입니다.
+- 통과 기준(판정 일치율, Opus 호출 수, 대체 실행 비율, 회귀)과 측정 절차는 [docs/2026-10-18-workers-measurement-plan.md](docs/2026-10-18-workers-measurement-plan.md)에 있습니다.
 
 ### 비용
 
@@ -196,7 +221,7 @@ Codex 검토 결과(review.final) 반영해줘
 | 코드 | 2 | 판가름 최대 1 |
 | 문서 | 3 | 점검자·판가름 최대 1씩 |
 
-Claude 검토자면 판단 불가 1건마다 의견 1이 더 붙고, 재검토는 회차마다 1입니다.
+Claude 검토자면 판단 불가 1건마다 의견 1이 더 붙고, 재검토는 회차마다 1입니다. `--workers external`이면 작업자 호출이 Claude 대신 Codex·Cursor로 나뉘고, `init`의 「규모:」 줄이 Claude·Codex·Cursor 호출 수를 나눠 보입니다. 대체 실행은 그만큼 Claude 호출로 돌아옵니다.
 
 - `detect`와 `init`이 예상 개수를 먼저 보여 줍니다.
 - 지적이 많으면 `--severity Critical,Warning`으로 먼저 돌립니다. 빠진 등급은 보류 후보로 남고, 나중에 「지금 반영」으로 이어서 처리할 수 있습니다.
@@ -224,10 +249,11 @@ PYTHONPATH=<스킬 경로> python3 -m cascade.cli <명령> [옵션]
 
 | 명령 | 하는 일 |
 | --- | --- |
-| `detect [--input F] [--doc F…] [--pr N] [--no-gh] [--reviewer R] [--json]` | 상황을 판정하고 추천·규모·멈춤 사유를 보여 줍니다. 읽기만 합니다. `--doc`은 커밋한 문서도 검토 대상으로 지정합니다. `--no-gh`면 PR을 조회하지 않습니다. |
+| `detect [--input F] [--doc F…] [--pr N] [--no-gh] [--reviewer R] [--workers W] [--cursor-model M] [--json]` | 상황을 판정하고 추천·규모·멈춤 사유를 보여 줍니다. 읽기만 합니다. `--doc`은 커밋한 문서도 검토 대상으로 지정합니다. `--no-gh`면 PR을 조회하지 않습니다. |
 | `review --kind code\|doc (--base B \| --uncommitted \| --commit SHA \| --doc F…) [--focus 관점] [--review-model M] [--review-effort E]` | Claude 첫 검토용 Workflow 입력을 만듭니다. |
-| `init --source S --input X [--doc F…] [--severity …] [--dry-run] [--max-rechecks N] [--reviewer R] [--review-model M] [--review-effort E]` | 실행을 시작하고 지적을 읽습니다. PR이면 `--input`에 PR 번호를 주고 `--pr-repo owner/name`·`--me <내 로그인>`을 붙일 수 있습니다. `--input` 대신 `--findings-json F`로 정규화한 지적 목록(`id`·`severity`·`location`·`body`)을 바로 줄 수도 있습니다. |
+| `init --source S --input X [--doc F…] [--severity …] [--dry-run] [--max-rechecks N] [--reviewer R] [--workers W] [--cursor-model M] [--review-model M] [--review-effort E]` | 실행을 시작하고 지적을 읽습니다. PR이면 `--input`에 PR 번호를 주고 `--pr-repo owner/name`·`--me <내 로그인>`을 붙일 수 있습니다. `--input` 대신 `--findings-json F`로 정규화한 지적 목록(`id`·`severity`·`location`·`body`)을 바로 줄 수도 있습니다. |
 | `jobs` / `judge` / `adjudicate` / `opinion` / `apply` / `recheck` | 회차 단계(`--run-dir`·`--round`) |
+| `workers --stage stage1\|checker` | `--workers external` 회차에서 CLI 작업(Codex·Cursor)을 돌리고 결과를 `stage1-cli.json`(점검자는 `checker-cli.json`)에 씁니다. 대체 실행할 작업이 있으면 `*-fallback-args.json`을 만듭니다. 한 번에 하나만 돌립니다. |
 | `resume --choices F` | 보류 후보마다 「지금 반영 / 구현 때 테스트로 / 보류」를 받습니다. 「지금 반영」이 있으면 회차를 엽니다. |
 | `report` / `status` / `cleanup` | 보고서, 다음 할 일, 정리 |
 
@@ -248,8 +274,12 @@ PYTHONPATH=<스킬 경로> python3 -m cascade.cli <명령> [옵션]
 | 변수 | 뜻 |
 | --- | --- |
 | `CASCADE_REPOS_TOML` | 검증 설정 파일 경로 |
-| `CASCADE_REVIEWER` | 기본 검토자(`auto`/`claude`/`codex`) |
+| `CASCADE_REVIEWER` | 기본 검토자(`auto`/`claude`/`codex`/`cursor`) |
+| `CASCADE_WORKERS` | 기본 작업자(`claude`/`external`). 기본값은 `claude` |
 | `CASCADE_RUN_REVIEW` | `codex-review`의 `run-review.sh` 경로 |
+| `CASCADE_CURSOR_REVIEW` | `cursor-review`의 `run-review.sh` 경로 |
+| `CASCADE_SANDBOX_CHECK` | 샌드박스 사전 점검 결과 파일 경로(기본 `~/.claude/cascade-fix/sandbox-check.json`) |
+| `CASCADE_CODEX` · `CASCADE_CURSOR_AGENT` | `codex`·`cursor-agent` 실행 파일 경로(작업자 실행기와 로그인 확인이 PATH 대신 씁니다) |
 | `CASCADE_GH` | `gh` 대신 쓸 명령 |
 
 ## 개발
@@ -258,9 +288,9 @@ PYTHONPATH=<스킬 경로> python3 -m cascade.cli <명령> [옵션]
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-- 테스트는 321개입니다. `codex-review` 스킬이 없으면 그 스크립트를 쓰는 테스트 11개는 건너뜁니다. 보관한 스크립트로 돌리려면 `CASCADE_RUN_REVIEW="$PWD/docs/codex-review-changes/run-review.sh"`를 앞에 붙입니다.
-- 디렉터리: `cascade/`(CLI와 단계 로직), `prompts/`(작업자·판정자·판가름·검토자 프롬프트), `scripts/run-jobs.js`(Workflow 스크립트), `eval/`(측정 도구), `docs/`(설계 검토 기록과 고친 `codex-review` 스크립트)
-- 측정: `eval/replay.py`가 과거 지적 표본을 그 커밋에서 다시 돌리고, `eval/score.py`가 판정 일치율·채택 경로·Opus 호출 절감을 채점합니다. 표본 형식과 순서는 [eval/sample-format.md](eval/sample-format.md)에 있습니다.
+- 테스트는 541개입니다. `codex-review` 스킬이 없으면 그 스크립트를 쓰는 테스트는 건너뜁니다. 보관한 스크립트로 돌리려면 `CASCADE_RUN_REVIEW="$PWD/docs/codex-review-changes/run-review.sh"`를 앞에 붙입니다.
+- 디렉터리: `cascade/`(CLI와 단계 로직), `prompts/`(작업자·판정자·판가름·검토자 프롬프트), `scripts/run-jobs.js`(Workflow 스크립트), `eval/`(측정 도구), `docs/`(설계 검토 기록, 고친 `codex-review` 스크립트, `cursor-review` 사본, 외부 작업자 측정 계획)
+- 측정: `eval/replay.py`가 과거 지적 표본을 그 커밋에서 다시 돌리고, `eval/score.py`가 판정 일치율·채택 경로·Opus 호출 절감을 채점합니다. 표본 형식과 순서는 [eval/sample-format.md](eval/sample-format.md)에 있습니다. `--workers external`과 Claude 작업자를 같은 표본에서 비교하는 절차는 [측정 계획](docs/2026-10-18-workers-measurement-plan.md)에 있습니다.
 - 출력 스키마를 바꾸면 `cascade/jobs.py`의 `SCHEMAS`와 `scripts/run-jobs.js`의 `SCHEMAS` 블록을 같이 고칩니다(테스트가 두 쪽이 같은지 확인합니다).
 - 배포할 때는 `.claude-plugin/plugin.json`의 `version`을 올립니다. 버전이 같으면 설치한 사람에게 업데이트로 보이지 않습니다.
 - 매니페스트 검사: `claude plugin validate .`
