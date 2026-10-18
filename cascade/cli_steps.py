@@ -34,6 +34,7 @@ from cascade.verify import (
     run_commands,
     run_worker_verifiers,
 )
+from cascade.workers import expected_model_id
 
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 RUN_JOBS = SKILL_ROOT / "scripts" / "run-jobs.js"
@@ -250,15 +251,19 @@ def worker_from(results: dict, fid: str, role: str) -> WorkerResult:
     return WorkerResult.from_dict(data) if isinstance(data, dict) else failed_result(fid, role)
 
 
-def model_warnings(results: dict[str, WorkerResult]) -> list[str]:
+def model_warnings(results: dict[str, WorkerResult], expected_ids: dict[str, str] | None = None) -> list[str]:
     out = []
     for key, r in results.items():
-        expected = ROLES.get(r.role, (None,))[0]
+        expected = (expected_ids or {}).get(key) or ROLES.get(r.role, (None,))[0]
         if not r.model_id and r.reason != CALL_FAILED:
             out.append(f"경고: {key} 모델 ID가 비어 있다(기대값 {expected})")
         elif r.model_id and expected and r.model_id != expected:
             out.append(f"경고: {key} 모델 ID가 {r.model_id} 이다(기대값 {expected})")
     return out
+
+
+def expected_model_ids(ledger: Ledger, results: dict[str, WorkerResult]) -> dict[str, str]:
+    return {key: expected_model_id(ledger.workers[r.role]) for key, r in results.items() if r.role in ledger.workers}
 
 
 def is_sensitive(paths: list[str], cfg: RepoConfig) -> bool:

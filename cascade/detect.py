@@ -9,6 +9,7 @@ from pathlib import Path
 
 from cascade.config import ConfigError, RepoConfig, detect_candidates, is_sensitive_path, load_repo_config
 from cascade.findings import ParseError, fetch_pr_findings, parse_codex_code, parse_codex_doc
+from cascade.jobs import RUNNER_CLAUDE
 from cascade.review import (
     CURSOR_SOURCES,
     REVIEWER_AUTO,
@@ -18,7 +19,9 @@ from cascade.review import (
     read_review_results,
     resolve,
 )
+from cascade.runners import RUNNER_CODEX, RUNNER_CURSOR
 from cascade.snapshot import RUN_DIR_NAME
+from cascade.workers import DEFAULT_CURSOR_MODEL, WORKERS_CLAUDE, WORKERS_EXTERNAL, consent_line, describe, has_external
 
 DOC_SUFFIXES = (".md", ".markdown", ".txt", ".rst")
 _LOCATION_FILE = re.compile(r"^(.+?):\d+")
@@ -186,24 +189,30 @@ def _classify_format(path: Path) -> tuple[str | None, int]:
     return "codex-doc", found[0]
 
 
-def estimate(findings: int, mode: str, reviewer: str) -> dict:
+def estimate(findings: int, mode: str, reviewer: str, workers: dict[str, dict] | None = None) -> dict:
     """한 회차의 에이전트 수. 판가름·의견은 갈린 지적에만 붙으므로 최대치다."""
-    per = 3 if mode == "doc" else 2
+    roles = ("a", "b", "writer") if mode == "doc" else ("a", "b")
+    by_runner = {runner: 0 for runner in (RUNNER_CLAUDE, RUNNER_CODEX, RUNNER_CURSOR)}
+    for role in roles:
+        by_runner[(workers or {}).get(role, {}).get("runner", RUNNER_CLAUDE)] += findings
     out = {
-        "stage1": findings * per,
+        "stage1": findings * len(roles),
+        "stage1_by_runner": by_runner,
         "checker_max": findings if mode == "doc" else 0,
         "adjudicator_max": findings,
         "opinion_max": findings if reviewer == REVIEWER_CLAUDE else 0,
         "recheck": 1 if reviewer == REVIEWER_CLAUDE else 0,
     }
     out["min"] = out["stage1"]
-    out["max"] = sum(v for k, v in out.items() if k not in ("min",))
+    out["max"] = sum(v for k, v in out.items() if k not in ("min", "stage1_by_runner"))
     return out
 
 
-def estimate_line(findings: int, mode: str, reviewer: str) -> str:
-    e = estimate(findings, mode, reviewer)
-    parts = [f"작업자 {e['stage1']}"]
+def estimate_line(findings: int, mode: str, reviewer: str, workers: dict[str, dict] | None = None) -> str:
+    e = estimate(findings, mode, reviewer, workers)
+    split = e["stage1_by_runner"]
+    by_runner = f"(Claude {split[RUNNER_CLAUDE]}·Codex {split[RUNNER_CODEX]}·Cursor {split[RUNNER_CURSOR]})" if has_external(workers) else ""
+    parts = [f"작업자 {e['stage1']}{by_runner}"]
     if e["checker_max"]:
         parts.append(f"점검자 최대 {e['checker_max']}")
     parts.append(f"판가름 최대 {e['adjudicator_max']}")
@@ -224,7 +233,8 @@ def _config(root: Path, repos_toml: Path) -> tuple[RepoConfig | None, str | None
 def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list[str] | None,
            input_path: Path | None = None, pr: str | None = None, reviewer_choice: str = REVIEWER_AUTO,
            root_flag: str = "", docs: list[Path] | None = None, cwd: Path | None = None,
-           cursor_ok: bool | Callable[[], bool] = False) -> dict:
+           cursor_ok: bool | Callable[[], bool] = False, workers_choice: str = WORKERS_CLAUDE,
+           cursor_model: str = DEFAULT_CURSOR_MODEL, workers: dict[str, dict] | None = None) -> dict:
     root = Path(root)
     branch = current_branch(root)
     base = default_base(root)
@@ -310,6 +320,10 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
         approvals.append("Cursor 전송 동의: 의견·재검토에 코드·문서를 Cursor(팀 프라이버시 모드)로 보낸다")
     elif reviewer != REVIEWER_CLAUDE:
         approvals.append("Codex 전송 동의: 의견·재검토에 코드·문서를 OpenAI로 보낸다")
+    if has_external(workers):
+        approvals.append(consent_line(workers))
+    elif workers_choice == WORKERS_EXTERNAL:
+        notes.append("--workers external 이지만 쓸 수 있는 외부 CLI가 없다. 작업자는 모두 Claude로 돈다")
     if rec["source"] == "pr-comment":
         approvals.append("PR 코멘트의 재현 명령이 있으면 jobs 뒤에 목록을 보이고 승인받는다")
 
@@ -322,7 +336,10 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
         notes.append("커밋하지 않은 변경이 있다. 채택 패치가 작업 트리에 섞이지 않게 하려면 --dry-run 을 쓴다")
 
     steps = rec["steps"]
-    flags = ("" if reviewer_choice == REVIEWER_AUTO else f" --reviewer {reviewer_choice}") + root_flag
+    workers_flag = f" --workers {workers_choice}" if workers_choice != WORKERS_CLAUDE else ""
+    if workers_choice == WORKERS_EXTERNAL and cursor_model != DEFAULT_CURSOR_MODEL:
+        workers_flag += f" --cursor-model {q(cursor_model)}"
+    flags = ("" if reviewer_choice == REVIEWER_AUTO else f" --reviewer {reviewer_choice}") + workers_flag + root_flag
     if not blockers and rec["source"]:
         if rec["source"].startswith("claude-") and input_path is None:
             rec["first_review"] = 1
@@ -336,7 +353,7 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
             doc_flags = "".join(f" --doc {q(str(d))}" for d in docs)
             steps.append(f"{cli} init --source {rec['source']} --input {q(str(input_path))}{doc_flags}{flags}")
     if found is not None and found > 0 and rec["mode"]:
-        rec["estimate"] = estimate(found, rec["mode"], reviewer)
+        rec["estimate"] = estimate(found, rec["mode"], reviewer, workers)
         if rec["estimate"]["stage1"] > SEVERITY_SPLIT_JOBS:
             notes.append(f"1단계 작업이 {rec['estimate']['stage1']}개다. --severity Critical,Warning 으로 먼저 돌리는 안을 함께 제시한다")
 
@@ -349,6 +366,7 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
         "pr": pr_data,
         "reviewer": reviewer,
         "reviewer_label": label(reviewer),
+        "workers": workers or {},
         "config": config,
         "recommendation": rec,
         "approvals": approvals,
@@ -368,11 +386,13 @@ def render(result: dict) -> str:
     if rec["source"]:
         lines.append(f"추천: --source {rec['source']} · 모드 {rec['mode']} · 검토자 {result['reviewer_label']}")
         lines.extend(f"  근거: {r}" for r in rec["reasons"])
+    if has_external(result["workers"]):
+        lines.append(f"작업자: {describe(result['workers'])}")
     if rec.get("estimate"):
         e = rec["estimate"]
         lines.append(f"규모: 에이전트 {e['min']}~{e['max']}개(1회차 기준)")
     elif rec["source"]:
-        e = estimate(1, rec["mode"], result["reviewer"])
+        e = estimate(1, rec["mode"], result["reviewer"], result["workers"])
         first = f"첫 검토 {rec['first_review']}개 + " if rec.get("first_review") else ""
         lines.append(f"규모: {first}지적 1건당 에이전트 {e['stage1']}~{e['max'] - e['recheck']}개"
                      + (f" + 재검토 회차당 {e['recheck']}개" if e["recheck"] else "") + " (지적 수는 첫 검토 뒤에 정해진다)")

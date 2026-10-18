@@ -67,6 +67,8 @@ class Ledger:
     reviewer: str = "codex"
     review_model: str = ""
     review_effort: str = ""
+    workers_choice: str = "claude"
+    workers: dict = field(default_factory=dict)
 
     def current_round(self) -> RoundRecord | None:
         return self.rounds[-1] if self.rounds else None

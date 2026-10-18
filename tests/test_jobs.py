@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from cascade import jobs  # noqa: E402
+from cascade import workers as workers_mod  # noqa: E402
 from cascade.config import RepoConfig  # noqa: E402
 from cascade.consensus import VERDICTS, WorkerResult  # noqa: E402
 from cascade.findings import Finding  # noqa: E402
@@ -400,6 +401,81 @@ class SchemaAndRulesTest(unittest.TestCase):
         ):
             self.assertIn(s, jobs.RULES)
         self.assertIn("고친 것이 없으면 커밋하지 않는다.", jobs.RULES)
+
+
+BOTH_WORKERS = workers_mod.assign("external", {"codex": True, "cursor": True}, "gpt-x", "composer-2.5")
+COMMIT_COMMAND = "git -c core.hooksPath=/dev/null commit"
+
+
+class CliJobsTest(unittest.TestCase):
+    def test_stage1_cli_job_has_runner_worktree_and_no_commit_rule(self):
+        args = jobs.build_stage1_jobs([F1], CFG, {"r1-01": {"a": WT_A, "b": WT_B}}, "code", BOTH_WORKERS)
+        a, b = by_id(args)["r1-01:a"], by_id(args)["r1-01:b"]
+        self.assertEqual((a["runner"], a["role"], a["worktree"], a["model"]), ("codex", "a", str(WT_A), "gpt-x"))
+        self.assertEqual((b["runner"], b["worktree"], b["model"]), ("cursor", str(WT_B), "composer-2.5"))
+        for j in (a, b):
+            self.assertIn("커밋하지 않는다", j["prompt"])
+            self.assertNotIn(COMMIT_COMMAND, j["prompt"])
+            self.assertIn(jobs.RULES_CLI, j["prompt"])
+            self.assertTrue(j["writable"])
+            self.assertIsNone(PLACEHOLDER.search(j["prompt"]))
+
+    def test_workers_none_keeps_prompts_and_keys(self):
+        wts = wts_for(F1, F2)
+        code = jobs.build_stage1_jobs([F1, F2], CFG, wts, "code")
+        for mode in ("code", "doc"):
+            plain = jobs.build_stage1_jobs([F1, F2], CFG, wts, mode)
+            claude = jobs.build_stage1_jobs([F1, F2], CFG, wts, mode, {})
+            self.assertEqual([j["prompt"] for j in plain["jobs"]], [j["prompt"] for j in claude["jobs"]])
+            for j in plain["jobs"]:
+                self.assertEqual(set(j), {"id", "label", "model", "effort", "kind", "prompt"})
+        self.assertIn(COMMIT_COMMAND, code["jobs"][0]["prompt"])
+        self.assertIn("검증을 마친 뒤 규칙의 커밋 명령으로 커밋한다.", code["jobs"][0]["prompt"])
+
+    def test_rules_cli_differs_only_in_commit_rule(self):
+        self.assertEqual(jobs.RULES.replace(jobs._COMMIT_RULE, jobs._CLI_COMMIT_RULE), jobs.RULES_CLI)
+        self.assertIn("커밋하지 않는다. 고친 내용은 작업 트리에 그대로 둔다.", jobs.RULES_CLI)
+
+    def test_doc_mode_writable_only_for_writer(self):
+        args = jobs.build_stage1_jobs([F2], CFG, wts_for(F2), "doc", BOTH_WORKERS)
+        by = by_id(args)
+        self.assertEqual({k: (j["runner"], j["writable"]) for k, j in by.items()},
+                         {"r1-02:a": ("codex", False), "r1-02:b": ("cursor", False), "r1-02:writer": ("codex", True)})
+        self.assertNotIn("커밋하지 않는다. 고친 내용", by["r1-02:a"]["prompt"])
+        self.assertIn(jobs.READ_ONLY_RULES, by["r1-02:a"]["prompt"])
+        self.assertIn(jobs.RULES_CLI, by["r1-02:writer"]["prompt"])
+        self.assertNotIn(COMMIT_COMMAND, by["r1-02:writer"]["prompt"])
+        self.assertIsNone(PLACEHOLDER.search(by["r1-02:writer"]["prompt"]))
+
+    def test_checker_job_runs_in_writer_worktree_read_only(self):
+        args = jobs.build_checker_jobs([F2], wts_for(F2), {"r1-02": PATCH_A}, BOTH_WORKERS)
+        c = by_id(args)["r1-02:checker"]
+        self.assertEqual((c["runner"], c["role"], c["worktree"], c["writable"]),
+                         ("cursor", "checker", str(Path("/tmp/cascade/wt-r1-02-writer")), False))
+        self.assertEqual(c["model"], "composer-2.5")
+        self.assertEqual(c["kind"], "checker")
+
+    def test_split_job_args_separates_claude_and_cli(self):
+        only_codex = workers_mod.assign("external", {"codex": True, "cursor": False}, "gpt-x", "composer-2.5")
+        args = jobs.build_stage1_jobs([F1], CFG, {"r1-01": {"a": WT_A, "b": WT_B}}, "code", only_codex)
+        with tempfile.TemporaryDirectory() as td:
+            claude, cli = jobs.split_job_args(args, Path(td) / "prompts")
+            self.assertEqual([j["id"] for j in claude["jobs"]], ["r1-01:b"])
+            self.assertEqual([j["id"] for j in cli["jobs"]], ["r1-01:a"])
+            self.assertEqual(set(claude["jobs"][0]), {"id", "label", "model", "effort", "kind", "promptPath"})
+            c = cli["jobs"][0]
+            self.assertEqual(set(c), {"id", "role", "kind", "runner", "model", "effort", "promptPath", "worktree", "writable"})
+            self.assertEqual((c["runner"], c["role"], c["kind"], c["worktree"], c["writable"]),
+                             ("codex", "a", "worker", str(WT_A), True))
+            for j in (*claude["jobs"], c):
+                self.assertTrue(Path(j["promptPath"]).is_file())
+
+    def test_split_job_args_without_workers_matches_write_job_args(self):
+        args = jobs.build_stage1_jobs([F1], CFG, {"r1-01": {"a": WT_A, "b": WT_B}}, "code")
+        with tempfile.TemporaryDirectory() as td:
+            claude, cli = jobs.split_job_args(args, Path(td) / "prompts")
+            self.assertEqual(claude, jobs.write_job_args(args, Path(td) / "prompts"))
+            self.assertEqual(cli, {"jobs": []})
 
 
 if __name__ == "__main__":

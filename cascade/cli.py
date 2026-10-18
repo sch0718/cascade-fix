@@ -41,6 +41,7 @@ from cascade.jobs import (
     build_stage1_jobs,
     location_file,
     read_results,
+    split_job_args,
     write_job_args,
 )
 from cascade.patches import ApplyReport, apply_all, changed_files, extract
@@ -91,6 +92,16 @@ from cascade.snapshot import (
     user_tree_fingerprint,
 )
 from cascade.verify import repro_cmds, run_repro, run_verifiers
+from cascade.workers import (
+    DEFAULT_CURSOR_MODEL,
+    WORKERS_CHOICES,
+    WORKERS_CLAUDE,
+    WORKERS_EXTERNAL,
+    assign_available,
+    consent_line,
+    describe,
+    has_external,
+)
 
 SOURCES = ("codex-doc", "codex-code", "claude-doc", "claude-code", "cursor-doc", "cursor-code", "pr-comment")
 HOLD_CHOICES = ("지금 반영", "구현 때 테스트로", "보류")
@@ -230,11 +241,17 @@ def _parse_claude_review(args):
     return [replace(f, source=args.source) for f in findings], raw
 
 
+def _check_workers(choice: str) -> None:
+    if choice not in WORKERS_CHOICES:
+        raise s.CliError(f"알 수 없는 작업자: {choice} ({' / '.join(WORKERS_CHOICES)}, CASCADE_WORKERS 확인)")
+
+
 def cmd_init(args) -> int:
     root = Path(args.root).resolve() if args.root else s.git_toplevel(Path.cwd())
     s.cfg_for(args.source, root)
     if args.reviewer not in REVIEWER_CHOICES:
         raise s.CliError(f"알 수 없는 검토자: {args.reviewer} ({' / '.join(REVIEWER_CHOICES)}, CASCADE_REVIEWER 확인)")
+    _check_workers(args.workers)
     reviewer = resolve(args.reviewer, args.source, s.RUN_REVIEW, s.cursor_reviewer_available)
     findings, raw = _parse_input(args, root)
     if not findings:
@@ -251,6 +268,7 @@ def cmd_init(args) -> int:
     if not findings:
         raise s.CliError(f"--severity {args.severity} 에 맞는 지적이 없다(전체 {len(deferred)}건). 등급을 넓힌다")
     docs, external = _split_docs(root, args.doc or [])
+    workers = assign_available(args.workers, args.cursor_model)
     ensure_excluded(root)
     snap = create_snapshot(root, _new_run_id(root), external)
     stamp = s.now()
@@ -270,6 +288,8 @@ def cmd_init(args) -> int:
         reviewer=reviewer,
         review_model=(args.review_model or DEFAULT_MODEL) if reviewer == REVIEWER_CLAUDE else "",
         review_effort=(args.review_effort or DEFAULT_EFFORT) if reviewer == REVIEWER_CLAUDE else "",
+        workers_choice=args.workers,
+        workers=workers,
     )
     write_findings(s.round_dir(snap.run_dir, 1) / "findings.json", findings)
     s.save_ledger(snap.run_dir, ledger)
@@ -279,7 +299,13 @@ def cmd_init(args) -> int:
     print(f"지적 {len(findings)}건: " + ", ".join(f"{k} {v}" for k, v in counts.items()))
     if deferred:
         print(f"등급 선택으로 뺀 지적 {len(deferred)}건은 보류 후보로 둔다(나중에 resume 「지금 반영」으로 돌릴 수 있다)")
-    print(f"규모: {estimate_line(len(findings), ledger.mode, reviewer)}")
+    print(f"규모: {estimate_line(len(findings), ledger.mode, reviewer, workers)}")
+    if args.workers == WORKERS_EXTERNAL:
+        if has_external(workers):
+            print(f"작업자: {describe(workers)}")
+            print(consent_line(workers))
+        else:
+            print("작업자: 쓸 수 있는 외부 CLI가 없다. 모두 Claude로 돈다(--workers claude 와 같다)")
     if args.dry_run:
         print("dry-run: 채택 패치를 작업 트리에 적용하지 않는다")
     if reviewer == REVIEWER_CLAUDE:
@@ -314,10 +340,13 @@ def cmd_detect(args) -> int:
     gh = None if args.no_gh else shlex.split(os.environ.get("CASCADE_GH", "gh"))
     if args.reviewer not in REVIEWER_CHOICES:
         raise s.CliError(f"알 수 없는 검토자: {args.reviewer} ({' / '.join(REVIEWER_CHOICES)}, CASCADE_REVIEWER 확인)")
+    _check_workers(args.workers)
     result = detect(root, repos_toml=s.repos_toml(), run_review=s.RUN_REVIEW, cursor_ok=s.cursor_reviewer_available, cli=s.CLI, gh=gh,
                     input_path=Path(args.input).resolve() if args.input else None, pr=args.pr,
                     reviewer_choice=args.reviewer, root_flag=_root_flag(args, root),
-                    docs=[Path(d).resolve() for d in args.doc or []], cwd=Path.cwd())
+                    docs=[Path(d).resolve() for d in args.doc or []], cwd=Path.cwd(),
+                    workers_choice=args.workers, cursor_model=args.cursor_model,
+                    workers=assign_available(args.workers, args.cursor_model))
     print(json.dumps(result, ensure_ascii=False, indent=2) if args.json else render_detect(result))
     return 0 if result["ok"] else ExitCodes.NEEDS_USER
 
@@ -394,13 +423,20 @@ def cmd_jobs(args) -> int:
                 for cmd in cmds:
                     print(f"  {fid}: {cmd}")
     out = rd / "stage1-args.json"
-    s.write_json(out, write_job_args(build_stage1_jobs(findings, cfg, wts, ledger.mode), rd / "prompts"))
+    claude_args, cli_args = split_job_args(
+        build_stage1_jobs(findings, cfg, wts, ledger.mode, ledger.workers or None), rd / "prompts")
+    s.write_json(out, claude_args)
+    cli_out = rd / "stage1-cli-args.json"
+    if cli_args["jobs"]:
+        s.write_json(cli_out, cli_args)
     ledger.snapshot = snap.to_dict()
     fingerprint = user_tree_fingerprint(snap.root, snap.run_dir)
     s.mark(rnd, "jobs", worktrees={fid: {r: str(p) for r, p in m.items()} for fid, m in wts.items()},
            fingerprint=fingerprint)
     s.save_ledger(run_dir, ledger)
-    print(f"작업 {len(findings) * len(roles)}건: {out}")
+    print(f"작업 {len(claude_args['jobs'])}건: {out}")
+    if cli_args["jobs"]:
+        print(f"CLI 작업 {len(cli_args['jobs'])}건: {cli_out}")
     _print_next(ledger, run_dir)
     return 0
 
@@ -451,7 +487,8 @@ def cmd_judge(args) -> int:
     checker_results = read_results(s.read_json(args.checker_results)) if args.checker_results else None
     baseline = s.baseline_failed(rd)
     repro = s.approved_repro(rd, args.allow_repro) if ledger.source == s.SOURCE_PR else None
-    for warning in s.model_warnings({**results, **(checker_results or {})}):
+    judged = {**results, **(checker_results or {})}
+    for warning in s.model_warnings(judged, s.expected_model_ids(ledger, judged)):
         print(warning)
     findings = s.findings_of(rnd)
     merged: dict[str, dict] = {}
@@ -484,11 +521,16 @@ def cmd_judge(args) -> int:
         if pending and checker_results is None:
             out = rd / "checker-args.json"
             wts = {f.id: {"writer": s.worktree(snap, f.id, "writer")} for f in pending}
-            jobs = build_checker_jobs(s.prompt_findings(ledger, pending), wts, writer_patches)
-            s.write_json(out, write_job_args(jobs, rd / "prompts"))
+            jobs = build_checker_jobs(s.prompt_findings(ledger, pending), wts, writer_patches, ledger.workers or None)
+            claude_args, cli_args = split_job_args(jobs, rd / "prompts")
+            s.write_json(out, claude_args)
+            if cli_args["jobs"]:
+                s.write_json(rd / "checker-cli-args.json", cli_args)
             s.mark(rnd, "judge-checker")
             s.save_ledger(run_dir, ledger)
-            print(f"점검자 작업 {len(pending)}건: {out}")
+            print(f"점검자 작업 {len(claude_args['jobs'])}건: {out}")
+            if cli_args["jobs"]:
+                print(f"CLI 점검자 작업 {len(cli_args['jobs'])}건: {rd / 'checker-cli-args.json'}")
             _print_next(ledger, run_dir)
             return 0
         for f in findings:
@@ -992,6 +1034,12 @@ def build_parser() -> argparse.ArgumentParser:
             p.add_argument("--force", action="store_true")
         return p
 
+    def add_workers_args(p):
+        p.add_argument("--workers", choices=WORKERS_CHOICES, default=os.environ.get("CASCADE_WORKERS") or WORKERS_CLAUDE,
+                       help="1단계 작업자(기본: 환경 변수 CASCADE_WORKERS, 없으면 claude). "
+                            "external: 쓸 수 있는 Codex·Cursor CLI에 A·writer, B·checker 자리를 배정")
+        p.add_argument("--cursor-model", default=DEFAULT_CURSOR_MODEL, help=f"Cursor 작업자 모델(기본 {DEFAULT_CURSOR_MODEL})")
+
     p = add("init", cmd_init, run_dir=False, force=False)
     p.add_argument("--source", choices=SOURCES, required=True)
     p.add_argument("--input")
@@ -1008,6 +1056,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--review-model", help=f"Claude 검토자 모델(기본 {DEFAULT_MODEL})")
     p.add_argument("--review-effort", choices=EFFORTS, help=f"Claude 검토자 effort(기본 {DEFAULT_EFFORT})")
     p.add_argument("--severity", help="이번 실행에서 처리할 등급(쉼표 구분, 예: Critical,Warning). 나머지는 보류 후보")
+    add_workers_args(p)
     p = add("detect", cmd_detect, run_dir=False, force=False)
     p.add_argument("--input")
     p.add_argument("--doc", action="append", help="검토할 문서(설계·계획 문서). 변경으로 잡히지 않는 커밋한 문서도 지정한다")
@@ -1016,6 +1065,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-gh", action="store_true")
     p.add_argument("--json", action="store_true")
     p.add_argument("--reviewer", choices=REVIEWER_CHOICES, default=os.environ.get("CASCADE_REVIEWER") or REVIEWER_AUTO)
+    add_workers_args(p)
     p = add("review", cmd_review, run_dir=False, force=False)
     p.add_argument("--kind", choices=("code", "doc"), required=True)
     p.add_argument("--base")
