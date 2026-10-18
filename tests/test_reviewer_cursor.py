@@ -10,7 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from cascade import cli_steps, runners  # noqa: E402
+from cascade import cli, cli_steps, runners  # noqa: E402
 from cascade.review import CURSOR_SOURCES, REVIEWER_CHOICES, resolve  # noqa: E402
 from test_cli_e2e import AUTH_LOG, FIXTURES, CliCodexResultTest, CliTestBase  # noqa: E402
 
@@ -157,6 +157,29 @@ class CursorReviewerTest(CliTestBase):
         p = self.cli("opinion", "--run-dir", str(self.run_dir), "--round", "1", "--id", "r1-02", "--result", str(final), ok=False)
         self.assertIn("이용 한도", p.stdout)
         self.assertNotIn("인증 실패 흔적", p.stdout)
+
+    def test_empty_final_after_usage_limit_stops_with_limit_guidance(self):
+        log = self.run_to_opinion()
+        final = Path(f"{log}.final")
+        final.write_text("", encoding="utf-8")
+        log.write_text('{"type":"result","is_error":true,"result":"You\'ve hit your usage limit"}\n', encoding="utf-8")
+        p = self.cli("opinion", "--run-dir", str(self.run_dir), "--round", "1", "--id", "r1-02", "--result", str(final), ok=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("비어 있다", p.stdout)
+        self.assertIn("이용 한도", p.stdout)
+        self.assertIn("cursor-agent login", p.stdout)
+        self.assertNotIn("r1-02", self.ledger().opinions)
+
+    def test_empty_final_after_login_failure_stops_recheck_with_login_guidance(self):
+        final = self.tmp / "recheck.out.final"
+        final.write_text("", encoding="utf-8")
+        final.with_suffix("").write_text("Authentication required\n", encoding="utf-8")
+        with self.assertRaises(cli_steps.CliError) as ctx:
+            cli._external_result_text(final, "재검토", "cursor")
+        message = str(ctx.exception)
+        self.assertIn("재검토 결과 파일이 비어 있다", message)
+        self.assertIn("cursor-agent login", message)
+        self.assertIn("인증 실패 흔적", message)
 
     def test_codex_reviewer_message_is_unchanged(self):
         self.env["CASCADE_REVIEWER"] = "codex"

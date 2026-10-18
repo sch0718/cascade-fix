@@ -215,13 +215,38 @@ class CursorReviewTest(unittest.TestCase):
                               env={"FAKE_CURSOR_JSON": body, "FAKE_CURSOR_EXIT": "1"})
         self.assertEqual(out.returncode, 75)
         self.assertIn("exit=75", out.stdout)
-        self.assertIn("usage limit", self.final_text())
+        self.assertEqual(self.final_text(), "")
+        self.assertIn("usage limit", self.out.read_text(encoding="utf-8"))
 
     def test_authentication_required_exits_77(self):
         body = '{"type":"result","is_error":true,"result":"Authentication required","session_id":"s"}'
         out = self.run_script("--doc", str(self.repo / "a.md"), "--out", str(self.out),
                               env={"FAKE_CURSOR_JSON": body, "FAKE_CURSOR_EXIT": "1"})
         self.assertEqual(out.returncode, 77)
+        self.assertEqual(self.final_text(), "")
+        self.assertIn("Authentication required", self.out.read_text(encoding="utf-8"))
+
+    def test_plain_usage_limit_output_exits_75_with_empty_final(self):
+        out = self.run_script("--doc", str(self.repo / "a.md"), "--out", str(self.out),
+                              env={"FAKE_CURSOR_JSON": "You've hit your usage limit", "FAKE_CURSOR_EXIT": "1"})
+        self.assertEqual(out.returncode, 75)
+        self.assertEqual(self.final_text(), "")
+        self.assertIn("usage limit", self.out.read_text(encoding="utf-8"))
+
+    def test_plain_authentication_output_exits_77_with_empty_final(self):
+        out = self.run_script("--opinion", str(self.prompt), "--repo", str(self.repo), "--out", str(self.out),
+                              env={"FAKE_CURSOR_JSON": "Not logged in", "FAKE_CURSOR_EXIT": "1"})
+        self.assertEqual(out.returncode, 77)
+        self.assertEqual(self.final_text(), "")
+        self.assertIn("Not logged in", self.out.read_text(encoding="utf-8"))
+
+    def test_other_error_envelope_keeps_final_empty(self):
+        body = '{"type":"result","is_error":true,"result":"internal failure","session_id":"s"}'
+        out = self.run_script("--recheck", str(self.prompt), "--repo", str(self.repo), "--out", str(self.out),
+                              env={"FAKE_CURSOR_JSON": body, "FAKE_CURSOR_EXIT": "1"})
+        self.assertEqual(out.returncode, 1)
+        self.assertEqual(self.final_text(), "")
+        self.assertIn("internal failure", self.out.read_text(encoding="utf-8"))
 
     def test_review_text_mentioning_usage_limit_is_not_an_error(self):
         body = ('{"type":"result","is_error":false,"result":"usage limit 처리 누락\\nSUMMARY: critical=0 warning=1 suggestion=0",'

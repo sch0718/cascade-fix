@@ -241,7 +241,7 @@ state = "none"
 usage = ""
 if envelope is not None:
     state = "error" if envelope.get("is_error") else "ok"
-    result = str(envelope.get("result", ""))
+    result = "" if state == "error" else str(envelope.get("result", ""))
     u = envelope.get("usage") or {}
     usage = "input={} output={} cache_read={} cache_write={}".format(
         u.get("inputTokens", 0), u.get("outputTokens", 0), u.get("cacheReadTokens", 0), u.get("cacheWriteTokens", 0))
