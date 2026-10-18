@@ -51,7 +51,12 @@ if sys.argv[1:2] == ["sandbox"]:
     args = sys.argv[2:]
     (log / f"codex-sandbox-{n}.env.json").write_text(json.dumps({"CODEX_HOME": os.environ.get("CODEX_HOME")}))
     command = args[args.index("--") + 1:]
-    if os.environ.get("FAKE_CODEX_SANDBOX_EXIT"):
+    if command[-3:] == ["sh", "-c", ":"]:
+        probe_exit = os.environ.get("FAKE_CODEX_SANDBOX_PROBE_EXIT")
+        if probe_exit:
+            sys.stderr.write(os.environ.get("FAKE_CODEX_SANDBOX_PROBE_STDERR", ""))
+            sys.exit(int(probe_exit))
+    elif os.environ.get("FAKE_CODEX_SANDBOX_EXIT"):
         sys.exit(int(os.environ["FAKE_CODEX_SANDBOX_EXIT"]))
     sys.exit(subprocess.run(command, cwd=args[args.index("-C") + 1]).returncode)
 n = claim("codex")

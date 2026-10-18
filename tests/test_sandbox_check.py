@@ -11,16 +11,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from cascade import sandbox_check, workers  # noqa: E402
 from cascade.config import RepoConfig  # noqa: E402
+from cascade.runners import tree_of  # noqa: E402
 from cascade.snapshot import commit_worktree  # noqa: E402
 from fake_cli import CODEX_BODY, CURSOR_BODY, fenced, install  # noqa: E402
-from helpers import git, run_cli  # noqa: E402
+from helpers import git, make_repo, run_cli  # noqa: E402
 from test_cli_e2e import FIXTURES, CliTestBase  # noqa: E402
 
 BOTH = {"codex": True, "cursor": True}
 
 
-def cursor_reply(cmds, exit_code=0):
-    return fenced(json.dumps({"results": [{"cmd": c, "exit": exit_code} for c in cmds]}))
+def cursor_reply(cmds, exit_code=0, probe_exit=0):
+    results = [{"cmd": "true", "exit": probe_exit}, *({"cmd": c, "exit": exit_code} for c in cmds)]
+    return fenced(json.dumps({"results": results}))
 
 
 class SandboxCheckBase(unittest.TestCase):
@@ -33,8 +35,7 @@ class SandboxCheckBase(unittest.TestCase):
         self.codex = install(bin_dir, "codex", CODEX_BODY)
         self.cursor = install(bin_dir, "cursor-agent", CURSOR_BODY)
         self.root = self.tmp / "repo"
-        self.wt = self.tmp / "wt"
-        self.wt.mkdir()
+        self.wt = make_repo(self.tmp / "wt", {"calc.py": "x = 1\n"}).resolve()
         self.log = self.tmp / "log"
         self.check = self.tmp / "sandbox-check.json"
         patcher = mock.patch.dict(os.environ, {
@@ -51,7 +52,9 @@ class SandboxCheckBase(unittest.TestCase):
         return len(list(self.log.glob(f"{name}-*.args.json"))) if self.log.is_dir() else 0
 
     def codex_commands(self):
-        return [json.loads(p.read_text(encoding="utf-8"))[-1] for p in sorted(self.log.glob("codex-sandbox-*.args.json"))]
+        calls = [json.loads(p.read_text(encoding="utf-8"))[-1] for p in sorted(self.log.glob("codex-sandbox-*.args.json"),
+                 key=lambda p: int(p.name.split("-")[2].split(".")[0]))]
+        return calls[1:]
 
     def set_cursor(self, *entries):
         os.environ["FAKE_CURSOR_RESULTS"] = json.dumps(list(entries))
@@ -123,14 +126,14 @@ class EnsureTest(SandboxCheckBase):
     def test_codex_runs_each_command_in_sandbox_with_isolated_home(self):
         self.set_cursor({"result": cursor_reply(["echo {files}"])})
         self.ensure(RepoConfig(tests=["echo {files}"]))
-        args = json.loads((self.log / "codex-sandbox-1.args.json").read_text(encoding="utf-8"))
+        args = json.loads((self.log / "codex-sandbox-2.args.json").read_text(encoding="utf-8"))
         self.assertEqual(args[:1], ["sandbox"])
         self.assertEqual(args[args.index("-C") + 1], str(self.wt))
         self.assertIn('sandbox_mode="workspace-write"', args)
         self.assertEqual(args[args.index("--") + 1:], ["sh", "-c", "echo"])
         for forbidden in ("--dangerously-bypass-approvals-and-sandbox", "danger-full-access"):
             self.assertNotIn(forbidden, " ".join(args))
-        home = json.loads((self.log / "codex-sandbox-1.env.json").read_text(encoding="utf-8"))["CODEX_HOME"]
+        home = json.loads((self.log / "codex-sandbox-2.env.json").read_text(encoding="utf-8"))["CODEX_HOME"]
         self.assertNotEqual(home, str(Path.home() / ".codex"))
         self.assertFalse(Path(home).exists())
 
@@ -164,7 +167,7 @@ class EnsureTest(SandboxCheckBase):
         cfg = RepoConfig(tests=["true"], lint=["echo hi"])
         first, first_lines = self.ensure(cfg)
         counts = (self.calls("codex-sandbox"), self.calls("cursor-agent"))
-        self.assertEqual(counts, (2, 1))
+        self.assertEqual(counts, (3, 1))
         second, second_lines = self.ensure(cfg)
         self.assertEqual((self.calls("codex-sandbox"), self.calls("cursor-agent")), counts)
         self.assertEqual((second, second_lines), (first, first_lines))
@@ -187,14 +190,14 @@ class EnsureTest(SandboxCheckBase):
         self.ensure(RepoConfig(tests=["true"]))
         before = self.calls("codex-sandbox")
         self.ensure(RepoConfig(tests=["true"], lint=["echo hi"]))
-        self.assertEqual(self.calls("codex-sandbox"), before + 2)
+        self.assertEqual(self.calls("codex-sandbox"), before + 3)
 
     def test_same_commands_in_other_repo_rerun(self):
         self.set_cursor({"result": cursor_reply(["true"])})
         cfg = RepoConfig(tests=["true"])
         self.ensure(cfg)
         sandbox_check.ensure(self.tmp / "other", cfg, self.wt, self.workers, [])
-        self.assertEqual(self.calls("codex-sandbox"), 2)
+        self.assertEqual(self.calls("codex-sandbox"), 4)
 
     def test_no_commands_or_no_external_workers_passes_without_calls(self):
         for cfg, initial in ((RepoConfig(), self.workers), (RepoConfig(tests=["false"]), workers.assign("claude", BOTH, "", ""))):
@@ -207,7 +210,7 @@ class EnsureTest(SandboxCheckBase):
         self.set_cursor({"result": "명령을 못 돌렸다"})
         updated, lines = self.ensure(RepoConfig(tests=["true"]))
         self.assertEqual(updated["b"]["runner"], "claude")
-        self.assertIn("cursor 샌드박스에서", lines[0])
+        self.assertIn("cursor 샌드박스 점검 명령 자체가 실패했다", lines[0])
         data = json.loads(self.check.read_text(encoding="utf-8"))
         self.assertEqual([k for k in data if "|cursor|" in k], [])
         self.assertEqual(len([k for k in data if "|codex|" in k]), 1)
@@ -227,6 +230,69 @@ class EnsureTest(SandboxCheckBase):
         updated, lines = self.ensure(RepoConfig(tests=["true"]))
         self.assertEqual((updated, lines), (self.workers, []))
         self.assertIsInstance(json.loads(self.check.read_text(encoding="utf-8")), dict)
+
+
+    def test_codex_probe_failure_is_not_cached_and_names_the_cause(self):
+        os.environ["FAKE_CODEX_SANDBOX_PROBE_EXIT"] = "2"
+        os.environ["FAKE_CODEX_SANDBOX_PROBE_STDERR"] = "error: unrecognized option '-C'"
+        self.addCleanup(os.environ.pop, "FAKE_CODEX_SANDBOX_PROBE_EXIT", None)
+        self.addCleanup(os.environ.pop, "FAKE_CODEX_SANDBOX_PROBE_STDERR", None)
+        self.set_cursor({"result": cursor_reply(["true", "echo hi"])})
+        updated, lines = self.ensure(RepoConfig(tests=["true"], lint=["echo hi"]))
+        self.assertEqual((updated["a"]["runner"], updated["writer"]["runner"]), ("claude", "claude"))
+        self.assertEqual(self.codex_commands(), [])
+        self.assertEqual(self.calls("codex-sandbox"), 1)
+        self.assertIn("codex 샌드박스 점검 명령 자체가 실패했다", lines[0])
+        self.assertIn("종료 코드 2", lines[0])
+        self.assertIn("unrecognized option", lines[0])
+        self.assertNotIn("검증 명령이 실패해", lines[0])
+        data = json.loads(self.check.read_text(encoding="utf-8"))
+        self.assertEqual([k for k in data if "|codex|" in k], [])
+
+    def test_codex_probe_failure_is_retried_on_next_run(self):
+        os.environ["FAKE_CODEX_SANDBOX_PROBE_EXIT"] = "2"
+        self.set_cursor({"result": cursor_reply(["true"])})
+        cfg = RepoConfig(tests=["true"])
+        self.ensure(cfg)
+        del os.environ["FAKE_CODEX_SANDBOX_PROBE_EXIT"]
+        updated, lines = self.ensure(cfg)
+        self.assertEqual((updated, lines), (self.workers, []))
+
+    def test_cursor_probe_not_reported_zero_is_not_cached(self):
+        self.set_cursor({"result": cursor_reply(["true"], probe_exit=1)})
+        updated, lines = self.ensure(RepoConfig(tests=["true"]))
+        self.assertEqual(updated["b"]["runner"], "claude")
+        self.assertIn("cursor 샌드박스 점검 명령 자체가 실패했다", lines[0])
+        self.assertIn("true", lines[0])
+        data = json.loads(self.check.read_text(encoding="utf-8"))
+        self.assertEqual([k for k in data if "|cursor|" in k], [])
+
+    def test_cursor_prompt_puts_probe_command_first(self):
+        self.set_cursor({"result": cursor_reply(["echo hi"])})
+        self.ensure(RepoConfig(tests=["echo hi"]))
+        stdin = (self.log / "cursor-agent-1.stdin").read_text(encoding="utf-8")
+        self.assertLess(stdin.index('"true"'), stdin.index("echo hi"))
+
+    def test_base_worktree_is_restored_after_checks(self):
+        os.environ["FAKE_CODEX_SANDBOX_EXIT"] = "1"
+        self.addCleanup(os.environ.pop, "FAKE_CODEX_SANDBOX_EXIT", None)
+        before = tree_of(self.wt)
+        cmd = "echo junk > outside.txt; rm calc.py; false"
+        self.set_cursor({"result": cursor_reply([cmd], 1)})
+        self.ensure(RepoConfig(tests=[cmd]))
+        self.assertEqual(tree_of(self.wt), before)
+        self.assertFalse((self.wt / "outside.txt").exists())
+        self.assertTrue((self.wt / "calc.py").is_file())
+
+    def test_base_worktree_is_restored_when_cursor_edits_files(self):
+        self.set_cursor({"result": cursor_reply(["true"])})
+        os.environ["FAKE_MUTATE"] = "junk.txt=x;calc.py=y"
+        self.addCleanup(os.environ.pop, "FAKE_MUTATE", None)
+        before = tree_of(self.wt)
+        self.ensure(RepoConfig(tests=["true"]))
+        self.assertEqual(tree_of(self.wt), before)
+        self.assertEqual((self.wt / "calc.py").read_text(encoding="utf-8"), "x = 1\n")
+        self.assertFalse((self.wt / "junk.txt").exists())
 
 
 class JobsSandboxCheckTest(CliTestBase):

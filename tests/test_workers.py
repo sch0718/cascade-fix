@@ -122,7 +122,7 @@ class ExternalWorkersBase(CliTestBase):
         bin_dir.mkdir()
         self.codex = install(bin_dir, "codex", CODEX_BODY)
         self.cursor = install(bin_dir, "cursor-agent", CURSOR_BODY)
-        reply = fenced(json.dumps({"results": [{"cmd": "python3 -m unittest", "exit": 0}]}))
+        reply = fenced(json.dumps({"results": [{"cmd": "true", "exit": 0}, {"cmd": "python3 -m unittest", "exit": 0}]}))
         self.env.update({"HOME": str(self.home), "FAKE_CLI_LOG": str(self.tmp / "log"),
                          "CASCADE_SANDBOX_CHECK": str(self.tmp / "sandbox-check.json"),
                          "FAKE_CURSOR_RESULTS": json.dumps([{"result": reply}])})
