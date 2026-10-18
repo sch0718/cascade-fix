@@ -13,7 +13,7 @@ from cascade import sandbox_check, workers  # noqa: E402
 from cascade.config import RepoConfig  # noqa: E402
 from cascade.snapshot import commit_worktree  # noqa: E402
 from fake_cli import CODEX_BODY, CURSOR_BODY, fenced, install  # noqa: E402
-from helpers import run_cli  # noqa: E402
+from helpers import git, run_cli  # noqa: E402
 from test_cli_e2e import FIXTURES, CliTestBase  # noqa: E402
 
 BOTH = {"codex": True, "cursor": True}
@@ -81,12 +81,32 @@ class CommandsTest(unittest.TestCase):
 
 class EnsureTest(SandboxCheckBase):
     def test_failing_command_in_codex_sandbox_demotes_codex(self):
-        self.set_cursor({"result": cursor_reply(["false"])})
-        updated, lines = self.ensure(RepoConfig(tests=["false"]))
+        os.environ["FAKE_CODEX_SANDBOX_EXIT"] = "1"
+        self.addCleanup(os.environ.pop, "FAKE_CODEX_SANDBOX_EXIT", None)
+        self.set_cursor({"result": cursor_reply(["true"])})
+        updated, lines = self.ensure(RepoConfig(tests=["true"]))
         self.assertEqual((updated["a"]["runner"], updated["writer"]["runner"]), ("claude", "claude"))
         self.assertEqual(updated["b"]["runner"], "cursor")
         self.assertEqual(len(lines), 1)
-        self.assertIn("codex 샌드박스에서 검증 명령이 실패해 이 저장소에서는 Claude 작업자를 쓴다: false", lines[0])
+        self.assertIn("codex 샌드박스에서 검증 명령이 실패해 이 저장소에서는 Claude 작업자를 쓴다: true", lines[0])
+
+    def test_tests_command_failing_inside_and_outside_sandbox_keeps_assignment(self):
+        self.set_cursor({"result": cursor_reply(["false"], 1)})
+        updated, lines = self.ensure(RepoConfig(tests=["false"]))
+        self.assertEqual((updated, lines), (self.workers, []))
+        data = json.loads(self.check.read_text(encoding="utf-8"))
+        self.assertEqual({entry["ok"] for entry in data.values()}, {True})
+
+    def test_outside_rerun_is_shared_between_runners(self):
+        os.environ["FAKE_CODEX_SANDBOX_EXIT"] = "1"
+        self.addCleanup(os.environ.pop, "FAKE_CODEX_SANDBOX_EXIT", None)
+        counter = self.tmp / "outside.log"
+        cmd = f"echo x >> {counter}"
+        self.set_cursor({"result": cursor_reply([cmd], 1)})
+        updated, lines = self.ensure(RepoConfig(tests=[cmd]))
+        self.assertEqual(len(lines), 2)
+        self.assertEqual({spec["runner"] for spec in updated.values()}, {"claude"})
+        self.assertEqual(counter.read_text(encoding="utf-8"), "x\n")
 
     def test_failing_command_in_cursor_reply_demotes_cursor(self):
         self.set_cursor({"result": cursor_reply(["true"], 1)})
@@ -138,8 +158,10 @@ class EnsureTest(SandboxCheckBase):
         self.assertEqual((self.calls("codex-sandbox"), self.calls("cursor-agent")), (0, 0))
 
     def test_cached_result_skips_rerun(self):
-        self.set_cursor({"result": cursor_reply(["true", "false"])})
-        cfg = RepoConfig(tests=["true"], lint=["false"])
+        os.environ["FAKE_CODEX_SANDBOX_EXIT"] = "1"
+        self.addCleanup(os.environ.pop, "FAKE_CODEX_SANDBOX_EXIT", None)
+        self.set_cursor({"result": cursor_reply(["true", "echo hi"])})
+        cfg = RepoConfig(tests=["true"], lint=["echo hi"])
         first, first_lines = self.ensure(cfg)
         counts = (self.calls("codex-sandbox"), self.calls("cursor-agent"))
         self.assertEqual(counts, (2, 1))
@@ -149,13 +171,15 @@ class EnsureTest(SandboxCheckBase):
         self.assertEqual(first["a"]["runner"], "claude")
 
     def test_result_file_records_outcome_time_and_failed_commands(self):
-        self.set_cursor({"result": cursor_reply(["true", "false"])})
-        self.ensure(RepoConfig(tests=["true"], lint=["false"]))
+        os.environ["FAKE_CODEX_SANDBOX_EXIT"] = "1"
+        self.addCleanup(os.environ.pop, "FAKE_CODEX_SANDBOX_EXIT", None)
+        self.set_cursor({"result": cursor_reply(["true", "echo hi"])})
+        self.ensure(RepoConfig(tests=["true"], lint=["echo hi"]))
         data = json.loads(self.check.read_text(encoding="utf-8"))
-        codex = data[sandbox_check.cache_key(self.root, "codex", ["true", "false"])]
-        self.assertEqual((codex["ok"], codex["failed"]), (False, ["false"]))
+        codex = data[sandbox_check.cache_key(self.root, "codex", ["true", "echo hi"])]
+        self.assertEqual((codex["ok"], codex["failed"]), (False, ["true", "echo hi"]))
         self.assertTrue(codex["at"])
-        cursor = data[sandbox_check.cache_key(self.root, "cursor", ["true", "false"])]
+        cursor = data[sandbox_check.cache_key(self.root, "cursor", ["true", "echo hi"])]
         self.assertEqual((cursor["ok"], cursor["failed"]), (True, []))
 
     def test_changed_commands_rerun(self):
@@ -256,6 +280,17 @@ class JobsSandboxCheckTest(CliTestBase):
         self.assertEqual(self.stage1_cli_jobs(), [])
         self.assertFalse((self.run_dir / "round-1" / "stage1-cli-args.json").exists())
         self.assertEqual({v["runner"] for v in self.ledger().workers.values()}, {"claude"})
+
+    def test_jobs_keeps_assignment_when_target_tests_fail_at_baseline(self):
+        (self.repo / "test_calc.py").write_text(
+            "import unittest\n\n\nclass T(unittest.TestCase):\n    def test_fail(self):\n        self.fail('baseline')\n",
+            encoding="utf-8")
+        git(self.repo, "commit", "-qam", "failing baseline test")
+        self.init("--workers", "external", "--reviewer", "claude")
+        p = self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1")
+        self.assertEqual((self.ledger().workers["a"]["runner"], self.ledger().workers["b"]["runner"]), ("codex", "cursor"))
+        self.assertEqual(self.stage1_cli_jobs(), ["r1-01:a", "r1-01:b", "r1-02:a", "r1-02:b"])
+        self.assertNotIn("샌드박스에서", p.stdout)
 
     def test_doc_mode_does_not_run_sandbox_check(self):
         raw = self.tmp / "doc.final"

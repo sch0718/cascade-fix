@@ -19,7 +19,7 @@ from cascade.runners import (
     find_codex,
     find_cursor_agent,
 )
-from cascade.verify import FILES, TIMEOUT
+from cascade.verify import FILES, TIMEOUT, run_commands
 from cascade.workers import DEFAULT_CURSOR_MODEL, demote
 
 INCONCLUSIVE = -1
@@ -122,6 +122,14 @@ def ensure(root: Path, cfg: RepoConfig, base_wt: Path, workers: dict, baseline_f
     checks = runners or _default_checks(workers)
     path = check_file()
     saved = _load(path)
+    outside: dict[str, bool] = {}
+
+    def fails_outside(pending: list[str]) -> set[str]:
+        todo = [cmd for cmd in pending if cmd not in outside]
+        for cmd, result in zip(todo, run_commands(Path(base_wt), [_runnable(c) for c in todo])):
+            outside[cmd] = not result.ok
+        return {cmd for cmd in pending if outside[cmd]}
+
     lines = []
     for runner in used:
         key = cache_key(root, runner, cmds)
@@ -129,6 +137,9 @@ def ensure(root: Path, cfg: RepoConfig, base_wt: Path, workers: dict, baseline_f
         if not isinstance(entry, dict):
             exits = checks[runner](Path(base_wt), cmds)
             failed = [cmd for cmd in cmds if exits.get(cmd, INCONCLUSIVE) != 0]
+            real = [cmd for cmd in failed if exits.get(cmd, INCONCLUSIVE) != INCONCLUSIVE]
+            not_sandbox = fails_outside(real) if real else set()
+            failed = [cmd for cmd in failed if cmd not in not_sandbox]
             entry = {"ok": not failed, "at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "failed": failed}
             if not any(exits.get(cmd, INCONCLUSIVE) == INCONCLUSIVE for cmd in cmds):
                 saved[key] = entry
