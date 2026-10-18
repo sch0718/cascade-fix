@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from cascade import cli_steps  # noqa: E402
+from cascade.rounds import RoundRecord  # noqa: E402
 from fake_cli import fenced, result_json  # noqa: E402
 from test_cli_e2e import CALC, FIXTURES, fix, results_json, section_of, worker_output  # noqa: E402
 from test_workers import ExternalWorkersBase  # noqa: E402
@@ -178,6 +179,8 @@ class WorkersCommandTest(WorkersTestBase):
         p = self.args("judge", ok=False)
         self.assertNotEqual(p.returncode, 0)
         self.assertIn("--results", p.stdout)
+        self.assertIn("Workflow", p.stdout)
+        self.assertIn("stage1-args.json", p.stdout)
 
     def test_next_steps_run_workers_and_workflow_together(self):
         self.use_fakes()
@@ -197,6 +200,43 @@ class WorkersCommandTest(WorkersTestBase):
         self.assertNotIn("(백그라운드로)", status)
         judge_line = next(line for line in status.splitlines() if " judge " in line)
         self.assertIn("--results", judge_line)
+
+    def test_jobs_force_discards_stale_workers_results(self):
+        self.cursor_results([dict(LIMIT_ENTRY, match="r1-02-b")])
+        self.start()
+        self.workers()
+        results_json(self.rd() / "stage1-fallback.json", [("r1-02:b", worker_output("사실", "claude-haiku-5-5"))])
+        self.args("jobs", "--force")
+        for name in ("stage1-cli.json", "stage1-fallback-args.json", "stage1-fallback.json"):
+            self.assertFalse((self.rd() / name).exists(), name)
+        status = self.cli("status", "--run-dir", str(self.run_dir)).stdout
+        self.assertTrue(any("(백그라운드로)" in line and " workers " in line for line in status.splitlines()))
+        self.assertNotIn("stage1-fallback-args.json", status)
+        p = self.args("judge", ok=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("workers 단계를 먼저", p.stdout)
+        self.workers()
+
+    def test_workers_requires_jobs_first(self):
+        self.use_fakes()
+        self.init("--workers", "external", "--reviewer", "claude")
+        p = self.workers(ok=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("jobs 단계를 먼저", p.stdout)
+
+    def test_next_steps_after_workers_include_pending_claude_workflow(self):
+        self.use_fakes()
+        del self.env["CASCADE_CURSOR_AGENT"]
+        self.init("--workers", "external", "--reviewer", "claude")
+        self.args("jobs")
+        p = self.workers()
+        lines = p.stdout.splitlines()
+        workflow = next(i for i, line in enumerate(lines) if "Workflow" in line and "stage1-args.json" in line)
+        judge = next(i for i, line in enumerate(lines) if " judge " in line)
+        self.assertLess(workflow, judge)
+        results_json(self.rd() / "stage1.json", [("r1-01:b", worker_output("사실", "claude-haiku-5-5"))])
+        status = self.cli("status", "--run-dir", str(self.run_dir)).stdout
+        self.assertNotIn("Workflow", status)
 
     def test_next_steps_without_cli_jobs_are_unchanged(self):
         self.init("--reviewer", "claude")
@@ -255,6 +295,63 @@ class DocWorkersTest(WorkersTestBase):
         self.assertIn("add가 더하게", (self.repo / "plan.md").read_text(encoding="utf-8"))
 
 
+    def start_doc(self, *workers):
+        self.use_fakes()
+        p = self.cli("init", *self.doc_args, *workers, "--reviewer", "claude")
+        self.run_dir = Path(next(x for x in p.stdout.splitlines() if x.startswith("run_dir=")).split("=", 1)[1])
+        self.args("jobs")
+
+    def test_rerunning_stage1_discards_checker_results(self):
+        self.start_doc("--workers", "external")
+        self.workers()
+        self.args("judge")
+        self.workers("checker")
+        self.assertTrue((self.rd() / "checker-cli.json").is_file())
+        self.args("workers", "--stage", "stage1", "--force")
+        self.assertFalse((self.rd() / "checker-cli.json").exists())
+        status = self.cli("status", "--run-dir", str(self.run_dir)).stdout
+        self.assertNotIn("--stage checker", status)
+        p = self.args("judge")
+        self.assertFalse((self.rd() / "decisions.json").exists())
+        self.assertIn("--stage checker", p.stdout)
+        p = self.args("judge", ok=False)
+        self.assertIn("workers 단계를 먼저", p.stdout)
+        self.workers("checker")
+        self.args("judge")
+        self.assertEqual([d["outcome"] for d in self.ledger().rounds[0].decisions], ["합의-사실"])
+
+    def test_jobs_force_discards_checker_state(self):
+        self.start_doc("--workers", "external")
+        self.workers()
+        self.args("judge")
+        self.workers("checker")
+        self.args("jobs", "--force")
+        self.assertFalse((self.rd() / "checker-cli.json").exists())
+        status = self.cli("status", "--run-dir", str(self.run_dir)).stdout
+        self.assertTrue(any("(백그라운드로)" in line and "--stage stage1" in line for line in status.splitlines()))
+
+    def test_checker_workers_need_first_judge(self):
+        self.start_doc("--workers", "external")
+        self.workers()
+        p = self.workers("checker", ok=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("judge 단계를 먼저", p.stdout)
+
+    def test_claude_doc_judge_without_checker_results_rebuilds_checker_jobs(self):
+        self.start_doc("--workers", "claude")
+        stage1 = results_json(self.rd() / "stage1.json", [
+            ("r1-01:a", worker_output("사실", "claude-sonnet-5-5")),
+            ("r1-01:b", worker_output("사실", "claude-haiku-5-5")),
+            ("r1-01:writer", worker_output("사실", "claude-sonnet-5-5")),
+        ])
+        wt = Path(self.ledger().snapshot["worktrees"]["r1-01-writer"])
+        (wt / "plan.md").write_text(PLAN.replace("고친다", "고쳐 add가 더하게 한다"), encoding="utf-8")
+        for _ in range(2):
+            p = self.args("judge", "--results", str(stage1))
+            self.assertIn("점검자 작업 1건", p.stdout)
+        self.assertFalse((self.rd() / "decisions.json").exists())
+
+
 class ReportWorkersTest(WorkersTestBase):
     def section(self):
         report = self.cli("report", "--run-dir", str(self.run_dir)).stdout
@@ -308,6 +405,19 @@ class StageResultsTest(unittest.TestCase):
         self.assertEqual(by_id["f:a"]["model_id"], "codex:default")
         self.assertEqual(by_id["g:b"]["model_id"], "claude-haiku-5-5")
         self.assertEqual(expected, {"f:a": "codex:default", "g:a": "codex:gpt-x", "g:b": "claude-haiku-5-5"})
+
+    def test_checker_stage_lists_claude_workflow_before_judge_when_result_missing(self):
+        with tempfile.TemporaryDirectory() as td:
+            rd = Path(td)
+            for name in ("checker-args.json", "checker-cli-args.json"):
+                (rd / name).write_text(json.dumps({"jobs": [{"id": "f:checker"}]}), encoding="utf-8")
+            rnd = RoundRecord(no=1, findings=[], decisions=[], adopted=[], recheck_opened=False, events=[
+                {"step": "jobs"}, {"step": "judge-checker"}, {"step": "workers-checker"}])
+            steps = cli_steps._stage_steps(rnd, rd.parent, rd, "checker")
+            self.assertTrue("checker-args.json" in steps[0] and "Workflow" in steps[0])
+            self.assertIn(" judge ", steps[-1])
+            (rd / "checker.json").write_text("{}", encoding="utf-8")
+            self.assertEqual(len(cli_steps._stage_steps(rnd, rd.parent, rd, "checker")), 1)
 
     def test_without_any_file_is_empty(self):
         with tempfile.TemporaryDirectory() as td:

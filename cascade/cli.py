@@ -452,6 +452,7 @@ def cmd_jobs(args) -> int:
         s.write_json(cli_out, cli_args)
     else:
         cli_out.unlink(missing_ok=True)
+    s.clear_cli_outputs(rd, s.STAGE1, s.STAGE_CHECKER)
     ledger.snapshot = snap.to_dict()
     fingerprint = user_tree_fingerprint(snap.root, snap.run_dir)
     s.mark(rnd, "jobs", worktrees={fid: {r: str(p) for r, p in m.items()} for fid, m in wts.items()},
@@ -487,7 +488,12 @@ def cmd_workers(args) -> int:
     ledger = s.load_ledger(run_dir)
     rnd = s.get_round(ledger, args.round)
     step = f"workers-{args.stage}"
-    s.guard(rnd, step, args.force)
+    if s.workers_done(rnd, args.stage) and not args.force:
+        raise s.CliError(f"회차 {rnd.no}의 {step} 단계는 이미 했다. 다시 하려면 --force 를 붙인다")
+    if not s.step_done(rnd, "jobs"):
+        raise s.CliError(f"회차 {rnd.no}의 jobs 단계를 먼저 한다")
+    if args.stage == s.STAGE_CHECKER and not s.checker_pending(rnd):
+        raise s.CliError(f"회차 {rnd.no}의 judge 단계를 먼저 한다(1차 호출이 점검자 작업을 만든다)")
     rd = s.round_dir(run_dir, rnd.no)
     cli_args = rd / f"{args.stage}-cli-args.json"
     if not cli_args.is_file():
@@ -501,6 +507,8 @@ def cmd_workers(args) -> int:
     failed = [o.id for o in outcomes if o.status != STATUS_OK]
     fallback_args = rd / f"{args.stage}-fallback-args.json"
     (rd / f"{args.stage}-fallback.json").unlink(missing_ok=True)
+    if args.stage == s.STAGE1:
+        s.clear_cli_outputs(rd, s.STAGE_CHECKER)
     if failed:
         s.write_json(fallback_args, {"jobs": [s.fallback_job(e) for e in entries if e["id"] in failed]})
     else:
@@ -562,7 +570,7 @@ def cmd_judge(args) -> int:
     stage1_json, loaded_ids = s.stage_inputs(run_dir, rnd, rd, s.STAGE1, args.results, "--results")
     results = read_results(stage1_json)
     checker_results = None
-    if args.checker_results or (ledger.mode == "doc" and s.step_done(rnd, "judge-checker")):
+    if args.checker_results or ((rd / "checker-cli-args.json").is_file() and s.checker_pending(rnd)):
         checker_json, checker_ids = s.stage_inputs(run_dir, rnd, rd, s.STAGE_CHECKER, args.checker_results, "--checker-results")
         checker_results = read_results(checker_json)
         loaded_ids |= checker_ids

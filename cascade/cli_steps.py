@@ -269,6 +269,27 @@ def expected_model_ids(ledger: Ledger, results: dict[str, WorkerResult]) -> dict
     return {key: expected_model_id(ledger.workers[r.role]) for key, r in results.items() if r.role in ledger.workers}
 
 
+def _last(rnd: RoundRecord, step: str) -> int:
+    return max((i for i, e in enumerate(rnd.events) if e.get("step") == step), default=-1)
+
+
+def workers_done(rnd: RoundRecord, stage: str) -> bool:
+    """workers 단계는 입력(stage1은 jobs, checker는 judge 1차)이 마지막으로 바뀐 뒤에 돌았을 때만 끝난 것으로 본다."""
+    source = "jobs" if stage == STAGE1 else "judge-checker"
+    return _last(rnd, f"workers-{stage}") > _last(rnd, source)
+
+
+def checker_pending(rnd: RoundRecord) -> bool:
+    """judge 1차가 마지막 1단계 갱신(jobs·workers stage1) 뒤에 점검자 작업을 만들었다."""
+    return _last(rnd, "judge-checker") > max(_last(rnd, "jobs"), _last(rnd, f"workers-{STAGE1}"))
+
+
+def clear_cli_outputs(rd: Path, *stages: str) -> None:
+    for stage in stages:
+        for name in (f"{stage}-cli.json", f"{stage}-fallback-args.json", f"{stage}-fallback.json"):
+            (Path(rd) / name).unlink(missing_ok=True)
+
+
 def has_jobs(path: Path) -> bool:
     return Path(path).is_file() and bool(read_json(path).get("jobs"))
 
@@ -305,14 +326,15 @@ def load_stage_results(rd: Path, stage: str, claude: Path | None) -> tuple[dict,
 
 def stage_inputs(run_dir: Path, rnd: RoundRecord, rd: Path, stage: str, claude: str | None, option: str) -> tuple[dict, dict[str, str]]:
     rd = Path(rd)
-    if (rd / f"{stage}-cli-args.json").is_file() and not step_done(rnd, f"workers-{stage}"):
+    if (rd / f"{stage}-cli-args.json").is_file() and not workers_done(rnd, stage):
         raise CliError(f"회차 {rnd.no}의 {stage} CLI 작업이 남았다. workers 단계를 먼저 한다: "
                        + _cmd("workers", run_dir, f"--round {rnd.no}", f"--stage {stage}"))
     fallback_args, fallback_out = rd / f"{stage}-fallback-args.json", rd / f"{stage}-fallback.json"
     if fallback_args.is_file() and not fallback_out.is_file():
         raise CliError(f"{stage} 대체 실행 결과({fallback_out.name})가 없다. 먼저 한다: " + workflow_step(fallback_args, fallback_out))
     if claude is None and has_jobs(rd / STAGE_ARGS[stage]):
-        raise CliError(f"{option} 가 필요하다: {STAGE_ARGS[stage]} 에 Claude 작업이 있다")
+        raise CliError(f"{option} 가 필요하다: {STAGE_ARGS[stage]} 에 Claude 작업이 있다. 먼저 한다: "
+                       + workflow_step(rd / STAGE_ARGS[stage], rd / STAGE_OUTPUTS[stage]))
     return load_stage_results(rd, stage, Path(claude) if claude else None)
 
 
@@ -663,19 +685,20 @@ def _judge_cmd(run_dir: Path, rd: Path, no: int, stage: str) -> str:
 
 
 def _judge_ready(rnd: RoundRecord, rd: Path, stage: str) -> bool:
-    return not (Path(rd) / f"{stage}-cli-args.json").is_file() or step_done(rnd, f"workers-{stage}")
+    return not (Path(rd) / f"{stage}-cli-args.json").is_file() or workers_done(rnd, stage)
 
 
 def _stage_steps(rnd: RoundRecord, run_dir: Path, rd: Path, stage: str) -> list[str]:
     claude = [workflow_step(rd / STAGE_ARGS[stage], rd / STAGE_OUTPUTS[stage])] if has_jobs(rd / STAGE_ARGS[stage]) else []
     if not (rd / f"{stage}-cli-args.json").is_file():
         return [*claude, _judge_cmd(run_dir, rd, rnd.no, stage)]
-    if not step_done(rnd, f"workers-{stage}"):
+    if not workers_done(rnd, stage):
         workers = f"(백그라운드로) {_cmd('workers', run_dir, f'--round {rnd.no}', f'--stage {stage}')}"
         return [workers, *claude, *(["Workflow와 workers는 서로 기다리지 않으므로 두 단계를 동시에 띄운다"] if claude else [])]
     fallback_args, fallback_out = rd / f"{stage}-fallback-args.json", rd / f"{stage}-fallback.json"
     fallback = [workflow_step(fallback_args, fallback_out)] if fallback_args.is_file() and not fallback_out.is_file() else []
-    return [*fallback, _judge_cmd(run_dir, rd, rnd.no, stage)]
+    pending = claude if not (rd / STAGE_OUTPUTS[stage]).is_file() else []
+    return [*pending, *fallback, _judge_cmd(run_dir, rd, rnd.no, stage)]
 
 
 def next_steps(ledger: Ledger, run_dir: Path) -> list[str]:
@@ -700,7 +723,7 @@ def next_steps(ledger: Ledger, run_dir: Path) -> list[str]:
     if not step_done(rnd, "jobs"):
         return [_cmd("jobs", run_dir, n)]
     if not step_done(rnd, "judge"):
-        if step_done(rnd, "judge-checker") and (rd / STAGE_ARGS[STAGE_CHECKER]).is_file():
+        if checker_pending(rnd) and (rd / STAGE_ARGS[STAGE_CHECKER]).is_file():
             return _stage_steps(rnd, run_dir, rd, STAGE_CHECKER)
         steps = _stage_steps(rnd, run_dir, rd, STAGE1)
         if _judge_ready(rnd, rd, STAGE1) and any(repro_listed(rd).values()):
