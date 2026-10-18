@@ -39,6 +39,15 @@ def mutate(root):
 '''
 
 CODEX_BODY = _COMMON + r'''
+if sys.argv[1:2] == ["sandbox"]:
+    import subprocess
+    n = claim("codex-sandbox")
+    args = sys.argv[2:]
+    (log / f"codex-sandbox-{n}.env.json").write_text(json.dumps({"CODEX_HOME": os.environ.get("CODEX_HOME")}))
+    command = args[args.index("--") + 1:]
+    if os.environ.get("FAKE_CODEX_SANDBOX_EXIT"):
+        sys.exit(int(os.environ["FAKE_CODEX_SANDBOX_EXIT"]))
+    sys.exit(subprocess.run(command, cwd=args[args.index("-C") + 1]).returncode)
 n = claim("codex")
 stamp("codex", n, "start")
 args = sys.argv[1:]

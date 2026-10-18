@@ -521,6 +521,21 @@ class CursorRunner:
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def ask(self, worktree: Path, prompt: str, model: str, profile: str = "worker") -> Outcome:
+        """프롬프트 하나를 worker 프로필로 보내고 결과 텍스트를 output["text"]에 담아 돌려 준다."""
+        job = CliJob("ask", "a", "worker", RUNNER_CURSOR, model, "", Path(), Path(worktree), True)
+        tmp = Path(tempfile.mkdtemp(prefix="cascade-cache-"))
+        try:
+            env = {**os.environ, **_tool_roots_env(), **cache_env(tmp), "HOME": str(cursor_home(tmp, profile))}
+            failed, envelope, usage = self._call(job, prompt, env)
+        except Exception as e:
+            return _unexpected(job, e)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        if failed:
+            return failed
+        return Outcome(job.id, job.runner, STATUS_OK, {"text": str(envelope.get("result", ""))}, usage, "")
+
     def _command(self, job: CliJob, resume: str | None) -> list[str]:
         cmd = [self.exe, "-p", "--trust", "--sandbox", "enabled", "--output-format", "json",
                "--model", job.model, "--workspace", str(job.worktree)]

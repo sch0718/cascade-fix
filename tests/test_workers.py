@@ -11,7 +11,7 @@ from cascade import detect, jobs, workers  # noqa: E402
 from cascade.cli_steps import model_warnings  # noqa: E402
 from cascade.consensus import WorkerResult  # noqa: E402
 from cascade.rounds import Ledger  # noqa: E402
-from fake_cli import CODEX_BODY, CURSOR_BODY, install  # noqa: E402
+from fake_cli import CODEX_BODY, CURSOR_BODY, fenced, install  # noqa: E402
 from helpers import run_cli  # noqa: E402
 from test_cli_e2e import FIXTURES, CliTestBase  # noqa: E402
 
@@ -122,7 +122,10 @@ class InitWorkersTest(CliTestBase):
         bin_dir.mkdir()
         self.codex = install(bin_dir, "codex", CODEX_BODY)
         self.cursor = install(bin_dir, "cursor-agent", CURSOR_BODY)
-        self.env.update({"HOME": str(self.home), "FAKE_CLI_LOG": str(self.tmp / "log")})
+        reply = fenced(json.dumps({"results": [{"cmd": "python3 -m unittest", "exit": 0}]}))
+        self.env.update({"HOME": str(self.home), "FAKE_CLI_LOG": str(self.tmp / "log"),
+                         "CASCADE_SANDBOX_CHECK": str(self.tmp / "sandbox-check.json"),
+                         "FAKE_CURSOR_RESULTS": json.dumps([{"result": reply}])})
 
     def use_fakes(self):
         self.env.update({"CASCADE_CODEX": str(self.codex), "CASCADE_CURSOR_AGENT": str(self.cursor)})

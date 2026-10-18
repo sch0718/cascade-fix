@@ -80,6 +80,7 @@ from cascade.rounds import (
     out_of_scope,
     parse_recheck,
 )
+from cascade.sandbox_check import ensure as ensure_sandbox
 from cascade.snapshot import (
     RUN_DIR_NAME,
     add_worktree,
@@ -409,11 +410,18 @@ def cmd_jobs(args) -> int:
             name = s.wt_name(f.id, role)
             wts[f.id][role] = snap.worktrees[name] if name in snap.worktrees else s.new_worktree(snap, name, base, cfg)
     rd = s.round_dir(run_dir, rnd.no)
+    failed: list[str] = []
     if ledger.mode == "code" and cfg.tests:
         located = list(dict.fromkeys(p for f in findings if (p := location_file(f.location))))
         failed = s.write_baseline(rd, base_wt, cfg, located)
         if failed:
             print(f"기준선에서 이미 실패하는 검증 명령(판정에서 제외): {', '.join(failed)}")
+    if ledger.mode == "code" and has_external(ledger.workers):
+        ledger.workers, notices = ensure_sandbox(Path(ledger.root), cfg, base_wt, ledger.workers, failed)
+        for notice in notices:
+            print(notice)
+        if notices:
+            s.save_ledger(run_dir, ledger)
     if ledger.source == s.SOURCE_PR:
         listed = {f.id: repro_cmds(f) for f in findings}
         s.write_json(rd / s.REPRO_FILE, listed)
@@ -429,6 +437,8 @@ def cmd_jobs(args) -> int:
     cli_out = rd / "stage1-cli-args.json"
     if cli_args["jobs"]:
         s.write_json(cli_out, cli_args)
+    else:
+        cli_out.unlink(missing_ok=True)
     ledger.snapshot = snap.to_dict()
     fingerprint = user_tree_fingerprint(snap.root, snap.run_dir)
     s.mark(rnd, "jobs", worktrees={fid: {r: str(p) for r, p in m.items()} for fid, m in wts.items()},
@@ -526,6 +536,8 @@ def cmd_judge(args) -> int:
             s.write_json(out, claude_args)
             if cli_args["jobs"]:
                 s.write_json(rd / "checker-cli-args.json", cli_args)
+            else:
+                (rd / "checker-cli-args.json").unlink(missing_ok=True)
             s.mark(rnd, "judge-checker")
             s.save_ledger(run_dir, ledger)
             print(f"점검자 작업 {len(claude_args['jobs'])}건: {out}")
