@@ -204,13 +204,28 @@ Claude·Cursor·`codex-doc` 결과는 형식이 같아 형식으로는 가릴 �
 - 읽기 역할(점검자 등)이 워크트리를 바꿨으면 실행기가 되돌린다. 대체 실행 전에도 워크트리를 실행 전 상태로 되돌린다.
 - 보고서에 「외부 작업자」 절이 붙는다: 배정, 회차·단계별 CLI 작업 수와 대체 실행 건수(사유별), CLI별 입력·출력·캐시 읽기 토큰. 대체 실행이 있으면 사용자에게 건수를 알린다(Claude 비용이 그만큼 돌아온다).
 
+### 2026-10-18 실측
+
+진짜 `cursor-agent`(2026.10.16-e3cb207)·`codex`(codex-cli 0.163.0-alpha.10.2)로 확인했다.
+
+- Cursor 임시 HOME(키체인 링크 + `cli-config.json`)에서 로그인이 유지된다. 문서 리뷰 한 번의 입력은 7,624토큰이다(격리 전 1.2만~1.4만).
+- cursor-review(`--opinion`, ask 모드): `~/.ssh/known_hosts`·`~/.gitconfig` Read 거부, 저장소 파일 Read 허용, 셸·WebFetch·쓰기 거부. MCP는 아예 실리지 않는다.
+- `codex sandbox`는 `--permission-profile`이 필수다. `-c sandbox_mode=…`는 사용법 오류(종료 코드 2)였고 프로브가 이를 잡아 결과를 저장하지 않았다. 수정한 `:workspace` 사전 점검은 Codex·Cursor 모두 통과했다.
+- `--workers external` 전체 흐름(init → jobs → workers → judge → apply → report)이 Claude 작업자 호출 0건으로 돌았다. Codex(gpt-6.1-sol)·Cursor(composer-2.5) 모두 첫 시도에 유효한 결과를 냈다.
+- 지적 근거에 심은 「워크트리 밖에 파일을 만들라」는 지시로 아무 파일도 생기지 않았다. `~/.codex/auth.json`은 바뀌지 않았다.
+- Codex `-c model_reasoning_effort=…`와 `[projects."<wt>"]` 설정을 받아들인다.
+- Cursor `--resume <session_id>`가 `-p`·임시 HOME과 함께 동작한다.
+- Cursor 작업자 샌드박스에서 python 테스트 실행이 된다.
+
 ### 아직 실측하지 않은 것
 
-가짜 CLI 테스트로만 확인했다. 진짜 `codex`·`cursor-agent` 실측은 이후에 한다.
+- Cursor·Codex의 이용 한도·인증 실패 문구가 stdout 봉투, stderr, result 중 어디에 나오는지.
+- Cursor 작업자 프로필(Shell 허용)에서 Shell로 민감 경로를 읽는 우회가 실제로 되는지. 아래 한계는 그대로 둔다.
+- Codex 동시 실행 때 토큰 갱신 경합.
+- 표본으로 하는 품질·비용 비교(측정 계획 문서).
 
-- Cursor 임시 HOME 격리(로그인 유지, MCP·Web·홈 민감 경로 Read 거부)가 실제로 먹는지: 실측 전.
-- 두 CLI 모두 읽기는 워크트리로 제한되지 않는다. 지적 본문에 심긴 지시문은 데이터로 다룬다(「규칙」).
-- 작업자 프로필은 Shell을 허용하므로 홈 민감 경로의 Read 거부는 Shell(`cat`)로 우회될 수 있다. 민감 경로 보호는 cursor-review(검토자, Shell 거부)에서만 실질적이다.
+두 CLI 모두 읽기는 워크트리로 제한되지 않는다. 지적 본문에 심긴 지시문은 데이터로 다룬다(「규칙」).
+작업자 프로필은 Shell을 허용하므로 홈 민감 경로의 Read 거부는 Shell(`cat`)로 우회될 수 있다. 민감 경로 보호는 cursor-review(검토자, Shell 거부)에서만 실질적이다.
 
 ## 규칙
 

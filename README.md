@@ -209,7 +209,8 @@ Codex 검토 결과(review.final) 반영해줘
 - 코드 모드에서 저장소마다 처음 한 번, 검증 명령을 각 CLI의 샌드박스 안에서 돌려 봅니다. 결과는 `~/.claude/cascade-fix/sandbox-check.json`에 남습니다. 샌드박스 안에서만 실패하는 CLI는 그 저장소에서 쓰지 않고 Claude로 돕니다. 샌드박스 밖에서도 실패하는 명령은 샌드박스 탓으로 보지 않습니다. 저장소 명령 전에 사소한 명령을 먼저 돌려 점검 호출 자체(사용법 오류 등)가 실패하면 결과를 저장하지 않고, 그 실행에서는 Claude로 돌고 다음에 다시 점검합니다. 점검이 base 워크트리에 남긴 변경은 되돌립니다.
 - CLI 작업은 `workers` 명령이 한 번에 돌리고 Claude 작업의 Workflow와 동시에 진행합니다. 메인 세션이 읽는 출력은 요약 몇 줄입니다.
 - 한도 초과·로그인 풀림·시간 초과(작업당 900초)·실행 오류·무효 결과가 나면 그 작업만 원래 Claude 모델로 다시 돕니다(대체 실행). 보고서의 「외부 작업자」 절에 사유별 건수와 CLI별 토큰이 남습니다.
-- 진짜 `codex`·`cursor-agent`로 하는 실측은 아직 하지 않았습니다. Cursor 임시 HOME 격리가 로그인을 유지하고 MCP·Web·홈 민감 경로 읽기를 막는지는 실측 전입니다. 사전 점검은 `codex sandbox -P :workspace`로 합니다. 2026-10-18 실측(codex-cli 0.163.0-alpha.10.2)에서 워크트리 안 쓰기만 되고 저장소 루트·홈 쓰기와 네트워크가 막혀 `exec -s workspace-write`와 같았습니다.
+- 2026-10-18에 진짜 `codex`·`cursor-agent`로 실측했습니다. Cursor 임시 HOME 격리는 로그인을 유지했고 MCP·Web·셸·쓰기와 홈 민감 경로 읽기를 막았습니다. `--workers external` 전체 흐름이 Claude 작업자 호출 없이 돌았습니다. 사전 점검은 `codex sandbox -P :workspace`로 하며, 워크트리 안 쓰기만 되고 저장소 루트·홈 쓰기와 네트워크가 막혀 `exec -s workspace-write`와 같았습니다(codex-cli 0.163.0-alpha.10.2).
+- 아직 실측하지 않은 것: 이용 한도·인증 실패 문구가 나오는 위치, 작업자 프로필에서 Shell로 민감 경로를 읽는 우회, Codex 동시 실행 때 토큰 갱신 경합, 표본 품질·비용 비교.
 - 작업자 프로필은 Shell을 허용하므로 홈 민감 경로의 Read 거부는 Shell(`cat`)로 우회될 수 있습니다. 민감 경로 보호는 cursor-review(검토자, Shell 거부)에서만 실질적입니다.
 - 통과 기준(판정 일치율, Opus 호출 수, 대체 실행 비율, 회귀)과 측정 절차는 [docs/2026-10-18-workers-measurement-plan.md](docs/2026-10-18-workers-measurement-plan.md)에 있습니다.
 

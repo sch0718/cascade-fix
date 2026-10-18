@@ -37,7 +37,14 @@ python3 -m unittest tests.test_cursor_review -v
 CASCADE_CURSOR_REVIEW=~/.claude/skills/cursor-review/scripts/run-review.sh python3 -m unittest tests.test_cursor_review
 ```
 
+## 실측
+
+2026-10-18에 진짜 `cursor-agent`(2026.10.16-e3cb207)로 확인했다.
+
+- 임시 HOME 격리가 로그인을 유지한다. 문서 리뷰 한 번의 입력은 7,624토큰이다(격리 전 1.2만~1.4만).
+- `--opinion`(ask 모드)에서 `~/.ssh/known_hosts`·`~/.gitconfig` Read는 거부되고 저장소 파일 Read는 된다. 셸·WebFetch·쓰기는 거부되고 MCP는 실리지 않는다.
+
 ## 확인하지 못한 것
 
-- 진짜 `cursor-agent`로 임시 HOME 격리가 로그인을 유지하고 도구를 막는지는 이 저장소의 테스트가 확인하지 못한다. 가짜 실행 파일은 인자·`$HOME`·설정 파일만 본다.
-- 거부 규칙 `Read(<HOME>/<경로>/**)`가 Cursor에서 의도대로 동작하는지도 같다. 실제 CLI로 따로 확인해야 한다.
+- 이 저장소의 테스트는 진짜 `cursor-agent`를 부르지 않는다. 가짜 실행 파일은 인자·`$HOME`·설정 파일만 본다. 위 실측은 사람이 따로 한 것이다.
+- 이용 한도·인증 실패 문구가 stdout 봉투, stderr, result 중 어디에 나오는지.
