@@ -21,6 +21,7 @@ for a in "$@"; do
   prev="$a"
 done
 for a in "$@"; do printf '%s\\0' "$a"; done > "$FAKE_CODEX_OUT"
+cp "$CODEX_HOME/config.toml" "$FAKE_CODEX_OUT.config"
 last=""
 for a in "$@"; do last="$a"; done
 [ "$last" = "-" ] && cat > "$FAKE_CODEX_OUT.stdin"
@@ -91,6 +92,13 @@ class RunReviewModesTest(unittest.TestCase):
 
     def test_run_review_opinion_mode_builds_exec_command(self):
         self.assert_exec_command("opinion")
+
+    def test_codex_home_turns_off_skill_list(self):
+        proc = self.run_script("--opinion", str(self.prompt), "--repo", str(self.repo), "--out", str(self.out))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        config = Path(f"{self.capture}.config").read_text(encoding="utf-8")
+        self.assertIn("[skills]\ninclude_instructions = false\n", config)
+        self.assertIn(f'[projects."{self.repo}"]\ntrust_level = "trusted"', config)
 
     def test_large_recheck_prompt_is_not_passed_as_argument(self):
         big = "diff 줄\n" * 300000
