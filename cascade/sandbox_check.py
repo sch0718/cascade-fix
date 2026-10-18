@@ -29,7 +29,7 @@ from cascade.workers import DEFAULT_CURSOR_MODEL, demote
 INCONCLUSIVE = -1
 PROBE = "true"
 CODEX_PROBE = ":"
-_CODEX_SANDBOX_MODE = 'sandbox_mode="workspace-write"'
+_CODEX_PERMISSION_PROFILE = ":workspace"
 _CURSOR_PROMPT = (
     "아래 셸 명령을 작업 디렉터리에서 하나씩 그대로 실행하고 각 종료 코드만 보고하라. "
     "파일을 고치거나 다른 명령을 돌리지 않는다. 실행하지 못한 명령은 exit에 -1을 쓴다. "
@@ -67,7 +67,7 @@ def _codex_sandbox(exe: str, wt: Path, command: str) -> _Run:
     try:
         home = tmp / "codex-home"
         home.mkdir()
-        argv = [exe, "sandbox", "-C", str(wt), "-c", _CODEX_SANDBOX_MODE, "--", "sh", "-c", command]
+        argv = [exe, "sandbox", "-P", _CODEX_PERMISSION_PROFILE, "-C", str(wt), "--", "sh", "-c", command]
         env = {**os.environ, **cache_env(tmp), "CODEX_HOME": str(home)}
         return _execute(argv, "", Path(wt), env, TIMEOUT)
     finally:

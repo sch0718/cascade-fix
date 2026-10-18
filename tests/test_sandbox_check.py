@@ -129,7 +129,8 @@ class EnsureTest(SandboxCheckBase):
         args = json.loads((self.log / "codex-sandbox-2.args.json").read_text(encoding="utf-8"))
         self.assertEqual(args[:1], ["sandbox"])
         self.assertEqual(args[args.index("-C") + 1], str(self.wt))
-        self.assertIn('sandbox_mode="workspace-write"', args)
+        self.assertEqual(args[args.index("-P") + 1], ":workspace")
+        self.assertNotIn("sandbox_mode", " ".join(args))
         self.assertEqual(args[args.index("--") + 1:], ["sh", "-c", "echo"])
         for forbidden in ("--dangerously-bypass-approvals-and-sandbox", "danger-full-access"):
             self.assertNotIn(forbidden, " ".join(args))
