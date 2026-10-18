@@ -605,6 +605,32 @@ def _claude_opinions(args, run_dir: Path, ledger: Ledger, rnd: RoundRecord) -> i
     return 0
 
 
+CODEX_AUTH_FAILURE = re.compile(r"\b401\b|unauthori[sz]ed|refresh[ _]token|codex login|not logged in", re.IGNORECASE)
+CODEX_LOG_TAIL_LINES = 5
+
+
+def _codex_result_text(result: Path, what: str) -> str:
+    """Codex 결과(`<로그>.final`)를 읽는다. 없거나 비면 실행 로그와 인증 실패 여부를 짚어 멈춘다."""
+    text = result.read_text(encoding="utf-8").strip() if result.is_file() else ""
+    if text:
+        return text
+    problem = "없다" if not result.is_file() else "비어 있다"
+    log = result.with_suffix("") if result.suffix == ".final" else None
+    lines = [f"Codex {what} 결과 파일이 {problem}: {result}"]
+    if log is None or not log.is_file():
+        lines.append(f"실행 로그도 없다({log or '로그 경로를 알 수 없다'}). RR 명령의 --out 경로와 종료 코드를 확인한다")
+    else:
+        log_text = log.read_text(encoding="utf-8", errors="replace")
+        tail = log_text.strip().splitlines()[-CODEX_LOG_TAIL_LINES:]
+        lines.append(f"실행 로그: {log}")
+        lines.extend(f"  | {line}" for line in tail)
+        if CODEX_AUTH_FAILURE.search(log_text):
+            lines.append("로그에 인증 실패 흔적이 있다(401·refresh token).")
+    lines.append("인증 실패면 터미널에서 `codex login`으로 다시 로그인한 뒤 RR을 다시 돌린다. "
+                 "RR은 한 번에 하나씩 돌린다(동시에 돌리면 refresh token이 겹쳐 소모돼 로그인이 풀릴 수 있다)")
+    raise s.CliError("\n".join(lines))
+
+
 def cmd_opinion(args) -> int:
     run_dir = Path(args.run_dir)
     ledger = s.load_ledger(run_dir)
@@ -616,9 +642,7 @@ def cmd_opinion(args) -> int:
     s.guard(rnd, f"opinion:{args.id}", args.force)
     if args.id not in {d["finding_id"] for d in rnd.decisions}:
         raise s.CliError(f"회차 {rnd.no}에 {args.id} 판정이 없다")
-    text = s.read_text(Path(args.result)).strip()
-    if not text:
-        raise s.CliError(f"의견 파일이 비어 있다: {args.result}")
+    text = _codex_result_text(Path(args.result), "의견")
     ledger.opinions[args.id] = text
     s.mark(rnd, f"opinion:{args.id}")
     s.save_ledger(run_dir, ledger)
@@ -793,9 +817,12 @@ def cmd_recheck(args) -> int:
     s.guard(rnd, "recheck", args.force)
     if not rnd.recheck_opened:
         raise s.CliError(f"회차 {rnd.no}은 재검토를 열지 않았다")
-    if not Path(args.result).is_file():
+    is_json = args.result.endswith(".json")
+    if not is_json:
+        _codex_result_text(Path(args.result), "재검토")
+    elif not Path(args.result).is_file():
         raise s.CliError(f"파일이 없다: {args.result}")
-    text, model_id = load_text(Path(args.result), s.recheck_job_id(rnd.no) if args.result.endswith(".json") else None)
+    text, model_id = load_text(Path(args.result), s.recheck_job_id(rnd.no) if is_json else None)
     if not text.strip():
         raise s.CliError(f"재검토 결과가 비어 있다(Workflow 호출 실패일 수 있다). 재검토 Workflow를 다시 돌린다: {args.result}")
     warning = model_warning(s.recheck_job_id(rnd.no), model_id, ledger.review_model)
