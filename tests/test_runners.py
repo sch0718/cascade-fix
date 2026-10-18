@@ -539,10 +539,6 @@ class AvailabilityTest(RunnerTestBase):
         self.assertEqual(self.calls("cursor-status"), 0)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 LIMIT_ENTRY = {"is_error": True, "result": "You've hit your usage limit", "exit": 1}
 CHECKER_RESULT = json.dumps({"verdict": "사실", "needs_design_decision": False, "reason": "맞다",
                              "checker_ok": True, "model_id": "x"})
@@ -731,3 +727,7 @@ class TreeTest(RunnerTestBase):
         self.assertEqual((self.wt / "d" / "b.txt").read_text(encoding="utf-8"), "b\n")
         self.assertFalse((self.wt / "new" / "deep" / "x.txt").exists())
         self.assertEqual(tree_of(self.wt), before)
+
+
+if __name__ == "__main__":
+    unittest.main()

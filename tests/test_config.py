@@ -107,10 +107,6 @@ class ConfigTest(unittest.TestCase):
         self.assertIn("검증 명령", p.stdout)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class RepoTomlLocationTest(unittest.TestCase):
     def setUp(self):
         from cascade import cli_steps
@@ -196,3 +192,7 @@ class RepoTomlLocationTest(unittest.TestCase):
             "tests/test_c.py": "from unittest import mock\n\n\ndef test_m():\n    assert mock.Mock()\n",
         })
         self.assertEqual(config.detect_candidates(mock)["tests"], ["pytest {files}"])
+
+
+if __name__ == "__main__":
+    unittest.main()
