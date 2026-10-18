@@ -40,7 +40,7 @@
 - Python 3.11 이상. 외부 패키지는 필요 없습니다.
 - git
 - (PR 모드) 로그인된 `gh` CLI
-- (선택) Codex를 검토자로 쓰려면 `codex-review` 스킬과 `codex` CLI. 이 스킬은 `run-review.sh`의 `--opinion`·`--recheck` 모드를 씁니다. 원래 `codex-review`에는 없는 모드라 [docs/codex-review-changes/](docs/codex-review-changes/README.md)의 diff를 먼저 적용해야 합니다. 같은 문서에 임시 CODEX_HOME에서 스킬 목록을 끄는 설정도 적어 두었습니다. 없으면 검토자는 자동으로 Claude가 됩니다.
+- (선택) Codex를 검토자로 쓰려면 `codex-review` 스킬과 `codex` CLI. 이 스킬은 `run-review.sh`의 `--opinion`·`--recheck` 모드를 씁니다. 원래 `codex-review`에는 없는 모드라 [docs/codex-review-changes/](docs/codex-review-changes/README.md)에 보관한 `run-review.sh`로 바꿔야 합니다. 이 스크립트는 임시 CODEX_HOME에서 스킬 목록을 꺼 Codex 프롬프트도 줄입니다. 없으면 검토자는 자동으로 Claude가 됩니다.
 
 ## 설치
 
@@ -258,8 +258,8 @@ PYTHONPATH=<스킬 경로> python3 -m cascade.cli <명령> [옵션]
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-- 테스트는 320개입니다. `codex-review` 스킬이 없으면 그 스크립트를 쓰는 테스트 10개는 건너뜁니다.
-- 디렉터리: `cascade/`(CLI와 단계 로직), `prompts/`(작업자·판정자·판가름·검토자 프롬프트), `scripts/run-jobs.js`(Workflow 스크립트), `eval/`(측정 도구), `docs/`(설계 검토 기록과 `codex-review` 변경 diff)
+- 테스트는 321개입니다. `codex-review` 스킬이 없으면 그 스크립트를 쓰는 테스트 11개는 건너뜁니다. 보관한 스크립트로 돌리려면 `CASCADE_RUN_REVIEW="$PWD/docs/codex-review-changes/run-review.sh"`를 앞에 붙입니다.
+- 디렉터리: `cascade/`(CLI와 단계 로직), `prompts/`(작업자·판정자·판가름·검토자 프롬프트), `scripts/run-jobs.js`(Workflow 스크립트), `eval/`(측정 도구), `docs/`(설계 검토 기록과 고친 `codex-review` 스크립트)
 - 측정: `eval/replay.py`가 과거 지적 표본을 그 커밋에서 다시 돌리고, `eval/score.py`가 판정 일치율·채택 경로·Opus 호출 절감을 채점합니다. 표본 형식과 순서는 [eval/sample-format.md](eval/sample-format.md)에 있습니다.
 - 출력 스키마를 바꾸면 `cascade/jobs.py`의 `SCHEMAS`와 `scripts/run-jobs.js`의 `SCHEMAS` 블록을 같이 고칩니다(테스트가 두 쪽이 같은지 확인합니다).
 - 배포할 때는 `.claude-plugin/plugin.json`의 `version`을 올립니다. 버전이 같으면 설치한 사람에게 업데이트로 보이지 않습니다.

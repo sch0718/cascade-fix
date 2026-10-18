@@ -11,7 +11,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from helpers import make_repo  # noqa: E402
 
-SCRIPT = Path.home() / ".claude" / "skills" / "codex-review" / "scripts" / "run-review.sh"
+# CASCADE_RUN_REVIEW를 주면 그 스크립트를 시험한다(예: docs/codex-review-changes/run-review.sh)
+SCRIPT = Path(os.environ.get("CASCADE_RUN_REVIEW")
+              or Path.home() / ".claude" / "skills" / "codex-review" / "scripts" / "run-review.sh")
 
 FAKE_CODEX = """#!/usr/bin/env bash
 out_file=""
