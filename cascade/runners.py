@@ -40,7 +40,8 @@ _AUTH_PATTERN = re.compile(
     re.IGNORECASE)
 _FENCED_JSON = re.compile(r"```json[ \t]*\r?\n(.*?)```", re.DOTALL)
 
-_SENSITIVE_DIRS = (".ssh", ".codex", ".cursor", ".claude", ".aws", ".config", ".gnupg", "Library/Keychains")
+_SENSITIVE_DIRS = (".ssh", ".codex", ".cursor", ".claude", ".aws", ".config", ".gnupg", ".docker", ".kube", "Library/Keychains")
+_SENSITIVE_FILES = (".netrc", ".npmrc", ".gitconfig")
 _PROFILE_DENY = {
     "review": ["Shell(*)", "Write(**)", "WebFetch(*)", "Mcp(*:*)"],
     "worker": ["WebFetch(*)", "Mcp(*:*)"],
@@ -194,7 +195,7 @@ def cursor_home(base: Path, profile: str) -> Path:
         keychains.symlink_to(real_home / "Library" / "Keychains")
     deny = list(_PROFILE_DENY[profile])
     deny += [f"Read({real_home}/{name}/**)" for name in _SENSITIVE_DIRS]
-    deny.append(f"Read({real_home}/.netrc)")
+    deny += [f"Read({real_home}/{name})" for name in _SENSITIVE_FILES]
     config = {"version": 1, "permissions": {"allow": [], "deny": deny}, "autoAcceptWebSearch": False}
     if profile == "review":
         config["approvalMode"] = "allowlist"

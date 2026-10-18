@@ -422,10 +422,14 @@ class CursorHomeTest(unittest.TestCase):
         self.assertTrue((home / "Library" / "Keychains").is_symlink())
         self.assertEqual(os.readlink(home / "Library" / "Keychains"), str(self.real_home / "Library" / "Keychains"))
         deny = config["permissions"]["deny"]
-        for rule in ("Shell(*)", "Write(**)", "WebFetch(*)", "Mcp(*:*)", f"Read({self.real_home}/.netrc)"):
+        for rule in ("Shell(*)", "Write(**)", "WebFetch(*)", "Mcp(*:*)"):
             self.assertIn(rule, deny)
-        for name in (".ssh", ".codex", ".cursor", ".claude", ".aws", ".config", ".gnupg", "Library/Keychains"):
+        for name in (".netrc", ".npmrc", ".gitconfig"):
+            self.assertIn(f"Read({self.real_home}/{name})", deny)
+            self.assertNotIn(f"Read({self.real_home}/{name}/**)", deny)
+        for name in (".ssh", ".codex", ".cursor", ".claude", ".aws", ".config", ".gnupg", ".docker", ".kube", "Library/Keychains"):
             self.assertIn(f"Read({self.real_home}/{name}/**)", deny)
+            self.assertNotIn(f"Read({self.real_home}/{name})", deny)
         self.assertEqual(config["approvalMode"], "allowlist")
         self.assertIs(config["autoAcceptWebSearch"], False)
         self.assertEqual(config["version"], 1)

@@ -93,9 +93,10 @@ import sys
 
 home = sys.argv[1]
 deny = ["Shell(*)", "Write(**)", "WebFetch(*)", "Mcp(*:*)"]
-for name in (".ssh", ".codex", ".cursor", ".claude", ".aws", ".config", ".gnupg", "Library/Keychains"):
+for name in (".ssh", ".codex", ".cursor", ".claude", ".aws", ".config", ".gnupg", ".docker", ".kube", "Library/Keychains"):
     deny.append(f"Read({home}/{name}/**)")
-deny.append(f"Read({home}/.netrc)")
+for name in (".netrc", ".npmrc", ".gitconfig"):
+    deny.append(f"Read({home}/{name})")
 print(json.dumps({"version": 1, "permissions": {"allow": [], "deny": deny},
                   "approvalMode": "allowlist", "autoAcceptWebSearch": False}, ensure_ascii=False))
 PY

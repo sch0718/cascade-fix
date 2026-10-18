@@ -6,10 +6,12 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from cascade import runners  # noqa: E402
 from helpers import git, make_repo  # noqa: E402
 
 SCRIPT = Path(os.environ.get("CASCADE_CURSOR_REVIEW")
@@ -121,8 +123,17 @@ class CursorReviewTest(unittest.TestCase):
         self.assertEqual(cfg["permissions"]["allow"], [])
         self.assertFalse(cfg["autoAcceptWebSearch"])
         for rule in ("Mcp(*:*)", "WebFetch(*)", "Shell(*)", "Write(**)", f"Read({self.home}/.ssh/**)",
-                     f"Read({self.home}/Library/Keychains/**)"):
+                     f"Read({self.home}/.docker/**)", f"Read({self.home}/.kube/**)",
+                     f"Read({self.home}/Library/Keychains/**)", f"Read({self.home}/.netrc)",
+                     f"Read({self.home}/.npmrc)", f"Read({self.home}/.gitconfig)"):
             self.assertIn(rule, cfg["permissions"]["deny"])
+
+    def test_config_matches_runners_review_profile(self):
+        self.run_script("--doc", str(self.repo / "a.md"), "--out", str(self.out))
+        with tempfile.TemporaryDirectory() as base, mock.patch.object(Path, "home", return_value=self.home):
+            home = runners.cursor_home(Path(base), "review")
+            expected = json.loads((home / ".cursor" / "cli-config.json").read_text(encoding="utf-8"))
+        self.assertEqual(json.loads(self.captured_config()), expected)
 
     def test_uncommitted_puts_diff_and_untracked_file_in_prompt(self):
         (self.repo / "a.md").write_text("바뀐 문서\n", encoding="utf-8")
