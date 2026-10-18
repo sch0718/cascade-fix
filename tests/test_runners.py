@@ -18,6 +18,7 @@ from cascade.runners import (  # noqa: E402
     STATUS_INVALID,
     STATUS_LIMIT,
     STATUS_OK,
+    STATUS_SKIPPED,
     STATUS_TIMEOUT,
     CliJob,
     CodexRunner,
@@ -26,8 +27,12 @@ from cascade.runners import (  # noqa: E402
     classify_failure,
     cursor_home,
     extract_json_block,
+    restore_tree,
+    run_all,
+    tree_of,
 )
 from fake_cli import CODEX_BODY, CURSOR_BODY, fenced, install, result_json  # noqa: E402
+from helpers import git, make_repo  # noqa: E402
 
 AUTH_BEFORE = '{"tokens": {"refresh_token": "old"}, "last_refresh": "2026-10-10T00:00:00Z"}'
 AUTH_AFTER = '{"tokens": {"refresh_token": "new"}, "last_refresh": "2026-10-18T00:00:00Z"}'
@@ -530,3 +535,193 @@ class AvailabilityTest(RunnerTestBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+LIMIT_ENTRY = {"is_error": True, "result": "You've hit your usage limit", "exit": 1}
+CHECKER_RESULT = json.dumps({"verdict": "사실", "needs_design_decision": False, "reason": "맞다",
+                             "checker_ok": True, "model_id": "x"})
+
+
+class RunAllTest(RunnerTestBase):
+    def setUp(self):
+        super().setUp()
+        self.wt = make_repo(self.tmp / "repo", {"a.txt": "orig\n"})
+        self.runners = {"codex": CodexRunner(self.codex, codex_dir=self.codex_dir), "cursor": CursorRunner(self.cursor)}
+
+    def env(self, **values):
+        patcher = mock.patch.dict(os.environ, values)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def cursor_jobs(self, count, **overrides):
+        return [self.cursor_job(id=f"F{i}:a", **overrides) for i in range(count)]
+
+    def started(self, name, n):
+        return float(self.log_text(name, "start", n))
+
+    def ended(self, name, n):
+        return float(self.log_text(name, "end", n))
+
+    def test_limit_stops_runner_and_skips_rest(self):
+        self.env(FAKE_CURSOR_RESULTS=json.dumps([fenced(result_json()), LIMIT_ENTRY]))
+        outcomes = run_all(self.cursor_jobs(4), self.runners, max_parallel=1)
+        self.assertEqual([o.status for o in outcomes], [STATUS_OK, STATUS_LIMIT, STATUS_SKIPPED, STATUS_SKIPPED])
+        self.assertEqual(self.calls("cursor-agent"), 2)
+        self.assertIn("limit", outcomes[2].detail)
+        self.assertIn("F1:a", outcomes[2].detail)
+        self.assertIsNone(outcomes[2].output)
+
+    def test_auth_failure_skips_rest(self):
+        entry = {"is_error": True, "result": "Authentication required. Run cursor-agent login", "exit": 1}
+        self.env(FAKE_CURSOR_RESULTS=json.dumps([entry]))
+        outcomes = run_all(self.cursor_jobs(3), self.runners, max_parallel=1)
+        self.assertEqual([o.status for o in outcomes], [STATUS_AUTH, STATUS_SKIPPED, STATUS_SKIPPED])
+        self.assertIn("auth", outcomes[1].detail)
+        self.assertEqual(self.calls("cursor-agent"), 1)
+
+    def test_running_jobs_finish_after_limit(self):
+        self.env(FAKE_CURSOR_RESULTS=json.dumps([LIMIT_ENTRY, fenced(result_json())]), FAKE_CURSOR_SLEEP="0.5")
+        outcomes = run_all(self.cursor_jobs(2), self.runners, max_parallel=2)
+        self.assertEqual(sorted(o.status for o in outcomes), [STATUS_LIMIT, STATUS_OK])
+        self.assertEqual(self.calls("cursor-agent"), 2)
+
+    def test_other_runner_continues_after_limit(self):
+        self.env(FAKE_CURSOR_RESULTS=json.dumps([LIMIT_ENTRY]))
+        jobs = [self.cursor_job(id="K1:a"), self.job(id="C1:a"), self.cursor_job(id="K2:a"), self.job(id="C2:a")]
+        outcomes = run_all(jobs, self.runners, max_parallel=1)
+        self.assertEqual([o.status for o in outcomes], [STATUS_LIMIT, STATUS_OK, STATUS_SKIPPED, STATUS_OK])
+        self.assertEqual(self.calls("cursor-agent"), 1)
+        self.assertEqual(self.calls("codex"), 2)
+
+    def test_readonly_job_changes_are_reverted(self):
+        (self.wt / "a.txt").write_text("작성자 수정\n", encoding="utf-8")
+        self.env(FAKE_CODEX_RESULT=CHECKER_RESULT, FAKE_MUTATE="b.txt=새 파일;a.txt=checker가 고침")
+        job = self.job(id="F1:checker", role="checker", kind="checker", writable=False)
+        [outcome] = run_all([job], self.runners)
+        self.assertEqual(outcome.status, STATUS_OK)
+        self.assertIn("읽기 역할이 파일을 바꿔 되돌림", outcome.detail)
+        self.assertEqual((self.wt / "a.txt").read_text(encoding="utf-8"), "작성자 수정\n")
+        self.assertFalse((self.wt / "b.txt").exists())
+
+    def test_readonly_job_without_changes_keeps_detail_empty(self):
+        job = self.job(id="F1:checker", role="checker", kind="checker", writable=False)
+        self.env(FAKE_CODEX_RESULT=CHECKER_RESULT)
+        [outcome] = run_all([job], self.runners)
+        self.assertEqual((outcome.status, outcome.detail), (STATUS_OK, ""))
+
+    def test_failed_writer_job_restores_pre_run_tree(self):
+        (self.wt / "a.txt").write_text("실행 전 수정\n", encoding="utf-8")
+        self.env(FAKE_MUTATE="a.txt=망가짐;new/c.txt=찌꺼기", FAKE_CODEX_EXIT="1")
+        before = tree_of(self.wt)
+        [outcome] = run_all([self.job()], self.runners)
+        self.assertEqual(outcome.status, STATUS_ERROR)
+        self.assertEqual((self.wt / "a.txt").read_text(encoding="utf-8"), "실행 전 수정\n")
+        self.assertFalse((self.wt / "new").exists())
+        self.assertEqual(tree_of(self.wt), before)
+
+    def test_successful_writer_job_keeps_changes(self):
+        self.env(FAKE_MUTATE="a.txt=고침;b.txt=새 파일")
+        [outcome] = run_all([self.job()], self.runners)
+        self.assertEqual(outcome.status, STATUS_OK)
+        self.assertEqual((self.wt / "a.txt").read_text(encoding="utf-8"), "고침")
+        self.assertTrue((self.wt / "b.txt").exists())
+
+    def test_restore_keeps_setup_symlink(self):
+        target = self.tmp / "deps"
+        target.mkdir()
+        (self.wt / "node_modules").symlink_to(target)
+        self.env(FAKE_MUTATE="a.txt=망가짐", FAKE_CODEX_EXIT="1")
+        [outcome] = run_all([self.job()], self.runners)
+        self.assertEqual(outcome.status, STATUS_ERROR)
+        self.assertTrue((self.wt / "node_modules").is_symlink())
+        self.assertEqual((self.wt / "node_modules").resolve(), target)
+        self.assertEqual((self.wt / "a.txt").read_text(encoding="utf-8"), "orig\n")
+
+    def test_codex_warmup_runs_first_job_alone(self):
+        (self.codex_dir / "auth.json").write_text('{"last_refresh": "2026-10-10T00:00:00Z"}', encoding="utf-8")
+        self.env(FAKE_CODEX_SLEEP="0.4")
+        jobs = [self.job(id=f"F{i}:a") for i in range(3)]
+        outcomes = run_all(jobs, self.runners, max_parallel=3, now=datetime(2026, 10, 18, tzinfo=timezone.utc))
+        self.assertEqual([o.status for o in outcomes], [STATUS_OK] * 3)
+        first_end = min(self.ended("codex", n) for n in (1, 2, 3))
+        second_start = sorted(self.started("codex", n) for n in (1, 2, 3))[1]
+        self.assertGreaterEqual(second_start, first_end)
+
+    def test_fresh_codex_token_runs_jobs_concurrently(self):
+        (self.codex_dir / "auth.json").write_text('{"last_refresh": "2026-10-17T00:00:00Z"}', encoding="utf-8")
+        self.env(FAKE_CODEX_SLEEP="0.8")
+        jobs = [self.job(id=f"F{i}:a") for i in range(2)]
+        run_all(jobs, self.runners, max_parallel=2, now=datetime(2026, 10, 18, tzinfo=timezone.utc))
+        self.assertLess(max(self.started("codex", n) for n in (1, 2)), min(self.ended("codex", n) for n in (1, 2)))
+
+    def test_max_parallel_limits_concurrency(self):
+        self.env(FAKE_CURSOR_SLEEP="0.5")
+        run_all(self.cursor_jobs(3), self.runners, max_parallel=1)
+        starts = sorted(self.started("cursor-agent", n) for n in (1, 2, 3))
+        ends = sorted(self.ended("cursor-agent", n) for n in (1, 2, 3))
+        self.assertGreaterEqual(starts[1], ends[0])
+        self.assertGreaterEqual(starts[2], ends[1])
+
+    def test_results_keep_input_order(self):
+        self.env(FAKE_CURSOR_SLEEP="0.2")
+        jobs = [self.cursor_job(id="K1:a"), self.job(id="C1:a"), self.cursor_job(id="K2:a"), self.job(id="C2:a"),
+                self.cursor_job(id="K3:a")]
+        outcomes = run_all(jobs, self.runners, max_parallel=2)
+        self.assertEqual([o.id for o in outcomes], ["K1:a", "C1:a", "K2:a", "C2:a", "K3:a"])
+
+    def test_runner_exception_becomes_error_and_others_continue(self):
+        class Boom:
+            def run(self, job):
+                raise RuntimeError("터짐")
+
+        jobs = [self.job(id="C1:a"), self.cursor_job(id="K1:a")]
+        outcomes = run_all(jobs, {"codex": Boom(), "cursor": self.runners["cursor"]})
+        self.assertEqual([o.status for o in outcomes], [STATUS_ERROR, STATUS_OK])
+        self.assertIn("터짐", outcomes[0].detail)
+
+    def test_unknown_runner_is_error(self):
+        [outcome] = run_all([self.job()], {"cursor": self.runners["cursor"]})
+        self.assertEqual(outcome.status, STATUS_ERROR)
+        self.assertEqual(self.calls("codex"), 0)
+
+    def test_untrackable_worktree_is_error_without_running(self):
+        plain = self.tmp / "plain"
+        plain.mkdir()
+        [outcome] = run_all([self.job(worktree=plain)], self.runners)
+        self.assertEqual(outcome.status, STATUS_ERROR)
+        self.assertEqual(self.calls("codex"), 0)
+
+    def test_empty_jobs(self):
+        self.assertEqual(run_all([], self.runners), [])
+
+
+class TreeTest(RunnerTestBase):
+    def setUp(self):
+        super().setUp()
+        self.wt = make_repo(self.tmp / "repo", {"a.txt": "orig\n", "d/b.txt": "b\n"})
+
+    def test_tree_of_ignores_hooks_and_matches_worktree_content(self):
+        hook = self.wt / ".git" / "hooks" / "pre-commit"
+        hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        hook.chmod(0o755)
+        self.assertEqual(tree_of(self.wt), git(self.wt, "rev-parse", "HEAD^{tree}"))
+        (self.wt / "c.txt").write_text("c\n", encoding="utf-8")
+        self.assertNotEqual(tree_of(self.wt), git(self.wt, "rev-parse", "HEAD^{tree}"))
+
+    def test_tree_of_is_stable_and_ignores_inherited_git_env(self):
+        with mock.patch.dict(os.environ, {"GIT_INDEX_FILE": str(self.tmp / "other-index"), "GIT_DIR": str(self.tmp / "nope")}):
+            first = tree_of(self.wt)
+        self.assertEqual(first, tree_of(self.wt))
+
+    def test_restore_tree_resets_modified_new_and_deleted(self):
+        (self.wt / "a.txt").write_text("수정\n", encoding="utf-8")
+        before = tree_of(self.wt)
+        (self.wt / "a.txt").write_text("또 수정\n", encoding="utf-8")
+        (self.wt / "d" / "b.txt").unlink()
+        (self.wt / "new" / "deep").mkdir(parents=True)
+        (self.wt / "new" / "deep" / "x.txt").write_text("x\n", encoding="utf-8")
+        restore_tree(self.wt, before)
+        self.assertEqual((self.wt / "a.txt").read_text(encoding="utf-8"), "수정\n")
+        self.assertEqual((self.wt / "d" / "b.txt").read_text(encoding="utf-8"), "b\n")
+        self.assertFalse((self.wt / "new" / "deep" / "x.txt").exists())
+        self.assertEqual(tree_of(self.wt), before)

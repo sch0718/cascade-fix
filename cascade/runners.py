@@ -8,17 +8,21 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import threading
 import tomllib
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from cascade.jobs import SCHEMAS, valid_output
+from cascade.patches import NO_HOOKS, _git_checked
 
 STATUS_OK, STATUS_INVALID, STATUS_LIMIT, STATUS_AUTH, STATUS_TIMEOUT, STATUS_ERROR, STATUS_SKIPPED = (
     "ok", "invalid", "limit", "auth", "timeout", "error", "skipped")
 RUNNER_CODEX, RUNNER_CURSOR = "codex", "cursor"
 JOB_TIMEOUT = 900
+MAX_PARALLEL = 4
 STATUS_COMMAND_TIMEOUT = 30
 KILL_GRACE = 5
 CODEX_WARMUP_AGE = timedelta(days=7)
@@ -559,3 +563,128 @@ class CursorRunner:
             if output is None:
                 return Outcome(job.id, job.runner, STATUS_INVALID, None, usage, "재요청 뒤에도 스키마를 따르지 않는 결과")
         return Outcome(job.id, job.runner, STATUS_OK, output, usage, "")
+
+
+READONLY_CHANGED = "읽기 역할이 파일을 바꿔 되돌림"
+_STOPPING = (STATUS_LIMIT, STATUS_AUTH)
+
+
+_tree_locks: dict[Path, threading.Lock] = {}
+_tree_locks_guard = threading.Lock()
+
+
+def _tree_lock(wt: Path) -> threading.Lock:
+    """같은 워크트리에서 동시에 도는 작업들이 인덱스 잠금을 두고 다투지 않게 git 호출을 한 줄로 세운다."""
+    with _tree_locks_guard:
+        return _tree_locks.setdefault(Path(wt).resolve(), threading.Lock())
+
+
+def tree_of(wt: Path) -> str:
+    """워크트리 전체(추적하지 않는 파일 포함)의 현재 내용을 가리키는 트리 해시."""
+    with _tree_lock(wt):
+        _git_checked(wt, *NO_HOOKS, "add", "-A")
+        return _git_checked(wt, *NO_HOOKS, "write-tree").strip()
+
+
+def restore_tree(wt: Path, tree: str) -> None:
+    """워크트리를 tree 내용으로 되돌린다. 먼저 새 파일을 인덱스에 올려 read-tree가 지울 수 있게 한다."""
+    with _tree_lock(wt):
+        _git_checked(wt, *NO_HOOKS, "add", "-A")
+        _git_checked(wt, *NO_HOOKS, "read-tree", "-u", "--reset", tree)
+
+
+class _Exhaustion:
+    """한도·인증으로 멈춘 runner와 그 원인. 아직 시작하지 않은 작업이 건너뛸 때 읽는다."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._reason: dict[str, str] = {}
+
+    def reason(self, runner: str) -> str | None:
+        with self._lock:
+            return self._reason.get(runner)
+
+    def record(self, outcome: Outcome) -> None:
+        if outcome.status in _STOPPING:
+            with self._lock:
+                self._reason.setdefault(outcome.runner, f"{outcome.id}에서 {outcome.status}: {outcome.detail}")
+
+
+def _skipped(job: CliJob, reason: str) -> Outcome:
+    return Outcome(job.id, job.runner, STATUS_SKIPPED, None, {}, f"{job.runner} 실행기가 멈춰 건너뜀({reason})")
+
+
+def _failed(job: CliJob, detail: str) -> Outcome:
+    return Outcome(job.id, job.runner, STATUS_ERROR, None, {}, detail)
+
+
+def _restored(outcome: Outcome, wt: Path, tree: str, note: str) -> Outcome:
+    try:
+        restore_tree(wt, tree)
+    except Exception as e:
+        return Outcome(outcome.id, outcome.runner, STATUS_ERROR, None, outcome.usage,
+                       f"워크트리를 되돌리지 못했다: {e}")
+    if note:
+        outcome.detail = f"{outcome.detail}; {note}" if outcome.detail else note
+    return outcome
+
+
+def _run_isolated(job: CliJob, runner: object) -> Outcome:
+    try:
+        before = tree_of(job.worktree)
+    except Exception as e:
+        return _failed(job, f"실행 전 워크트리 상태를 기록하지 못했다: {e}")
+    try:
+        outcome = runner.run(job)
+    except Exception as e:
+        outcome = _unexpected(job, e)
+    if job.writable:
+        return outcome if outcome.status == STATUS_OK else _restored(outcome, job.worktree, before, "")
+    try:
+        changed = tree_of(job.worktree) != before
+    except Exception as e:
+        return _failed(job, f"실행 뒤 워크트리 상태를 확인하지 못했다: {e}")
+    return _restored(outcome, job.worktree, before, READONLY_CHANGED) if changed else outcome
+
+
+def _run_one(job: CliJob, runners: dict[str, object], exhausted: _Exhaustion) -> Outcome:
+    reason = exhausted.reason(job.runner)
+    if reason:
+        return _skipped(job, reason)
+    runner = runners.get(job.runner)
+    if runner is None:
+        return _failed(job, f"{job.runner} 실행기가 없다")
+    outcome = _run_isolated(job, runner)
+    exhausted.record(outcome)
+    return outcome
+
+
+def _run_group(group: list[tuple[int, CliJob]], runner: object, runners: dict[str, object], exhausted: _Exhaustion,
+               max_parallel: int, now: datetime, results: list[Outcome | None]) -> None:
+    def run(item: tuple[int, CliJob]) -> None:
+        index, job = item
+        results[index] = _run_one(job, runners, exhausted)
+
+    warmup = getattr(runner, "warmup_needed", None)
+    if warmup is not None and warmup(now):
+        run(group[0])
+        group = group[1:]
+    with ThreadPoolExecutor(max_parallel) as pool:
+        list(pool.map(run, group))
+
+
+def run_all(jobs: list[CliJob], runners: dict[str, object], max_parallel: int = MAX_PARALLEL,
+            now: datetime | None = None) -> list[Outcome]:
+    """runner별로 작업을 동시에 돌린다. 반환 순서는 입력과 같다."""
+    now = now or datetime.now(timezone.utc)
+    results: list[Outcome | None] = [None] * len(jobs)
+    groups: dict[str, list[tuple[int, CliJob]]] = {}
+    for index, job in enumerate(jobs):
+        groups.setdefault(job.runner, []).append((index, job))
+    exhausted = _Exhaustion()
+    with ThreadPoolExecutor(max(len(groups), 1)) as outer:
+        futures = [outer.submit(_run_group, group, runners.get(name), runners, exhausted, max_parallel, now, results)
+                   for name, group in groups.items()]
+        for future in futures:
+            future.result()
+    return results
