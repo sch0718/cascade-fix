@@ -29,6 +29,13 @@ def stamp(name, n, event):
         f.write(repr(time.time()))
 
 
+def commit(root):
+    import subprocess
+    subprocess.run(["git", "-C", str(root), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(root), "-c", "user.email=fake@example.com", "-c", "user.name=fake",
+                    "commit", "-q", "--no-verify", "--allow-empty", "-m", "fake cli commit"], check=True, capture_output=True)
+
+
 def mutate(root):
     spec = os.environ.get("FAKE_MUTATE", "")
     for item in filter(None, spec.split(";")):
@@ -42,6 +49,8 @@ def mutate(root):
                 target = Path(root) / rel
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(content)
+    if os.environ.get("FAKE_COMMIT"):
+        commit(root)
 '''
 
 CODEX_BODY = _COMMON + r'''

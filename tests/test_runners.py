@@ -625,6 +625,56 @@ class RunAllTest(RunnerTestBase):
         self.assertFalse((self.wt / "new").exists())
         self.assertEqual(tree_of(self.wt), before)
 
+    def head(self):
+        return git(self.wt, "rev-parse", "HEAD")
+
+    def test_failed_writer_job_that_committed_restores_head(self):
+        before_head, before_tree = self.head(), tree_of(self.wt)
+        self.env(FAKE_MUTATE="a.txt=커밋됨;new.txt=새 파일", FAKE_COMMIT="1", FAKE_CODEX_EXIT="1")
+        [outcome] = run_all([self.job()], self.runners)
+        self.assertEqual(outcome.status, STATUS_ERROR)
+        self.assertEqual(self.head(), before_head)
+        self.assertEqual(tree_of(self.wt), before_tree)
+        self.assertEqual((self.wt / "a.txt").read_text(encoding="utf-8"), "orig\n")
+        self.assertFalse((self.wt / "new.txt").exists())
+        self.assertEqual(git(self.wt, "show", "HEAD:a.txt"), "orig")
+
+    def test_failed_writer_job_restores_head_of_detached_worktree(self):
+        git(self.wt, "checkout", "-q", "--detach")
+        before_head = self.head()
+        self.env(FAKE_MUTATE="a.txt=커밋됨", FAKE_COMMIT="1", FAKE_CODEX_EXIT="1")
+        [outcome] = run_all([self.job()], self.runners)
+        self.assertEqual(outcome.status, STATUS_ERROR)
+        self.assertEqual(self.head(), before_head)
+        self.assertEqual(git(self.wt, "rev-parse", "--abbrev-ref", "HEAD"), "HEAD")
+        self.assertEqual((self.wt / "a.txt").read_text(encoding="utf-8"), "orig\n")
+
+    def test_successful_writer_job_that_committed_keeps_commit(self):
+        before_head = self.head()
+        self.env(FAKE_MUTATE="a.txt=커밋됨", FAKE_COMMIT="1")
+        [outcome] = run_all([self.job()], self.runners)
+        self.assertEqual(outcome.status, STATUS_OK)
+        self.assertNotEqual(self.head(), before_head)
+        self.assertEqual(git(self.wt, "show", "HEAD:a.txt"), "커밋됨")
+
+    def test_readonly_job_that_committed_is_reverted_to_original_head(self):
+        before_head, before_tree = self.head(), tree_of(self.wt)
+        self.env(FAKE_CODEX_RESULT=CHECKER_RESULT, FAKE_MUTATE="a.txt=checker가 고침", FAKE_COMMIT="1")
+        job = self.job(id="F1:checker", role="checker", kind="checker", writable=False)
+        [outcome] = run_all([job], self.runners)
+        self.assertEqual(outcome.status, STATUS_OK)
+        self.assertIn("읽기 역할이 파일을 바꿔 되돌림", outcome.detail)
+        self.assertEqual(self.head(), before_head)
+        self.assertEqual(tree_of(self.wt), before_tree)
+
+    def test_readonly_job_with_empty_commit_is_reverted_to_original_head(self):
+        before_head = self.head()
+        self.env(FAKE_CODEX_RESULT=CHECKER_RESULT, FAKE_COMMIT="1")
+        job = self.job(id="F1:checker", role="checker", kind="checker", writable=False)
+        [outcome] = run_all([job], self.runners)
+        self.assertIn("읽기 역할이 파일을 바꿔 되돌림", outcome.detail)
+        self.assertEqual(self.head(), before_head)
+
     def test_successful_writer_job_keeps_changes(self):
         self.env(FAKE_MUTATE="a.txt=고침;b.txt=새 파일")
         [outcome] = run_all([self.job()], self.runners)

@@ -635,8 +635,20 @@ def _failed(job: CliJob, detail: str) -> Outcome:
     return Outcome(job.id, job.runner, STATUS_ERROR, None, {}, detail)
 
 
-def _restored(outcome: Outcome, wt: Path, tree: str, note: str) -> Outcome:
+def head_of(wt: Path) -> str:
+    return _git_checked(wt, *NO_HOOKS, "rev-parse", "HEAD").strip()
+
+
+def restore_head(wt: Path, sha: str) -> None:
+    """HEAD(분리된 HEAD면 HEAD 자체, 브랜치에 있으면 그 브랜치)를 sha 커밋으로 되돌린다."""
+    with _tree_lock(wt):
+        _git_checked(wt, *NO_HOOKS, "update-ref", "HEAD", sha)
+
+
+def _restored(outcome: Outcome, wt: Path, state: tuple[str, str], note: str) -> Outcome:
+    tree, head = state
     try:
+        restore_head(wt, head)
         restore_tree(wt, tree)
     except Exception as e:
         return Outcome(outcome.id, outcome.runner, STATUS_ERROR, None, outcome.usage,
@@ -648,7 +660,7 @@ def _restored(outcome: Outcome, wt: Path, tree: str, note: str) -> Outcome:
 
 def _run_isolated(job: CliJob, runner: object) -> Outcome:
     try:
-        before = tree_of(job.worktree)
+        before = (tree_of(job.worktree), head_of(job.worktree))
     except Exception as e:
         return _failed(job, f"실행 전 워크트리 상태를 기록하지 못했다: {e}")
     try:
@@ -658,7 +670,7 @@ def _run_isolated(job: CliJob, runner: object) -> Outcome:
     if job.writable:
         return outcome if outcome.status == STATUS_OK else _restored(outcome, job.worktree, before, "")
     try:
-        changed = tree_of(job.worktree) != before
+        changed = (tree_of(job.worktree), head_of(job.worktree)) != before
     except Exception as e:
         return _failed(job, f"실행 뒤 워크트리 상태를 확인하지 못했다: {e}")
     return _restored(outcome, job.worktree, before, READONLY_CHANGED) if changed else outcome
