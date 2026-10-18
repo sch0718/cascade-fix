@@ -235,7 +235,7 @@ def cmd_init(args) -> int:
     s.cfg_for(args.source, root)
     if args.reviewer not in REVIEWER_CHOICES:
         raise s.CliError(f"알 수 없는 검토자: {args.reviewer} ({' / '.join(REVIEWER_CHOICES)}, CASCADE_REVIEWER 확인)")
-    reviewer = resolve(args.reviewer, args.source, s.RUN_REVIEW, s.cursor_reviewer_available())
+    reviewer = resolve(args.reviewer, args.source, s.RUN_REVIEW, s.cursor_reviewer_available)
     findings, raw = _parse_input(args, root)
     if not findings:
         print("지적 0건 — 원문을 확인하라")
@@ -314,7 +314,7 @@ def cmd_detect(args) -> int:
     gh = None if args.no_gh else shlex.split(os.environ.get("CASCADE_GH", "gh"))
     if args.reviewer not in REVIEWER_CHOICES:
         raise s.CliError(f"알 수 없는 검토자: {args.reviewer} ({' / '.join(REVIEWER_CHOICES)}, CASCADE_REVIEWER 확인)")
-    result = detect(root, repos_toml=s.repos_toml(), run_review=s.RUN_REVIEW, cursor_ok=s.cursor_reviewer_available(), cli=s.CLI, gh=gh,
+    result = detect(root, repos_toml=s.repos_toml(), run_review=s.RUN_REVIEW, cursor_ok=s.cursor_reviewer_available, cli=s.CLI, gh=gh,
                     input_path=Path(args.input).resolve() if args.input else None, pr=args.pr,
                     reviewer_choice=args.reviewer, root_flag=_root_flag(args, root),
                     docs=[Path(d).resolve() for d in args.doc or []], cwd=Path.cwd())

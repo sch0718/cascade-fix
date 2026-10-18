@@ -10,7 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from cascade import cli_steps  # noqa: E402
+from cascade import cli_steps, runners  # noqa: E402
 from cascade.review import CURSOR_SOURCES, REVIEWER_CHOICES, resolve  # noqa: E402
 from test_cli_e2e import AUTH_LOG, FIXTURES, CliCodexResultTest, CliTestBase  # noqa: E402
 
@@ -32,6 +32,20 @@ class ResolveTest(unittest.TestCase):
         self.assertEqual(resolve("auto", "codex-code", self.missing, cursor_ok=False), "claude")
         self.assertEqual(resolve("auto", "claude-code", self.rr, cursor_ok=True), "claude")
 
+    def test_cursor_availability_is_checked_only_when_needed(self):
+        calls = []
+
+        def probe():
+            calls.append(1)
+            return True
+
+        self.assertEqual(resolve("cursor", "codex-code", self.missing, probe), "cursor")
+        self.assertEqual(resolve("auto", "claude-code", self.missing, probe), "claude")
+        self.assertEqual(resolve("auto", "codex-code", self.rr, probe), "codex")
+        self.assertEqual(calls, [])
+        self.assertEqual(resolve("auto", "codex-code", self.missing, probe), "cursor")
+        self.assertEqual(calls, [1])
+
     def test_explicit_choice_is_kept(self):
         self.assertEqual(resolve("cursor", "claude-doc", self.missing), "cursor")
 
@@ -45,9 +59,9 @@ class CursorAgentLookupTest(unittest.TestCase):
         self.addCleanup(lambda: [os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
                                  for k, v in saved.items()])
 
-    def executable(self, name):
+    def executable(self, name, body=""):
         path = self.tmp / name
-        path.write_text("#!/bin/sh\n", encoding="utf-8")
+        path.write_text(f"#!/bin/sh\n{body}", encoding="utf-8")
         path.chmod(path.stat().st_mode | stat.S_IXUSR)
         return path
 
@@ -57,12 +71,12 @@ class CursorAgentLookupTest(unittest.TestCase):
         self.assertEqual(cli_steps.find_cursor_review(), script)
         agent = self.executable("cursor-agent")
         os.environ["CASCADE_CURSOR_AGENT"] = str(agent)
-        self.assertEqual(cli_steps.find_cursor_agent(), agent)
+        self.assertEqual(runners.find_cursor_agent(), str(agent))
         os.environ["CASCADE_CURSOR_AGENT"] = str(self.tmp / "nope")
-        self.assertIsNone(cli_steps.find_cursor_agent())
+        self.assertIsNone(runners.find_cursor_agent())
 
     def test_available_needs_script_and_agent(self):
-        agent = self.executable("cursor-agent")
+        agent = self.executable("cursor-agent", 'echo "Logged in as tester"\n')
         script = self.executable("run-review.sh")
         os.environ["CASCADE_CURSOR_AGENT"] = str(agent)
         original = cli_steps.CURSOR_REVIEW

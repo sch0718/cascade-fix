@@ -29,6 +29,8 @@ def make_repo(tmp, files):
 def run_cli(args, cwd, env=None):
     full_env = dict(os.environ)
     full_env["CASCADE_REVIEWER"] = "codex"  # 기존 테스트는 Codex 경로를 본다. Claude 경로는 env로 덮어쓴다
+    for name in ("CASCADE_CODEX", "CASCADE_CURSOR_AGENT"):  # 테스트가 덮어쓰지 않는 한 진짜 CLI를 찾지 못한다
+        full_env[name] = str(SKILL_ROOT / "tests" / "no-such-cli")
     if env:
         full_env.update(env)
     full_env["PYTHONPATH"] = str(SKILL_ROOT)

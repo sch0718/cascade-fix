@@ -338,7 +338,7 @@ def _valid_verify(value) -> bool:
     )
 
 
-def _valid(output, role: str) -> bool:
+def valid_output(output, role: str) -> bool:
     if not isinstance(output, dict):
         return False
     schema = CHECKER_SCHEMA if role == "checker" else WORKER_SCHEMA
@@ -361,7 +361,7 @@ def read_results(results_json: dict) -> dict[str, WorkerResult]:
         job_id = item["id"]
         finding_id, _, role = job_id.rpartition(":")
         output = item.get("output")
-        if not _valid(output, role):
+        if not valid_output(output, role):
             read[job_id] = WorkerResult(
                 finding_id=finding_id,
                 role=role,

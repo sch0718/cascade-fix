@@ -1,0 +1,120 @@
+import json
+import stat
+import sys
+from pathlib import Path
+
+_COMMON = r'''
+import json, os, sys, time
+from pathlib import Path
+
+log = Path(os.environ["FAKE_CLI_LOG"])
+log.mkdir(parents=True, exist_ok=True)
+
+
+def claim(name):
+    n = 1
+    while True:
+        try:
+            fd = os.open(log / f"{name}-{n}.args.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+        except FileExistsError:
+            n += 1
+            continue
+        with os.fdopen(fd, "w") as f:
+            json.dump(sys.argv[1:], f)
+        return n
+
+
+def stamp(name, n, event):
+    with open(log / f"{name}-{n}.{event}", "w") as f:
+        f.write(repr(time.time()))
+
+
+def mutate(root):
+    spec = os.environ.get("FAKE_MUTATE", "")
+    for item in filter(None, spec.split(";")):
+        rel, _, content = item.partition("=")
+        target = Path(root) / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+'''
+
+CODEX_BODY = _COMMON + r'''
+n = claim("codex")
+stamp("codex", n, "start")
+args = sys.argv[1:]
+home = Path(os.environ["CODEX_HOME"])
+(log / f"codex-{n}.env.json").write_text(json.dumps({
+    k: os.environ.get(k) for k in ("CODEX_HOME", "UV_CACHE_DIR", "PIP_CACHE_DIR", "XDG_CACHE_HOME", "npm_config_cache")}))
+(log / f"codex-{n}.config.toml").write_text((home / "config.toml").read_text())
+(log / f"codex-{n}.auth-is-link").write_text(str((home / "auth.json").is_symlink()))
+if args and args[-1] == "-":
+    (log / f"codex-{n}.stdin").write_text(sys.stdin.read())
+sleep = float(os.environ.get("FAKE_CODEX_SLEEP", "0"))
+if sleep:
+    time.sleep(sleep)
+mutate(args[args.index("-C") + 1])
+if os.environ.get("FAKE_CODEX_REFRESH"):
+    (home / "auth.json").write_text(os.environ["FAKE_CODEX_REFRESH"])
+if os.environ.get("FAKE_CODEX_TOUCH_ORIGINAL"):
+    Path(os.environ["FAKE_CODEX_ORIGINAL_AUTH"]).write_text(os.environ["FAKE_CODEX_TOUCH_ORIGINAL"])
+if "-o" in args and "FAKE_CODEX_RESULT" in os.environ:
+    Path(args[args.index("-o") + 1]).write_text(os.environ["FAKE_CODEX_RESULT"])
+print(json.dumps({"type": "thread.started"}))
+print(json.dumps({"type": "turn.completed", "usage": {
+    "input_tokens": 11, "cached_input_tokens": 3, "output_tokens": 7, "reasoning_output_tokens": 2}}))
+sys.stderr.write(os.environ.get("FAKE_CODEX_STDERR", ""))
+stamp("codex", n, "end")
+sys.exit(int(os.environ.get("FAKE_CODEX_EXIT", "0")))
+'''
+
+CURSOR_BODY = _COMMON + r'''
+if sys.argv[1:] == ["status"]:
+    claim("cursor-status")
+    print(os.environ.get("FAKE_CURSOR_STATUS", "✓ Logged in as tester@example.com"))
+    sys.exit(0)
+n = claim("cursor-agent")
+stamp("cursor-agent", n, "start")
+home = Path(os.environ["HOME"])
+(log / f"cursor-agent-{n}.stdin").write_text(sys.stdin.read())
+(log / f"cursor-agent-{n}.env.json").write_text(json.dumps({
+    k: os.environ.get(k) for k in (
+        "HOME", "PYENV_ROOT", "UV_PYTHON_INSTALL_DIR", "UV_CACHE_DIR", "PIP_CACHE_DIR", "XDG_CACHE_HOME", "npm_config_cache")}))
+config = home / ".cursor" / "cli-config.json"
+if config.is_file():
+    (log / f"cursor-agent-{n}.config.json").write_text(config.read_text())
+sleep = float(os.environ.get("FAKE_CURSOR_SLEEP", "0"))
+if sleep:
+    time.sleep(sleep)
+mutate(sys.argv[sys.argv.index("--workspace") + 1])
+responses = json.loads(os.environ.get("FAKE_CURSOR_RESULTS", '[""]'))
+entry = responses[min(n, len(responses)) - 1]
+if isinstance(entry, str):
+    entry = {"result": entry}
+if "stdout" in entry:
+    sys.stdout.write(entry["stdout"])
+else:
+    print(json.dumps({
+        "type": "result", "subtype": "success", "is_error": entry.get("is_error", False),
+        "result": entry.get("result", ""), "session_id": "s",
+        "usage": {"inputTokens": 100, "outputTokens": 20, "cacheReadTokens": 5, "cacheWriteTokens": 1}}))
+sys.stderr.write(entry.get("stderr", ""))
+stamp("cursor-agent", n, "end")
+sys.exit(entry.get("exit", 0))
+'''
+
+
+def install(directory, name, body):
+    path = Path(directory) / name
+    path.write_text(f"#!{sys.executable}\n{body}", encoding="utf-8")
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+    return path
+
+
+def result_json(**overrides):
+    result = {"verdict": "사실", "needs_design_decision": False, "reason": "재현함", "verify": [], "model_id": "self-reported"}
+    result.update(overrides)
+    return json.dumps(result, ensure_ascii=False)
+
+
+def fenced(text):
+    return f"설명\n```json\n{text}\n```\n"

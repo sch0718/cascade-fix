@@ -4,6 +4,7 @@ import json
 import re
 import shlex
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 from cascade.config import ConfigError, RepoConfig, detect_candidates, is_sensitive_path, load_repo_config
@@ -223,7 +224,7 @@ def _config(root: Path, repos_toml: Path) -> tuple[RepoConfig | None, str | None
 def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list[str] | None,
            input_path: Path | None = None, pr: str | None = None, reviewer_choice: str = REVIEWER_AUTO,
            root_flag: str = "", docs: list[Path] | None = None, cwd: Path | None = None,
-           cursor_ok: bool = False) -> dict:
+           cursor_ok: bool | Callable[[], bool] = False) -> dict:
     root = Path(root)
     branch = current_branch(root)
     base = default_base(root)

@@ -1,5 +1,6 @@
 import json
 import shlex
+from collections.abc import Callable
 from pathlib import Path
 
 from cascade.jobs import KIND_REVIEW, ROLES, _render
@@ -31,14 +32,15 @@ def label(reviewer: str) -> str:
     return REVIEWER_LABELS.get(reviewer, reviewer)
 
 
-def resolve(choice: str, source: str, run_review: Path, cursor_ok: bool = False) -> str:
+def resolve(choice: str, source: str, run_review: Path, cursor_ok: bool | Callable[[], bool] = False) -> str:
     if choice != REVIEWER_AUTO:
         return choice
     if source in CLAUDE_SOURCES:
         return REVIEWER_CLAUDE
     if Path(run_review).is_file():
         return REVIEWER_CODEX
-    return REVIEWER_CURSOR if cursor_ok else REVIEWER_CLAUDE
+    available = cursor_ok() if callable(cursor_ok) else cursor_ok
+    return REVIEWER_CURSOR if available else REVIEWER_CLAUDE
 
 
 def claude_prompt(prompt: str, repo: str | Path) -> str:

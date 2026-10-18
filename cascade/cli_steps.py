@@ -2,7 +2,6 @@ import json
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import tomllib
 from dataclasses import replace
@@ -25,6 +24,7 @@ from cascade.jobs import ROLES, AdjInput, location_file, split_location, write_j
 from cascade.patches import DIFF_FLAGS, changed_files, record_setup_paths
 from cascade.review import REVIEWER_CLAUDE, REVIEWER_CURSOR, claude_prompt, review_job
 from cascade.rounds import STATUS_DONE, Ledger, RoundRecord, ledger_path, needs_recheck
+from cascade.runners import cursor_available
 from cascade.snapshot import Snapshot, add_worktree, tree_diff_stat, user_tree_fingerprint
 from cascade.verify import (
     VerifyResult,
@@ -61,18 +61,6 @@ def find_cursor_review() -> Path:
         Path.home() / ".claude" / "skills" / "cursor-review" / "scripts" / "run-review.sh",
     ]
     return next((c for c in candidates if c.is_file()), candidates[-1])
-
-
-def find_cursor_agent() -> Path | None:
-    """cursor-agent 실행 파일. 환경 변수 CASCADE_CURSOR_AGENT를 주면 그것만 본다."""
-    if os.environ.get("CASCADE_CURSOR_AGENT"):
-        agent = Path(os.environ["CASCADE_CURSOR_AGENT"])
-        return agent if agent.is_file() and os.access(agent, os.X_OK) else None
-    on_path = shutil.which("cursor-agent")
-    if on_path:
-        return Path(on_path)
-    local = Path.home() / ".local" / "bin" / "cursor-agent"
-    return local if local.is_file() and os.access(local, os.X_OK) else None
 
 
 RUN_REVIEW = find_run_review()
@@ -597,7 +585,7 @@ def _q(value) -> str:
 
 
 def cursor_reviewer_available() -> bool:
-    return CURSOR_REVIEW.is_file() and find_cursor_agent() is not None
+    return CURSOR_REVIEW.is_file() and cursor_available()
 
 
 def review_script(ledger: Ledger) -> Path:
