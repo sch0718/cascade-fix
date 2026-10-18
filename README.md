@@ -40,7 +40,7 @@
 - Python 3.11 이상. 외부 패키지는 필요 없습니다.
 - git
 - (PR 모드) 로그인된 `gh` CLI
-- (선택) Codex를 검토자로 쓰려면 `codex-review` 스킬과 `codex` CLI. 이 스킬은 `run-review.sh`의 `--opinion`·`--recheck` 모드를 씁니다. 원래 `codex-review`에는 없는 모드라 [docs/codex-review-changes/](docs/codex-review-changes/README.md)의 diff를 먼저 적용해야 합니다. 없으면 검토자는 자동으로 Claude가 됩니다.
+- (선택) Codex를 검토자로 쓰려면 `codex-review` 스킬과 `codex` CLI. 이 스킬은 `run-review.sh`의 `--opinion`·`--recheck` 모드를 씁니다. 원래 `codex-review`에는 없는 모드라 [docs/codex-review-changes/](docs/codex-review-changes/README.md)의 diff를 먼저 적용해야 합니다. 같은 문서에 임시 CODEX_HOME에서 스킬 목록을 끄는 설정도 적어 두었습니다. 없으면 검토자는 자동으로 Claude가 됩니다.
 
 ## 설치
 
@@ -181,7 +181,7 @@ Codex 검토 결과(review.final) 반영해줘
 | --- | --- |
 | `auto` (기본) | Claude 리뷰로 시작했거나 `codex-review` 스킬이 없으면 Claude, 아니면 Codex |
 | `claude` | 의견·재검토를 Claude 에이전트가 맡습니다. 외부(OpenAI) 전송이 없습니다. |
-| `codex` | `run-review.sh --opinion/--recheck`로 Codex에 보냅니다. 저장소마다 전송 동의를 받습니다. |
+| `codex` | `run-review.sh --opinion/--recheck`로 Codex에 보냅니다. 저장소마다 전송 동의를 받습니다. 호출은 한 번에 하나씩 돌립니다(동시에 토큰을 갱신하면 로그인이 풀릴 수 있습니다). 결과가 없으면 실행 로그와 인증 실패 여부를 보여 주고 멈춥니다. |
 
 - 기본값은 환경 변수 `CASCADE_REVIEWER`로 바꿉니다.
 - Claude 검토자의 기본 모델은 `claude-fable-5-1`(effort `high`)입니다. 판가름을 맡는 Opus와 다른 모델을 써서 같은 판단을 되풀이하지 않게 하려는 것입니다.
@@ -258,7 +258,7 @@ PYTHONPATH=<스킬 경로> python3 -m cascade.cli <명령> [옵션]
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-- 테스트는 314개입니다. `codex-review` 스킬이 없으면 그 스크립트를 쓰는 테스트 10개는 건너뜁니다.
+- 테스트는 320개입니다. `codex-review` 스킬이 없으면 그 스크립트를 쓰는 테스트 10개는 건너뜁니다.
 - 디렉터리: `cascade/`(CLI와 단계 로직), `prompts/`(작업자·판정자·판가름·검토자 프롬프트), `scripts/run-jobs.js`(Workflow 스크립트), `eval/`(측정 도구), `docs/`(설계 검토 기록과 `codex-review` 변경 diff)
 - 측정: `eval/replay.py`가 과거 지적 표본을 그 커밋에서 다시 돌리고, `eval/score.py`가 판정 일치율·채택 경로·Opus 호출 절감을 채점합니다. 표본 형식과 순서는 [eval/sample-format.md](eval/sample-format.md)에 있습니다.
 - 출력 스키마를 바꾸면 `cascade/jobs.py`의 `SCHEMAS`와 `scripts/run-jobs.js`의 `SCHEMAS` 블록을 같이 고칩니다(테스트가 두 쪽이 같은지 확인합니다).

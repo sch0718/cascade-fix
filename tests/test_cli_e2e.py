@@ -468,6 +468,91 @@ class CliEndToEndTest(CliTestBase):
         self.cli("apply", "--run-dir", str(self.run_dir), "--round", "1")
 
 
+
+AUTH_LOG = "codex 시작\nERROR: unexpected status 401 Unauthorized: refresh token was already used\n"
+
+
+class CliCodexResultTest(CliTestBase):
+    def run_to_opinion(self):
+        self.init()
+        self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1")
+        for name in ("r1-01-a", "r1-01-b"):
+            wt = self.wt(name)
+            (wt / "calc.py").write_text(fix(CALC, "return a - b", "return a + b"), encoding="utf-8")
+            commit_worktree(wt, name)
+        stage1 = self.run_dir / "round-1" / "stage1.json"
+        shutil.copyfile(FIXTURES / "workflow-stage1.json", stage1)
+        self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1))
+        adj = self.run_dir / "round-1" / "adj.json"
+        adj.write_text(json.dumps({"results": [{"id": "r1-02:adjudicator", "output": None}]}), encoding="utf-8")
+        self.cli("adjudicate", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(adj))
+        return self.run_dir / "round-1" / "opinion-r1-02.out"
+
+    def opinion(self, final):
+        return self.cli("opinion", "--run-dir", str(self.run_dir), "--round", "1", "--id", "r1-02",
+                        "--result", str(final), ok=False)
+
+    def test_missing_opinion_final_points_to_log_and_auth_failure(self):
+        log = self.run_to_opinion()
+        log.write_text(AUTH_LOG, encoding="utf-8")
+        p = self.opinion(Path(f"{log}.final"))
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn(str(log), p.stdout)
+        self.assertIn("401 Unauthorized", p.stdout)
+        self.assertIn("인증 실패", p.stdout)
+        self.assertIn("codex login", p.stdout)
+        self.assertNotIn("r1-02", self.ledger().opinions)
+
+    def test_empty_opinion_final_shows_log_tail_without_auth_claim(self):
+        log = self.run_to_opinion()
+        log.write_text("codex 시작\nERROR: stream disconnected\n", encoding="utf-8")
+        final = Path(f"{log}.final")
+        final.write_text("\n", encoding="utf-8")
+        p = self.opinion(final)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("비어 있다", p.stdout)
+        self.assertIn("stream disconnected", p.stdout)
+        self.assertNotIn("인증 실패 흔적", p.stdout)
+        self.assertIn("codex login", p.stdout)
+
+    def test_missing_log_is_reported(self):
+        log = self.run_to_opinion()
+        p = self.opinion(Path(f"{log}.final"))
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("실행 로그도 없다", p.stdout)
+
+    def test_missing_recheck_final_points_to_log_not_workflow(self):
+        self.run_to_apply()
+        log = self.run_dir / "round-1" / "recheck.out"
+        log.write_text(AUTH_LOG, encoding="utf-8")
+        p = self.cli("recheck", "--run-dir", str(self.run_dir), "--round", "1", "--result", f"{log}.final", ok=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn(str(log), p.stdout)
+        self.assertIn("인증 실패", p.stdout)
+        self.assertNotIn("Workflow", p.stdout)
+        self.assertFalse(self.ledger().rounds[0].events[-1].get("step") == "recheck")
+
+    def test_empty_recheck_final_points_to_log_not_workflow(self):
+        self.run_to_apply()
+        log = self.run_dir / "round-1" / "recheck.out"
+        log.write_text(AUTH_LOG, encoding="utf-8")
+        final = Path(f"{log}.final")
+        final.write_text("", encoding="utf-8")
+        p = self.cli("recheck", "--run-dir", str(self.run_dir), "--round", "1", "--result", str(final), ok=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("비어 있다", p.stdout)
+        self.assertIn(str(log), p.stdout)
+        self.assertNotIn("Workflow", p.stdout)
+
+    def test_empty_recheck_json_still_points_to_workflow(self):
+        self.run_to_apply()
+        result = self.run_dir / "round-1" / "recheck.json"
+        result.write_text(json.dumps({"results": []}), encoding="utf-8")
+        p = self.cli("recheck", "--run-dir", str(self.run_dir), "--round", "1", "--result", str(result), ok=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("Workflow", p.stdout)
+
+
 class CliDocModeTest(CliTestBase):
     PLAN = "# 계획\n\n1단계는 `calc.py`를 고친다.\n"
 
