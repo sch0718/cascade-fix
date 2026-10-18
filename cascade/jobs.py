@@ -29,6 +29,8 @@ _COMMIT_RULE = (
 _COMMIT_STEP = "검증을 마친 뒤 규칙의 커밋 명령으로 커밋한다."
 _CLI_COMMIT_STEP = "검증을 마친 뒤 커밋하지 않고 고친 내용을 작업 트리에 그대로 둔다."
 _CLI_COMMIT_RULE = "커밋하지 않는다. 고친 내용은 작업 트리에 그대로 둔다."
+_VERIFY_RULE = "커밋하기 전에 검증 명령을 직접 돌리고 그 결과를 verify에 적는다."
+_CLI_VERIFY_RULE = "작업을 마치기 전에 검증 명령을 직접 돌리고 그 결과를 verify에 적는다."
 _SHARED_RULES = [
     "현재 디렉터리는 사용자 저장소다. 반드시 워크트리 절대 경로만 쓴다(`cd <워크트리> && …` 또는 `git -C <워크트리> …`).",
     "`git stash`·`git checkout`·`git switch`·`git reset`·`git branch`·`git push`는 쓰지 않는다. 수정 전 상태는 `git show HEAD:<파일>`로 본다.",
@@ -39,19 +41,19 @@ _SHARED_RULES = [
 ]
 
 
-def _write_rules(commit_rule: str) -> str:
+def _write_rules(verify_rule: str, commit_rule: str) -> str:
     return "\n".join(f"- {s}" for s in [
         "테스트를 고치거나 지워서 통과시키지 않는다.",
         *_SHARED_RULES,
         "워크트리 밖의 파일은 건드리지 않는다.",
         "수정은 지적 범위에 한정한다.",
-        "커밋하기 전에 검증 명령을 직접 돌리고 그 결과를 verify에 적는다.",
+        verify_rule,
         commit_rule,
     ])
 
 
-RULES = _write_rules(_COMMIT_RULE)
-RULES_CLI = _write_rules(_CLI_COMMIT_RULE)
+RULES = _write_rules(_VERIFY_RULE, _COMMIT_RULE)
+RULES_CLI = _write_rules(_CLI_VERIFY_RULE, _CLI_COMMIT_RULE)
 READ_ONLY_RULES = "\n".join(f"- {s}" for s in [
     *_SHARED_RULES,
     "워크트리는 읽기만 한다. 파일을 고치지 않고 커밋하지 않는다.",

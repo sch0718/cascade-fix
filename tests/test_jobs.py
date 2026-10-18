@@ -433,8 +433,14 @@ class CliJobsTest(unittest.TestCase):
         self.assertIn("검증을 마친 뒤 규칙의 커밋 명령으로 커밋한다.", code["jobs"][0]["prompt"])
 
     def test_rules_cli_differs_only_in_commit_rule(self):
-        self.assertEqual(jobs.RULES.replace(jobs._COMMIT_RULE, jobs._CLI_COMMIT_RULE), jobs.RULES_CLI)
+        cli = jobs.RULES.replace(jobs._COMMIT_RULE, jobs._CLI_COMMIT_RULE).replace(jobs._VERIFY_RULE, jobs._CLI_VERIFY_RULE)
+        self.assertEqual(cli, jobs.RULES_CLI)
         self.assertIn("커밋하지 않는다. 고친 내용은 작업 트리에 그대로 둔다.", jobs.RULES_CLI)
+
+    def test_rules_cli_does_not_mention_committing_before_verifying(self):
+        self.assertIn("작업을 마치기 전에 검증 명령을 직접 돌리고 그 결과를 verify에 적는다.", jobs.RULES_CLI)
+        self.assertNotIn("커밋하기 전에", jobs.RULES_CLI)
+        self.assertIn("커밋하기 전에 검증 명령을 직접 돌리고 그 결과를 verify에 적는다.", jobs.RULES)
 
     def test_doc_mode_writable_only_for_writer(self):
         args = jobs.build_stage1_jobs([F2], CFG, wts_for(F2), "doc", BOTH_WORKERS)
