@@ -48,6 +48,7 @@ from cascade.report import render, write_prepared
 from cascade.review import (
     CALL_FAILED_NOTE,
     CLAUDE_SOURCES,
+    CURSOR_SOURCES,
     DEFAULT_EFFORT,
     DEFAULT_MODEL,
     EFFORTS,
@@ -55,6 +56,8 @@ from cascade.review import (
     REVIEWER_AUTO,
     REVIEWER_CHOICES,
     REVIEWER_CLAUDE,
+    REVIEWER_CODEX,
+    REVIEWER_CURSOR,
     build_review_prompt,
     claude_prompt,
     label,
@@ -89,7 +92,7 @@ from cascade.snapshot import (
 )
 from cascade.verify import repro_cmds, run_repro, run_verifiers
 
-SOURCES = ("codex-doc", "codex-code", "claude-doc", "claude-code", "pr-comment")
+SOURCES = ("codex-doc", "codex-code", "claude-doc", "claude-code", "cursor-doc", "cursor-code", "pr-comment")
 HOLD_CHOICES = ("지금 반영", "구현 때 테스트로", "보류")
 CHOICE_NOW = "지금 반영"
 REASON_APPLY_FAILED = "패치 적용 실패"
@@ -201,8 +204,10 @@ def _parse_input(args, root: Path):
     if args.source in CLAUDE_SOURCES:
         return _parse_claude_review(args)
     raw = s.read_text(Path(args.input))
-    parser = parse_codex_doc if args.source == "codex-doc" else parse_codex_code
     try:
+        if args.source in CURSOR_SOURCES:
+            return [replace(f, source=args.source) for f in parse_codex_doc(raw, 1)], raw
+        parser = parse_codex_doc if args.source == "codex-doc" else parse_codex_code
         return parser(raw, 1), raw
     except ParseError as e:
         raise s.CliError(str(e), ExitCodes.PARSE_ERROR) from None
@@ -230,7 +235,7 @@ def cmd_init(args) -> int:
     s.cfg_for(args.source, root)
     if args.reviewer not in REVIEWER_CHOICES:
         raise s.CliError(f"알 수 없는 검토자: {args.reviewer} ({' / '.join(REVIEWER_CHOICES)}, CASCADE_REVIEWER 확인)")
-    reviewer = resolve(args.reviewer, args.source, s.RUN_REVIEW)
+    reviewer = resolve(args.reviewer, args.source, s.RUN_REVIEW, s.cursor_reviewer_available())
     findings, raw = _parse_input(args, root)
     if not findings:
         print("지적 0건 — 원문을 확인하라")
@@ -280,9 +285,11 @@ def cmd_init(args) -> int:
     if reviewer == REVIEWER_CLAUDE:
         print(f"의견·재검토: Claude 단독({ledger.review_model}, {ledger.review_effort}) — 외부 전송 없음")
     else:
-        print(f"의견·재검토: Codex({s.RUN_REVIEW})")
-        if not s.RUN_REVIEW.is_file():
-            print("경고: codex-review 스킬이 없다. Claude 단독으로 돌리려면 --reviewer claude 로 다시 init 한다")
+        script = s.review_script(ledger)
+        print(f"의견·재검토: {label(reviewer)}({script})")
+        if not script.is_file():
+            skill = "cursor-review" if reviewer == REVIEWER_CURSOR else "codex-review"
+            print(f"경고: {skill} 스킬이 없다. Claude 단독으로 돌리려면 --reviewer claude 로 다시 init 한다")
     _print_next(ledger, snap.run_dir)
     return 0
 
@@ -307,7 +314,7 @@ def cmd_detect(args) -> int:
     gh = None if args.no_gh else shlex.split(os.environ.get("CASCADE_GH", "gh"))
     if args.reviewer not in REVIEWER_CHOICES:
         raise s.CliError(f"알 수 없는 검토자: {args.reviewer} ({' / '.join(REVIEWER_CHOICES)}, CASCADE_REVIEWER 확인)")
-    result = detect(root, repos_toml=s.repos_toml(), run_review=s.RUN_REVIEW, cli=s.CLI, gh=gh,
+    result = detect(root, repos_toml=s.repos_toml(), run_review=s.RUN_REVIEW, cursor_ok=s.cursor_reviewer_available(), cli=s.CLI, gh=gh,
                     input_path=Path(args.input).resolve() if args.input else None, pr=args.pr,
                     reviewer_choice=args.reviewer, root_flag=_root_flag(args, root),
                     docs=[Path(d).resolve() for d in args.doc or []], cwd=Path.cwd())
@@ -605,29 +612,34 @@ def _claude_opinions(args, run_dir: Path, ledger: Ledger, rnd: RoundRecord) -> i
     return 0
 
 
-CODEX_AUTH_FAILURE = re.compile(r"\b401\b|unauthori[sz]ed|refresh[ _]token|codex login|not logged in", re.IGNORECASE)
-CODEX_LOG_TAIL_LINES = 5
+EXTERNAL_AUTH_FAILURE = re.compile(r"\b401\b|unauthori[sz]ed|refresh[ _]token|codex login|not logged in|Authentication required", re.IGNORECASE)
+EXTERNAL_USAGE_LIMIT = re.compile(r"usage limit", re.IGNORECASE)
+EXTERNAL_LOG_TAIL_LINES = 5
+LOGIN_COMMANDS = {REVIEWER_CODEX: "codex login", REVIEWER_CURSOR: "cursor-agent login"}
 
 
-def _codex_result_text(result: Path, what: str) -> str:
-    """Codex 결과(`<로그>.final`)를 읽는다. 없거나 비면 실행 로그와 인증 실패 여부를 짚어 멈춘다."""
+def _external_result_text(result: Path, what: str, reviewer: str) -> str:
+    """외부 검토자(Codex·Cursor) 결과(`<로그>.final`)를 읽는다. 없거나 비면 실행 로그와 인증 실패·이용 한도 여부를 짚어 멈춘다."""
     text = result.read_text(encoding="utf-8").strip() if result.is_file() else ""
     if text:
         return text
     problem = "없다" if not result.is_file() else "비어 있다"
     log = result.with_suffix("") if result.suffix == ".final" else None
-    lines = [f"Codex {what} 결과 파일이 {problem}: {result}"]
+    lines = [f"{label(reviewer)} {what} 결과 파일이 {problem}: {result}"]
     if log is None or not log.is_file():
         lines.append(f"실행 로그도 없다({log or '로그 경로를 알 수 없다'}). RR 명령의 --out 경로와 종료 코드를 확인한다")
     else:
         log_text = log.read_text(encoding="utf-8", errors="replace")
-        tail = log_text.strip().splitlines()[-CODEX_LOG_TAIL_LINES:]
+        tail = log_text.strip().splitlines()[-EXTERNAL_LOG_TAIL_LINES:]
         lines.append(f"실행 로그: {log}")
         lines.extend(f"  | {line}" for line in tail)
-        if CODEX_AUTH_FAILURE.search(log_text):
-            lines.append("로그에 인증 실패 흔적이 있다(401·refresh token).")
-    lines.append("인증 실패면 터미널에서 `codex login`으로 다시 로그인한 뒤 RR을 다시 돌린다. "
-                 "RR은 한 번에 하나씩 돌린다(동시에 돌리면 refresh token이 겹쳐 소모돼 로그인이 풀릴 수 있다)")
+        if EXTERNAL_AUTH_FAILURE.search(log_text):
+            lines.append("로그에 인증 실패 흔적이 있다(401·refresh token·Authentication required).")
+        if EXTERNAL_USAGE_LIMIT.search(log_text):
+            lines.append("로그에 이용 한도 도달 흔적이 있다(usage limit). 한도가 풀린 뒤 RR을 다시 돌린다.")
+    lines.append(f"인증 실패면 터미널에서 `{LOGIN_COMMANDS.get(reviewer, LOGIN_COMMANDS[REVIEWER_CODEX])}`으로 다시 로그인한 뒤 RR을 다시 돌린다.")
+    if reviewer == REVIEWER_CODEX:
+        lines.append("RR은 한 번에 하나씩 돌린다(동시에 돌리면 refresh token이 겹쳐 소모돼 로그인이 풀릴 수 있다)")
     raise s.CliError("\n".join(lines))
 
 
@@ -642,7 +654,7 @@ def cmd_opinion(args) -> int:
     s.guard(rnd, f"opinion:{args.id}", args.force)
     if args.id not in {d["finding_id"] for d in rnd.decisions}:
         raise s.CliError(f"회차 {rnd.no}에 {args.id} 판정이 없다")
-    text = _codex_result_text(Path(args.result), "의견")
+    text = _external_result_text(Path(args.result), "의견", ledger.reviewer)
     ledger.opinions[args.id] = text
     s.mark(rnd, f"opinion:{args.id}")
     s.save_ledger(run_dir, ledger)
@@ -819,7 +831,7 @@ def cmd_recheck(args) -> int:
         raise s.CliError(f"회차 {rnd.no}은 재검토를 열지 않았다")
     is_json = args.result.endswith(".json")
     if not is_json:
-        _codex_result_text(Path(args.result), "재검토")
+        _external_result_text(Path(args.result), "재검토", ledger.reviewer)
     elif not Path(args.result).is_file():
         raise s.CliError(f"파일이 없다: {args.result}")
     text, model_id = load_text(Path(args.result), s.recheck_job_id(rnd.no) if is_json else None)
@@ -992,7 +1004,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--root")
     p.add_argument("--reviewer", choices=REVIEWER_CHOICES, default=os.environ.get("CASCADE_REVIEWER") or REVIEWER_AUTO,
                    help="판가름 뒤 의견·재검토를 맡을 검토자(기본: 환경 변수 CASCADE_REVIEWER, 없으면 auto). "
-                        "auto: claude-* 입력이거나 codex-review 스킬이 없으면 claude")
+                        "auto: claude-* 입력이면 claude, 아니면 codex-review 스킬이 있으면 codex, 없으면 cursor를 쓸 수 있을 때 cursor, 아니면 claude")
     p.add_argument("--review-model", help=f"Claude 검토자 모델(기본 {DEFAULT_MODEL})")
     p.add_argument("--review-effort", choices=EFFORTS, help=f"Claude 검토자 effort(기본 {DEFAULT_EFFORT})")
     p.add_argument("--severity", help="이번 실행에서 처리할 등급(쉼표 구분, 예: Critical,Warning). 나머지는 보류 후보")

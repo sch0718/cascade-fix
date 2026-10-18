@@ -2,6 +2,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import tomllib
 from dataclasses import replace
@@ -22,7 +23,7 @@ from cascade.consensus import (
 from cascade.findings import Finding
 from cascade.jobs import ROLES, AdjInput, location_file, split_location, write_job_args
 from cascade.patches import DIFF_FLAGS, changed_files, record_setup_paths
-from cascade.review import REVIEWER_CLAUDE, claude_prompt, review_job
+from cascade.review import REVIEWER_CLAUDE, REVIEWER_CURSOR, claude_prompt, review_job
 from cascade.rounds import STATUS_DONE, Ledger, RoundRecord, ledger_path, needs_recheck
 from cascade.snapshot import Snapshot, add_worktree, tree_diff_stat, user_tree_fingerprint
 from cascade.verify import (
@@ -51,12 +52,36 @@ def find_run_review() -> Path:
     return next((c for c in candidates if c.is_file()), candidates[-1])
 
 
+def find_cursor_review() -> Path:
+    """cursor-review 스킬의 run-review.sh. 플러그인 캐시에 설치돼도 개인 스킬 위치를 찾는다."""
+    if os.environ.get("CASCADE_CURSOR_REVIEW"):
+        return Path(os.environ["CASCADE_CURSOR_REVIEW"])
+    candidates = [
+        SKILL_ROOT.parent / "cursor-review" / "scripts" / "run-review.sh",
+        Path.home() / ".claude" / "skills" / "cursor-review" / "scripts" / "run-review.sh",
+    ]
+    return next((c for c in candidates if c.is_file()), candidates[-1])
+
+
+def find_cursor_agent() -> Path | None:
+    """cursor-agent 실행 파일. 환경 변수 CASCADE_CURSOR_AGENT를 주면 그것만 본다."""
+    if os.environ.get("CASCADE_CURSOR_AGENT"):
+        agent = Path(os.environ["CASCADE_CURSOR_AGENT"])
+        return agent if agent.is_file() and os.access(agent, os.X_OK) else None
+    on_path = shutil.which("cursor-agent")
+    if on_path:
+        return Path(on_path)
+    local = Path.home() / ".local" / "bin" / "cursor-agent"
+    return local if local.is_file() and os.access(local, os.X_OK) else None
+
+
 RUN_REVIEW = find_run_review()
+CURSOR_REVIEW = find_cursor_review()
 CLI = f"PYTHONPATH={shlex.quote(str(SKILL_ROOT))} python3 -m cascade.cli"
 ROLE_SUFFIX = {"a": "a", "b": "b", "writer": "writer", "adjudicator": "adj"}
 DOC_SUFFIXES = (".md", ".markdown", ".txt", ".rst")
 SOURCE_DOC = "codex-doc"
-DOC_SOURCES = (SOURCE_DOC, "claude-doc")
+DOC_SOURCES = (SOURCE_DOC, "claude-doc", "cursor-doc")
 SOURCE_PR = "pr-comment"
 EXTERNAL_PREFIX = "외부/"
 REASON_NO_PATCH = "패치 없음"
@@ -571,8 +596,16 @@ def _q(value) -> str:
     return shlex.quote(str(value))
 
 
-def run_review_cmd(mode: str, prompt: Path, root: str, out: Path) -> str:
-    return f"{_q(RUN_REVIEW)} --{mode} {_q(prompt)} --repo {_q(root)} --out {_q(out)}"
+def cursor_reviewer_available() -> bool:
+    return CURSOR_REVIEW.is_file() and find_cursor_agent() is not None
+
+
+def review_script(ledger: Ledger) -> Path:
+    return CURSOR_REVIEW if ledger.reviewer == REVIEWER_CURSOR else RUN_REVIEW
+
+
+def run_review_cmd(mode: str, prompt: Path, root: str, out: Path, script: Path = RUN_REVIEW) -> str:
+    return f"{_q(script)} --{mode} {_q(prompt)} --repo {_q(root)} --out {_q(out)}"
 
 
 def _cmd(name: str, run_dir: Path, *rest: str) -> str:
@@ -628,7 +661,7 @@ def next_steps(ledger: Ledger, run_dir: Path) -> list[str]:
         fid = pending[0]
         out = rd / f"opinion-{fid}.out"
         return [
-            run_review_cmd("opinion", rd / f"opinion-{fid}.md", ledger.root, out),
+            run_review_cmd("opinion", rd / f"opinion-{fid}.md", ledger.root, out, review_script(ledger)),
             _cmd("opinion", run_dir, n, f"--id {fid}", f"--result {_q(str(out) + '.final')}"),
         ]
     if not step_done(rnd, "apply"):
@@ -643,7 +676,7 @@ def next_steps(ledger: Ledger, run_dir: Path) -> list[str]:
         repo_file = rd / RECHECK_REPO_FILE
         repo = repo_file.read_text(encoding="utf-8").strip() if repo_file.is_file() else ledger.root
         return [
-            run_review_cmd("recheck", rd / "recheck-prompt.md", repo, out),
+            run_review_cmd("recheck", rd / "recheck-prompt.md", repo, out, review_script(ledger)),
             _cmd("recheck", run_dir, n, f"--result {_q(str(out) + '.final')}"),
         ]
     return [_cmd("report", run_dir)]

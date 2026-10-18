@@ -55,6 +55,12 @@ class ClassifyInputTest(unittest.TestCase):
         doc = self.write("doc.final", SECTIONED.format(title="모호하다", loc="plan.md:3"))
         self.assertEqual(detect.classify_input(doc), ("codex-doc", 1))
 
+    def test_detect_names_cursor_review_output(self):
+        doc = self.write("cursor-review.AbC123.final", SECTIONED.format(title="모호하다", loc="plan.md:3"))
+        self.assertEqual(detect.classify_input(doc), ("cursor-doc", 1))
+        code = self.write("cursor-review.XyZ789.final", SECTIONED.format(title="틀렸다", loc="app.py:1"))
+        self.assertEqual(detect.classify_input(code), ("cursor-code", 1))
+
 
 class DetectCliTest(unittest.TestCase):
     def setUp(self):
@@ -197,6 +203,22 @@ class DetectCliTest(unittest.TestCase):
         self.assertEqual((rec["source"], rec["estimate"]["stage1"]), ("codex-code", 4))
         self.assertIn("--reviewer codex", rec["steps"][0])
         self.assertTrue(any("Codex 전송 동의" in a for a in r["approvals"]))
+
+    def test_detect_cursor_reviewer_asks_cursor_consent(self):
+        code, r = self.detect("--input", str(FIXTURES / "codex-code-e2e.final"), "--reviewer", "cursor")
+        self.assertEqual(r["reviewer"], "cursor")
+        self.assertEqual(r["reviewer_label"], "Cursor")
+        self.assertTrue(any("Cursor 전송 동의" in a and "팀 프라이버시 모드" in a for a in r["approvals"]))
+        self.assertFalse(any("Codex 전송 동의" in a for a in r["approvals"]))
+        self.assertIn("--reviewer cursor", r["recommendation"]["steps"][0])
+
+    def test_detect_cursor_result_file_recommends_cursor_source(self):
+        raw = self.tmp / "cursor-review.AbC123.final"
+        raw.write_text(SECTIONED.format(title="모호하다", loc="README.md:3"), encoding="utf-8")
+        code, r = self.detect("--input", str(raw), "--reviewer", "cursor")
+        rec = r["recommendation"]
+        self.assertEqual((rec["source"], rec["mode"]), ("cursor-doc", "doc"))
+        self.assertIn("--source cursor-doc", rec["steps"][0])
 
     def test_external_doc_result_passes_doc_to_init(self):
         ext = self.tmp / "outside" / "external-plan.md"

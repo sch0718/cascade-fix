@@ -16,7 +16,7 @@ def default_repos_toml() -> Path:
 
     return repos_toml()
 REQUIRED = ("id", "repo", "commit", "source", "finding", "truth", "baseline_opus_calls")
-SOURCES = ("codex-doc", "codex-code", "claude-doc", "claude-code", "pr-comment")
+SOURCES = ("codex-doc", "codex-code", "claude-doc", "claude-code", "cursor-doc", "cursor-code", "pr-comment")
 ROUND = "1"
 
 

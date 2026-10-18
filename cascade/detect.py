@@ -8,7 +8,15 @@ from pathlib import Path
 
 from cascade.config import ConfigError, RepoConfig, detect_candidates, is_sensitive_path, load_repo_config
 from cascade.findings import ParseError, fetch_pr_findings, parse_codex_code, parse_codex_doc
-from cascade.review import REVIEWER_AUTO, REVIEWER_CLAUDE, label, read_review_results, resolve
+from cascade.review import (
+    CURSOR_SOURCES,
+    REVIEWER_AUTO,
+    REVIEWER_CLAUDE,
+    REVIEWER_CURSOR,
+    label,
+    read_review_results,
+    resolve,
+)
 from cascade.snapshot import RUN_DIR_NAME
 
 DOC_SUFFIXES = (".md", ".markdown", ".txt", ".rst")
@@ -137,12 +145,24 @@ def doc_targets(path: Path, root: Path) -> list[Path]:
     return out
 
 
+CURSOR_RESULT_PREFIX = "cursor-review"
+CURSOR_SOURCE_BY_FORMAT = {"codex-doc": "cursor-doc", "claude-code": "cursor-code"}
+
+
 def classify_input(path: Path) -> tuple[str | None, int]:
     """결과 파일이 어떤 --source 인지와 지적 수를 추정한다.
 
-    Claude 검토 결과와 codex-doc 결과는 같은 Critical/Warning/Suggestion 형식이라 형식으로는 못 가른다.
+    Claude·Cursor 검토 결과와 codex-doc 결과는 같은 Critical/Warning/Suggestion 형식이라 형식으로는 못 가른다.
     지적 위치가 모두 문서 파일이면 문서 모드, 코드 파일이 하나라도 있으면 코드 모드로 본다.
+    파일명이 cursor-review 로 시작하면(cursor-review 스킬의 기본 이름) 같은 모드의 cursor-* 로 본다.
     """
+    source, found = _classify_format(path)
+    if path.name.startswith(CURSOR_RESULT_PREFIX):
+        source = CURSOR_SOURCE_BY_FORMAT.get(source, source)
+    return source, found
+
+
+def _classify_format(path: Path) -> tuple[str | None, int]:
     raw = path.read_text(encoding="utf-8")
     try:
         data = json.loads(raw)
@@ -202,7 +222,8 @@ def _config(root: Path, repos_toml: Path) -> tuple[RepoConfig | None, str | None
 
 def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list[str] | None,
            input_path: Path | None = None, pr: str | None = None, reviewer_choice: str = REVIEWER_AUTO,
-           root_flag: str = "", docs: list[Path] | None = None, cwd: Path | None = None) -> dict:
+           root_flag: str = "", docs: list[Path] | None = None, cwd: Path | None = None,
+           cursor_ok: bool = False) -> dict:
     root = Path(root)
     branch = current_branch(root)
     base = default_base(root)
@@ -271,7 +292,7 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
         blockers.append("처리할 것이 없다: 결과 파일·PR 리뷰 스레드·커밋하지 않은 변경·앞선 커밋이 모두 없다"
                         " (이미 커밋한 문서는 --doc <문서> 로 지정한다)")
 
-    reviewer = resolve(reviewer_choice, rec["source"] or "", run_review)
+    reviewer = resolve(reviewer_choice, rec["source"] or "", run_review, cursor_ok)
     cfg, cfg_error = _config(root, repos_toml)
     if cfg_error:
         blockers.append(cfg_error)
@@ -284,7 +305,9 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
             approvals.append(f"{REGISTER_APPROVAL}: {repos_toml} 에 [repos.\"{root}\"] 항목을 후보로 적는다(사용자 확인)")
         else:
             blockers.append("코드 모드인데 테스트 명령을 찾지 못했다. 테스트 없는 저장소의 코드 수정은 이 스킬로 하지 않는다")
-    if reviewer != REVIEWER_CLAUDE:
+    if reviewer == REVIEWER_CURSOR:
+        approvals.append("Cursor 전송 동의: 의견·재검토에 코드·문서를 Cursor(팀 프라이버시 모드)로 보낸다")
+    elif reviewer != REVIEWER_CLAUDE:
         approvals.append("Codex 전송 동의: 의견·재검토에 코드·문서를 OpenAI로 보낸다")
     if rec["source"] == "pr-comment":
         approvals.append("PR 코멘트의 재현 명령이 있으면 jobs 뒤에 목록을 보이고 승인받는다")
@@ -294,7 +317,7 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
     sensitive = [p for p in changed_all if is_sensitive_path(p, patterns)]
     if sensitive:
         notes.append("보안·인증·삭제 경로가 바뀌었다. 이 경로를 고친 지적은 채택하지 않고 판단 불가로 보낸다: " + ", ".join(sensitive[:5]))
-    if uncommitted and rec["source"] in ("pr-comment", "codex-code", "codex-doc"):
+    if uncommitted and rec["source"] in ("pr-comment", "codex-code", "codex-doc", *CURSOR_SOURCES):
         notes.append("커밋하지 않은 변경이 있다. 채택 패치가 작업 트리에 섞이지 않게 하려면 --dry-run 을 쓴다")
 
     steps = rec["steps"]
