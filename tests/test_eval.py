@@ -1,11 +1,13 @@
 import contextlib
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -14,7 +16,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import replay  # noqa: E402
 import score  # noqa: E402
+from fake_cli import fenced, result_json  # noqa: E402
 from helpers import git, make_repo, write_repos_toml  # noqa: E402
+from test_cli_workers import LIMIT_ENTRY, WorkersTestBase  # noqa: E402
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 CALC = "def add(a, b):\n    return a - b\n"
@@ -43,7 +47,8 @@ def worker(verdict, role, checker_ok=None):
             "reason": "근거", "verify": [], "checker_ok": checker_ok, "model_id": "m", "patch": ""}
 
 
-def make_run(runs, item_id, decisions, results=None, mode="code", opinions=None, apply=None, error=None):
+def make_run(runs, item_id, decisions, results=None, mode="code", opinions=None, apply=None, error=None,
+             events=None, files=None):
     base = Path(runs) / item_id
     base.mkdir(parents=True, exist_ok=True)
     write_json(base / "meta.json", {"error": error} if error else {"truth": {}, "baseline_opus_calls": 1})
@@ -51,15 +56,29 @@ def make_run(runs, item_id, decisions, results=None, mode="code", opinions=None,
         return
     write_json(base / "ledger.json", {"mode": mode, "source": "codex-doc" if mode == "doc" else "codex-code",
                                       "opinions": opinions or {},
-                                      "rounds": [{"no": 1, "decisions": decisions}]})
+                                      "rounds": [{"no": 1, "decisions": decisions, "events": events or []}]})
     rnd = base / "run" / "round-1"
     write_json(rnd / "results.json", results or {})
+    for name, data in (files or {}).items():
+        write_json(rnd / name, data)
     if apply is not None:
         write_json(rnd / "apply.json", apply)
 
 
 def decision(outcome, patch_from=None, reasons=None):
     return {"finding_id": "r1-01", "outcome": outcome, "patch_from": patch_from, "reasons": reasons or []}
+
+
+def claude_job(job_id, model):
+    return {"id": job_id, "label": job_id, "model": model, "effort": "low", "kind": "worker", "promptPath": "p.md"}
+
+
+def jobs_file(*jobs):
+    return {"jobs": [claude_job(*j) for j in jobs]}
+
+
+def workers_event(stage, counts, usage=None, fallback=None):
+    return {"step": f"workers-{stage}", "counts": counts, "usage": usage or {}, "fallback": fallback or []}
 
 
 class ScoreTest(unittest.TestCase):
@@ -161,6 +180,128 @@ class ScoreTest(unittest.TestCase):
         make_run(self.runs, "s1", [decision("합의-사실", "a")])
         m = score.compute(self.runs, score.load_sample(self.sample))
         self.assertIn("| 문서 점검자 정확도 | - |", score.render(m))
+
+    def test_score_counts_claude_calls_and_fallbacks(self):
+        make_run(self.runs, "s1", [decision("합의-사실", "a")],
+                 events=[workers_event("stage1", {"ok": 1, "limit": 1}, {"codex": {"input": 11, "output": 7, "cache_read": 3}},
+                                       ["r1-01:b"])],
+                 files={"stage1-args.json": jobs_file(),
+                        "stage1-cli-args.json": {"jobs": [{"id": "r1-01:a"}, {"id": "r1-01:b"}]},
+                        "stage1-fallback-args.json": jobs_file(("r1-01:b", "claude-haiku-5-5")),
+                        "adj-args.json": jobs_file(("r1-01:adjudicator", "claude-opus-5-5"))})
+        m = score.compute(self.runs, score.load_sample(self.sample))
+        self.assertEqual(m["claude_calls"], {"sonnet": 0, "haiku": 1, "opus": 1})
+        self.assertEqual(m["fallback"], {"한도": 1})
+        self.assertEqual((m["cli_jobs"], m["invalid"]), (2, 0))
+        self.assertEqual(m["usage"], {"codex": {"input": 11, "output": 7, "cache_read": 3}})
+
+    def test_score_counts_claude_worker_jobs_by_model_name(self):
+        make_run(self.runs, "s1", [decision("합의-사실", "a")],
+                 files={"stage1-args.json": jobs_file(("r1-01:a", "claude-sonnet-5-5"), ("r1-01:b", "claude-haiku-5-5")),
+                        "checker-args.json": jobs_file(("r1-01:checker", "claude-haiku-5-5")),
+                        "adj-args.json": jobs_file(("r1-01:adjudicator", "claude-opus-5-5"))})
+        m = score.compute(self.runs, score.load_sample(self.sample))
+        self.assertEqual(m["claude_calls"], {"sonnet": 1, "haiku": 2, "opus": 1})
+        self.assertEqual((m["fallback"], m["cli_jobs"], m["invalid"], m["usage"]), ({}, 0, 0, {}))
+
+    def test_score_uses_last_workers_event_per_stage_and_sums_invalid_and_usage(self):
+        usage = {"cursor": {"input": 100, "output": 20, "cache_read": 5}}
+        make_run(self.runs, "s1", [decision("합의-사실", "a")], events=[
+            workers_event("stage1", {"ok": 1, "error": 1}, usage, ["r1-01:b"]),
+            workers_event("stage1", {"ok": 1, "invalid": 1}, usage, ["r1-01:b"]),
+            workers_event("checker", {"ok": 1, "auth": 1, "skipped": 1}, usage, ["r1-01:b", "r1-01:c"])])
+        m = score.compute(self.runs, score.load_sample(self.sample))
+        self.assertEqual((m["cli_jobs"], m["invalid"]), (5, 1))
+        self.assertEqual(m["fallback"], {"무효": 1, "로그인": 1, "건너뜀": 1})
+        self.assertEqual(m["usage"], {"cursor": {"input": 200, "output": 40, "cache_read": 10}})
+
+    def test_render_without_workers_keeps_table_unchanged(self):
+        self.three_runs()
+        text = score.render(score.compute(self.runs, score.load_sample(self.sample)))
+        self.assertNotIn("대체 실행", text)
+        self.assertNotIn("Claude 호출", text)
+
+    def test_render_with_cli_jobs_adds_workers_rows(self):
+        make_run(self.runs, "s1", [decision("합의-사실", "a")],
+                 events=[workers_event("stage1", {"ok": 3, "invalid": 1}, {"codex": {"input": 1, "output": 2, "cache_read": 3}})],
+                 files={"adj-args.json": jobs_file(("r1-01:adjudicator", "claude-opus-5-5"))})
+        text = score.render(score.compute(self.runs, score.load_sample(self.sample)))
+        self.assertIn("| 대체 실행 | 1/4 (25.0%) — 무효 1 |", text)
+        self.assertIn("| 무효 결과 | 1/4 (25.0%) |", text)
+        self.assertIn("| Claude 호출 | Sonnet 0 · Haiku 0 · Opus 1 |", text)
+        self.assertIn("| CLI 사용량(codex) | 입력 1 · 출력 2 · 캐시 읽기 3 |", text)
+
+
+class CompareTest(unittest.TestCase):
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.runs = Path(self._td.name)
+
+    def metrics(self, agreement, opus, fallback=None, cli_jobs=10, regressions=None):
+        m = score.compute(self.runs, {})
+        m.update(agreement=agreement, opus_calls=opus, fallback=fallback or {}, cli_jobs=cli_jobs)
+        if regressions is not None:
+            m.update(regression_measured=True, regressions=regressions)
+        return m
+
+    def verdict(self, ext, base):
+        return score.compare_verdict_line(ext, base)
+
+    def test_compare_verdict_line_passes_within_criteria(self):
+        line = self.verdict(self.metrics(0.86, 3, {"한도": 1}), self.metrics(0.90, 3))
+        self.assertIn("통과", line)
+        self.assertNotIn("미달", line)
+        self.assertIn("일치율 차이 4.0%p", line)
+        self.assertIn("대체 실행 1/10", line)
+        self.assertIn("회귀 미측정", line)
+
+    def test_compare_verdict_line_fails_on_agreement(self):
+        line = self.verdict(self.metrics(0.84, 3, {"한도": 1}), self.metrics(0.90, 3))
+        self.assertIn("미달(일치율)", line)
+
+    def test_compare_agreement_boundary_is_inclusive(self):
+        self.assertIn("통과", self.verdict(self.metrics(0.85, 3), self.metrics(0.90, 3)))
+
+    def test_compare_fails_on_opus_fallback_and_regression_with_all_causes(self):
+        line = self.verdict(self.metrics(0.90, 4, {"오류": 2}, regressions=1), self.metrics(0.90, 3))
+        self.assertIn("미달(Opus 호출, 대체 실행, 회귀)", line)
+
+    def test_compare_fallback_boundary_is_ten_percent(self):
+        self.assertIn("통과", self.verdict(self.metrics(0.90, 3, {"한도": 1}), self.metrics(0.90, 3)))
+        self.assertIn("미달(대체 실행)", self.verdict(self.metrics(0.90, 3, {"한도": 2}), self.metrics(0.90, 3)))
+
+    def test_compare_without_cli_jobs_is_not_a_pass(self):
+        line = self.verdict(self.metrics(0.90, 3, cli_jobs=0), self.metrics(0.90, 3))
+        self.assertIn("미달(대체 실행 미측정)", line)
+
+    def test_compare_without_agreement_is_not_a_pass(self):
+        self.assertIn("미달(일치율)", self.verdict(self.metrics(None, 3), self.metrics(0.90, 3)))
+
+    def test_compare_table_puts_both_runs_side_by_side(self):
+        ext, base = self.metrics(0.86, 3, {"한도": 1}), self.metrics(0.90, 3, cli_jobs=0)
+        ext["claude_calls"], base["claude_calls"] = {"sonnet": 0, "haiku": 1, "opus": 3}, {"sonnet": 4, "haiku": 4, "opus": 3}
+        text = score.render_compare(ext, base)
+        self.assertIn("| 값 | Claude 작업자 | 외부 작업자 |", text)
+        self.assertIn("| Claude 호출 | Sonnet 4 · Haiku 4 · Opus 3 | Sonnet 0 · Haiku 1 · Opus 3 |", text)
+        self.assertIn("| Opus 호출 수 | 3 | 3 |", text)
+        self.assertIn("| 대체 실행 | - | 1/10 (10.0%) — 한도 1 |", text)
+        self.assertIn("통과", text.splitlines()[-1])
+
+    def test_compare_cli_prints_table_and_verdict(self):
+        sample = FIXTURES / "sample.jsonl"
+        base, ext = self.runs / "claude", self.runs / "external"
+        make_run(base, "s1", [decision("합의-사실", "a")])
+        make_run(ext, "s1", [decision("합의-사실", "a")],
+                 events=[workers_event("stage1", {"ok": 10})])
+        out = self.runs / "cmp.md"
+        p = subprocess.run([sys.executable, str(ROOT / "eval" / "score.py"), "--runs", str(ext), "--baseline-runs", str(base),
+                            "--sample", str(sample), "--out", str(out)], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("| 값 | Claude 작업자 | 외부 작업자 |", p.stdout)
+        self.assertIn("비교 판정: 통과", p.stdout)
+        self.assertNotIn("성공 기준:", p.stdout)
+        self.assertIn("비교 판정: 통과", out.read_text(encoding="utf-8"))
 
 
 class ReplayTest(unittest.TestCase):
@@ -284,6 +425,75 @@ class ReplayTest(unittest.TestCase):
         meta = json.loads((self.out / "item-01" / "meta.json").read_text(encoding="utf-8"))
         self.assertIn("HEAD", meta["error"])
         self.assertEqual(git(self.repo, "worktree", "list", "--porcelain").count("worktree "), 1)
+
+
+class ReplayExternalTest(WorkersTestBase):
+    def setUp(self):
+        super().setUp()
+        self.use_fakes()
+        self.env["FAKE_CODEX_RESULT"] = result_json(verdict="아님")
+        self.env["FAKE_CURSOR_RESULTS"] = json.dumps([self.sandbox_reply, {"result": fenced(result_json(verdict="아님"))}],
+                                                     ensure_ascii=False)
+        self.out = self.tmp / "out"
+        self.fake = self.tmp / "fake"
+
+    def sample(self):
+        item = {"id": "item-01", "repo": str(self.repo), "commit": git(self.repo, "rev-parse", "HEAD"),
+                "source": "codex-code", "doc": None, "finding": FINDING,
+                "truth": {"verdict": "아님", "accepted_patch": None}, "baseline_opus_calls": 1}
+        path = self.tmp / "sample.jsonl"
+        path.write_text(json.dumps(item, ensure_ascii=False) + "\n", encoding="utf-8")
+        return path
+
+    def replay(self, *extra):
+        argv = ["--sample", str(self.sample()), "--out", str(self.out), "--repos-toml", self.env["CASCADE_REPOS_TOML"], *extra]
+        with mock.patch.dict(os.environ, self.env), contextlib.redirect_stdout(io.StringIO()) as buf:
+            code = replay.main(argv)
+        return code, buf.getvalue()
+
+    def test_replay_external_runs_workers_with_fake_cli(self):
+        code, _ = self.replay("--workers", "external", "--fake-results", str(self.fake))
+        self.assertEqual(code, 0)
+        base = self.out / "item-01"
+        ledger = json.loads((base / "ledger.json").read_text(encoding="utf-8"))
+        self.assertEqual(ledger["workers_choice"], "external")
+        self.assertEqual(ledger["rounds"][0]["decisions"][0]["outcome"], "합의-아님")
+        rnd = base / "run" / "round-1"
+        self.assertTrue((rnd / "stage1-cli.json").is_file())
+        self.assertFalse((rnd / "stage1.json").exists())
+        self.assertTrue((base / "run" / "report.md").is_file())
+        m = score.compute(self.out, score.load_sample(self.sample()))
+        self.assertEqual((m["agree"], m["judged"], m["cli_jobs"], m["fallback"]), (1, 1, 2, {}))
+        self.assertEqual(m["claude_calls"], {"sonnet": 0, "haiku": 0, "opus": 0})
+        self.assertEqual(set(m["usage"]), {"codex", "cursor"})
+
+    def test_replay_external_uses_fake_fallback_results_for_failed_cli_job(self):
+        self.cursor_results([dict(LIMIT_ENTRY, match="r1-01-b")])
+        write_json(self.fake / "item-01" / "stage1-fallback.json", {"results": [
+            {"id": "r1-01:b", "output": {"verdict": "아님", "needs_design_decision": False, "reason": "쓰임이 없다",
+                                         "verify": [], "model_id": "claude-haiku-5-5"}}]})
+        code, _ = self.replay("--workers", "external", "--fake-results", str(self.fake))
+        self.assertEqual(code, 0)
+        m = score.compute(self.out, score.load_sample(self.sample()))
+        self.assertEqual((m["agree"], m["judged"]), (1, 1))
+        self.assertEqual((m["fallback"], m["claude_calls"]["haiku"]), ({"한도": 1}, 1))
+
+    def test_replay_external_without_fake_results_stops_after_workers(self):
+        code, text = self.replay("--workers", "external")
+        self.assertEqual(code, 0)
+        meta = json.loads((self.out / "item-01" / "meta.json").read_text(encoding="utf-8"))
+        run_dir = Path(meta["pending_run_dir"])
+        self.assertTrue((run_dir / "round-1" / "stage1-cli.json").is_file())
+        self.assertFalse((run_dir / "round-1" / "decisions.json").exists())
+        self.assertIn("workers", text)
+
+    def test_replay_claude_workers_is_default(self):
+        code, _ = self.replay()
+        self.assertEqual(code, 0)
+        meta = json.loads((self.out / "item-01" / "meta.json").read_text(encoding="utf-8"))
+        ledger = json.loads((Path(meta["pending_run_dir"]) / "ledger.json").read_text(encoding="utf-8"))
+        self.assertEqual(ledger["workers_choice"], "claude")
+        self.assertFalse((Path(meta["pending_run_dir"]) / "round-1" / "stage1-cli.json").exists())
 
 
 if __name__ == "__main__":

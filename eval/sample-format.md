@@ -64,7 +64,9 @@
 
    `--collect`는 `cleanup`을 돌리고 `run_dir`을 `<결과 폴더>/<id>/run/`으로 복사하며 `ledger.json`을 `<결과 폴더>/<id>/`에 놓고 워크트리를 지운다.
 
-2. 모델 없이 배관만 시험하려면 `--fake-results <폴더>`를 준다. 폴더 안에 `<id>/stage1.json`(필요하면 `adj.json`, `checker.json`)을 두면 `judge`·`adjudicate`·`apply`·`report`·`cleanup`까지 한 번에 돌고 항목마다 워크트리를 지운다.
+   외부 작업자(Codex·Cursor)를 재려면 `--workers external`을 준다. 항목마다 `jobs` 뒤에 `workers --stage stage1`을 스스로 돌려 CLI 작업을 끝내고, 대체 실행이나 Claude 몫으로 남은 stage1 작업이 있을 때만 위처럼 멈춘다. 기본값은 `--workers claude`다. 같은 표본을 `--workers claude`와 `--workers external`로 각각 다른 `--out` 아래에 돌린다.
+
+2. 모델 없이 배관만 시험하려면 `--fake-results <폴더>`를 준다. 폴더 안에 `<id>/stage1.json`(필요하면 `adj.json`, `checker.json`)을 두면 `judge`·`adjudicate`·`apply`·`report`·`cleanup`까지 한 번에 돌고 항목마다 워크트리를 지운다. `--workers external`에서 CLI 작업이 모두 끝나 Claude 작업이 없으면 `stage1.json`은 필요 없고, 대체 실행이 생기면 그 결과를 `<id>/stage1-fallback.json`에 둔다.
 
 3. 채점.
 
@@ -86,5 +88,22 @@
    | 오류 항목 수 | `replay.py`가 `meta.json`에 오류를 적은 항목. 채점에서 뺀다 |
 
    회귀는 전향(실제 적용) 실행에서만 측정된다. 소급 재생은 항상 dry-run이라 전체 테스트를 돌리지 않으므로 `apply.json`에 `final_ok`가 없고, 이때 표는 「측정 불가」, 판정 줄은 「회귀 미측정」으로 적는다. `--collect`는 마지막 회차의 `apply.json`이 없는 항목을 수집하지 않고 `meta.json`에 `incomplete`를 적으며, 채점은 그런 항목을 오류 항목처럼 빼고 「미완료 항목 수」로 따로 센다. 항목에 오류가 하나라도 있으면 `replay.py`는 종료 코드 1을 돌려준다.
+
+   `--workers external`로 돌린 결과에는 표에 행이 더해진다(CLI 작업이 있을 때만).
+
+   | 값 | 계산 |
+   | --- | --- |
+   | 대체 실행 | 회차 이벤트 `workers-*`의 사유별 건수 합 ÷ 전체 CLI 작업. 사유는 한도·로그인·시간 초과·무효·오류·건너뜀 |
+   | 무효 결과 | 재요청 뒤에도 무효인 CLI 작업 ÷ 전체 CLI 작업 |
+   | Claude 호출 | Claude가 돈 작업 수를 모델 이름으로 센 값(Sonnet·Haiku·Opus). `stage1-args.json`·`checker-args.json`의 Claude 작업, 대체 실행(`*-fallback-args.json`), 판가름(`adj-args.json`)을 더한다. CLI가 맡은 작업은 세지 않는다 |
+   | CLI 사용량 | CLI별 입력·출력·캐시 읽기 토큰의 합 |
+
+   외부 작업자와 Claude 작업자를 같은 표본에서 나란히 비교하려면 `--baseline-runs`에 Claude 작업자로 돌린 결과 폴더를 준다.
+
+   ```
+   python3 eval/score.py --runs <external 결과> --baseline-runs <claude 결과> --sample eval/sample.jsonl [--out compare.md]
+   ```
+
+   표는 「Claude 작업자 | 외부 작업자」 두 열이고 끝에 「비교 판정」 한 줄이 붙는다. 통과 기준은 일치율 차이 5%p 이하, Opus 호출 수가 Claude 작업자 실행 이하, 대체 실행이 CLI 작업의 10% 이하, 회귀 0건이다. 못 미치는 항목은 `미달(일치율, Opus 호출, 대체 실행, 회귀)`처럼 적는다. 외부 실행에 CLI 작업이 없으면 대체 실행을 잴 수 없으므로 `미달(대체 실행 미측정)`이다. 소급 재생은 회귀를 못 재므로 「회귀 미측정」이라 적고 판정에서는 뺀다. 이때 단일 실행의 성공 기준 줄(95%·40%)은 나오지 않는다. 절차 전체는 `docs/2026-10-18-workers-measurement-plan.md`에 있다.
 
    성공 기준은 판정 일치 95% 이상, Opus 호출 40% 이하, 회귀 0건이다. 하나라도 못 미치면 값과 원인을 보고하고 구조를 되돌릴지 사용자가 정한다.

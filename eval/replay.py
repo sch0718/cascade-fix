@@ -18,6 +18,7 @@ def default_repos_toml() -> Path:
 REQUIRED = ("id", "repo", "commit", "source", "finding", "truth", "baseline_opus_calls")
 SOURCES = ("codex-doc", "codex-code", "claude-doc", "claude-code", "cursor-doc", "cursor-code", "pr-comment")
 ROUND = "1"
+WORKERS_CLAUDE, WORKERS_EXTERNAL = "claude", "external"
 
 
 def load_sample(path) -> list[dict]:
@@ -110,7 +111,11 @@ def base_env(toml: Path) -> dict:
     return env
 
 
-def run_item(item: dict, out: Path, repos_toml: Path, fake: Path | None) -> None:
+def has_jobs(path: Path) -> bool:
+    return path.is_file() and bool(read_json(path).get("jobs"))
+
+
+def run_item(item: dict, out: Path, repos_toml: Path, fake: Path | None, workers: str = WORKERS_CLAUDE) -> None:
     repo = Path(item["repo"]).resolve()
     base = (out / item["id"]).resolve()
     wt = base / "wt"
@@ -132,29 +137,41 @@ def run_item(item: dict, out: Path, repos_toml: Path, fake: Path | None) -> None
         write_worktree_toml(repos_toml, repo, wt, base / "repos.toml")
         findings = base / "findings-input.json"
         write_json(findings, [item["finding"]])
-        args = ["init", "--source", item["source"], "--findings-json", str(findings), "--dry-run"]
+        args = ["init", "--source", item["source"], "--findings-json", str(findings), "--workers", workers, "--dry-run"]
         if item.get("doc"):
             args += ["--doc", doc_arg(item["doc"], repo, wt)]
         out_text = cli(wt, env, *args)
         run_dir = Path(next(x for x in out_text.splitlines() if x.startswith("run_dir=")).split("=", 1)[1])
         rd = str(run_dir)
         cli(wt, env, "jobs", "--run-dir", rd, "--round", ROUND)
+        round_dir = run_dir / "round-1"
+        if (round_dir / "stage1-cli-args.json").is_file():
+            cli(wt, env, "workers", "--run-dir", rd, "--round", ROUND, "--stage", "stage1")
         if fake is None:
             write_json(base / "meta.json", {**meta, "pending_run_dir": rd})
-            print(f"{item['id']}: 작업 파일 {run_dir / 'round-1' / 'stage1-args.json'}")
-            print("  스킬의 Workflow로 stage1을 돌리고 judge → adjudicate → apply → report 를 이어간 뒤 --collect 로 모은다")
+            if (round_dir / "stage1-cli.json").is_file():
+                print(f"{item['id']}: CLI 작업은 workers 로 끝났다. 남은 Claude 작업 파일: {round_dir / 'stage1-args.json'}"
+                      f", {round_dir / 'stage1-fallback-args.json'}")
+            else:
+                print(f"{item['id']}: 작업 파일 {round_dir / 'stage1-args.json'}")
+            print("  스킬의 Workflow로 남은 stage1 작업을 돌리고 judge → adjudicate → apply → report 를 이어간 뒤 --collect 로 모은다")
             return
         item_fake = fake / item["id"]
-        stage1 = run_dir / "round-1" / "stage1.json"
-        shutil.copyfile(item_fake / "stage1.json", stage1)
-        judge = ["judge", "--run-dir", rd, "--round", ROUND, "--results", str(stage1)]
+        stage1 = round_dir / "stage1.json"
+        fallback_args = round_dir / "stage1-fallback-args.json"
+        if fallback_args.is_file():
+            shutil.copyfile(item_fake / "stage1-fallback.json", round_dir / "stage1-fallback.json")
+        judge = ["judge", "--run-dir", rd, "--round", ROUND]
+        if has_jobs(round_dir / "stage1-args.json"):
+            shutil.copyfile(item_fake / "stage1.json", stage1)
+            judge += ["--results", str(stage1)]
         if (item_fake / "checker.json").is_file():
-            checker = run_dir / "round-1" / "checker.json"
+            checker = round_dir / "checker.json"
             shutil.copyfile(item_fake / "checker.json", checker)
             judge += ["--checker-results", str(checker)]
         cli(wt, env, *judge)
         if (item_fake / "adj.json").is_file():
-            adj = run_dir / "round-1" / "adj.json"
+            adj = round_dir / "adj.json"
             shutil.copyfile(item_fake / "adj.json", adj)
             cli(wt, env, "adjudicate", "--run-dir", rd, "--round", ROUND, "--results", str(adj))
         cli(wt, env, "apply", "--run-dir", rd, "--round", ROUND)
@@ -194,7 +211,10 @@ def main(argv=None) -> int:
     parser.add_argument("--sample", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--limit", type=int)
-    parser.add_argument("--fake-results", help="<id>/stage1.json(·adj.json·checker.json)을 두는 폴더. 모델을 부르지 않는다")
+    parser.add_argument("--workers", choices=(WORKERS_CLAUDE, WORKERS_EXTERNAL), default=WORKERS_CLAUDE,
+                        help="작업자. external이면 CLI 작업을 workers 단계로 돌리고 남은 Claude 작업만 Workflow(또는 --fake-results)에 맡긴다")
+    parser.add_argument("--fake-results", help="<id>/stage1.json(·adj.json·checker.json·stage1-fallback.json)을 두는 폴더. 모델을 부르지 않는다. "
+                        "Claude 작업이 없는 stage1.json은 필요 없다")
     parser.add_argument("--repos-toml", default=str(default_repos_toml()))
     parser.add_argument("--collect", action="store_true", help="모델을 부르는 실제 실행이 끝난 항목의 원장을 모으고 정리한다")
     args = parser.parse_args(argv)
@@ -208,7 +228,7 @@ def main(argv=None) -> int:
             if args.collect:
                 print(f"{item['id']}: {'수집' if collect_item(item, out, toml) else '건너뜀(대기 중이 아니거나 apply 전)'}")
             else:
-                run_item(item, out, toml, fake)
+                run_item(item, out, toml, fake, args.workers)
                 print(f"{item['id']}: 완료" if fake else "")
         except Exception as e:
             failed += 1
