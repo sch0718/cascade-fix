@@ -233,6 +233,26 @@ def _execute(cmd: list[str], stdin: str, cwd: Path, env: dict, timeout: float) -
         return _Run(proc.returncode, stdout, stderr, timed_out=True)
 
 
+def _codex_failure_text(stdout: str, stderr: str) -> str:
+    """에이전트 대화는 빼고 오류 이벤트의 메시지, JSON이 아닌 줄, stderr만 모은다."""
+    parts = []
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            parts.append(line)
+            continue
+        if isinstance(event, dict) and event.get("type") in ("error", "turn.failed"):
+            error = event.get("error")
+            parts.append(str(event.get("message") or (error.get("message") if isinstance(error, dict) else error) or ""))
+    parts.append(stderr)
+    return "\n".join(parts)
+
+
+def _unexpected(job: CliJob, e: Exception) -> Outcome:
+    return Outcome(job.id, job.runner, STATUS_ERROR, None, {}, f"예상 밖 오류: {type(e).__name__}: {e}")
+
+
 def _failure(job: CliJob, run: _Run, usage: dict, timeout: float) -> Outcome | None:
     if run.missing:
         return Outcome(job.id, job.runner, STATUS_ERROR, None, usage, f"실행 파일을 실행하지 못했다: {_tail(run.stderr)}")
@@ -356,6 +376,12 @@ class CodexRunner:
             return ""
         if refreshed == snapshot:
             return ""
+        try:
+            valid = isinstance(json.loads(refreshed), dict)
+        except ValueError:
+            valid = False
+        if not valid:
+            return "auth.json 복사본이 올바른 JSON이 아니어서(쓰는 중 끝났을 수 있다) 되돌려 쓰지 않았다"
         auth = self.codex_dir / "auth.json"
         with _AuthLock(auth):
             try:
@@ -367,6 +393,12 @@ class CodexRunner:
         return "auth.json 충돌: 실행 중 원본이 바뀌어 갱신된 토큰을 되돌려 쓰지 않았다. codex login이 필요할 수 있다"
 
     def run(self, job: CliJob) -> Outcome:
+        try:
+            return self._run_job(job)
+        except Exception as e:
+            return _unexpected(job, e)
+
+    def _run_job(self, job: CliJob) -> Outcome:
         if not (self.codex_dir / "auth.json").is_file():
             return Outcome(job.id, job.runner, STATUS_AUTH, None, {}, f"{self.codex_dir / 'auth.json'} 없음: codex login 필요")
         prompt = job.prompt_path.read_text(encoding="utf-8")
@@ -407,9 +439,9 @@ class CodexRunner:
         if failed:
             return failed
         if run.returncode != 0:
-            text = _without_prompt(f"{run.stdout}\n{run.stderr}", prompt)
+            text = _without_prompt(_codex_failure_text(run.stdout, run.stderr), prompt)
             return Outcome(job.id, job.runner, classify_failure(text), None, usage,
-                           f"종료 코드 {run.returncode}: {_tail(_without_prompt(run.stderr, prompt) or run.stdout)}")
+                           f"종료 코드 {run.returncode}: {_tail(text) or _tail(run.stdout)}")
         if not result_file.is_file():
             return Outcome(job.id, job.runner, STATUS_ERROR, None, usage, "결과 파일이 없다")
         try:
@@ -469,6 +501,12 @@ class CursorRunner:
         self.timeout = timeout
 
     def run(self, job: CliJob) -> Outcome:
+        try:
+            return self._run_job(job)
+        except Exception as e:
+            return _unexpected(job, e)
+
+    def _run_job(self, job: CliJob) -> Outcome:
         schema = json.dumps(SCHEMAS[job.kind], ensure_ascii=False)
         prompt = job.prompt_path.read_text(encoding="utf-8") + _OUTPUT_INSTRUCTION.format(schema=schema)
         tmp = Path(tempfile.mkdtemp(prefix="cascade-cache-"))
@@ -497,8 +535,10 @@ class CursorRunner:
             return Outcome(job.id, job.runner, status, None, usage,
                            f"JSON 봉투가 아니다(종료 코드 {run.returncode}): {_tail(_without_prompt(run.stderr, stdin) or run.stdout)}"), None, usage
         if run.returncode != 0 or envelope.get("is_error"):
+            message = str(envelope.get("result", "")) if envelope.get("is_error") else ""
+            text = _without_prompt(f"{message}\n{run.stderr}", stdin)
             return Outcome(job.id, job.runner, classify_failure(text), None, usage,
-                           f"종료 코드 {run.returncode}: {_tail(str(envelope.get('result', '')) or run.stderr)}"), None, usage
+                           f"종료 코드 {run.returncode}: {_tail(message) or _tail(run.stderr) or _tail(str(envelope.get('result', '')))}"), None, usage
         return None, envelope, usage
 
     def _run(self, job: CliJob, prompt: str, schema: str, env: dict) -> Outcome:

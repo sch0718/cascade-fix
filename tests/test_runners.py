@@ -162,6 +162,38 @@ class CodexRunnerTest(RunnerTestBase):
         self.assertEqual(out.status, STATUS_LIMIT)
         self.assertIsNone(out.output)
 
+    def test_agent_message_text_does_not_decide_failure_class(self):
+        for message in ("cascade/api.py:401 에서 확인했다", "429 응답의 rate limit 재시도가 빠졌다", "Authentication required 문구를 찾았다"):
+            events = [{"type": "item.completed", "item": {"type": "agent_message", "text": message}},
+                      {"type": "turn.failed", "error": {"message": "stream disconnected before completion"}}]
+            with self.subTest(message=message), mock.patch.dict(
+                    os.environ, {"FAKE_CODEX_EXIT": "1", "FAKE_CODEX_EVENTS": json.dumps(events)}):
+                self.assertEqual(self.run_codex().status, STATUS_ERROR)
+
+    def test_error_events_decide_failure_class(self):
+        cases = {STATUS_LIMIT: {"type": "error", "message": "You've hit your usage limit"},
+                 STATUS_AUTH: {"type": "turn.failed", "error": {"message": "401 Unauthorized"}}}
+        for status, event in cases.items():
+            with self.subTest(status=status), mock.patch.dict(
+                    os.environ, {"FAKE_CODEX_EXIT": "1", "FAKE_CODEX_EVENTS": json.dumps([event])}):
+                self.assertEqual(self.run_codex().status, status)
+
+    def test_truncated_auth_copy_is_not_written_back(self):
+        with mock.patch.dict(os.environ, {"FAKE_CODEX_REFRESH": '{"tokens": {"refre'}):
+            out = self.run_codex()
+        self.assertEqual(out.status, STATUS_OK)
+        self.assertEqual((self.codex_dir / "auth.json").read_text(encoding="utf-8"), AUTH_BEFORE)
+        self.assertIn("JSON", out.detail)
+
+    def test_unexpected_exception_becomes_error_outcome(self):
+        out = self.run_codex(self.job(prompt_path=self.tmp / "missing.md"))
+        self.assertEqual(out.status, STATUS_ERROR)
+        self.assertIn("FileNotFoundError", out.detail)
+        with mock.patch.object(CodexRunner, "_prepare_home", side_effect=OSError("auth.json 사라짐")):
+            out = self.run_codex()
+        self.assertEqual(out.status, STATUS_ERROR)
+        self.assertIn("auth.json 사라짐", out.detail)
+
     def test_missing_result_file_is_error(self):
         env = dict(os.environ)
         env.pop("FAKE_CODEX_RESULT")
@@ -288,6 +320,24 @@ class CursorRunnerTest(RunnerTestBase):
             out = self.run_cursor()
         self.assertEqual(out.status, STATUS_LIMIT)
         self.assertEqual(self.calls("cursor-agent"), 1)
+
+    def test_agent_text_in_result_does_not_decide_failure_class(self):
+        entry = {"result": "cascade/api.py:401 의 rate limit 재시도가 빠졌다", "exit": 1}
+        with mock.patch.dict(os.environ, {"FAKE_CURSOR_RESULTS": json.dumps([entry])}):
+            self.assertEqual(self.run_cursor().status, STATUS_ERROR)
+        entry = {"result": "401 Unauthorized 응답을 처리하지 않는다", "stderr": "crashed", "exit": 1}
+        with mock.patch.dict(os.environ, {"FAKE_CURSOR_RESULTS": json.dumps([entry])}):
+            self.assertEqual(self.run_cursor().status, STATUS_ERROR)
+
+    def test_stderr_decides_failure_class_with_envelope(self):
+        entry = {"result": "", "stderr": "You've hit your usage limit", "exit": 1}
+        with mock.patch.dict(os.environ, {"FAKE_CURSOR_RESULTS": json.dumps([entry])}):
+            self.assertEqual(self.run_cursor().status, STATUS_LIMIT)
+
+    def test_unexpected_exception_becomes_error_outcome(self):
+        out = self.run_cursor(self.cursor_job(prompt_path=self.tmp / "missing.md"))
+        self.assertEqual(out.status, STATUS_ERROR)
+        self.assertIn("FileNotFoundError", out.detail)
 
     def test_auth_failure_is_auth(self):
         entry = {"is_error": True, "result": "Authentication required", "exit": 1}

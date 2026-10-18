@@ -60,6 +60,8 @@ if os.environ.get("FAKE_CODEX_TOUCH_ORIGINAL"):
 if "-o" in args and "FAKE_CODEX_RESULT" in os.environ:
     Path(args[args.index("-o") + 1]).write_text(os.environ["FAKE_CODEX_RESULT"])
 print(json.dumps({"type": "thread.started"}))
+for event in json.loads(os.environ.get("FAKE_CODEX_EVENTS", "[]")):
+    print(json.dumps(event))
 print(json.dumps({"type": "turn.completed", "usage": {
     "input_tokens": 11, "cached_input_tokens": 3, "output_tokens": 7, "reasoning_output_tokens": 2}}))
 sys.stderr.write(os.environ.get("FAKE_CODEX_STDERR", ""))
