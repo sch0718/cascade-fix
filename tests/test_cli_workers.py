@@ -133,6 +133,29 @@ class WorkersCommandTest(WorkersTestBase):
         p = self.args("judge")
         self.assertIn("r1-02:b 모델 ID가 cursor:composer-2.5 이다(기대값 claude-haiku-5-5)", p.stdout)
 
+    def test_workers_force_is_refused_after_judge_and_keeps_results(self):
+        self.start()
+        self.workers()
+        self.args("judge")
+        ledger_before = (self.run_dir / "ledger.json").read_bytes()
+        cli_before = (self.rd() / "stage1-cli.json").read_bytes()
+        results_before = (self.rd() / "results.json").read_bytes()
+        for extra in ((), ("--force",)):
+            p = self.args("workers", "--stage", "stage1", *extra, ok=False)
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn("judge를 이미 했다", p.stdout)
+            self.assertIn("jobs --force", p.stdout)
+        self.assertEqual((self.run_dir / "ledger.json").read_bytes(), ledger_before)
+        self.assertEqual((self.rd() / "stage1-cli.json").read_bytes(), cli_before)
+        self.assertEqual((self.rd() / "results.json").read_bytes(), results_before)
+
+    def test_workers_after_jobs_force_reopens_round_after_judge(self):
+        self.start()
+        self.workers()
+        self.args("judge")
+        self.args("jobs", "--force")
+        self.workers()
+
     def test_workers_command_is_refused_twice_without_force(self):
         self.start()
         self.workers()
@@ -338,6 +361,33 @@ class DocWorkersTest(WorkersTestBase):
         self.workers("checker")
         self.args("judge")
         self.assertEqual([d["outcome"] for d in self.ledger().rounds[0].decisions], ["합의-사실"])
+
+    def test_checker_workers_force_is_refused_after_final_judge(self):
+        self.start_doc("--workers", "external")
+        self.workers()
+        self.args("judge")
+        self.workers("checker")
+        self.args("judge")
+        ledger_before = (self.run_dir / "ledger.json").read_bytes()
+        cli_before = (self.rd() / "checker-cli.json").read_bytes()
+        results_before = (self.rd() / "results.json").read_bytes()
+        for extra in ((), ("--force",)):
+            p = self.args("workers", "--stage", "checker", *extra, ok=False)
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn("judge를 이미 했다", p.stdout)
+            self.assertIn("jobs --force", p.stdout)
+        self.assertEqual((self.run_dir / "ledger.json").read_bytes(), ledger_before)
+        self.assertEqual((self.rd() / "checker-cli.json").read_bytes(), cli_before)
+        self.assertEqual((self.rd() / "results.json").read_bytes(), results_before)
+
+    def test_stage1_workers_force_is_refused_after_final_judge_in_doc_mode(self):
+        self.start_doc("--workers", "external")
+        self.workers()
+        self.args("judge")
+        self.workers("checker")
+        self.args("judge")
+        p = self.args("workers", "--stage", "stage1", "--force", ok=False)
+        self.assertIn("judge를 이미 했다", p.stdout)
 
     def test_jobs_force_discards_checker_state(self):
         self.start_doc("--workers", "external")

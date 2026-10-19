@@ -279,6 +279,12 @@ def workers_done(rnd: RoundRecord, stage: str) -> bool:
     return _last(rnd, f"workers-{stage}") > _last(rnd, source)
 
 
+def judged_after_workers_input(rnd: RoundRecord, stage: str) -> bool:
+    """workers 단계의 입력(stage1은 jobs, checker는 judge 1차)이 마지막으로 바뀐 뒤에 judge가 이미 끝났다."""
+    source = "jobs" if stage == STAGE1 else "judge-checker"
+    return _last(rnd, "judge") > _last(rnd, source)
+
+
 def checker_pending(rnd: RoundRecord) -> bool:
     """judge 1차가 마지막 1단계 갱신(jobs·workers stage1) 뒤에 점검자 작업을 만들었다."""
     return _last(rnd, "judge-checker") > max(_last(rnd, "jobs"), _last(rnd, f"workers-{STAGE1}"))

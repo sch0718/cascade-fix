@@ -492,10 +492,12 @@ def cmd_workers(args) -> int:
     ledger = s.load_ledger(run_dir)
     rnd = s.get_round(ledger, args.round)
     step = f"workers-{args.stage}"
-    if s.workers_done(rnd, args.stage) and not args.force:
-        raise s.CliError(f"회차 {rnd.no}의 {step} 단계는 이미 했다. 다시 하려면 --force 를 붙인다")
     if not s.step_done(rnd, "jobs"):
         raise s.CliError(f"회차 {rnd.no}의 jobs 단계를 먼저 한다")
+    if s.judged_after_workers_input(rnd, args.stage):
+        raise s.CliError(f"회차 {rnd.no}의 judge를 이미 했다. 작업자 결과를 다시 만들려면 jobs --force로 회차를 다시 연다")
+    if s.workers_done(rnd, args.stage) and not args.force:
+        raise s.CliError(f"회차 {rnd.no}의 {step} 단계는 이미 했다. 다시 하려면 --force 를 붙인다")
     if args.stage == s.STAGE_CHECKER and not s.checker_pending(rnd):
         raise s.CliError(f"회차 {rnd.no}의 judge 단계를 먼저 한다(1차 호출이 점검자 작업을 만든다)")
     rd = s.round_dir(run_dir, rnd.no)
