@@ -28,6 +28,10 @@ done
 [ -n "$mode" ] || usage
 
 find_cursor() {
+  if [ -n "${CASCADE_CURSOR_AGENT:-}" ]; then
+    [ -f "$CASCADE_CURSOR_AGENT" ] && [ -x "$CASCADE_CURSOR_AGENT" ] && { echo "$CASCADE_CURSOR_AGENT"; return; }
+    return 1
+  fi
   if [ -n "${CURSOR_AGENT:-}" ] && [ -x "$CURSOR_AGENT" ]; then echo "$CURSOR_AGENT"; return; fi
   if command -v cursor-agent >/dev/null 2>&1; then command -v cursor-agent; return; fi
   [ -x "$HOME/.local/bin/cursor-agent" ] && { echo "$HOME/.local/bin/cursor-agent"; return; }

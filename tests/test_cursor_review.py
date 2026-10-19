@@ -63,6 +63,7 @@ class CursorReviewTest(unittest.TestCase):
         full_env["FAKE_CURSOR_OUT"] = str(self.capture)
         full_env["FAKE_CURSOR_JSON"] = DEFAULT_JSON
         full_env.pop("CURSOR_AGENT", None)
+        full_env.pop("CASCADE_CURSOR_AGENT", None)
         if env:
             full_env.update(env)
         return subprocess.run(["bash", str(SCRIPT), *args], capture_output=True, text=True, env=full_env, cwd=cwd)
@@ -284,6 +285,32 @@ class CursorReviewTest(unittest.TestCase):
         other.chmod(other.stat().st_mode | stat.S_IXUSR)
         out = self.run_script("--doc", str(self.repo / "a.md"), "--out", str(self.out),
                               env={"CURSOR_AGENT": str(other)}, path="/usr/bin:/bin")
+        self.assertEqual(out.returncode, 0, out.stderr)
+
+    def test_cascade_cursor_agent_alone_is_found_without_path_or_local_bin(self):
+        other = self.bin / "other-agent"
+        other.write_text(FAKE_CURSOR, encoding="utf-8")
+        other.chmod(other.stat().st_mode | stat.S_IXUSR)
+        out = self.run_script("--doc", str(self.repo / "a.md"), "--out", str(self.out),
+                              env={"CASCADE_CURSOR_AGENT": str(other)}, path="/usr/bin:/bin")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertTrue(self.capture.exists())
+
+    def test_cascade_cursor_agent_that_is_not_executable_exits_69_even_if_path_has_agent(self):
+        out = self.run_script("--doc", str(self.repo / "a.md"), "--out", str(self.out),
+                              env={"CASCADE_CURSOR_AGENT": str(self.bin / "no-such-agent")})
+        self.assertEqual(out.returncode, 69)
+        self.assertFalse(self.capture.exists())
+
+    def test_cascade_cursor_agent_wins_over_cursor_agent(self):
+        winner = self.bin / "winner-agent"
+        winner.write_text(FAKE_CURSOR, encoding="utf-8")
+        winner.chmod(winner.stat().st_mode | stat.S_IXUSR)
+        loser = self.bin / "loser-agent"
+        loser.write_text("#!/usr/bin/env bash\nexit 9\n", encoding="utf-8")
+        loser.chmod(loser.stat().st_mode | stat.S_IXUSR)
+        out = self.run_script("--doc", str(self.repo / "a.md"), "--out", str(self.out),
+                              env={"CASCADE_CURSOR_AGENT": str(winner), "CURSOR_AGENT": str(loser)})
         self.assertEqual(out.returncode, 0, out.stderr)
 
     def test_known_list_is_included_for_doc(self):
