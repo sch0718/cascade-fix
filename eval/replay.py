@@ -158,9 +158,6 @@ def run_item(item: dict, out: Path, repos_toml: Path, fake: Path | None, workers
             return
         item_fake = fake / item["id"]
         stage1 = round_dir / "stage1.json"
-        fallback_args = round_dir / "stage1-fallback-args.json"
-        if fallback_args.is_file():
-            shutil.copyfile(item_fake / "stage1-fallback.json", round_dir / "stage1-fallback.json")
         judge = ["judge", "--run-dir", rd, "--round", ROUND]
         if has_jobs(round_dir / "stage1-args.json"):
             shutil.copyfile(item_fake / "stage1.json", stage1)
@@ -212,12 +209,15 @@ def main(argv=None) -> int:
     parser.add_argument("--out", required=True)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--workers", choices=(WORKERS_CLAUDE, WORKERS_EXTERNAL), default=WORKERS_CLAUDE,
-                        help="작업자. external이면 CLI 작업을 workers 단계로 돌리고 남은 Claude 작업만 Workflow(또는 --fake-results)에 맡긴다")
-    parser.add_argument("--fake-results", help="<id>/stage1.json(·adj.json·checker.json·stage1-fallback.json)을 두는 폴더. 모델을 부르지 않는다. "
-                        "Claude 작업이 없는 stage1.json은 필요 없다")
+                        help="작업자. external이면 CLI 작업을 workers 단계로 돌리고 남은 Claude 작업만 Workflow에 맡긴다. "
+                        "--fake-results와 함께 쓸 수 없다")
+    parser.add_argument("--fake-results", help="<id>/stage1.json(·adj.json·checker.json)을 두는 폴더. 모델을 부르지 않는다. "
+                        "모델을 부르는 external 작업자와 함께 쓸 수 없다")
     parser.add_argument("--repos-toml", default=str(default_repos_toml()))
     parser.add_argument("--collect", action="store_true", help="모델을 부르는 실제 실행이 끝난 항목의 원장을 모으고 정리한다")
     args = parser.parse_args(argv)
+    if args.fake_results and args.workers == WORKERS_EXTERNAL:
+        parser.error("--fake-results는 모델을 부르지 않으므로 --workers external과 함께 쓸 수 없다(external은 Codex·Cursor를 부른다)")
     items = load_sample(args.sample)[: args.limit]
     out, toml = Path(args.out), Path(args.repos_toml)
     out.mkdir(parents=True, exist_ok=True)

@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import replay  # noqa: E402
 import score  # noqa: E402
 from fake_cli import fenced, result_json  # noqa: E402
-from helpers import git, make_repo, write_repos_toml  # noqa: E402
+from helpers import git, make_repo, run_cli, write_repos_toml  # noqa: E402
 from test_cli_workers import LIMIT_ENTRY, WorkersTestBase  # noqa: E402
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -451,32 +451,61 @@ class ReplayExternalTest(WorkersTestBase):
             code = replay.main(argv)
         return code, buf.getvalue()
 
-    def test_replay_external_runs_workers_with_fake_cli(self):
-        code, _ = self.replay("--workers", "external", "--fake-results", str(self.fake))
+    def pending(self):
+        meta = json.loads((self.out / "item-01" / "meta.json").read_text(encoding="utf-8"))
+        return Path(meta["pending_run_dir"])
+
+    def finish_by_cli(self):
+        base = self.out / "item-01"
+        env = {**self.env, "CASCADE_REPOS_TOML": str(base / "repos.toml")}
+        run_dir = str(self.pending())
+        for command in ("judge", "apply", "report"):
+            extra = ["--round", "1"] if command != "report" else []
+            p = run_cli([command, "--run-dir", run_dir, *extra], cwd=base / "wt", env=env)
+            self.assertEqual(p.returncode, 0, f"{command}\n{p.stdout}\n{p.stderr}")
+
+    def test_replay_external_runs_workers_with_fake_cli_then_collects(self):
+        code, _ = self.replay("--workers", "external")
+        self.assertEqual(code, 0)
+        run_dir = self.pending()
+        self.assertTrue((run_dir / "round-1" / "stage1-cli.json").is_file())
+        self.assertFalse((run_dir / "round-1" / "stage1.json").exists())
+        self.finish_by_cli()
+        code, _ = self.replay("--collect")
         self.assertEqual(code, 0)
         base = self.out / "item-01"
         ledger = json.loads((base / "ledger.json").read_text(encoding="utf-8"))
         self.assertEqual(ledger["workers_choice"], "external")
         self.assertEqual(ledger["rounds"][0]["decisions"][0]["outcome"], "합의-아님")
-        rnd = base / "run" / "round-1"
-        self.assertTrue((rnd / "stage1-cli.json").is_file())
-        self.assertFalse((rnd / "stage1.json").exists())
         self.assertTrue((base / "run" / "report.md").is_file())
         m = score.compute(self.out, score.load_sample(self.sample()))
         self.assertEqual((m["agree"], m["judged"], m["cli_jobs"], m["fallback"]), (1, 1, 2, {}))
         self.assertEqual(m["claude_calls"], {"sonnet": 0, "haiku": 0, "opus": 0})
         self.assertEqual(set(m["usage"]), {"codex", "cursor"})
 
-    def test_replay_external_uses_fake_fallback_results_for_failed_cli_job(self):
+    def test_replay_external_uses_fallback_results_for_failed_cli_job(self):
         self.cursor_results([dict(LIMIT_ENTRY, match="r1-01-b")])
-        write_json(self.fake / "item-01" / "stage1-fallback.json", {"results": [
+        code, _ = self.replay("--workers", "external")
+        self.assertEqual(code, 0)
+        write_json(self.pending() / "round-1" / "stage1-fallback.json", {"results": [
             {"id": "r1-01:b", "output": {"verdict": "아님", "needs_design_decision": False, "reason": "쓰임이 없다",
                                          "verify": [], "model_id": "claude-haiku-5-5"}}]})
-        code, _ = self.replay("--workers", "external", "--fake-results", str(self.fake))
+        self.finish_by_cli()
+        code, _ = self.replay("--collect")
         self.assertEqual(code, 0)
         m = score.compute(self.out, score.load_sample(self.sample()))
         self.assertEqual((m["agree"], m["judged"]), (1, 1))
         self.assertEqual((m["fallback"], m["claude_calls"]["haiku"]), ({"한도": 1}, 1))
+
+    def test_replay_rejects_fake_results_with_external_workers_before_any_cli_call(self):
+        with mock.patch.dict(os.environ, self.env), contextlib.redirect_stderr(io.StringIO()) as err:
+            with self.assertRaises(SystemExit) as ctx:
+                replay.main(["--sample", str(self.sample()), "--out", str(self.out), "--workers", "external",
+                             "--fake-results", str(self.fake)])
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertIn("external", err.getvalue())
+        self.assertIn("모델을 부르지 않", err.getvalue())
+        self.assertFalse((self.out / "item-01").exists())
 
     def test_replay_external_without_fake_results_stops_after_workers(self):
         code, text = self.replay("--workers", "external")

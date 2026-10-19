@@ -66,7 +66,7 @@
 
    외부 작업자(Codex·Cursor)를 재려면 `--workers external`을 준다. 항목마다 `jobs` 뒤에 `workers --stage stage1`을 스스로 돌려 CLI 작업을 끝내고, 대체 실행이나 Claude 몫으로 남은 stage1 작업이 있을 때만 위처럼 멈춘다. 기본값은 `--workers claude`다. 같은 표본을 `--workers claude`와 `--workers external`로 각각 다른 `--out` 아래에 돌린다.
 
-2. 모델 없이 배관만 시험하려면 `--fake-results <폴더>`를 준다. 폴더 안에 `<id>/stage1.json`(필요하면 `adj.json`, `checker.json`)을 두면 `judge`·`adjudicate`·`apply`·`report`·`cleanup`까지 한 번에 돌고 항목마다 워크트리를 지운다. `--workers external`에서 CLI 작업이 모두 끝나 Claude 작업이 없으면 `stage1.json`은 필요 없고, 대체 실행이 생기면 그 결과를 `<id>/stage1-fallback.json`에 둔다.
+2. 모델 없이 배관만 시험하려면 `--fake-results <폴더>`를 준다. 폴더 안에 `<id>/stage1.json`(필요하면 `adj.json`, `checker.json`)을 두면 `judge`·`adjudicate`·`apply`·`report`·`cleanup`까지 한 번에 돌고 항목마다 워크트리를 지운다. `--workers external`은 Codex·Cursor를 실제로 부르므로 `--fake-results`와 함께 쓸 수 없다(함께 주면 오류로 거절한다). 외부 작업자 쪽 배관은 `--fake-results` 없이 가짜 CLI(`CASCADE_CODEX`·`CASCADE_CURSOR_AGENT`)로 시험한다.
 
 3. 채점.
 

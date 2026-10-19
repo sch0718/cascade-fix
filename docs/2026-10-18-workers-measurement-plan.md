@@ -34,7 +34,7 @@ python3 eval/replay.py --sample eval/sample.jsonl --out <결과>/external --work
 - `--workers claude`는 `jobs`까지 만들고 멈춘다. 항목마다 스킬의 Workflow로 stage1을 돌리고 `judge` → `adjudicate` → `apply` → `report`를 이어간 뒤 `--collect`로 모은다(`eval/sample-format.md`의 「돌리는 순서」).
 - `--workers external`은 항목마다 `jobs` 뒤에 `workers --stage stage1`을 스스로 돌려 CLI 작업을 끝낸다. 대체 실행(Claude로 다시 도는 작업)이나 Claude 몫으로 남은 작업이 있을 때만 멈추므로, 그 작업만 Workflow로 돌리고 `judge` 이후를 이어간 뒤 `--collect`로 모은다.
 - 두 실행의 Opus 판가름(`claude-opus-5-5` high)은 그대로다. 바뀌는 것은 A·writer와 B·checker 자리의 작업자뿐이다.
-- 모델을 부르는 실제 실행 전에 `--fake-results`로 배관을 먼저 시험할 수 있다. 모델을 부르지 않는다.
+- 모델을 부르는 실제 실행 전에 `--workers claude`에서 `--fake-results`로 배관을 먼저 시험할 수 있다. 모델을 부르지 않는다. `--workers external`은 Codex·Cursor를 실제로 부르므로 `--fake-results`와 함께 쓸 수 없고, 함께 주면 오류로 거절한다.
 - 한 항목이 오류로 끝나도 나머지는 계속 돈다. 오류 항목은 채점에서 빠지고 표에 따로 센다. 한쪽 실행에서만 빠진 항목이 많으면 두 열의 표본이 달라지므로 「채점한 항목 수」가 같은지 먼저 본다.
 
 ## 3. 채점
