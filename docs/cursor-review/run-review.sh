@@ -25,6 +25,7 @@ while [ $# -gt 0 ]; do
     *) usage ;;
   esac
 done
+[ -z "$out" ] || rm -f "$out.final"
 [ -n "$mode" ] || usage
 
 find_cursor() {

@@ -313,6 +313,28 @@ class CursorReviewTest(unittest.TestCase):
                               env={"CASCADE_CURSOR_AGENT": str(winner), "CURSOR_AGENT": str(loser)})
         self.assertEqual(out.returncode, 0, out.stderr)
 
+    def assert_rerun_removes_previous_final(self, expected, doc=None, env=None):
+        first = self.run_script("--doc", str(self.repo / "a.md"), "--out", str(self.out))
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertNotEqual(self.final_text(), "")
+        again = self.run_script("--doc", doc or str(self.repo / "a.md"), "--out", str(self.out), env=env)
+        self.assertEqual(again.returncode, expected, again.stderr)
+        final = Path(f"{self.out}.final")
+        self.assertTrue(not final.exists() or final.read_text(encoding="utf-8") == "")
+
+    def test_rerun_after_login_expired_removes_previous_final(self):
+        self.assert_rerun_removes_previous_final(77, env={"FAKE_CURSOR_STATUS": "Not logged in"})
+
+    def test_rerun_with_missing_agent_removes_previous_final(self):
+        self.assert_rerun_removes_previous_final(69, env={"CASCADE_CURSOR_AGENT": str(self.bin / "no-such-agent")})
+
+    def test_rerun_with_missing_doc_removes_previous_final(self):
+        self.assert_rerun_removes_previous_final(3, doc=str(self.repo / "none.md"))
+
+    def test_rerun_with_usage_limit_removes_previous_final(self):
+        body = '{"type":"result","is_error":true,"result":"You\'ve hit your usage limit","session_id":"s"}'
+        self.assert_rerun_removes_previous_final(75, env={"FAKE_CURSOR_JSON": body, "FAKE_CURSOR_EXIT": "1"})
+
     def test_known_list_is_included_for_doc(self):
         known = self.repo.parent / "known.md"
         known.write_text("- a.md:1 — 이미 기각한 지적: 아님\n", encoding="utf-8")

@@ -150,6 +150,18 @@ class CursorReviewerTest(CliTestBase):
         self.assertIn("Cursor", p.stdout)
         self.assertIn("인증 실패 흔적", p.stdout)
 
+    def test_removed_final_after_login_expired_rerun_stops_opinion(self):
+        log = self.run_to_opinion()
+        final = Path(f"{log}.final")
+        final.write_text("이전 회차 의견\n", encoding="utf-8")
+        final.unlink()
+        log.write_text("Not logged in\n", encoding="utf-8")
+        p = self.cli("opinion", "--run-dir", str(self.run_dir), "--round", "1", "--id", "r1-02", "--result", str(final), ok=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("결과 파일이 없다", p.stdout)
+        self.assertIn("cursor-agent login", p.stdout)
+        self.assertNotIn("r1-02", self.ledger().opinions)
+
     def test_cursor_usage_limit_is_pointed_out(self):
         log = self.run_to_opinion()
         final = Path(f"{log}.final")
