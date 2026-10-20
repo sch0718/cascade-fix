@@ -362,6 +362,26 @@ class ReplayTest(unittest.TestCase):
         m = score.compute(self.out, score.load_sample(sample))
         self.assertEqual((m["agree"], m["judged"]), (1, 1))
 
+    def test_replay_fake_skips_adjudicate_without_adj_args(self):
+        sample = self.write_sample([self.item("item-01")])
+        fake = self.write_fake("item-01")
+        write_json(fake / "item-01" / "adj.json", {"results": [
+            {"id": "r1-01:adjudicator", "output": {"verdict": "사실", "needs_design_decision": False, "reason": "x",
+                                                   "verify": [], "model_id": "claude-opus-5-5"}}]})
+        self.assertEqual(self.run_replay(sample, "--fake-results", str(fake)), 0)
+        base = self.out / "item-01"
+        self.assertNotIn("error", json.loads((base / "meta.json").read_text(encoding="utf-8")))
+        ledger = json.loads((base / "ledger.json").read_text(encoding="utf-8"))
+        self.assertEqual(ledger["rounds"][0]["decisions"][0]["outcome"], "합의-아님")
+        self.assertFalse((base / "run" / "round-1" / "adj.json").exists())
+
+    def test_replay_passes_adopt_on_both_pass_to_init(self):
+        sample = self.write_sample([self.item("item-01")])
+        fake = self.write_fake("item-01")
+        self.assertEqual(self.run_replay(sample, "--fake-results", str(fake), "--adopt-on-both-pass"), 0)
+        ledger = json.loads((self.out / "item-01" / "ledger.json").read_text(encoding="utf-8"))
+        self.assertIs(ledger["adopt_on_both_pass"], True)
+
     def test_replay_worktree_add_skips_user_hooks(self):
         marker = self.tmp / "hook-ran"
         hook = self.repo / ".git" / "hooks" / "post-checkout"
