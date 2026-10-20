@@ -33,6 +33,9 @@ DESIGN_CHOICE = "선택: [ ] 직접 정함 [ ] 보류"
 DESIGN_CHOICE_WITH_OPTIONS = "선택: [ ] 선택지 ___ [ ] 직접 정함 [ ] 보류"
 DESIGN_CHOICE_WITH_PATCH = "선택: [ ] 작성자 안 채택(패치 직접 적용) [ ] 직접 정함 [ ] 보류"
 DRY_RUN_NOT_APPLIED = "적용 안 됨(dry-run)"
+REPLY_ADOPTED = "반영했습니다."
+REPLY_REBUTTAL = "확인 결과 고치지 않았습니다."
+REPLY_PENDING = "검토 중입니다."
 UNTIMED_STEPS = ("report",)
 TABLE_FOOTNOTE = (
     "합의-아님은 합의 칸에 한 번 세고 사람이 볼 목록의 반박 칸에도 오른다. "
@@ -131,11 +134,11 @@ def _failed_items(apply: dict | None) -> list[tuple[str, str]]:
     return items
 
 
-def _failed_ids(ledger: Ledger, run_dir: Path | None) -> dict[str, str]:
-    failed: dict[str, str] = {}
+def _failed_ids(ledger: Ledger, run_dir: Path | None) -> dict[tuple[int, str], str]:
+    failed: dict[tuple[int, str], str] = {}
     for rnd in ledger.rounds:
         for fid, tail in _failed_items(_load_apply(run_dir, rnd.no)):
-            failed[fid] = tail
+            failed[(rnd.no, fid)] = tail
     return failed
 
 
@@ -228,8 +231,13 @@ def _bucket_section(name: str, items: list[tuple[int, dict, dict]], ledger: Ledg
             if opinion:
                 out.append(f"  - {reviewer_label(ledger.reviewer)} 의견:")
                 out.extend(f"    > {line}" for line in opinion.splitlines()[:OPINION_MAX_LINES])
-            out.append(f"  - 패치 a: round-{round_no}/patch-{fid}-a.diff")
-            out.append(f"  - 패치 b: round-{round_no}/patch-{fid}-b.diff")
+            if ledger.mode == "doc":
+                out.append(f"  - 패치 작성자: round-{round_no}/patch-{fid}-writer.diff")
+            else:
+                out.append(f"  - 패치 a: round-{round_no}/patch-{fid}-a.diff")
+                out.append(f"  - 패치 b: round-{round_no}/patch-{fid}-b.diff")
+            if run_dir is not None and (run_dir / f"round-{round_no}" / f"patch-{fid}-adj.diff").is_file():
+                out.append(f"  - 패치 판가름: round-{round_no}/patch-{fid}-adj.diff")
         else:
             out.extend(_indent_reasons(decision.get("reasons", [])))
             out.append(f"  - {HOLD_CHOICE}")
@@ -240,14 +248,15 @@ def _bucket_section(name: str, items: list[tuple[int, dict, dict]], ledger: Ledg
     return out
 
 
-def _round_row(rnd, ledger: Ledger) -> str:
+def _round_row(rnd) -> str:
     consensus = sum(1 for d in rnd.decisions
                     if d["outcome"] in (OUTCOME_AGREED_FACT, OUTCOME_AGREED_NO) or d.get("adopted_as") == OUTCOME_AGREED_FACT)
     sent = sum(1 for d in rnd.decisions if _was_adjudicated(d))
     adjudicated = sum(1 for d in rnd.decisions
                       if (d["outcome"] == OUTCOME_ADJUDICATE and d.get("patch_from") is not None)
                       or d.get("adopted_as") == OUTCOME_ADJUDICATE)
-    codex = sum(1 for f in rnd.findings if f.get("id") in ledger.opinions)
+    steps = {e.get("step") for e in rnd.events}
+    codex = sum(1 for f in rnd.findings if f"opinion:{f.get('id')}" in steps)
     human = sum(
         1
         for d in rnd.decisions
@@ -257,16 +266,22 @@ def _round_row(rnd, ledger: Ledger) -> str:
     return f"| {rnd.no} | {len(rnd.findings)} | {consensus} | {sent} | {adjudicated} | {codex} | {human} |"
 
 
-def _adopted_pairs(ledger: Ledger, failed: dict[str, str]) -> list[tuple[dict, dict]]:
+def _adopted_pairs(ledger: Ledger, failed: dict[tuple[int, str], str]) -> list[tuple[dict, dict]]:
     pairs = []
     for rnd in ledger.rounds:
         for d in rnd.decisions:
-            if _is_adopted(d) and d["finding_id"] not in failed:
+            if _is_adopted(d) and (rnd.no, d["finding_id"]) not in failed:
                 pairs.append((_finding_of(rnd, d["finding_id"]), d))
     return pairs
 
 
-def _commit_message(ledger: Ledger, failed: dict[str, str]) -> str:
+def _bullet(finding: dict) -> str:
+    head = f"- {finding['id']} {finding.get('location', '-')}"
+    first = _first_line(finding.get("body", ""))
+    return f"{head}: {first}" if first else head
+
+
+def _commit_message(ledger: Ledger, failed: dict[tuple[int, str], str]) -> str:
     pairs = _adopted_pairs(ledger, failed)
     if not pairs:
         return ""
@@ -275,7 +290,7 @@ def _commit_message(ledger: Ledger, failed: dict[str, str]) -> str:
         subject = f"fix: {first}" if first else f"fix: 리뷰 지적 {pairs[0][0]['id']} 반영"
     else:
         subject = f"fix: {len(pairs)}건의 리뷰 지적 반영"
-    bullets = [f"- {f['id']} {f.get('location', '-')}: {_first_line(f.get('body', ''))}" for f, _ in pairs]
+    bullets = [_bullet(f) for f, _ in pairs]
     return "\n".join([subject, "", *bullets]) + "\n"
 
 
@@ -287,39 +302,75 @@ def _final_decisions(ledger: Ledger) -> dict[str, tuple[int, dict]]:
     return final
 
 
-def _reply_drafts(ledger: Ledger, run_dir: Path | None, failed: dict[str, str]) -> dict[str, str]:
-    final = _final_decisions(ledger)
-    drafts: dict[str, str] = {}
+def _thread_findings(ledger: Ledger) -> dict[str, list[dict]]:
+    threads: dict[str, list[dict]] = {}
     for rnd in ledger.rounds:
         for f in rnd.findings:
             thread_id = f.get("thread_id")
             if not thread_id:
                 continue
-            entry = final.get(f["id"])
-            if entry is None:
-                drafts[thread_id] = "검토 중입니다. 미판정"
-                continue
-            round_no, d = entry
-            reasons = d.get("reasons", [])
-            if _is_adopted(d) and f["id"] in failed:
-                drafts[thread_id] = f"적용 실패: {_first_line(failed[f['id']])}. 검토 중입니다."
-            elif _is_adopted(d):
-                drafts[thread_id] = " ".join(["반영했습니다.", *reasons[:1]]).strip()
-            elif _bucket_of(d) == BUCKET_REBUTTAL:
-                lines = _judge_lines(d, _load_results(run_dir, round_no))
-                drafts[thread_id] = " ".join(["확인 결과", " / ".join(lines)]).strip()
-            else:
-                drafts[thread_id] = f"검토 중입니다. {d['outcome']}"
+            items = threads.setdefault(thread_id, [])
+            if all(item["id"] != f["id"] for item in items):
+                items.append(f)
+    return threads
+
+
+def _rebuttal_grounds(decision: dict, results: dict | None) -> list[str]:
+    fid = decision["finding_id"]
+    reasons = decision.get("reasons", [])
+    if decision["outcome"] == OUTCOME_ADJUDICATE:
+        opus = _worker_reason(results, fid, "adjudicator")
+        prefix = f"{ADJUDICATION_MARK}:"
+        notes = [r[len(prefix):].strip() for r in reasons if r.startswith(prefix) and r != ADJUDICATED_NO]
+        grounds = [opus] if opus else notes[-1:]
+    else:
+        a = _worker_reason(results, fid, "a")
+        b = _worker_reason(results, fid, "b")
+        grounds = [a, b] if a and b else [r.split(":", 1)[1].strip() for r in reasons if r.startswith(("a:", "b:"))]
+    return [g for g in dict.fromkeys(grounds) if g]
+
+
+def _finding_reply(fid: str, entry: tuple[int, dict] | None, run_dir: Path | None,
+                   failed: dict[tuple[int, str], str], summary: str) -> str:
+    if entry is None:
+        return REPLY_PENDING
+    round_no, d = entry
+    if _is_adopted(d) and (round_no, fid) in failed:
+        return f"적용 실패: {_first_line(failed[(round_no, fid)])}. {REPLY_PENDING}"
+    if _is_adopted(d):
+        return " ".join([REPLY_ADOPTED, summary]).strip()
+    if _bucket_of(d) == BUCKET_REBUTTAL:
+        grounds = _rebuttal_grounds(d, _load_results(run_dir, round_no))
+        return " ".join([REPLY_REBUTTAL, " / ".join(grounds)]).strip()
+    return REPLY_PENDING
+
+
+def _reply_drafts(ledger: Ledger, run_dir: Path | None, failed: dict[tuple[int, str], str]) -> dict[str, str]:
+    final = _final_decisions(ledger)
+    drafts: dict[str, str] = {}
+    for thread_id, findings in _thread_findings(ledger).items():
+        if len(findings) == 1:
+            f = findings[0]
+            drafts[thread_id] = _finding_reply(f["id"], final.get(f["id"]), run_dir, failed, _first_line(f.get("body", "")))
+            continue
+        paragraphs = []
+        for f in findings:
+            summary = _first_line(f.get("body", ""))
+            reply = _finding_reply(f["id"], final.get(f["id"]), run_dir, failed, "")
+            paragraphs.append(f"> {summary}\n{reply}" if summary else reply)
+        drafts[thread_id] = "\n\n".join(paragraphs)
     return drafts
 
 
-def _resolve_targets(ledger: Ledger, failed: dict[str, str]) -> list[str]:
-    targets = []
-    for f, _ in _adopted_pairs(ledger, failed):
-        thread_id = f.get("thread_id")
-        if thread_id and thread_id not in targets:
-            targets.append(thread_id)
-    return targets
+def _resolve_targets(ledger: Ledger, failed: dict[tuple[int, str], str]) -> list[str]:
+    final = _final_decisions(ledger)
+
+    def settled(fid: str) -> bool:
+        entry = final.get(fid)
+        return entry is not None and _is_adopted(entry[1]) and (entry[0], fid) not in failed
+
+    return [thread_id for thread_id, findings in _thread_findings(ledger).items()
+            if all(settled(f["id"]) for f in findings)]
 
 
 def _prepared_section(ledger: Ledger, run_dir: Path | None) -> list[str]:
@@ -452,7 +503,7 @@ def render(ledger: Ledger, dry_run: bool, run_dir: Path | None = None) -> str:
             "",
             f"| 회차 | 지적 | 합의 | 판가름 회부 | 판가름 채택 | {reviewer_label(ledger.reviewer)} 검토 | 사람 |",
             "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
-            *[_round_row(rnd, ledger) for rnd in ledger.rounds],
+            *[_round_row(rnd) for rnd in ledger.rounds],
             "",
             TABLE_FOOTNOTE,
             "",
