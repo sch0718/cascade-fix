@@ -115,7 +115,7 @@ def _python_import_pattern(rel: Path) -> re.Pattern | None:
     return re.compile(
         rf"^[ \t]*(?:import\s+(?:[\w.]+\s*,\s*)*(?:{alt})\b"
         rf"|from\s+(?:\.*(?:{alt}))\s+import\b"
-        rf"|from\s+(?:{package})\s+import\s+[^\n]*\b{stem}\b)",
+        rf"|from\s+(?:{package})\s+import\s+(?:\((?:[^)#]|#[^\n]*\n)*?|[^\n#]*)\b{stem}\b)",
         re.M,
     )
 
@@ -127,9 +127,17 @@ def _js_import_pattern(rel: Path) -> re.Pattern:
     )
 
 
+def _read_text(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
 def related_tests(root: Path, changed: list[str]) -> list[str]:
     root = Path(root)
     all_tests = [p for p in _iter_files(root) if TEST_NAME.match(p.name)]
+    texts: dict[Path, str | None] = {}
     found: set[str] = set()
     for rel_str in changed:
         rel = Path(rel_str)
@@ -147,11 +155,10 @@ def related_tests(root: Path, changed: list[str]) -> list[str]:
             elif TEST_DIRS & set(test_rel.parts[:-1]) and test.stem in name_matches:
                 found.add(test_rel.as_posix())
             elif import_pattern is not None:
-                try:
-                    text = test.read_text(encoding="utf-8")
-                except (OSError, UnicodeDecodeError):
-                    continue
-                if import_pattern.search(text):
+                if test not in texts:
+                    texts[test] = _read_text(test)
+                text = texts[test]
+                if text is not None and import_pattern.search(text):
                     found.add(test_rel.as_posix())
     return sorted(found)
 
@@ -291,7 +298,7 @@ def repro_cmds(finding: Finding) -> list[str]:
     for match in FENCE.finditer(paragraph):
         lines = [line.strip() for line in match.group(2).splitlines()]
         prompted = [line[2:].strip() for line in lines if line.startswith("$ ")]
-        cmds += [line for line in (prompted if prompted else lines) if line]
+        cmds += [line for line in (prompted if prompted else lines) if line and not line.startswith("#")]
     return cmds
 
 
