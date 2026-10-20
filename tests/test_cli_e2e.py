@@ -942,6 +942,31 @@ class CliSafetyTest(CliTestBase):
         self.assertEqual(self.ledger().rounds[0].adopted, ["r1-01", "r1-02"])
         self.assertEqual(sum(1 for e in self.ledger().rounds[0].events if e["step"] == "apply-patched"), 1)
 
+    def test_apply_rerun_after_snapshot_failure_keeps_patched_record(self):
+        state = {}
+
+        def break_snapshot_branch():
+            state["branch"] = self.ledger().snapshot["branch"]
+            state["commit"] = git(self.repo, "rev-parse", state["branch"])
+            git(self.repo, "branch", "-D", state["branch"])
+
+        cli = self.cli
+        self.cli = lambda *args, ok=True: cli(*args, ok=ok and args[0] != "apply")
+        p = self.run_to_apply(before_apply=break_snapshot_branch)
+        self.cli = cli
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("return a * b", (self.repo / "calc.py").read_text(encoding="utf-8"))
+        self.assertTrue(any(e["step"] == "apply-patched" for e in self.ledger().rounds[0].events))
+        git(self.repo, "branch", state["branch"], state["commit"])
+        p = self.cli("apply", "--run-dir", str(self.run_dir), "--round", "1")
+        self.assertIn("적용을 건너뛰고", p.stdout)
+        apply = json.loads((self.run_dir / "round-1" / "apply.json").read_text(encoding="utf-8"))
+        self.assertEqual((apply["applied"], apply["failed"]), (["r1-01", "r1-02"], []))
+        rnd = self.ledger().rounds[0]
+        self.assertEqual(rnd.adopted, ["r1-01", "r1-02"])
+        self.assertTrue(rnd.result_commit)
+        self.assertNotEqual(rnd.result_commit, state["commit"])
+
     def test_recheck_diff_excludes_test_artifacts_and_other_user_edits(self):
         toml = write_repos_toml(self.tmp, {str(self.repo): {
             "tests": ["python3 -m unittest {files}"],

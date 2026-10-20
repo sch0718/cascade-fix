@@ -864,9 +864,14 @@ def _patch_dry_run(run_dir, ledger, rnd, rd, patches) -> Path:
 
 def _patch_user_tree(run_dir, ledger, rnd, rd, patches, root) -> None:
     report = apply_all(root, patches, s.external_docs(ledger))
-    rnd.result_commit = snapshot_tree(s.snapshot_of(ledger), list(s.external_docs(ledger).values()))
     _record_apply(run_dir, ledger, rnd, rd, report, report.to_dict(), patches)
     print(f"적용 {len(report.applied)}건, 실패 {len(report.failed)}건")
+    _snapshot_result(run_dir, ledger, rnd)
+
+
+def _snapshot_result(run_dir, ledger, rnd) -> None:
+    rnd.result_commit = snapshot_tree(s.snapshot_of(ledger), list(s.external_docs(ledger).values()))
+    s.save_ledger(run_dir, ledger)
 
 
 def _remove_round_worktrees(ledger: Ledger, rnd: RoundRecord) -> None:
@@ -895,6 +900,8 @@ def cmd_apply(args) -> int:
         data = s.read_json(rd / "apply.json")
         if ledger.dry_run:
             recheck_repo = data.get("result_worktree", recheck_repo)
+        elif not rnd.result_commit:
+            _snapshot_result(run_dir, ledger, rnd)
     else:
         patches = _adopted_patches(rnd, rd)
         if ledger.dry_run:
