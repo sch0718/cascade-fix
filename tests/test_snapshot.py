@@ -248,5 +248,13 @@ class SnapshotTest(unittest.TestCase):
         self.assertEqual((old_wt / "a.py").read_text(), "x=1\n")
         self.assertEqual((new_wt / "a.py").read_text(), "x=2\n")
 
+    def test_make_repo_ignores_global_gpgsign(self):
+        global_cfg = self.tmp / "gitconfig"
+        global_cfg.write_text("[commit]\n\tgpgsign = true\n[gpg]\n\tprogram = false\n")
+        with mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(global_cfg), "GIT_CONFIG_NOSYSTEM": "1"}):
+            repo = make_repo(self.tmp / "repo", {"a.py": "x=1\n"})
+        self.assertEqual(git(repo, "config", "--local", "commit.gpgsign"), "false")
+        self.assertRegex(git(repo, "rev-parse", "HEAD"), r"^[0-9a-f]{40}$")
+
 if __name__ == "__main__":
     unittest.main()

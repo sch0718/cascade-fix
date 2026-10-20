@@ -362,6 +362,37 @@ class ReplayTest(unittest.TestCase):
         m = score.compute(self.out, score.load_sample(sample))
         self.assertEqual((m["agree"], m["judged"]), (1, 1))
 
+    def test_replay_doc_mode_uses_fake_results_and_writes_ledgers(self):
+        (self.repo / "plan.md").write_text("# 계획\n\n1단계는 `calc.py`를 고친다.\n", encoding="utf-8")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-qm", "plan")
+        item = {"id": "doc-01", "repo": str(self.repo), "commit": git(self.repo, "rev-parse", "HEAD"),
+                "source": "codex-doc", "doc": "plan.md",
+                "finding": {**FINDING, "source": "codex-doc", "location": "plan.md:3", "body": "단계가 모호하다"},
+                "truth": {"verdict": "아님", "accepted_patch": None}, "baseline_opus_calls": 1}
+        sample = self.write_sample([item])
+        fake = self.tmp / "fake"
+        write_json(fake / "doc-01" / "stage1.json", {"results": [
+            {"id": f"r1-01:{r}", "output": {"verdict": "아님", "needs_design_decision": False, "reason": "이미 구체적이다",
+                                            "verify": [], "model_id": m}}
+            for r, m in (("a", "claude-sonnet-5-5"), ("b", "claude-haiku-5-5"), ("writer", "claude-sonnet-5-5"))]})
+        self.assertEqual(self.run_replay(sample, "--fake-results", str(fake)), 0)
+        base = self.out / "doc-01"
+        meta = json.loads((base / "meta.json").read_text(encoding="utf-8"))
+        self.assertNotIn("error", meta)
+        ledger = json.loads((base / "ledger.json").read_text(encoding="utf-8"))
+        self.assertEqual((ledger["mode"], ledger["source"]), ("doc", "codex-doc"))
+        self.assertEqual(list(ledger["docs"]), ["plan.md"])
+        self.assertEqual(ledger["rounds"][0]["decisions"][0]["outcome"], "합의-아님")
+        self.assertTrue((base / "run" / "round-1" / "results.json").is_file())
+        self.assertTrue((base / "run" / "report.md").is_file())
+        self.assertFalse((base / "wt").exists())
+        self.assertEqual(git(self.repo, "worktree", "list", "--porcelain").count("worktree "), 1)
+        self.assertEqual(git(self.repo, "branch", "--list", "cascade-fix/*"), "")
+        self.assertEqual(git(self.repo, "status", "--porcelain"), "")
+        m = score.compute(self.out, score.load_sample(sample))
+        self.assertEqual((m["agree"], m["judged"]), (1, 1))
+
     def test_replay_worktree_add_skips_user_hooks(self):
         marker = self.tmp / "hook-ran"
         hook = self.repo / ".git" / "hooks" / "post-checkout"
