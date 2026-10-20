@@ -105,6 +105,37 @@ class PatchesTest(unittest.TestCase):
         self.assertIn("+++ b/a.py", diff)
         self.assertEqual(patches.changed_files(diff), ["a.py"])
 
+    def test_extract_ignores_user_diff_context_zero(self):
+        body = "".join(f"def f{i}():\n    return {i}\n\n" for i in range(6))
+        repo = make_repo(self.tmp / "ctx", {"m.py": body})
+        git(repo, "config", "diff.context", "0")
+        snap = snapshot.create_snapshot(repo, "run1", [])
+        wt = snapshot.add_worktree(snap, "w1")
+        new = body.replace("def f2():\n    return 2\n\n", "") + "def g():\n    return 9\n\n"
+        (wt / "m.py").write_text(new)
+        rep = patches.apply_all(repo, [("r1-01", patches.extract(wt, snap.commit))])
+        self.assertEqual(rep.failed, [])
+        self.assertEqual((repo / "m.py").read_text(), new)
+
+    def test_changed_files_reads_quoted_paths(self):
+        diff = (
+            'diff --git "a/auth/q\\"x.py" "b/auth/q\\"x.py"\nnew file mode 100644\n'
+            'diff --git "a/t\\tb.py" "b/t\\tb.py"\nnew file mode 100644\n'
+            'diff --git "a/\\355\\225\\234.py" "b/\\355\\225\\234.py"\nnew file mode 100644\n'
+        )
+        self.assertEqual(patches.changed_files(diff), ['auth/q"x.py', "t\tb.py", "한.py"])
+
+    def test_extract_quoted_path_is_listed_and_applies(self):
+        snap = snapshot.create_snapshot(self.repo, "run1", [])
+        wt = snapshot.add_worktree(snap, "w1")
+        (wt / "auth").mkdir()
+        (wt / "auth" / 'q"x.py').write_text("k=1\n")
+        diff = patches.extract(wt, snap.commit)
+        self.assertEqual(patches.changed_files(diff), ['auth/q"x.py'])
+        rep = patches.apply_all(self.repo, [("r1-01", diff)])
+        self.assertEqual(rep.failed, [])
+        self.assertEqual((self.repo / "auth" / 'q"x.py').read_text(), "k=1\n")
+
     def test_extract_covers_rename_mode_and_binary_and_applies(self):
         snap = snapshot.create_snapshot(self.repo, "run1", [])
         wt = snapshot.add_worktree(snap, "w1")
