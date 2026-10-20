@@ -77,7 +77,7 @@ def _agree_on_verdict(a: WorkerResult, b: WorkerResult) -> Decision | None:
     _check_verdict(a)
     _check_verdict(b)
     if a.verdict == VERDICT_UNDECIDED and b.verdict == VERDICT_UNDECIDED:
-        return _decision(a, OUTCOME_UNDECIDABLE, ["호출 실패"])
+        return _decision(a, OUTCOME_UNDECIDABLE, ["둘 다 못 정함", f"a: {a.reason}", f"b: {b.reason}"])
     if a.verdict != b.verdict:
         return _decision(a, OUTCOME_ADJUDICATE, [f"판정이 갈림: a={a.verdict}, b={b.verdict}"])
     if a.verdict == VERDICT_NO:

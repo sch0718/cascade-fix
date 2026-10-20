@@ -110,7 +110,13 @@ class DecideTest(unittest.TestCase):
         b = worker("b", consensus.VERDICT_UNDECIDED)
         d = consensus.decide(a, b, [], [], "", "")
         self.assertEqual(d.outcome, consensus.OUTCOME_UNDECIDABLE)
-        self.assertIn("호출 실패", d.reasons)
+        self.assertEqual(d.reasons, ["둘 다 못 정함", "a: 근거", "b: 근거"])
+
+    def test_both_undecided_keeps_call_failure_per_worker(self):
+        a = worker("a", consensus.VERDICT_UNDECIDED, reason="호출 실패")
+        b = worker("b", consensus.VERDICT_UNDECIDED, reason="요구사항이 불분명")
+        d = consensus.decide(a, b, [], [], "", "")
+        self.assertEqual(d.reasons, ["둘 다 못 정함", "a: 호출 실패", "b: 요구사항이 불분명"])
 
     def test_sensitive_path_never_adopted(self):
         d = consensus.decide(worker("a"), worker("b"), [ok()], [ok()], PATCH_X, PATCH_X, sensitive=True)

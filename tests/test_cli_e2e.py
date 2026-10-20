@@ -797,12 +797,41 @@ class CliSafetyTest(CliTestBase):
         self.assertFalse(cli_steps.step_done(self.ledger().rounds[0], "judge"))
 
         (self.repo / "calc.py").write_text(CALC, encoding="utf-8")
-        git(self.repo, "branch", "stray")
+        self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1))
+
+    def _jobs_then_stage1(self):
+        self.init()
+        self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1")
+        stage1 = self.run_dir / "round-1" / "stage1.json"
+        shutil.copyfile(FIXTURES / "workflow-stage1.json", stage1)
+        return stage1
+
+    def test_judge_warns_and_continues_when_only_branches_change(self):
+        git(self.repo, "branch", "other-session")
+        stage1 = self._jobs_then_stage1()
+        git(self.repo, "branch", "-D", "other-session")
+        git(self.repo, "branch", "fetched")
+        p = self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1))
+        self.assertIn("경고", p.stdout)
+        self.assertIn("- refs/heads/other-session", p.stdout)
+        self.assertIn("+ refs/heads/fetched", p.stdout)
+        self.assertTrue(cli_steps.step_done(self.ledger().rounds[0], "judge"))
+
+    def test_judge_stops_when_user_checkout_switches_branch(self):
+        stage1 = self._jobs_then_stage1()
+        git(self.repo, "switch", "-q", "-c", "side")
         p = self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1), ok=False)
         self.assertEqual(p.returncode, 6, p.stdout)
-        self.assertIn("+ refs/heads/stray", p.stdout)
-        git(self.repo, "branch", "-D", "stray")
-        self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1))
+        self.assertIn("refs/heads/main → refs/heads/side", p.stdout)
+        self.assertFalse(cli_steps.step_done(self.ledger().rounds[0], "judge"))
+
+    def test_judge_stops_when_worker_worktree_attaches_to_branch(self):
+        stage1 = self._jobs_then_stage1()
+        git(self.wt("r1-01-a"), "switch", "-q", "-c", "worker-branch")
+        p = self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1), ok=False)
+        self.assertEqual(p.returncode, 6, p.stdout)
+        self.assertIn("r1-01-a refs/heads/worker-branch", p.stdout)
+        self.assertFalse(cli_steps.step_done(self.ledger().rounds[0], "judge"))
 
     def test_baseline_failures_are_excluded_and_setup_runs_in_worktrees(self):
         lint = "python3 -c 'import sys; sys.exit(1)'"

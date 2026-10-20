@@ -136,7 +136,8 @@ Claude·Cursor·`codex-doc` 결과는 형식이 같아 형식으로는 가릴 �
    - `pr-comment`이면 코멘트에서 뽑은 재현 명령을 `round-N/repro-cmds.json`에 쓰고 출력한다. 이 명령은 사용자 셸에서 돈다. 사용자에게 명령 목록을 보이고 승인받은 뒤 `judge`에 `--allow-repro <run_dir>/round-N/repro-cmds.json`으로 넘긴다. 승인이 없으면 재현 검증을 건너뛴다(경고만 낸다).
 3. **Workflow(1단계)** — (`--workers external`이면 아래 「외부 작업자」의 동시 실행을 따른다.) `RJ`(`scripts/run-jobs.js`, 「다음:」 줄에 절대 경로가 나온다)를 Read로 읽어 그 내용을 Workflow 도구의 `script` 입력으로 통째로 넘긴다(`RJ` 경로를 `scriptPath`로 주면 작업 디렉터리 밖이라 거부된다). 첫 실행 결과에 나오는 `Script file:` 경로(Workflow가 저장해 둔 사본)는 `scriptPath`로 받으므로, 이 세션의 둘째 Workflow부터는 그 경로를 `scriptPath`로 넘긴다. `args`는 `stage1-args.json`의 내용(JSON 객체)이다. 작업마다 `{id, label, model, effort, kind, promptPath}`만 있고 프롬프트 본문은 `round-N/prompts/`의 파일에 있다. 프롬프트를 읽어 옮겨 적지 않는다. 반환값 `{results: [...]}`는 완료 알림의 `<output-file>` JSON에서 `.result`를 꺼내 그대로 `round-N/stage1.json`에 저장한다(예: `python3 -c 'import json,sys; json.dump(json.load(open(sys.argv[1]))["result"], open(sys.argv[2], "w"), ensure_ascii=False)' <output-file> <저장 경로>`). 알림 본문의 `<result>`는 `<`·`>`가 `&lt;`·`&gt;`로 바뀌어 보이므로 옮겨 적지 않는다.
 4. **judge** — `CF judge --run-dir <run_dir> --round N --results <run_dir>/round-N/stage1.json [--allow-repro <승인한 목록>]`
-   - 종료 코드 6: jobs 뒤 사용자 저장소(작업 트리·HEAD·stash·브랜치)가 바뀌었다. 작업자가 워크트리 밖을 건드렸을 수 있다. 출력된 `git diff --stat`을 사용자에게 보이고 멈춘다. `adjudicate`도 같은 검사를 한다.
+   - 종료 코드 6: jobs 뒤 사용자 저장소(작업 트리·HEAD·현재 브랜치·stash)가 바뀌었거나 작업자 워크트리가 브랜치에 붙었다. 작업자가 워크트리 밖을 건드렸을 수 있다. 출력된 `git diff --stat`을 사용자에게 보이고 멈춘다. `adjudicate`도 같은 검사를 한다.
+   - 브랜치 목록만 바뀌었으면(다른 세션의 fetch·삭제 등) 경고와 바뀐 브랜치를 출력하고 계속한다.
    - 문서 모드에서 `checker-args.json`이 나오면 같은 방식으로 Workflow를 돌려 `round-N/checker.json`에 저장하고, `CF judge … --results …/stage1.json --checker-results …/checker.json`으로 다시 부른다.
    - 판가름 대상이 있으면 `round-N/adj-args.json`이 생긴다.
 5. **Workflow(판가름)** — `adj-args.json`이 있으면 3과 같은 방식으로 돌려 `round-N/adj.json`에 저장한다.
