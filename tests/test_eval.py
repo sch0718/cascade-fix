@@ -416,6 +416,15 @@ class ReplayTest(unittest.TestCase):
         self.assertFalse((base / "wt").exists())
         self.assertEqual(git(self.repo, "worktree", "list", "--porcelain").count("worktree "), 1)
 
+    def test_worktree_toml_matches_key_written_through_symlink(self):
+        link = self.tmp / "link"
+        link.symlink_to(self.tmp)
+        (self.tmp / "cfg").mkdir()
+        toml = write_repos_toml(self.tmp / "cfg", {str(link / "repo"): {"tests": ["make test"]}})
+        dest = self.tmp / "wt.toml"
+        replay.write_worktree_toml(toml, self.repo, self.tmp / "wt", dest)
+        self.assertIn('tests = ["make test"]', dest.read_text(encoding="utf-8"))
+
     def test_replay_rejects_reused_worktree_at_other_commit(self):
         (self.repo / "calc.py").write_text(CALC + "\n", encoding="utf-8")
         git(self.repo, "commit", "-qam", "second")

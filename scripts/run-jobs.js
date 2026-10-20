@@ -164,7 +164,7 @@ const SCHEMAS = {
 }
 // SCHEMAS 끝
 
-const jobs = args.jobs ?? []
+const jobs = args?.jobs ?? []
 log(`jobs: ${jobs.length}건`)
 
 const results = await pipeline(jobs, j => {

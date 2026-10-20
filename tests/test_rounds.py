@@ -1,7 +1,9 @@
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -177,6 +179,35 @@ class LedgerTest(unittest.TestCase):
             ledger.save(path)
             self.assertEqual(rounds.Ledger.load(path).status, "종료")
             self.assertEqual([p.name for p in Path(tmp).iterdir()], ["ledger.json"])
+
+    def test_save_survives_interleaved_save_to_same_path(self):
+        outer = rounds.Ledger(run_id="outer", source="s", mode="doc", root="/", snapshot={}, dry_run=True)
+        inner = rounds.Ledger(run_id="inner", source="s", mode="doc", root="/", snapshot={}, dry_run=True)
+        real_replace = os.replace
+        calls = []
+
+        def replace(src, dst):
+            calls.append(src)
+            if len(calls) == 1:
+                inner.save(dst)
+            real_replace(src, dst)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = rounds.ledger_path(Path(tmp))
+            with mock.patch.object(rounds.os, "replace", side_effect=replace):
+                outer.save(path)
+            self.assertNotEqual(Path(calls[0]).name, Path(calls[1]).name)
+            self.assertEqual(rounds.Ledger.load(path).run_id, "outer")
+            self.assertEqual([p.name for p in Path(tmp).iterdir()], ["ledger.json"])
+
+    def test_save_removes_temp_file_when_replace_fails(self):
+        ledger = rounds.Ledger(run_id="r", source="s", mode="doc", root="/", snapshot={}, dry_run=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = rounds.ledger_path(Path(tmp))
+            with mock.patch.object(rounds.os, "replace", side_effect=OSError("교체 실패")):
+                with self.assertRaises(OSError):
+                    ledger.save(path)
+            self.assertEqual(list(Path(tmp).iterdir()), [])
 
     def test_current_round_none_when_empty(self):
         ledger = rounds.Ledger(run_id="r", source="s", mode="doc", root="/", snapshot={}, dry_run=True)
