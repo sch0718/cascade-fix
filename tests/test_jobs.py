@@ -118,6 +118,22 @@ class Stage1CodeTest(unittest.TestCase):
             self.assertIn("ruff check .", p)
             self.assertIn("두 작업자", p)
 
+    def test_code_prompts_have_design_decision_criteria_for_claude_and_cli_workers(self):
+        wts = {"r1-01": {"a": WT_A, "b": WT_B}}
+        built = [jobs.build_stage1_jobs([F1], CFG, wts, "code"), jobs.build_stage1_jobs([F1], CFG, wts, "code", BOTH_WORKERS)]
+        for args in built:
+            for j in args["jobs"]:
+                p = j["prompt"]
+                self.assertIn("## 설계 결정 기준", p, j["id"])
+                self.assertIn("고치기 전에 지적이 바꾸라는 동작이 의도된 것인지 확인한다.", p)
+                self.assertIn("`git log -p -- <파일>`", p)
+                self.assertIn("지적이 바꾸라는 동작이 주석·커밋 메시지·테스트·문서에 의도로 적혀 있다.", p)
+                self.assertIn("취향·가독성·범위(이 변경에서 할 일인지)", p)
+                self.assertIn("`reason`에 확인한 의도 근거", p)
+                self.assertIn("「설계 결정 기준」에 하나라도 걸리면 true", p)
+        for j in jobs.build_stage1_jobs([F2], CFG, wts_for(F2), "doc")["jobs"]:
+            self.assertNotIn("## 설계 결정 기준", j["prompt"])
+
     def test_template_placeholders_all_filled(self):
         built = [
             jobs.build_stage1_jobs([F1, F2], CFG, wts_for(F1, F2), "code"),
