@@ -550,6 +550,7 @@ def _judge_code(ledger, rnd, f, results, snap, cfg, baseline, repro):
                 recorded += extra
     sensitive = s.is_sensitive(changed_files(pa) + changed_files(pb), cfg)
     d = s.without_empty_patch(decide(a, b, va, vb, pa, pb, sensitive), {"a": pa, "b": pb}, adjudicated=False)
+    d = s.without_lossy_patch(d, {"a": pa, "b": pb})
     workers = {"a": a, "b": b}
     return d, workers, {"a": [r.to_dict() for r in ra], "b": [r.to_dict() for r in rb]}
 
@@ -634,7 +635,9 @@ def cmd_judge(args) -> int:
             a, b = s.worker_from(merged, f.id, "a"), s.worker_from(merged, f.id, "b")
             checker = s.worker_from(merged, f.id, "checker") if f"{f.id}:checker" in merged else None
             d = decide_doc(a, b, checker, doc_problems[f.id])
-            decisions.append(s.without_empty_patch(d, {"writer": writer_patches[f.id]}, adjudicated=False))
+            d = s.without_empty_patch(d, {"writer": writer_patches[f.id]}, adjudicated=False)
+            d = s.without_lossy_patch(d, {"writer": writer_patches[f.id]})
+            decisions.append(s.without_outside_docs(d, {"writer": writer_patches[f.id]}, ledger.docs))
 
     by_id = {f.id: f for f in s.prompt_findings(ledger, findings)}
     adj_items = []
@@ -703,7 +706,10 @@ def cmd_adjudicate(args) -> int:
         if ledger.mode == "code" and s.is_sensitive(changed_files(adj.patch), cfg) and REASON_SENSITIVE not in d.reasons:
             d.reasons.append(REASON_SENSITIVE)
         patches = {role: s.worker_from(merged, f.id, role).patch for role in ("a", "b", "writer")}
-        new = s.without_empty_patch(after_adjudication(d, adj, vadj), {**patches, "adjudicator": adj.patch}, adjudicated=True)
+        patches["adjudicator"] = adj.patch
+        new = s.without_lossy_patch(s.without_empty_patch(after_adjudication(d, adj, vadj), patches, adjudicated=True), patches)
+        if ledger.mode == "doc":
+            new = s.without_outside_docs(new, patches, ledger.docs)
         if adj.patch.strip():
             s.patch_path(rd, f.id, "adjudicator").write_text(adj.patch, encoding="utf-8")
         merged[f"{f.id}:adjudicator"] = adj.to_dict()

@@ -36,6 +36,10 @@ def _decode(data: bytes) -> str:
     return data.decode("utf-8", errors="replace")
 
 
+def is_lossy(diff: str) -> bool:
+    return "\ufffd" in diff
+
+
 def _git_checked(cwd: Path, *args: str) -> str:
     p = _git(cwd, *args)
     if p.returncode != 0:

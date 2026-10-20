@@ -437,6 +437,20 @@ class CliEndToEndTest(CliTestBase):
         self.assertEqual(self.ledger().rounds[0].adopted, [])
         self.assertEqual(self.ledger().status, "종료")
 
+    def test_non_utf8_patch_is_not_adopted(self):
+        self.init()
+        self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1")
+        for name in ("r1-01-a", "r1-01-b"):
+            wt = self.wt(name)
+            (wt / "calc.py").write_text(fix(CALC, "return a - b", "return a + b"), encoding="utf-8")
+            (wt / "notes.txt").write_bytes(b"na\xefve\n")
+        stage1 = self.run_dir / "round-1" / "stage1.json"
+        shutil.copyfile(FIXTURES / "workflow-stage1.json", stage1)
+        self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1))
+        d = {x["finding_id"]: x for x in self.ledger().rounds[0].decisions}
+        self.assertEqual((d["r1-01"]["outcome"], d["r1-01"]["patch_from"]), ("판단불가", None))
+        self.assertEqual(d["r1-01"]["reasons"][-1], "UTF-8 아닌 패치")
+
     def test_missing_full_tests_falls_back_to_tests_with_warning(self):
         toml = write_repos_toml(self.tmp, {str(self.repo): {"tests": ["python3 -m unittest {files}"]}})
         self.env["CASCADE_REPOS_TOML"] = str(toml)
@@ -596,6 +610,33 @@ class CliDocModeTest(CliTestBase):
         self.assertIn("add가 더하게", (self.repo / "plan.md").read_text(encoding="utf-8"))
         self.assertTrue((self.run_dir / "round-1" / "recheck-prompt.md").is_file())
 
+
+    def test_doc_mode_writer_patch_touching_non_doc_file_is_not_adopted(self):
+        (self.repo / "plan.md").write_text(self.PLAN, encoding="utf-8")
+        raw = self.tmp / "doc.final"
+        raw.write_text("Warning\n1. 단계가 모호하다\n   위치: plan.md:3\n   근거: 무엇을 고치는지 없다\n", encoding="utf-8")
+        p = self.cli("init", "--source", "codex-doc", "--input", str(raw), "--doc", str(self.repo / "plan.md"))
+        self.run_dir = Path(next(x for x in p.stdout.splitlines() if x.startswith("run_dir=")).split("=", 1)[1])
+        self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1")
+        wt = self.wt("r1-01-writer")
+        (wt / "plan.md").write_text(self.PLAN.replace("고친다", "고쳐 add가 더하게 한다"), encoding="utf-8")
+        (wt / "auth.py").write_text("TOKEN = 1\n", encoding="utf-8")
+        stage1 = results_json(self.run_dir / "round-1" / "stage1.json", [
+            ("r1-01:a", worker_output("사실", "claude-sonnet-5-5")),
+            ("r1-01:b", worker_output("사실", "claude-haiku-5-5")),
+            ("r1-01:writer", worker_output("사실", "claude-sonnet-5-5")),
+        ])
+        self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1))
+        checker = results_json(self.run_dir / "round-1" / "checker.json", [
+            ("r1-01:checker", {**worker_output("사실", "claude-haiku-5-5"), "checker_ok": True}),
+        ])
+        self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1),
+                 "--checker-results", str(checker))
+        d = self.ledger().rounds[0].decisions[0]
+        self.assertEqual((d["outcome"], d["patch_from"]), ("판단불가", None))
+        self.assertEqual(d["reasons"][-1], "문서 밖 파일 수정: auth.py")
+        self.cli("apply", "--run-dir", str(self.run_dir), "--round", "1")
+        self.assertFalse((self.repo / "auth.py").exists())
 
     def _run_doc_to_apply(self, doc, location):
         doc.write_text(self.PLAN, encoding="utf-8")
