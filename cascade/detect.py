@@ -8,7 +8,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from cascade.config import ConfigError, RepoConfig, detect_candidates, is_sensitive_path, load_repo_config
-from cascade.findings import ParseError, fetch_pr_findings, parse_codex_code, parse_codex_doc
+from cascade.findings import GH_TIMEOUT, ParseError, fetch_pr_findings, parse_codex_code, parse_codex_doc
 from cascade.jobs import RUNNER_CLAUDE
 from cascade.review import (
     CURSOR_SOURCES,
@@ -97,7 +97,11 @@ def pr_info(root: Path, gh: list[str], number: str | None = None) -> tuple[dict 
     if not m:
         return None, f"PR 주소를 해석하지 못했다: {data.get('url')}"
     owner, name, num = m.group(1), m.group(2), int(m.group(3))
-    me = subprocess.run([*gh, "api", "user", "--jq", ".login"], capture_output=True, text=True).stdout.strip()
+    try:
+        me = subprocess.run([*gh, "api", "user", "--jq", ".login"], capture_output=True, text=True,
+                            timeout=GH_TIMEOUT).stdout.strip()
+    except subprocess.TimeoutExpired:
+        me = ""
     try:
         findings = fetch_pr_findings(owner, name, num, me, gh)
     except (RuntimeError, ValueError, KeyError) as e:

@@ -437,6 +437,21 @@ class CliEndToEndTest(CliTestBase):
         self.assertEqual(self.ledger().rounds[0].adopted, [])
         self.assertEqual(self.ledger().status, "종료")
 
+    def _recheck(self, text):
+        self.run_to_apply()
+        result = self.tmp / "recheck.final"
+        result.write_text(text, encoding="utf-8")
+        return self.cli("recheck", "--run-dir", str(self.run_dir), "--round", "1", "--result", str(result))
+
+    def test_recheck_without_resolution_section_warns_once(self):
+        p = self._recheck(RECHECK_RESULT.split("Critical", 1)[1].join(["Critical", ""]))
+        self.assertIn("절이 없다", p.stdout)
+        self.assertNotIn("해소 여부가 없는 지적", p.stdout)
+
+    def test_recheck_with_unreadable_resolution_lines_warns(self):
+        p = self._recheck(RECHECK_RESULT.replace("r1-01: 해소됨", "r1-01 해소됨").replace("r1-02: 해소됨", "r1-02 해소됨"))
+        self.assertIn("경고: 해소 여부가 없는 지적은 해소 안 됨으로 본다: r1-01, r1-02", p.stdout)
+
     def test_non_utf8_patch_is_not_adopted(self):
         self.init()
         self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1")
@@ -782,13 +797,20 @@ class CliPrCommentTest(CliTestBase):
 class CliInitTest(CliTestBase):
     def test_zero_findings_warns_and_ends(self):
         raw = self.tmp / "empty.final"
-        raw.write_text("검토 결과\n- [P2] 위치에 공백 — some file.py:3\n", encoding="utf-8")
+        raw.write_text("검토 결과\n- [P2] 위치가 빠진 항목\n", encoding="utf-8")
         p = self.cli("init", "--source", "codex-code", "--input", str(raw))
         self.assertIn("지적 0건 — 원문을 확인하라", p.stdout)
         self.assertIn("검토 결과", p.stdout)
-        self.assertIn("[P", p.stdout)
+        self.assertIn("경고: 형식을 읽지 못한 항목 1건: - [P2] 위치가 빠진 항목", p.stdout)
         self.assertIn("status=종료", p.stdout)
         self.assertFalse((self.repo / ".cascade-fix").exists())
+
+    def test_partly_unparsed_code_items_warn(self):
+        raw = self.tmp / "code.final"
+        raw.write_text("- [P2] add가 뺀다 — calc.py:2\n  본문.\n- [P2] 위치가 빠진 항목\n  본문.\n", encoding="utf-8")
+        p = self.cli("init", "--source", "codex-code", "--input", str(raw))
+        self.assertIn("경고: 형식을 읽지 못한 항목 1건: - [P2] 위치가 빠진 항목", p.stdout)
+        self.assertIn("run_dir=", p.stdout)
 
     def test_doc_parse_error_exits_5_with_line(self):
         raw = self.tmp / "doc.final"
@@ -1070,6 +1092,17 @@ class CliResumeTest(unittest.TestCase):
 
 
 class CliStepsTest(unittest.TestCase):
+    def test_gh_call_that_hangs_is_a_failed_call(self):
+        from cascade import cli
+        old = cli.GH_TIMEOUT
+        cli.GH_TIMEOUT = 1
+        try:
+            p = cli._run_gh([sys.executable, "-c", "import time; time.sleep(30)"])
+        finally:
+            cli.GH_TIMEOUT = old
+        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(p.stdout, "")
+
     def _ledger(self, severity):
         done = [RoundRecord(no=n, findings=[], decisions=[], adopted=[], recheck_opened=True) for n in (1, 2)]
         rnd = RoundRecord(no=3, findings=[{"id": "r3-01", "severity": severity}], decisions=[],

@@ -27,12 +27,14 @@ from cascade.consensus import (
 from cascade.detect import detect, estimate_line
 from cascade.detect import render as render_detect
 from cascade.findings import (
+    GH_TIMEOUT,
     SEVERITIES,
     Finding,
     ParseError,
     fetch_pr_findings,
     parse_codex_code,
     parse_codex_doc,
+    unparsed_code_items,
     write_findings,
 )
 from cascade.jobs import (
@@ -193,9 +195,15 @@ def _load_findings_json(path: str, source: str) -> list[Finding]:
     return findings
 
 
+def _run_gh(argv: list[str]) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=GH_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(argv, 1, "", f"시간 초과({GH_TIMEOUT}초)")
+
+
 def _warn_pr_head(root: Path, gh: list[str], owner: str, name: str, number: str) -> None:
-    p = subprocess.run([*gh, "pr", "view", number, "-R", f"{owner}/{name}", "--json", "headRefOid", "--jq", ".headRefOid"],
-                       capture_output=True, text=True)
+    p = _run_gh([*gh, "pr", "view", number, "-R", f"{owner}/{name}", "--json", "headRefOid", "--jq", ".headRefOid"])
     pr_head = p.stdout.strip() if p.returncode == 0 else ""
     local = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True).stdout.strip()
     if not pr_head:
@@ -218,14 +226,18 @@ def _parse_input(args, root: Path):
         gh = shlex.split(os.environ.get("CASCADE_GH", "gh"))
         me = args.me
         if me is None:
-            p = subprocess.run([*gh, "api", "user", "--jq", ".login"], capture_output=True, text=True)
+            p = _run_gh([*gh, "api", "user", "--jq", ".login"])
             me = p.stdout.strip() if p.returncode == 0 else ""
             if not me:
                 print("경고: 내 계정을 알 수 없어 본인 코멘트를 거르지 못한다(--me 로 준다)")
         if not args.input.isdigit():
             raise s.CliError(f"pr-comment의 --input은 PR 번호다: {args.input}")
         _warn_pr_head(root, gh, owner, name, args.input)
-        return fetch_pr_findings(owner, name, int(args.input), me, gh, 1), ""
+        warnings: list[str] = []
+        found = fetch_pr_findings(owner, name, int(args.input), me, gh, 1, warnings)
+        for warning in warnings:
+            print(warning)
+        return found, ""
     if args.source in CLAUDE_SOURCES:
         return _parse_claude_review(args)
     raw = s.read_text(Path(args.input))
@@ -268,12 +280,16 @@ def cmd_init(args) -> int:
     _check_workers(args.workers)
     reviewer = resolve(args.reviewer, args.source, s.RUN_REVIEW, s.cursor_reviewer_available)
     findings, raw = _parse_input(args, root)
+    skipped = unparsed_code_items(raw) if args.source == "codex-code" else []
     if not findings:
         print("지적 0건 — 원문을 확인하라")
         for line in raw.splitlines()[:RAW_PREVIEW_LINES]:
             print(f"  | {line}")
-        if "[P" in raw:
+        if "[P" in raw and not skipped:
             print("경고: 원문에 「[P」가 있다. 파서가 항목을 놓쳤을 수 있다")
+    if skipped:
+        print(f"경고: 형식을 읽지 못한 항목 {len(skipped)}건: {' / '.join(skipped)}")
+    if not findings:
         print(f"status={STATUS_DONE}")
         return 0
     keep = _severity_filter(args.severity)
@@ -998,12 +1014,13 @@ def cmd_recheck(args) -> int:
         resolved, new = parse_recheck(text, rnd.no + 1)
     except ParseError as e:
         raise s.CliError(f"재검토 결과 {e}", ExitCodes.PARSE_ERROR) from None
-    if not any(line.strip() == RESOLUTION_HEADER for line in text.splitlines()):
+    has_header = any(line.strip() == RESOLUTION_HEADER for line in text.splitlines())
+    if not has_header:
         print(f"경고: 「{RESOLUTION_HEADER}」 절이 없다. 고친 지적을 모두 해소 안 됨으로 본다")
         resolved = {}
     adopted = [f for f in s.findings_of(rnd) if f.id in rnd.adopted]
     missing = [f.id for f in adopted if f.id not in resolved]
-    if resolved and missing:
+    if has_header and missing:
         print(f"경고: 해소 여부가 없는 지적은 해소 안 됨으로 본다: {', '.join(missing)}")
     unresolved = [s.unresolved_copy(f) for f in adopted if resolved.get(f.id) is not True]
     numbered = s.renumber(unresolved + new + s.carried_findings(rnd), rnd.no + 1, ledger.source)
