@@ -304,6 +304,7 @@ def cmd_init(args) -> int:
         review_effort=(args.review_effort or DEFAULT_EFFORT) if reviewer == REVIEWER_CLAUDE else "",
         workers_choice=args.workers,
         workers=workers,
+        adopt_on_both_pass=args.adopt_on_both_pass,
     )
     write_findings(s.round_dir(snap.run_dir, 1) / "findings.json", findings)
     s.save_ledger(snap.run_dir, ledger)
@@ -322,6 +323,8 @@ def cmd_init(args) -> int:
             print("작업자: 쓸 수 있는 외부 CLI가 없다. 모두 Claude로 돈다(--workers claude 와 같다)")
     if args.dry_run:
         print("dry-run: 채택 패치를 작업 트리에 적용하지 않는다")
+    if args.adopt_on_both_pass:
+        print("한쪽 채택: 같은 판정에 패치가 달라도 둘 다 검증을 통과하면 작은 패치를 채택한다(판가름 안 함)")
     if reviewer == REVIEWER_CLAUDE:
         print(f"의견·재검토: Claude 단독({ledger.review_model}, {ledger.review_effort}) — 외부 전송 없음")
     else:
@@ -549,7 +552,8 @@ def _judge_code(ledger, rnd, f, results, snap, cfg, baseline, repro):
                 judged += extra
                 recorded += extra
     sensitive = s.is_sensitive(changed_files(pa) + changed_files(pb), cfg)
-    d = s.without_empty_patch(decide(a, b, va, vb, pa, pb, sensitive), {"a": pa, "b": pb}, adjudicated=False)
+    d = decide(a, b, va, vb, pa, pb, sensitive, ledger.adopt_on_both_pass)
+    d = s.without_empty_patch(d, {"a": pa, "b": pb}, adjudicated=False)
     workers = {"a": a, "b": b}
     return d, workers, {"a": [r.to_dict() for r in ra], "b": [r.to_dict() for r in rb]}
 
@@ -1145,6 +1149,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pr-repo")
     p.add_argument("--me")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--adopt-on-both-pass", action="store_true",
+                   help="코드 모드에서 같은 판정에 패치가 달라도 둘 다 검증을 통과하면 판가름 없이 작은 패치를 채택")
     p.add_argument("--max-rechecks", type=int, default=2)
     p.add_argument("--root")
     p.add_argument("--reviewer", choices=REVIEWER_CHOICES, default=os.environ.get("CASCADE_REVIEWER") or REVIEWER_AUTO,

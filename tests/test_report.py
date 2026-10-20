@@ -254,6 +254,20 @@ class RenderTest(unittest.TestCase):
         self.assertEqual(first_body, "**적용하지 않음(dry-run)**")
         self.assertNotIn("적용하지 않음(dry-run)", report.render(ledger, dry_run=False))
 
+    def test_adopt_on_both_pass_note_counts_rule_adoptions(self):
+        decisions = [
+            decision("A1", OUTCOME_AGREED_FACT, "b", ["둘 다 검증 통과: 작은 패치 b 채택"]),
+            decision("A2", OUTCOME_AGREED_FACT, "a"),
+            decision("A3", OUTCOME_UNDECIDABLE, None, ["둘 다 검증 통과: 작은 패치 a 채택", "보안 경로"]),
+        ]
+        ledger = make_ledger([finding("A1"), finding("A2"), finding("A3")], decisions)
+        self.assertNotIn("--adopt-on-both-pass", report.render(ledger, dry_run=False))
+        ledger.adopt_on_both_pass = True
+        table = section(report.render(ledger, dry_run=False), "## 회차별 지적과 채택 경로")
+        self.assertIn("| 1 | 3 | 2 | 0 | 0 | 0 | 1 |", table)
+        self.assertIn("이번 실행은 --adopt-on-both-pass 로 돌았다", table)
+        self.assertIn("이 규칙으로 채택한 지적 1건", table)
+
     def test_header_line(self):
         text = report.render(full_ledger(), dry_run=False)
         self.assertIn("출처: local · 모드: code · 검토자: Codex · 상태: 진행", text)

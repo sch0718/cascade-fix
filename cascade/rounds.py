@@ -69,6 +69,7 @@ class Ledger:
     review_effort: str = ""
     workers_choice: str = "claude"
     workers: dict = field(default_factory=dict)
+    adopt_on_both_pass: bool = False
 
     def current_round(self) -> RoundRecord | None:
         return self.rounds[-1] if self.rounds else None

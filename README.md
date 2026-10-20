@@ -37,6 +37,8 @@
 
 보안·인증·삭제 경로(`**/auth*`, `**/security*`, `**/*delete*`, `**/migrations/**`)를 고친 지적은 채택하지 않고 사람 목록으로 보냅니다.
 
+코드 모드에서 작업자 둘이 같은 판정(사실)을 내고 둘 다 검증을 통과했지만 패치가 다르면, 기본은 Opus 판가름으로 보냅니다. `init --adopt-on-both-pass`를 주면 판가름 없이 바뀐 줄이 적은 패치를 채택합니다(같으면 작업자 A). 검증 명령이 하나도 돌지 않았거나 한쪽 패치가 비었으면 이 옵션을 줘도 판가름으로 갑니다. 보안 경로는 이때도 채택하지 않고 사람 목록으로 보냅니다. 효과를 아직 측정하지 않아 기본값은 꺼져 있습니다.
+
 ## 요구 사항
 
 - Claude Code. 여러 에이전트를 띄우는 **Workflow 도구**를 쓸 수 있어야 합니다.
@@ -253,7 +255,7 @@ PYTHONPATH=<스킬 경로> python3 -m cascade.cli <명령> [옵션]
 | --- | --- |
 | `detect [--input F] [--doc F…] [--pr N] [--no-gh] [--reviewer R] [--workers W] [--cursor-model M] [--json]` | 상황을 판정하고 추천·규모·멈춤 사유를 보여 줍니다. 읽기만 합니다. `--doc`은 커밋한 문서도 검토 대상으로 지정합니다. `--no-gh`면 PR을 조회하지 않습니다. |
 | `review --kind code\|doc (--base B \| --uncommitted \| --commit SHA \| --doc F…) [--focus 관점] [--review-model M] [--review-effort E]` | Claude 첫 검토용 Workflow 입력을 만듭니다. |
-| `init --source S --input X [--doc F…] [--severity …] [--dry-run] [--max-rechecks N] [--reviewer R] [--workers W] [--cursor-model M] [--review-model M] [--review-effort E]` | 실행을 시작하고 지적을 읽습니다. PR이면 `--input`에 PR 번호를 주고 `--pr-repo owner/name`·`--me <내 로그인>`을 붙일 수 있습니다. `--input` 대신 `--findings-json F`로 정규화한 지적 목록(`id`·`severity`·`location`·`body`)을 바로 줄 수도 있습니다. |
+| `init --source S --input X [--doc F…] [--severity …] [--dry-run] [--adopt-on-both-pass] [--max-rechecks N] [--reviewer R] [--workers W] [--cursor-model M] [--review-model M] [--review-effort E]` | 실행을 시작하고 지적을 읽습니다. PR이면 `--input`에 PR 번호를 주고 `--pr-repo owner/name`·`--me <내 로그인>`을 붙일 수 있습니다. `--input` 대신 `--findings-json F`로 정규화한 지적 목록(`id`·`severity`·`location`·`body`)을 바로 줄 수도 있습니다. |
 | `jobs` / `judge` / `adjudicate` / `opinion` / `apply` / `recheck` | 회차 단계(`--run-dir`·`--round`) |
 | `workers --stage stage1\|checker` | `--workers external` 회차에서 CLI 작업(Codex·Cursor)을 돌리고 결과를 `stage1-cli.json`(점검자는 `checker-cli.json`)에 씁니다. 대체 실행할 작업이 있으면 `*-fallback-args.json`을 만듭니다. 한 번에 하나만 돌립니다. |
 | `resume --choices F` | 보류 후보마다 「지금 반영 / 구현 때 테스트로 / 보류」를 받습니다. 「지금 반영」이 있으면 회차를 엽니다. |

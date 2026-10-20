@@ -14,6 +14,9 @@ PATCH_X = (
 PATCH_Y = (
     "diff --git a/m.py b/m.py\n--- a/m.py\n+++ b/m.py\n@@ -1 +1 @@\n-x = 1\n+x = 3\n"
 )
+PATCH_BIG = (
+    "diff --git a/m.py b/m.py\n--- a/m.py\n+++ b/m.py\n@@ -1 +1,2 @@\n-x = 1\n+x = 4\n+y = 5\n"
+)
 
 
 def worker(role="a", verdict=consensus.VERDICT_FACT, design=False, reason="근거", patch="", checker_ok=None):
@@ -127,6 +130,50 @@ class DecideTest(unittest.TestCase):
         d = consensus.decide(worker("a"), worker("b"), [ok()], [ok()], PATCH_X, PATCH_Y, sensitive=True)
         self.assertEqual(d.outcome, consensus.OUTCOME_ADJUDICATE)
         self.assertIn("보안 경로", d.reasons)
+
+    def test_adopt_on_both_pass_takes_smaller_patch(self):
+        d = consensus.decide(worker("a"), worker("b"), [ok()], [ok()], PATCH_BIG, PATCH_X, adopt_on_both_pass=True)
+        self.assertEqual(d.outcome, consensus.OUTCOME_AGREED_FACT)
+        self.assertEqual(d.patch_from, "b")
+        self.assertEqual(d.reasons, ["둘 다 검증 통과: 작은 패치 b 채택"])
+        d = consensus.decide(worker("a"), worker("b"), [ok()], [ok()], PATCH_X, PATCH_BIG, adopt_on_both_pass=True)
+        self.assertEqual(d.patch_from, "a")
+        self.assertEqual(d.reasons, ["둘 다 검증 통과: 작은 패치 a 채택"])
+
+    def test_adopt_on_both_pass_counts_removed_lines_that_look_like_headers(self):
+        removes_comments = (
+            "diff --git a/q.sql b/q.sql\n--- a/q.sql\n+++ b/q.sql\n@@ -1,4 +1 @@\n"
+            "--- 주석 1\n--- 주석 2\n--- 주석 3\n select 1;\n"
+        )
+        d = consensus.decide(worker("a"), worker("b"), [ok()], [ok()], removes_comments, PATCH_X, adopt_on_both_pass=True)
+        self.assertEqual(d.patch_from, "b")
+
+    def test_adopt_on_both_pass_same_size_takes_a(self):
+        d = consensus.decide(worker("a"), worker("b"), [ok()], [ok()], PATCH_X, PATCH_Y, adopt_on_both_pass=True)
+        self.assertEqual(d.outcome, consensus.OUTCOME_AGREED_FACT)
+        self.assertEqual(d.patch_from, "a")
+        self.assertEqual(d.reasons, ["둘 다 검증 통과: 크기가 같아 a 채택"])
+
+    def test_adopt_on_both_pass_needs_verifiers_and_both_patches(self):
+        d = consensus.decide(worker("a"), worker("b"), [], [ok()], PATCH_X, PATCH_Y, adopt_on_both_pass=True)
+        self.assertEqual(d.outcome, consensus.OUTCOME_ADJUDICATE)
+        self.assertEqual(d.reasons, ["패치가 다름", "검증기 없음"])
+        d = consensus.decide(worker("a"), worker("b"), [ok()], [ok()], "", PATCH_Y, adopt_on_both_pass=True)
+        self.assertEqual(d.outcome, consensus.OUTCOME_ADJUDICATE)
+        self.assertEqual(d.reasons, ["패치가 다름"])
+
+    def test_adopt_on_both_pass_leaves_one_pass_to_adjudication(self):
+        d = consensus.decide(worker("a"), worker("b"), [fail()], [ok()], PATCH_X, PATCH_BIG, adopt_on_both_pass=True)
+        self.assertEqual(d.outcome, consensus.OUTCOME_ADJUDICATE)
+        self.assertEqual(d.patch_from, "b")
+        self.assertIn("한쪽만 검증 통과", d.reasons)
+
+    def test_adopt_on_both_pass_sensitive_goes_human(self):
+        d = consensus.decide(worker("a"), worker("b"), [ok()], [ok()], PATCH_X, PATCH_BIG,
+                             sensitive=True, adopt_on_both_pass=True)
+        self.assertEqual(d.outcome, consensus.OUTCOME_UNDECIDABLE)
+        self.assertIsNone(d.patch_from)
+        self.assertEqual(d.reasons, ["둘 다 검증 통과: 작은 패치 a 채택", "보안 경로"])
 
     def test_no_verifiers_adopts_with_note(self):
         d = consensus.decide(worker("a"), worker("b"), [], [], PATCH_X, PATCH_X)

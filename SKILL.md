@@ -127,9 +127,10 @@ Claude·Cursor·`codex-doc` 결과는 형식이 같아 형식으로는 가릴 �
 
 `jobs`·`judge`·`adjudicate`·`apply`는 검증 명령과 테스트를 돌려 Bash 시간 제한을 넘길 수 있다. Bash 도구의 `run_in_background`로 돌리고 완료 알림을 기다린 뒤 출력을 읽는다.
 
-1. **init** — `CF init --source <종류> --input <결과 파일|PR 번호> [--doc <문서>…] [--dry-run] [--max-rechecks N] [--severity Critical,Warning] [--reviewer auto|codex|cursor|claude] [--workers claude|external] [--cursor-model M] [--review-model M] [--review-effort E]`
+1. **init** — `CF init --source <종류> --input <결과 파일|PR 번호> [--doc <문서>…] [--dry-run] [--adopt-on-both-pass] [--max-rechecks N] [--severity Critical,Warning] [--reviewer auto|codex|cursor|claude] [--workers claude|external] [--cursor-model M] [--review-model M] [--review-effort E]`
    - 출력의 `run_dir=<경로>`를 이후 모든 명령에 `--run-dir`로 준다. 「규모:」 줄에 회차당 에이전트 수가 나온다(외부 작업자면 Claude·Codex·Cursor 호출 수로 나뉜다).
    - `--severity`로 고르지 않은 등급의 지적은 처리하지 않고 처음부터 보류 후보로 둔다. 나중에 「지금 반영」으로 고르면 `resume`이 회차를 연다. 등급은 검토자가 붙인 것을 그대로 쓴다(다시 매기지 않는다).
+   - `--adopt-on-both-pass`(기본 꺼짐, 코드 모드만): 작업자 둘이 같은 판정(사실)에 둘 다 검증을 통과했는데 패치가 다르면, 판가름 대신 바뀐 줄이 적은 패치를 채택한다(같으면 a). 사유는 「둘 다 검증 통과: …」로 남고 보고서 합의 칸에 센다. 검증 명령이 하나도 안 돌았거나 한쪽 패치가 비었으면 판가름으로 간다. 보안 경로는 채택하지 않고 판단 불가로 보낸다. 측정 전이라 사용자가 요청할 때만 붙인다.
    - 종료 코드 4: 검증 설정 없음(위 「실행 전 확인」 2). 5: 결과 파일을 해석하지 못함 — 출력된 줄을 사용자에게 보이고 멈춘다.
    - 「지적 0건 — 원문을 확인하라」가 나오면 출력된 원문 앞부분을 사용자에게 보이고 끝낸다.
 2. **jobs** — `CF jobs --run-dir <run_dir> --round N` → `round-N/stage1-args.json`. 기준선(수정 전 base 워크트리)에서 build·typecheck·lint 명령을 한 번 돌려 이미 실패하는 명령을 `round-N/baseline.json`에 적는다(판정에서 제외). `tests` 명령은 기준선에서 실패해도 제외하지 않는다(지적이 곧 실패하는 테스트면 수정이 통과시켜야 한다).

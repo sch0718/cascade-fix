@@ -437,6 +437,32 @@ class CliEndToEndTest(CliTestBase):
         self.assertEqual(self.ledger().rounds[0].adopted, [])
         self.assertEqual(self.ledger().status, "종료")
 
+    def test_adopt_on_both_pass_takes_smaller_patch_without_opus(self):
+        p = self.init("--adopt-on-both-pass")
+        self.assertIn("둘 다 검증을 통과하면 작은 패치를 채택한다", p.stdout)
+        self.assertTrue(self.ledger().adopt_on_both_pass)
+        self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1")
+        (self.wt("r1-01-a") / "calc.py").write_text(
+            fix(CALC, "return a - b", "total = a + b\n    return total"), encoding="utf-8")
+        (self.wt("r1-01-b") / "calc.py").write_text(fix(CALC, "return a - b", "return a + b"), encoding="utf-8")
+        stage1 = results_json(self.run_dir / "round-1" / "stage1.json", [
+            ("r1-01:a", worker_output("사실", "claude-sonnet-5-5")),
+            ("r1-01:b", worker_output("사실", "claude-haiku-5-5")),
+            ("r1-02:a", worker_output("아님", "claude-sonnet-5-5")),
+            ("r1-02:b", worker_output("아님", "claude-haiku-5-5")),
+        ])
+        self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1))
+        d = {x["finding_id"]: x for x in self.ledger().rounds[0].decisions}
+        self.assertEqual((d["r1-01"]["outcome"], d["r1-01"]["patch_from"]), ("합의-사실", "b"))
+        self.assertEqual(d["r1-01"]["reasons"], ["둘 다 검증 통과: 작은 패치 b 채택"])
+        self.assertFalse((self.run_dir / "round-1" / "adj-args.json").exists())
+        self.cli("apply", "--run-dir", str(self.run_dir), "--round", "1")
+        self.assertIn("return a + b\n\n\ndef ident", (self.repo / "calc.py").read_text(encoding="utf-8"))
+        p = self.cli("report", "--run-dir", str(self.run_dir))
+        self.assertIn("| 1 | 2 | 2 | 0 | 0 | 0 | 0 |", p.stdout)
+        self.assertIn("이번 실행은 --adopt-on-both-pass 로 돌았다", p.stdout)
+        self.assertIn("이 규칙으로 채택한 지적 1건", p.stdout)
+
     def test_missing_full_tests_falls_back_to_tests_with_warning(self):
         toml = write_repos_toml(self.tmp, {str(self.repo): {"tests": ["python3 -m unittest {files}"]}})
         self.env["CASCADE_REPOS_TOML"] = str(toml)

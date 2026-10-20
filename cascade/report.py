@@ -9,6 +9,7 @@ from cascade.consensus import (
     OUTCOME_DESIGN,
     OUTCOME_HOLD,
     OUTCOME_UNDECIDABLE,
+    REASON_BOTH_PASS,
 )
 from cascade.review import CLAUDE_SOURCES
 from cascade.review import label as reviewer_label
@@ -257,6 +258,16 @@ def _round_row(rnd, ledger: Ledger) -> str:
     return f"| {rnd.no} | {len(rnd.findings)} | {consensus} | {sent} | {adjudicated} | {codex} | {human} |"
 
 
+def _adopt_on_both_pass_note(ledger: Ledger) -> list[str]:
+    if not ledger.adopt_on_both_pass:
+        return []
+    n = sum(1 for rnd in ledger.rounds for d in rnd.decisions
+            if OUTCOME_AGREED_FACT in (d["outcome"], d.get("adopted_as"))
+            and any(r.startswith(REASON_BOTH_PASS) for r in d.get("reasons", [])))
+    return [f"이번 실행은 --adopt-on-both-pass 로 돌았다. 같은 판정에 패치가 달라도 둘 다 검증을 통과하면 "
+            f"판가름 없이 작은 패치를 채택해 합의 칸에 센다. 이 규칙으로 채택한 지적 {n}건.", ""]
+
+
 def _adopted_pairs(ledger: Ledger, failed: dict[str, str]) -> list[tuple[dict, dict]]:
     pairs = []
     for rnd in ledger.rounds:
@@ -456,6 +467,7 @@ def render(ledger: Ledger, dry_run: bool, run_dir: Path | None = None) -> str:
             "",
             TABLE_FOOTNOTE,
             "",
+            *_adopt_on_both_pass_note(ledger),
             "## 사람이 볼 목록",
             "",
         ]
