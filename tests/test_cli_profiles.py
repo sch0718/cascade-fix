@@ -9,12 +9,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from cascade import cli_steps, profiles  # noqa: E402
+from cascade import cli_steps, profiles, review  # noqa: E402
 from cascade.report import render  # noqa: E402
 from cascade.rounds import Ledger, RoundRecord  # noqa: E402
 from cascade.snapshot import commit_worktree  # noqa: E402
 from helpers import make_repo, run_cli, write_repos_toml  # noqa: E402
-from test_claude_reviewer import review_results  # noqa: E402
+from test_claude_reviewer import CLAUDE_REVIEW, review_results  # noqa: E402
 from test_cli_e2e import CALC, RECHECK_RESULT, fix  # noqa: E402
 from test_workers import ExternalWorkersBase  # noqa: E402
 
@@ -649,6 +649,319 @@ class ReviewRolesFallbackTest(ReviewRolesBase):
         self.assertEqual(self.current("opinion")["runner"], "claude")
         self.assertEqual(self.substituted(), [{"role": "code.opinion", "from": "codex", "to": "claude", "reason": "이용 한도"}])
         self.assertIn("Workflow 실행", self.next_steps(p)[0])
+
+
+FIRST_REVIEW_PROFILES = """
+[profiles.split]
+"code.review" = { runner = "claude", model = "claude-sonnet-5-5", effort = "low" }
+
+[profiles.cursor-first]
+"code.review" = { runner = "cursor", model = "composer-9" }
+
+[profiles.codex-then-cursor-first]
+"code.review" = { runner = "codex", fallback = { runner = "cursor", model = "composer-9" } }
+"""
+OPUS = "claude-opus-5-5"
+
+
+class FirstReviewTest(ExternalWorkersBase):
+    def setUp(self):
+        super().setUp()
+        toml = Path(self.env["CASCADE_REPOS_TOML"])
+        toml.write_text(toml.read_text(encoding="utf-8") + FIRST_REVIEW_PROFILES, encoding="utf-8")
+        self.use_fakes()
+        self.rr, self.cr = self.tmp / "run-review.sh", self.tmp / "cursor-run-review.sh"
+        for script in (self.rr, self.cr):
+            script.write_text("#!/bin/sh\n", encoding="utf-8")
+        self.env.update({**NO_LEGACY_ENV, "CASCADE_RUN_REVIEW": str(self.rr), "CASCADE_CURSOR_REVIEW": str(self.cr)})
+
+    def review(self, *extra, kind="code", scope=("--base", "main"), env=None):
+        return run_cli(["review", "--kind", kind, *scope, *extra], self.repo, env={**self.env, **(env or {})})
+
+    def review_dir(self, p):
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        line = next(x for x in p.stdout.splitlines() if x.startswith("review_dir="))
+        return Path(line.split("=", 1)[1])
+
+    def meta(self, review_dir):
+        return json.loads((review_dir / "review-meta.json").read_text(encoding="utf-8"))
+
+    def next_lines(self, p):
+        lines = p.stdout.splitlines()
+        return [x.strip() for x in lines[lines.index("다음:") + 1:]]
+
+    def init_line(self, p):
+        return next(x for x in self.next_lines(p) if " init --source " in x)
+
+    def test_review_with_local_prints_rr(self):
+        p = self.review("--profile", "local")
+        review_dir = self.review_dir(p)
+        self.assertFalse((review_dir / "review-args.json").exists())
+        self.assertIn("run-review.sh --base main", p.stdout)
+        self.assertIn(f"--repo {self.repo}", p.stdout)
+        self.assertIn(f"--out {review_dir / 'review.out'}", p.stdout)
+        self.assertNotIn("--model", p.stdout)
+        self.assertIn("--source codex-code", p.stdout)
+        self.assertIn(f"--input {review_dir / 'review.out.final'}", p.stdout)
+        self.assertIn("--profile local", p.stdout)
+        self.assertIn("검토자: Codex", p.stdout)
+        steps = self.next_lines(p)
+        self.assertTrue(steps[0].startswith(str(self.rr)), steps)
+        self.assertEqual(self.meta(review_dir), {
+            "role": "code.review", "requested": {"runner": "codex", "model": "", "effort": ""},
+            "actual": {"runner": "codex", "model": "", "effort": ""}, "fallback_reason": None, "attempts": [],
+            "args": {"kind": "code", "base": "main", "uncommitted": False, "commit": None, "docs": [], "focus": "",
+                     "root": str(self.repo)},
+            "profile": "local", "explicit": True})
+
+    def test_review_doc_with_local_prints_rr_with_docs(self):
+        (self.repo / "plan.md").write_text("# 계획\n", encoding="utf-8")
+        p = self.review("--profile", "local", "--focus", "순서", kind="doc", scope=("--doc", str(self.repo / "plan.md")))
+        review_dir = self.review_dir(p)
+        command, init = self.next_lines(p)[:2]
+        self.assertIn(f"run-review.sh --doc {self.repo / 'plan.md'}", command)
+        self.assertIn("--focus", command)
+        self.assertIn("--source codex-doc", init)
+        self.assertIn(f"--doc {self.repo / 'plan.md'}", init)
+        self.assertEqual(self.meta(review_dir)["role"], "doc.review")
+        self.assertEqual(self.meta(review_dir)["args"]["docs"], [str(self.repo / "plan.md")])
+
+    def test_review_cursor_cell_prints_cr_with_model(self):
+        p = self.review("--profile", "cursor-first", "--uncommitted", scope=())
+        command = self.next_lines(p)[0]
+        self.assertTrue(command.startswith(str(self.cr) + " --uncommitted"), command)
+        self.assertIn("--model composer-9", command)
+        self.assertIn("--source cursor-code", p.stdout)
+        self.assertIn("검토자: Cursor", p.stdout)
+
+    def test_review_model_rejected_for_external_cell(self):
+        for option in (["--review-model", "claude-sonnet-5-5"], ["--review-effort", "low"]):
+            with self.subTest(option=option):
+                p = self.review("--profile", "local", *option)
+                self.assertEqual(p.returncode, 5, p.stdout + p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertIn("code.review", p.stdout)
+                self.assertIn(option[0], p.stdout)
+
+    def test_review_model_for_claude_cell_is_validated(self):
+        p = self.review("--profile", "split", "--review-model", "composer-2.5")
+        self.assertEqual(p.returncode, 5, p.stdout + p.stderr)
+        self.assertIn("--review-model composer-2.5", p.stdout)
+
+    def test_explicit_profile_does_not_propagate_review_model(self):
+        p = self.review("--profile", "split")
+        review_dir = self.review_dir(p)
+        [job] = json.loads((review_dir / "review-args.json").read_text(encoding="utf-8"))["jobs"]
+        self.assertEqual((job["model"], job["effort"]), (SONNET, "low"))
+        init_line = self.init_line(p)
+        self.assertNotIn("--review-model", init_line)
+        self.assertNotIn("--review-effort", init_line)
+        self.assertIn("--profile split", init_line)
+        self.assertIn("--source claude-code", init_line)
+        self.assertIn(f"--input {review_dir / 'review.json'}", init_line)
+        self.assertEqual(self.meta(review_dir)["actual"], {"runner": "claude", "model": SONNET, "effort": "low"})
+
+    def test_explicit_profile_review_option_overrides_cell_but_is_not_propagated(self):
+        p = self.review("--profile", "split", "--review-model", OPUS, "--review-effort", "high")
+        review_dir = self.review_dir(p)
+        [job] = json.loads((review_dir / "review-args.json").read_text(encoding="utf-8"))["jobs"]
+        self.assertEqual((job["model"], job["effort"]), (OPUS, "high"))
+        self.assertNotIn("--review-model", self.init_line(p))
+        self.assertNotIn("--review-effort", self.init_line(p))
+        self.assertEqual(self.meta(review_dir)["requested"], {"runner": "claude", "model": OPUS, "effort": "high"})
+
+    def test_env_profile_is_explicit_too(self):
+        p = self.review("--review-model", OPUS, env={"CASCADE_PROFILE": "split"})
+        init_line = self.init_line(p)
+        self.assertIn("--profile split", init_line)
+        self.assertNotIn("--review-model", init_line)
+        self.assertTrue(self.meta(self.review_dir(p))["explicit"])
+
+    def test_init_from_claude_first_review_keeps_the_opinion_cell(self):
+        p = self.review("--profile", "split")
+        review_dir = self.review_dir(p)
+        review_results(review_dir / "review.json", "review:reviewer", CLAUDE_REVIEW, SONNET)
+        q = run_cli(["init", "--source", "claude-code", "--input", str(review_dir / "review.json"), "--profile", "split"],
+                    self.repo, env=self.env)
+        self.assertEqual(q.returncode, 0, q.stdout + q.stderr)
+        self.assertNotIn("경고", q.stdout)
+        run_dir = Path(next(x for x in q.stdout.splitlines() if x.startswith("run_dir=")).split("=", 1)[1])
+        ledger = json.loads((run_dir / "ledger.json").read_text(encoding="utf-8"))
+        self.assertEqual((ledger["reviewer"], ledger["review_model"]), ("claude", FABLE))
+        self.assertEqual(ledger["profile"]["roles"]["code.review"]["model"], SONNET)
+        self.assertEqual(ledger["profile"]["first_review"]["actual"]["model"], SONNET)
+
+    def test_default_profile_keeps_old_propagation(self):
+        p = self.review("--review-model", SONNET, "--review-effort", "low")
+        init_line = self.init_line(p)
+        self.assertIn(f"--review-model {SONNET}", init_line)
+        self.assertIn("--review-effort low", init_line)
+        self.assertNotIn("--profile", init_line)
+        meta = self.meta(self.review_dir(p))
+        self.assertEqual((meta["profile"], meta["explicit"]), ("default", False))
+        self.assertEqual(meta["requested"], {"runner": "claude", "model": SONNET, "effort": "low"})
+
+    def test_missing_script_substitutes_the_fallback_and_says_so(self):
+        p = self.review("--profile", "local", env={"CASCADE_RUN_REVIEW": str(self.tmp / "none.sh")})
+        review_dir = self.review_dir(p)
+        self.assertIn("대체: code.review codex → claude", p.stdout)
+        self.assertTrue((review_dir / "review-args.json").is_file())
+        self.assertIn("--source claude-code", self.init_line(p))
+        meta = self.meta(review_dir)
+        self.assertEqual((meta["requested"]["runner"], meta["actual"]["runner"]), ("codex", "claude"))
+        self.assertEqual(meta["attempts"], [{"runner": "codex", "reason": meta["fallback_reason"]}])
+        self.assertTrue(meta["fallback_reason"])
+
+    def test_unavailable_cli_substitutes_the_fallback(self):
+        p = self.review("--profile", "local", env={"CASCADE_CODEX": str(self.tmp / "no-such-cli")})
+        self.assertIn("대체: code.review codex → claude — 미설치 또는 로그인 필요", p.stdout)
+        self.assertEqual(self.meta(self.review_dir(p))["actual"]["runner"], "claude")
+
+    def test_fallback_from_updates_same_dir(self):
+        first = self.review_dir(self.review("--profile", "local"))
+        other = self.review_dir(self.review("--profile", "local"))
+        self.assertNotEqual(first, other)
+        p = run_cli(["review", "--review-dir", str(first), "--fallback-from", "codex", "--reason", "한도"], self.repo,
+                    env=self.env)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        meta = self.meta(first)
+        self.assertEqual((meta["requested"]["runner"], meta["actual"]["runner"], meta["fallback_reason"]),
+                         ("codex", "claude", "한도"))
+        self.assertEqual(meta["attempts"], [{"runner": "codex", "reason": "한도"}])
+        self.assertEqual(meta["actual"]["model"], FABLE)
+        self.assertTrue((first / "review-args.json").exists())
+        self.assertFalse((other / "review-args.json").exists())
+        self.assertEqual(self.meta(other)["actual"]["runner"], "codex")
+        self.assertEqual(self.meta(other)["attempts"], [])
+        [job] = json.loads((first / "review-args.json").read_text(encoding="utf-8"))["jobs"]
+        self.assertEqual((job["model"], job["effort"]), (FABLE, "high"))
+        self.assertIn("diff main...HEAD", Path(job["promptPath"]).read_text(encoding="utf-8"))
+        init_line = self.init_line(p)
+        self.assertIn("--source claude-code", init_line)
+        self.assertIn(f"--input {first / 'review.json'}", init_line)
+        self.assertIn("--profile local", init_line)
+        self.assertIn(f"--root {self.repo}", init_line)
+        self.assertIn("한도", p.stdout)
+
+    def test_fallback_from_reuses_the_original_scope_not_the_cwd(self):
+        first = self.review_dir(self.review("--profile", "local", "--commit", "HEAD", scope=()))
+        p = run_cli(["review", "--review-dir", str(first), "--fallback-from", "codex", "--reason", "한도"], self.tmp,
+                    env=self.env)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        [job] = json.loads((first / "review-args.json").read_text(encoding="utf-8"))["jobs"]
+        self.assertIn(str(self.repo), Path(job["promptPath"]).read_text(encoding="utf-8"))
+        self.assertIn(f"--root {self.repo}", self.init_line(p))
+
+    def test_fallback_to_a_cursor_cell_prints_cr(self):
+        first = self.review_dir(self.review("--profile", "codex-then-cursor-first"))
+        p = run_cli(["review", "--review-dir", str(first), "--fallback-from", "codex", "--reason", "오류"], self.repo,
+                    env=self.env)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertFalse((first / "review-args.json").exists())
+        command = self.next_lines(p)[0]
+        self.assertTrue(command.startswith(str(self.cr) + " --base main"), command)
+        self.assertIn("--model composer-9", command)
+        self.assertIn(f"--out {first / 'review.out'}", command)
+        self.assertIn("--source cursor-code", self.init_line(p))
+        meta = self.meta(first)
+        self.assertEqual((meta["requested"]["runner"], meta["actual"]["runner"], meta["actual"]["model"]),
+                         ("codex", "cursor", "composer-9"))
+        self.assertEqual(meta["attempts"], [{"runner": "codex", "reason": "오류"}])
+
+    def test_fallback_to_a_cursor_cell_without_its_script_ends_at_claude(self):
+        first = self.review_dir(self.review("--profile", "codex-then-cursor-first"))
+        p = run_cli(["review", "--review-dir", str(first), "--fallback-from", "codex", "--reason", "오류"], self.repo,
+                    env={**self.env, "CASCADE_CURSOR_REVIEW": str(self.tmp / "none.sh")})
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        meta = self.meta(first)
+        self.assertEqual(meta["actual"]["runner"], "claude")
+        self.assertEqual([a["runner"] for a in meta["attempts"]], ["codex", "cursor"])
+        self.assertTrue((first / "review-args.json").is_file())
+
+    def test_fallback_from_errors(self):
+        empty = self.tmp / "empty"
+        empty.mkdir()
+        first = self.review_dir(self.review("--profile", "local"))
+        cases = (
+            ["--fallback-from", "codex"],
+            ["--review-dir", str(empty), "--fallback-from", "codex"],
+            ["--review-dir", str(self.tmp / "missing"), "--fallback-from", "codex"],
+            ["--review-dir", str(first), "--fallback-from", "cursor"],
+            ["--review-dir", str(first), "--fallback-from", "claude"],
+            ["--review-dir", str(first)],
+        )
+        for extra in cases:
+            with self.subTest(extra=extra):
+                p = run_cli(["review", *extra, "--reason", "x"], self.repo, env=self.env)
+                self.assertEqual(p.returncode, 5, p.stdout + p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+        self.assertEqual(self.meta(first)["attempts"], [])
+
+    def test_review_without_kind_is_still_a_usage_error(self):
+        p = run_cli(["review", "--base", "main"], self.repo, env=self.env)
+        self.assertEqual(p.returncode, 2)
+
+    def test_init_carries_first_review_meta(self):
+        first = self.review_dir(self.review("--profile", "local"))
+        run_cli(["review", "--review-dir", str(first), "--fallback-from", "codex", "--reason", "한도"], self.repo,
+                env=self.env)
+        review_results(first / "review.json", "review:reviewer", CLAUDE_REVIEW, FABLE)
+        p = run_cli(["init", "--source", "claude-code", "--input", str(first / "review.json"), "--profile", "local"],
+                    self.repo, env=self.env)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        run_dir = Path(next(x for x in p.stdout.splitlines() if x.startswith("run_dir=")).split("=", 1)[1])
+        ledger = json.loads((run_dir / "ledger.json").read_text(encoding="utf-8"))
+        self.assertEqual(ledger["profile"]["first_review"], {
+            "role": "code.review", "requested": {"runner": "codex", "model": "", "effort": ""},
+            "actual": {"runner": "claude", "model": FABLE, "effort": "high"}, "fallback_reason": "한도",
+            "attempts": [{"runner": "codex", "reason": "한도"}]})
+
+    def test_init_carries_the_meta_of_an_external_first_review_without_fallback(self):
+        first = self.review_dir(self.review("--profile", "local"))
+        shutil.copyfile(FIXTURES / "codex-code-e2e.final", first / "review.out.final")
+        p = run_cli(["init", "--source", "codex-code", "--input", str(first / "review.out.final"), "--profile", "local"],
+                    self.repo, env=self.env)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        run_dir = Path(next(x for x in p.stdout.splitlines() if x.startswith("run_dir=")).split("=", 1)[1])
+        first_review = json.loads((run_dir / "ledger.json").read_text(encoding="utf-8"))["profile"]["first_review"]
+        self.assertEqual((first_review["requested"]["runner"], first_review["actual"]["runner"],
+                          first_review["fallback_reason"], first_review["attempts"]), ("codex", "codex", None, []))
+
+    def test_init_without_meta_keeps_first_review_empty(self):
+        p = run_cli(["init", "--source", "codex-code", "--input", str(FIXTURES / "codex-code-e2e.final")], self.repo,
+                    env=self.env)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        run_dir = Path(next(x for x in p.stdout.splitlines() if x.startswith("run_dir=")).split("=", 1)[1])
+        self.assertEqual(json.loads((run_dir / "ledger.json").read_text(encoding="utf-8"))["profile"]["first_review"], {})
+
+    def test_init_ignores_a_meta_of_the_other_mode(self):
+        first = self.review_dir(self.review("--profile", "local"))
+        meta = self.meta(first)
+        meta["role"] = "doc.review"
+        (first / "review-meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        shutil.copyfile(FIXTURES / "codex-code-e2e.final", first / "review.out.final")
+        p = run_cli(["init", "--source", "codex-code", "--input", str(first / "review.out.final")], self.repo, env=self.env)
+        run_dir = Path(next(x for x in p.stdout.splitlines() if x.startswith("run_dir=")).split("=", 1)[1])
+        self.assertEqual(json.loads((run_dir / "ledger.json").read_text(encoding="utf-8"))["profile"]["first_review"], {})
+
+
+class FirstReviewCommandTest(unittest.TestCase):
+    def test_first_review_command_per_runner_and_scope(self):
+        args = {"kind": "code", "base": "main", "uncommitted": False, "commit": None, "docs": [], "focus": "", "root": "/r p"}
+        codex = {"runner": "codex", "model": "", "effort": ""}
+        cursor = {"runner": "cursor", "model": "composer-9", "effort": ""}
+        command, result = review.first_review_command(codex, args, Path("/d"))
+        self.assertEqual(command, f"{shlex.quote(str(cli_steps.RUN_REVIEW))} --base main --repo '/r p' --out /d/review.out")
+        self.assertEqual(result, "/d/review.out.final")
+        command, _ = review.first_review_command(cursor, {**args, "base": None, "commit": "abc123"}, Path("/d"))
+        self.assertEqual(command, f"{shlex.quote(str(cli_steps.CURSOR_REVIEW))} --commit abc123 --repo '/r p' "
+                                  "--out /d/review.out --model composer-9")
+        command, _ = review.first_review_command(codex, {**args, "base": None, "uncommitted": True, "focus": "보안"},
+                                                 Path("/d"))
+        self.assertIn(" --uncommitted --focus ", command)
+        docs = {**args, "kind": "doc", "base": None, "docs": ["/a.md", "/b c.md"]}
+        command, _ = review.first_review_command(codex, docs, Path("/d"))
+        self.assertIn(" --doc /a.md --doc '/b c.md' --repo ", command)
 
 
 class ReviewHelpersTest(unittest.TestCase):

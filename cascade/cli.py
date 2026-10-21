@@ -57,6 +57,7 @@ from cascade.review import (
     DEFAULT_MODEL,
     EFFORTS,
     REVIEW_JOB,
+    REVIEW_META,
     REVIEWER_AUTO,
     REVIEWER_CHOICES,
     REVIEWER_CLAUDE,
@@ -64,6 +65,7 @@ from cascade.review import (
     REVIEWER_CURSOR,
     build_review_prompt,
     claude_prompt,
+    first_review_command,
     label,
     load_text,
     model_warning,
@@ -130,6 +132,10 @@ REASON_FINAL_BASELINE_FAILED = "전체 테스트 실패(기준선도 실패)"
 REASON_OUT_OF_SCOPE = "재검토 범위 밖"
 REASON_SEVERITY_DEFERRED = "등급 선택(--severity)으로 이번 실행에서 뺌"
 SANDBOX_REASON = "샌드박스 점검 실패"
+REVIEW_NO_SCRIPT_REASON = "검토 스크립트 없음"
+REVIEW_DEFAULT_REASON = "실행 오류"
+REVIEW_IGNORED_ENVS = ("CASCADE_WORKERS", "CASCADE_REVIEWER")
+FIRST_REVIEW_KEYS = ("role", "requested", "actual", "fallback_reason", "attempts")
 RAW_PREVIEW_LINES = 5
 FINAL_TAIL_CHARS = 2000
 
@@ -208,7 +214,7 @@ def _warn_pr_head(root: Path, gh: list[str], owner: str, name: str, number: str)
         print(f"경고: 로컬 HEAD({local[:12]})가 PR #{number}의 head({pr_head[:12]})와 다르다. PR 브랜치를 받아 온 뒤 실행한다")
 
 
-def _parse_input(args, root: Path):
+def _parse_input(args, root: Path, expected_model: str):
     if args.findings_json:
         return _load_findings_json(args.findings_json, args.source), ""
     if not args.input:
@@ -231,7 +237,7 @@ def _parse_input(args, root: Path):
         _warn_pr_head(root, gh, owner, name, args.input)
         return fetch_pr_findings(owner, name, int(args.input), me, gh, 1), ""
     if args.source in CLAUDE_SOURCES:
-        return _parse_claude_review(args)
+        return _parse_claude_review(args, expected_model)
     raw = s.read_text(Path(args.input))
     try:
         if args.source in CURSOR_SOURCES:
@@ -242,14 +248,14 @@ def _parse_input(args, root: Path):
         raise s.CliError(str(e), ExitCodes.PARSE_ERROR) from None
 
 
-def _parse_claude_review(args):
+def _parse_claude_review(args, expected_model: str):
     path = Path(args.input)
     if not path.is_file():
         raise s.CliError(f"파일이 없다: {path}")
     raw, model_id = load_text(path, REVIEW_JOB if path.suffix == ".json" else None)
     if not raw.strip():
         raise s.CliError(f"Claude 검토 결과가 비어 있다(Workflow 호출 실패일 수 있다): {path}", ExitCodes.PARSE_ERROR)
-    warning = model_warning(REVIEW_JOB, model_id, args.review_model or DEFAULT_MODEL)
+    warning = model_warning(REVIEW_JOB, model_id, expected_model)
     if warning:
         print(warning)
     try:
@@ -306,13 +312,40 @@ def _consent_option(raw: str | None) -> set[str] | None:
     return set(names)
 
 
+def _first_review_meta(args, mode: str) -> dict:
+    if args.findings_json or not args.input or args.source == "pr-comment":
+        return {}
+    path = Path(args.input).parent / REVIEW_META
+    if not path.is_file():
+        return {}
+    try:
+        meta = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        print(f"경고: {path}를 읽지 못해 첫 검토 이력을 남기지 못한다")
+        return {}
+    if not isinstance(meta, dict) or meta.get("role") != f"{mode}.review":
+        return {}
+    return {key: meta[key] for key in FIRST_REVIEW_KEYS if key in meta}
+
+
+def _expected_review_model(args, resolved: profiles.Resolved, mode: str, first_review: dict) -> str:
+    actual = first_review.get("actual") or {}
+    if actual.get("runner") == REVIEWER_CLAUDE:
+        return actual["model"]
+    if args.review_model and not resolved.explicit:
+        return args.review_model
+    return resolved.roles[f"{mode}.review"]["model"] or DEFAULT_MODEL
+
+
 def cmd_init(args) -> int:
     root = Path(args.root).resolve() if args.root else s.git_toplevel(Path.cwd())
     s.cfg_for(args.source, root)
     consent = _consent_option(args.consent)
     available: dict[str, bool] = {}
     resolved = _resolve_profile(args, root, available)
-    findings, raw = _parse_input(args, root)
+    mode = "doc" if args.source in s.DOC_SOURCES else "code"
+    first_review = _first_review_meta(args, mode)
+    findings, raw = _parse_input(args, root, _expected_review_model(args, resolved, mode, first_review))
     if not findings:
         print("지적 0건 — 원문을 확인하라")
         for line in raw.splitlines()[:RAW_PREVIEW_LINES]:
@@ -327,7 +360,6 @@ def cmd_init(args) -> int:
     if not findings:
         raise s.CliError(f"--severity {args.severity} 에 맞는 지적이 없다(전체 {len(deferred)}건). 등급을 넓힌다")
     docs, external = _split_docs(root, args.doc or [])
-    mode = "doc" if args.source in s.DOC_SOURCES else "code"
     roles, substituted = _decide_roles(args, resolved, args.source, available)
     roles = assignment.fill_codex_model(roles, codex_model(Path.home() / ".codex"))
     if consent is not None:
@@ -335,7 +367,7 @@ def cmd_init(args) -> int:
         substituted = [*substituted, *dropped]
     consented = assignment.used_recipients(roles, mode)
     record = {"name": resolved.name, "source": resolved.source, "explicit": resolved.explicit, "roles": roles,
-              "overrides": resolved.overrides, "substituted": substituted, "consented": consented, "first_review": {}}
+              "overrides": resolved.overrides, "substituted": substituted, "consented": consented, "first_review": first_review}
     requested = args.workers or (None if resolved.explicit else os.environ.get("CASCADE_WORKERS") or None)
     legacy = assignment.legacy_fields({**record, "adopt_on_both_pass": resolved.adopt_on_both_pass}, mode, requested)
     reviewer, workers, workers_choice = legacy["reviewer"], legacy["workers"], legacy["workers_choice"]
@@ -454,43 +486,180 @@ def cmd_detect(args) -> int:
     return 0 if result["ok"] else ExitCodes.NEEDS_USER
 
 
-def cmd_review(args) -> int:
-    root = Path(args.root).resolve() if args.root else s.git_toplevel(Path.cwd())
+def _review_scope(args, root: Path) -> dict:
+    docs = []
     if args.kind == "doc":
         if not args.doc:
             raise s.CliError("문서 검토는 --doc <문서> 를 하나 이상 준다")
-        docs = []
         for raw in args.doc:
             path = Path(raw).resolve()
             if not path.is_file():
                 raise s.CliError(f"문서가 없다: {raw}")
-            docs.append(path.relative_to(root).as_posix() if path.is_relative_to(root) else str(path))
-        prompt = build_review_prompt("doc", root, docs=docs, focus=args.focus or "")
-    else:
-        if sum(bool(x) for x in (args.base, args.uncommitted, args.commit)) != 1:
-            raise s.CliError("코드 검토는 --base <브랜치> / --uncommitted / --commit <SHA> 중 하나를 준다")
-        prompt = build_review_prompt("code", root, base=args.base, uncommitted=args.uncommitted,
-                                     commit=args.commit, focus=args.focus or "")
-    ensure_excluded(root)
+            docs.append(str(path))
+    elif sum(bool(x) for x in (args.base, args.uncommitted, args.commit)) != 1:
+        raise s.CliError("코드 검토는 --base <브랜치> / --uncommitted / --commit <SHA> 중 하나를 준다")
+    return {"kind": args.kind, "base": args.base, "uncommitted": args.uncommitted, "commit": args.commit,
+            "docs": docs, "focus": args.focus or "", "root": str(root)}
+
+
+def _review_prompt(scope: dict) -> str:
+    root = Path(scope["root"])
+    if scope["kind"] == "doc":
+        docs = [Path(d).relative_to(root).as_posix() if Path(d).is_relative_to(root) else d for d in scope["docs"]]
+        return build_review_prompt("doc", root, docs=docs, focus=scope["focus"])
+    return build_review_prompt("code", root, base=scope["base"], uncommitted=scope["uncommitted"],
+                               commit=scope["commit"], focus=scope["focus"])
+
+
+def _review_profile(args, root: Path, flag: str | None) -> profiles.Resolved:
+    env = {name: value for name, value in os.environ.items() if name not in REVIEW_IGNORED_ENVS}
+    try:
+        return profiles.resolve(root, s.repos_toml(), flag=flag, cli=profiles.LegacyOptions(), env=env,
+                                available={}, codex_model="")
+    except ConfigError as e:
+        raise s.CliError(str(e), ExitCodes.PARSE_ERROR) from None
+
+
+def _first_review_cell(resolved: profiles.Resolved, mode: str) -> dict:
+    roles = assignment.resolve_auto(resolved.roles, f"claude-{mode}", s.RUN_REVIEW, False, name=resolved.name)
+    return roles[f"{mode}.review"]
+
+
+def _apply_review_options(args, name: str, key: str, cell: dict) -> dict:
+    options = [(field, flag, value) for field, flag, value
+               in (("model", "--review-model", args.review_model), ("effort", "--review-effort", args.review_effort)) if value]
+    if not options:
+        return cell
+    if cell["runner"] != REVIEWER_CLAUDE:
+        flags = " ".join(f"{flag} {value}" for _, flag, value in options)
+        raise s.CliError(f"{key} 칸의 runner가 {cell['runner']}라 {flags}를 쓸 수 없다. 두 옵션은 claude 칸에만 쓴다",
+                         ExitCodes.PARSE_ERROR)
+    notes = [f"{key} ← {flag} {value}" for _, flag, value in options]
+    out = {**cell, **{field: value for field, _, value in options}}
+    try:
+        profiles.validate(name, {"adopt_on_both_pass": True, "roles": {**profiles.builtin("claude-only")["roles"], key: out}})
+    except profiles.ProfileError as e:
+        raise s.CliError(str(profiles.explain_overrides(e, notes)), ExitCodes.PARSE_ERROR) from None
+    return out
+
+
+def _first_review_unusable(runner: str, available: dict[str, bool]) -> str | None:
+    if runner == REVIEWER_CLAUDE:
+        return None
+    if not _probe(available, (runner,))[runner]:
+        return assignment.UNAVAILABLE_REASON
+    script = s.CURSOR_REVIEW if runner == REVIEWER_CURSOR else s.RUN_REVIEW
+    return None if script.is_file() else REVIEW_NO_SCRIPT_REASON
+
+
+def _first_review_target(cell: dict, attempts: list[dict], available: dict[str, bool]) -> dict:
+    consented = {r for r in (cell["runner"], cell["fallback"]["runner"]) if r in assignment.EXTERNAL_RUNNERS}
+
+    def target() -> dict:
+        return assignment.fallback_target(cell, consented, {a["runner"] for a in attempts}, "reviewer")
+
+    current = target() if attempts else cell
+    while reason := _first_review_unusable(current["runner"], available):
+        attempts.append({"runner": current["runner"], "reason": reason})
+        current = target()
+    return current
+
+
+def _new_review_dir(root: Path) -> Path:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     out_dir, n = root / RUN_DIR_NAME / f"review-{stamp}", 2
     while out_dir.exists():
         out_dir, n = root / RUN_DIR_NAME / f"review-{stamp}-{n}", n + 1
-    model, effort = args.review_model or DEFAULT_MODEL, args.review_effort or DEFAULT_EFFORT
-    job = review_job(REVIEW_JOB, f"{args.kind} review", claude_prompt(prompt, root), model, effort)
-    args_path = out_dir / "review-args.json"
-    s.write_json(args_path, write_job_args({"jobs": [job]}, out_dir / "prompts"))
-    result = out_dir / "review.json"
-    source = "claude-doc" if args.kind == "doc" else "claude-code"
-    docs_args = "".join(f" --doc {shlex.quote(str(Path(d).resolve()))}" for d in args.doc or [])
-    print(f"review_dir={out_dir}")
-    print(f"검토자: Claude({model}, {effort})")
+    return out_dir
+
+
+def _runner_values(cell: dict) -> dict:
+    return {key: cell[key] for key in ("runner", "model", "effort")}
+
+
+def _emit_first_review(args, review_dir: Path, meta: dict, new_attempts: list[dict], root_flag: str) -> None:
+    scope, actual, key = meta["args"], meta["actual"], meta["role"]
+    root = Path(scope["root"])
+    source = f"{actual['runner']}-{scope['kind']}"
+    print(f"review_dir={review_dir}")
+    for i, attempt in enumerate(new_attempts):
+        to = new_attempts[i + 1]["runner"] if i + 1 < len(new_attempts) else actual["runner"]
+        print(f"대체: {key} {attempt['runner']} → {to} — {attempt['reason']}")
+    if actual["runner"] == REVIEWER_CLAUDE:
+        model, effort = actual["model"], actual["effort"]
+        job = review_job(REVIEW_JOB, f"{scope['kind']} review", claude_prompt(_review_prompt(scope), root), model, effort)
+        args_path, result = review_dir / "review-args.json", review_dir / "review.json"
+        s.write_json(args_path, write_job_args({"jobs": [job]}, review_dir / "prompts"))
+        print(f"검토자: Claude({model}, {effort})")
+        step = s.workflow_step(args_path, result)
+    else:
+        step, result = first_review_command(actual, scope, review_dir)
+        print(f"검토자: {label(actual['runner'])}" + (f"({actual['model']})" if actual["model"] else ""))
+    if meta["explicit"]:
+        carried = f" --profile {shlex.quote(meta['profile'])}"
+    else:
+        carried = ((f" --review-model {shlex.quote(args.review_model)}" if args.review_model else "")
+                   + (f" --review-effort {args.review_effort}" if args.review_effort else ""))
+    docs_args = "".join(f" --doc {shlex.quote(d)}" for d in scope["docs"])
     print("다음:")
-    print(f"  {s.workflow_step(args_path, result)}")
-    print(f"  {s.CLI} init --source {source} --input {shlex.quote(str(result))}{docs_args}"
-          + (f" --review-model {shlex.quote(model)}" if args.review_model else "")
-          + (f" --review-effort {effort}" if args.review_effort else "")
-          + _root_flag(args, root))
+    print(f"  {step}")
+    print(f"  {s.CLI} init --source {source} --input {shlex.quote(str(result))}{docs_args}{carried}{root_flag}")
+
+
+def _load_review_meta(review_dir: Path) -> dict:
+    path = review_dir / REVIEW_META
+    if not path.is_file():
+        raise s.CliError(f"{path}가 없다. CF review가 만든 첫 검토 폴더를 --review-dir로 준다", ExitCodes.PARSE_ERROR)
+    meta = s.read_json(path)
+    try:
+        [meta[name] for name in ("role", "actual", "attempts", "profile", "explicit")]
+        meta["requested"]["runner"], meta["args"]["root"]
+    except (KeyError, TypeError):
+        raise s.CliError(f"{path}의 형식이 맞지 않는다", ExitCodes.PARSE_ERROR) from None
+    return meta
+
+
+def _review_fallback(args) -> int:
+    if not args.fallback_from:
+        raise s.CliError("--review-dir은 --fallback-from과 함께 쓴다", ExitCodes.PARSE_ERROR)
+    if not args.review_dir:
+        raise s.CliError("--fallback-from은 처음 첫 검토 폴더를 가리키는 --review-dir과 함께 쓴다", ExitCodes.PARSE_ERROR)
+    review_dir = Path(args.review_dir).resolve()
+    meta = _load_review_meta(review_dir)
+    requested = meta["requested"]["runner"]
+    if args.fallback_from not in assignment.EXTERNAL_RUNNERS or requested != args.fallback_from:
+        raise s.CliError(f"--fallback-from {args.fallback_from}가 처음 요청한 runner({requested})와 다르다", ExitCodes.PARSE_ERROR)
+    scope, key = meta["args"], meta["role"]
+    resolved = _review_profile(args, Path(scope["root"]), args.profile or meta["profile"])
+    cell = {**meta["requested"], "fallback": _first_review_cell(resolved, scope["kind"])["fallback"]}
+    attempts = [*meta["attempts"], {"runner": args.fallback_from, "reason": args.reason or REVIEW_DEFAULT_REASON}]
+    added = len(meta["attempts"])
+    actual = _apply_review_options(args, meta["profile"], key, _first_review_target(cell, attempts, {}))
+    meta = {**meta, "actual": _runner_values(actual), "fallback_reason": attempts[-1]["reason"], "attempts": attempts}
+    s.write_json(review_dir / REVIEW_META, meta)
+    _emit_first_review(args, review_dir, meta, attempts[added:], f" --root {shlex.quote(scope['root'])}")
+    return 0
+
+
+def cmd_review(args) -> int:
+    if args.review_dir or args.fallback_from:
+        return _review_fallback(args)
+    if not args.kind:
+        build_parser().error("the following arguments are required: --kind")
+    root = Path(args.root).resolve() if args.root else s.git_toplevel(Path.cwd())
+    scope = _review_scope(args, root)
+    resolved = _review_profile(args, root, args.profile)
+    key = f"{args.kind}.review"
+    requested = _apply_review_options(args, resolved.name, key, _first_review_cell(resolved, args.kind))
+    attempts: list[dict] = []
+    actual = _first_review_target(requested, attempts, {})
+    ensure_excluded(root)
+    review_dir = _new_review_dir(root)
+    meta = {"role": key, "requested": _runner_values(requested), "actual": _runner_values(actual),
+            "fallback_reason": attempts[-1]["reason"] if attempts else None, "attempts": attempts, "args": scope,
+            "profile": resolved.name, "explicit": resolved.explicit}
+    s.write_json(review_dir / REVIEW_META, meta)
+    _emit_first_review(args, review_dir, meta, attempts, _root_flag(args, root))
     return 0
 
 
@@ -1338,7 +1507,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--profile", help="역할 프로필 이름(기본: 환경 변수 CASCADE_PROFILE, repos.toml, 없으면 내장 default)")
     add_workers_args(p)
     p = add("review", cmd_review, run_dir=False, force=False)
-    p.add_argument("--kind", choices=("code", "doc"), required=True)
+    p.add_argument("--kind", choices=("code", "doc"))
     p.add_argument("--base")
     p.add_argument("--uncommitted", action="store_true")
     p.add_argument("--commit")
@@ -1348,6 +1517,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--profile", help="역할 프로필 이름(기본: 환경 변수 CASCADE_PROFILE, repos.toml, 없으면 내장 default)")
     p.add_argument("--review-model")
     p.add_argument("--review-effort", choices=EFFORTS)
+    p.add_argument("--review-dir", help="--fallback-from으로 이력을 고칠 처음 첫 검토 폴더(review_dir=로 찍힌 곳)")
+    p.add_argument("--fallback-from", help="실패한 첫 검토 runner(codex·cursor). 처음 요청한 runner와 같아야 한다")
+    p.add_argument("--reason", help=f"--fallback-from의 사유(기본 {REVIEW_DEFAULT_REASON})")
     add("jobs", cmd_jobs, round_no=True)
     p = add("workers", cmd_workers, round_no=True)
     p.add_argument("--stage", choices=(s.STAGE1, s.STAGE_CHECKER), required=True)
