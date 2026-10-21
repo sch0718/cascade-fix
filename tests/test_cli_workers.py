@@ -175,12 +175,13 @@ class WorkersCommandTest(WorkersTestBase):
         self.start()
         self.workers()
         self.args("judge")
-        ledger = self.ledger()
-        ledger.rounds[0].events.append({"step": "apply", "at": "x"})
-        ledger.save(self.run_dir / "ledger.json")
-        p = self.args("jobs", "--force", ok=False)
-        self.assertNotEqual(p.returncode, 0)
-        self.assertIn("apply", p.stdout)
+        for step in ("apply-patched", "apply"):
+            ledger = self.ledger()
+            ledger.rounds[0].events.append({"step": step, "at": "x"})
+            ledger.save(self.run_dir / "ledger.json")
+            p = self.args("jobs", "--force", ok=False)
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn("apply", p.stdout)
 
     def test_workers_command_is_refused_twice_without_force(self):
         self.start()

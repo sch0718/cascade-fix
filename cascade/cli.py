@@ -420,8 +420,8 @@ _JUDGE_OUTPUTS = ("decisions.json", "results.json", "verify.json", "adj-args.jso
 
 def _reopen_round(ledger, rnd, rd: Path) -> None:
     """jobs 를 다시 하면 그 뒤 단계(작업자·판정·의견·판가름)가 남긴 상태를 지워 이전 판정이 이어지지 않게 한다."""
-    if s.step_done(rnd, "apply"):
-        raise s.CliError(f"회차 {rnd.no}는 이미 apply 했다. 적용한 회차는 jobs 로 다시 열지 않는다")
+    if s.step_done(rnd, "apply") or s.step_done(rnd, "apply-patched"):
+        raise s.CliError(f"회차 {rnd.no}는 이미 apply 했다(패치 적용 포함). 적용한 회차는 jobs 로 다시 열지 않는다")
     first = next(i for i, e in enumerate(rnd.events) if e.get("step") == "jobs")
     rnd.events = rnd.events[:first]
     held = {f["id"] for f in rnd.hold_findings}
@@ -694,6 +694,7 @@ def cmd_judge(args) -> int:
         if d.outcome == OUTCOME_ADJUDICATE:
             name = s.wt_name(d.finding_id, "adjudicator")
             wt = snap.worktrees[name] if name in snap.worktrees else s.new_worktree(snap, name, s.base_of(ledger, rnd), cfg)
+            _pin_worktrees(rd / WORKTREE_INPUTS, [wt])
             adj_items.append(s.adj_input(ledger, by_id[d.finding_id], merged, verify, wt, cfg, d.reasons))
     if adj_items:
         s.write_json(rd / "adj-args.json", write_job_args(build_adjudicator_jobs(adj_items), rd / "prompts"))
