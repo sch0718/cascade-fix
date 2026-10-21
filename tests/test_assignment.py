@@ -211,6 +211,16 @@ class ResolveAutoTest(unittest.TestCase):
             assignment.resolve_auto(roles, "claude-code", self.missing, False)
         self.assertEqual(ctx.exception.cell, "code.opinion")
 
+    def test_claude_resolution_fills_empty_model_and_effort_from_claude_only(self):
+        roles = profiles.builtin("default")["roles"]
+        for key in ("code.opinion", "code.review"):
+            roles[key] = {**roles[key], "model": "", "effort": ""}
+        out = assignment.resolve_auto(roles, "claude-code", self.missing, False)
+        claude_only = profiles.builtin("claude-only")["roles"]
+        for key in ("code.opinion", "code.review"):
+            self.assertEqual((out[key]["runner"], out[key]["model"], out[key]["effort"]),
+                             ("claude", claude_only[key]["model"], claude_only[key]["effort"]))
+
     def test_non_auto_cells_are_untouched(self):
         roles = profiles.builtin("local")["roles"]
         self.assertEqual(assignment.resolve_auto(roles, "claude-code", self.missing, False), roles)
