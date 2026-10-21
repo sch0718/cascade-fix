@@ -221,6 +221,31 @@ class CliEndToEndTest(CliTestBase):
         self.assertTrue((self.run_dir / "ledger.json").is_file())
         self.assertFalse((self.run_dir / "wt").exists())
 
+    def _stage1_with_disagreement(self):
+        for name in ("r1-01-a", "r1-01-b"):
+            wt = self.wt(name)
+            (wt / "calc.py").write_text(fix(CALC, "return a - b", "return a + b"), encoding="utf-8")
+            commit_worktree(wt, f"cascade-fix {name}")
+        wt = self.wt("r1-02-a")
+        (wt / "calc.py").write_text(fix(CALC, "return a + b", "return a * b"), encoding="utf-8")
+        commit_worktree(wt, "cascade-fix r1-02 a")
+        stage1 = self.run_dir / "round-1" / "stage1.json"
+        shutil.copyfile(FIXTURES / "workflow-stage1.json", stage1)
+        self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1))
+
+    def test_jobs_force_resets_adjudicator_worktree(self):
+        self.init()
+        self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1")
+        self._stage1_with_disagreement()
+        adj_wt = self.wt("r1-02-adj")
+        start = git(adj_wt, "rev-parse", "HEAD")
+        (adj_wt / "calc.py").write_text(fix(CALC, "return a + b", "return a * b"), encoding="utf-8")
+        commit_worktree(adj_wt, "cascade-fix r1-02 adjudicator")
+        self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1", "--force")
+        self._stage1_with_disagreement()
+        self.assertEqual(git(adj_wt, "rev-parse", "HEAD"), start)
+        self.assertEqual((adj_wt / "calc.py").read_text(encoding="utf-8"), CALC)
+
     def test_dry_run_leaves_working_tree_and_shows_banner(self):
         self.run_to_apply("--dry-run")
         self.assertEqual((self.repo / "calc.py").read_text(encoding="utf-8"), CALC)

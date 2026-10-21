@@ -2,6 +2,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+from cascade.cli_steps import exhausted_runners
 from cascade.consensus import (
     OUTCOME_ADJUDICATE,
     OUTCOME_AGREED_FACT,
@@ -13,6 +14,8 @@ from cascade.consensus import (
 from cascade.review import CLAUDE_SOURCES
 from cascade.review import label as reviewer_label
 from cascade.rounds import Ledger
+from cascade.runners import STATUS_AUTH
+from cascade.workers import LOGIN_COMMANDS, WORKERS_CLAUDE, describe, fallback_counts
 
 SOURCE_PR_COMMENT = "pr-comment"
 BUCKET_REBUTTAL = "반박"
@@ -399,6 +402,45 @@ def _calls_section(ledger: Ledger, run_dir: Path | None) -> list[str]:
     return out
 
 
+def _worker_events(ledger: Ledger) -> list[tuple[int, str, dict]]:
+    return [(rnd.no, e["step"][len("workers-"):], e) for rnd in ledger.rounds for e in rnd.events
+            if str(e.get("step", "")).startswith("workers-")]
+
+
+def _auth_runners(ledger: Ledger, run_dir: Path | None) -> list[str]:
+    found = [runner for rnd in ledger.rounds for runner, entry in exhausted_runners(rnd).items()
+             if entry.get("status") == STATUS_AUTH and runner in LOGIN_COMMANDS]
+    if run_dir is not None:
+        for no, stage, _ in _worker_events(ledger):
+            data = _read_json(Path(run_dir) / f"round-{no}" / f"{stage}-cli.json")
+            outcomes = data.get("outcomes", []) if isinstance(data, dict) else []
+            found += [o["runner"] for o in outcomes if o.get("status") == STATUS_AUTH and o.get("runner") in LOGIN_COMMANDS]
+    return list(dict.fromkeys(found))
+
+
+def _workers_section(ledger: Ledger, run_dir: Path | None) -> list[str]:
+    if ledger.workers_choice == WORKERS_CLAUDE or not ledger.workers:
+        return []
+    out = ["## 외부 작업자", "", f"배정: {describe(ledger.workers)}", ""]
+    events = _worker_events(ledger)
+    usage: dict[str, dict[str, int]] = {}
+    for no, stage, event in events:
+        total = sum((event.get("counts") or {}).values())
+        n, reasons = fallback_counts(event.get("counts") or {})
+        out.append(f"- 회차 {no} {stage}: CLI 작업 {total}건, 대체 실행 {n}건" + (f"({reasons})" if n else ""))
+        for runner, tokens in (event.get("usage") or {}).items():
+            sums = usage.setdefault(runner, {"input": 0, "output": 0, "cache_read": 0})
+            for key in sums:
+                sums[key] += tokens.get(key, 0)
+    if usage:
+        out.extend(["", "| CLI | 입력 토큰 | 출력 토큰 | 캐시 읽기 토큰 |", "| --- | ---: | ---: | ---: |"])
+        out.extend(f"| {runner} | {t['input']} | {t['output']} | {t['cache_read']} |" for runner, t in usage.items())
+    for runner in _auth_runners(ledger, run_dir):
+        out.extend(["", f"{runner}: 로그인이 풀렸다. `{LOGIN_COMMANDS[runner]}` 로 다시 로그인한 뒤 이어서 돌린다."])
+    out.append("")
+    return out
+
+
 def render(ledger: Ledger, dry_run: bool, run_dir: Path | None = None) -> str:
     run_dir = Path(run_dir) if run_dir is not None else None
     out = [f"# cascade-fix 보고서 {ledger.run_id}", ""]
@@ -424,6 +466,7 @@ def render(ledger: Ledger, dry_run: bool, run_dir: Path | None = None) -> str:
     out.extend(_baseline_section(ledger, run_dir))
     out.extend(_prepared_section(ledger, run_dir))
     out.extend(_calls_section(ledger, run_dir))
+    out.extend(_workers_section(ledger, run_dir))
     return "\n".join(out).rstrip("\n") + "\n"
 
 

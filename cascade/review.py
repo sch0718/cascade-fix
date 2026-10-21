@@ -1,15 +1,18 @@
 import json
 import shlex
+from collections.abc import Callable
 from pathlib import Path
 
 from cascade.jobs import KIND_REVIEW, ROLES, _render
 
 REVIEWER_CODEX = "codex"
+REVIEWER_CURSOR = "cursor"
 REVIEWER_CLAUDE = "claude"
 REVIEWER_AUTO = "auto"
-REVIEWER_CHOICES = (REVIEWER_AUTO, REVIEWER_CODEX, REVIEWER_CLAUDE)
-REVIEWER_LABELS = {REVIEWER_CODEX: "Codex", REVIEWER_CLAUDE: "Claude"}
+REVIEWER_CHOICES = (REVIEWER_AUTO, REVIEWER_CODEX, REVIEWER_CURSOR, REVIEWER_CLAUDE)
+REVIEWER_LABELS = {REVIEWER_CODEX: "Codex", REVIEWER_CURSOR: "Cursor", REVIEWER_CLAUDE: "Claude"}
 CLAUDE_SOURCES = ("claude-code", "claude-doc")
+CURSOR_SOURCES = ("cursor-code", "cursor-doc")
 DEFAULT_MODEL, DEFAULT_EFFORT = ROLES["reviewer"]
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 REVIEW_JOB = "review:reviewer"
@@ -29,12 +32,15 @@ def label(reviewer: str) -> str:
     return REVIEWER_LABELS.get(reviewer, reviewer)
 
 
-def resolve(choice: str, source: str, run_review: Path) -> str:
+def resolve(choice: str, source: str, run_review: Path, cursor_ok: bool | Callable[[], bool] = False) -> str:
     if choice != REVIEWER_AUTO:
         return choice
-    if source in CLAUDE_SOURCES or not Path(run_review).is_file():
+    if source in CLAUDE_SOURCES:
         return REVIEWER_CLAUDE
-    return REVIEWER_CODEX
+    if Path(run_review).is_file():
+        return REVIEWER_CODEX
+    available = cursor_ok() if callable(cursor_ok) else cursor_ok
+    return REVIEWER_CURSOR if available else REVIEWER_CLAUDE
 
 
 def claude_prompt(prompt: str, repo: str | Path) -> str:
