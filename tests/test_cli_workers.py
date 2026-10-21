@@ -23,6 +23,10 @@ CHECKER_RESULT = json.dumps({"verdict": "사실", "needs_design_decision": False
                              "checker_ok": True, "model_id": "x"}, ensure_ascii=False)
 
 
+def role_sections(report):
+    return section_of(report, "## 역할 배정") + section_of(report, "## 역할별 사용량")
+
+
 class WorkersTestBase(ExternalWorkersBase):
     def setUp(self):
         super().setUp()
@@ -82,7 +86,8 @@ class WorkersCommandTest(WorkersTestBase):
         self.assertIn("return a + b\n\n\ndef ident", calc)
         self.assertIn("return a * b", calc)
         report = self.cli("report", "--run-dir", str(self.run_dir)).stdout
-        self.assertIn("## 외부 작업자", report)
+        self.assertIn("## 역할 배정", report)
+        self.assertIn("## 역할별 사용량", report)
 
     def test_empty_codex_model_reports_default_model_id_without_warning(self):
         (self.home / ".codex" / "config.toml").write_text("", encoding="utf-8")
@@ -353,7 +358,7 @@ class ProfileFallbackTest(WorkersTestBase):
         self.assertIn("| cursor | 200 | 40 | 10 |", section)
 
     def section(self):
-        return section_of(self.cli("report", "--run-dir", str(self.run_dir)).stdout, "## 외부 작업자")
+        return role_sections(self.cli("report", "--run-dir", str(self.run_dir)).stdout)
 
     def test_fallback_outside_consent_goes_claude_only(self):
         self.start_profile('{ runner = "codex", fallback = { runner = "cursor" } }', "--consent", "codex")
@@ -525,7 +530,7 @@ class DocWorkersTest(WorkersTestBase):
         self.assertIn("r1-01:b에서 limit", outcome["detail"])
         self.assertEqual([j["id"] for j in self.read("checker-fallback-args.json")["jobs"]], ["r1-01:checker"])
         report = self.cli("report", "--run-dir", str(self.run_dir)).stdout
-        section = section_of(report, "## 외부 작업자")
+        section = role_sections(report)
         self.assertIn("회차 1 stage1: CLI 작업 3건, 대체 실행 1건(한도 1)", section)
         self.assertIn("회차 1 checker: CLI 작업 1건, 대체 실행 1건(건너뜀 1)", section)
 
@@ -600,7 +605,7 @@ class DocWorkersTest(WorkersTestBase):
 class ReportWorkersTest(WorkersTestBase):
     def section(self):
         report = self.cli("report", "--run-dir", str(self.run_dir)).stdout
-        return section_of(report, "## 외부 작업자")
+        return role_sections(report)
 
     def test_report_shows_fallback_and_usage(self):
         self.cursor_results([dict(LIMIT_ENTRY, match="r1-02-b")])
@@ -642,10 +647,13 @@ class ReportWorkersTest(WorkersTestBase):
         self.assertIn("대체 실행 0", p.stdout)
         self.assertNotIn("codex login", self.section())
 
-    def test_report_without_external_workers_has_no_section(self):
+    def test_report_without_external_workers_has_no_cli_lines(self):
         self.init("--reviewer", "claude")
         report = self.cli("report", "--run-dir", str(self.run_dir)).stdout
         self.assertNotIn("외부 작업자", report)
+        self.assertIn("## 역할 배정", report)
+        self.assertNotIn("CLI 작업", report)
+        self.assertNotIn("배정: A·writer", report)
 
 
 class StageResultsTest(unittest.TestCase):

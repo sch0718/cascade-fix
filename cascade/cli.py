@@ -132,7 +132,7 @@ REASON_FINAL_BASELINE_FAILED = "전체 테스트 실패(기준선도 실패)"
 REASON_OUT_OF_SCOPE = "재검토 범위 밖"
 REASON_SEVERITY_DEFERRED = "등급 선택(--severity)으로 이번 실행에서 뺌"
 SANDBOX_REASON = "샌드박스 점검 실패"
-REVIEW_NO_SCRIPT_REASON = "검토 스크립트 없음"
+REVIEW_NO_SCRIPT_REASON = assignment.NO_SCRIPT_REASON
 REVIEW_DEFAULT_REASON = "실행 오류"
 REVIEW_IGNORED_ENVS = ("CASCADE_WORKERS", "CASCADE_REVIEWER")
 FIRST_REVIEW_KEYS = ("role", "requested", "actual", "fallback_reason", "attempts")
@@ -408,7 +408,7 @@ def cmd_init(args) -> int:
     if deferred:
         print(f"등급 선택으로 뺀 지적 {len(deferred)}건은 보류 후보로 둔다(나중에 resume 「지금 반영」으로 돌릴 수 있다)")
     _print_assignment(resolved, roles, substituted, mode)
-    print(f"규모: {estimate_line(len(findings), ledger.mode, reviewer, workers)}")
+    print(f"규모: {estimate_line(len(findings), ledger.mode, reviewer, workers, roles if resolved.explicit else None)}")
     if workers_choice == WORKERS_EXTERNAL:
         if has_external(workers):
             print(f"작업자: {describe(workers)}")
@@ -483,7 +483,8 @@ def cmd_detect(args) -> int:
                         reviewer_choice=reviewer_choice, root_flag=_root_flag(args, root),
                         docs=[Path(d).resolve() for d in args.doc or []], cwd=Path.cwd(),
                         workers_choice=workers_choice, cursor_model=cursor_model,
-                        profile=resolved, available=available, profile_flag=args.profile)
+                        profile=resolved, available=available, profile_flag=args.profile,
+                        codex_model=codex_model(Path.home() / ".codex"))
     except profiles.ProfileError as e:
         raise s.CliError(str(profiles.explain_overrides(e, resolved.overrides)), ExitCodes.PARSE_ERROR) from None
     print(json.dumps(result, ensure_ascii=False, indent=2) if args.json else render_detect(result))
@@ -611,9 +612,10 @@ def _emit_first_review(args, review_dir: Path, meta: dict, new_attempts: list[di
         carried = ((f" --review-model {shlex.quote(args.review_model)}" if args.review_model else "")
                    + (f" --review-effort {args.review_effort}" if args.review_effort else ""))
     docs_args = "".join(f" --doc {shlex.quote(d)}" for d in scope["docs"])
+    consent = f" --consent {','.join(meta['consent']) or 'none'}" if "consent" in meta else ""
     print("다음:")
     print(f"  {step}")
-    print(f"  {s.CLI} init --source {source} --input {shlex.quote(str(result))}{docs_args}{carried}{root_flag}")
+    print(f"  {s.CLI} init --source {source} --input {shlex.quote(str(result))}{docs_args}{carried}{consent}{root_flag}")
 
 
 def _load_review_meta(review_dir: Path) -> dict:
@@ -666,7 +668,7 @@ def cmd_review(args) -> int:
     meta = {"role": key, "requested": {**_runner_values(requested), "fallback": _runner_values(cell["fallback"])},
             "actual": _runner_values(actual), "fallback_reason": attempts[-1]["reason"] if attempts else None,
             "attempts": attempts, "consented": consented, "args": scope, "profile": resolved.name,
-            "explicit": resolved.explicit}
+            "explicit": resolved.explicit, **({"consent": sorted(consent)} if consent is not None else {})}
     _emit_first_review(args, _new_review_dir(root), meta, attempts, _root_flag(args, root))
     return 0
 

@@ -11,6 +11,7 @@ from cascade.workers import DEFAULT_CURSOR_MODEL, RECIPIENTS, WORKERS_EXTERNAL
 
 UNAVAILABLE_REASON = "미설치 또는 로그인 필요"
 NO_CONSENT_REASON = "전송 동의 없음"
+NO_SCRIPT_REASON = "검토 스크립트 없음"
 FALLBACK_SUFFIX = "(대체)"
 EXTERNAL_RUNNERS = (RUNNER_CODEX, RUNNER_CURSOR)
 
@@ -24,11 +25,16 @@ _MODE_WORKER_KEYS = {
     "doc": {"a": "doc.judge_a", "b": "doc.judge_b", "writer": "doc.writer", "checker": "doc.checker"},
 }
 _WORKER_ROLES = ("a", "b", "judge_a", "judge_b", "writer", "checker")
+_REVIEW_ROLES = ("review", "opinion", "recheck")
 _OVERRIDE_SEPARATOR = " ← "
 
 
 def _role(key: str) -> str:
     return key.split(".", 1)[1]
+
+
+def job_cell_key(mode: str, role: str) -> str | None:
+    return f"{mode}.{role}" if role == "adjudicator" else _MODE_WORKER_KEYS.get(mode, {}).get(role)
 
 
 def _cell_label(key: str) -> str:
@@ -58,12 +64,20 @@ def _runner_label(cell: dict) -> str:
     return f"{name}({detail})" if detail else name
 
 
-def _mode_keys(roles: dict, mode: str) -> list[str]:
+def mode_keys(roles: dict, mode: str) -> list[str]:
     return [key for key in ROLE_KEYS if key.startswith(f"{mode}.") and key in roles]
 
 
+def work_keys(roles: dict, mode: str) -> list[str]:
+    return [key for key in mode_keys(roles, mode) if _role(key) not in _REVIEW_ROLES]
+
+
+def model_nickname(model: str) -> str:
+    return _claude_name(model).split()[0]
+
+
 def roles_line(roles: dict, mode: str) -> str:
-    return "역할: " + ", ".join(f"{_cell_label(key)}={_runner_label(roles[key])}" for key in _mode_keys(roles, mode))
+    return "역할: " + ", ".join(f"{_cell_label(key)}={_runner_label(roles[key])}" for key in mode_keys(roles, mode))
 
 
 def _external_runners(cell: dict) -> set[str]:
@@ -138,7 +152,7 @@ def fill_codex_model(roles: dict, model: str) -> dict:
 
 def recipients(roles: dict, mode: str) -> dict[str, list[str]]:
     out: dict[str, list[str]] = {runner: [] for runner in EXTERNAL_RUNNERS}
-    for key in _mode_keys(roles, mode):
+    for key in mode_keys(roles, mode):
         cell = roles[key]
         if cell["runner"] in out:
             out[cell["runner"]].append(key)

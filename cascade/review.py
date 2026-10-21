@@ -45,12 +45,12 @@ def resolve(choice: str, source: str, run_review: Path, cursor_ok: bool | Callab
     return REVIEWER_CURSOR if available else REVIEWER_CLAUDE
 
 
-def first_review_command(cell: dict, args: dict, review_dir: Path) -> tuple[str, str]:
+def first_review_command(cell: dict, args: dict, review_dir: Path, script: Path | None = None) -> tuple[str, str]:
     """외부 첫 검토(Codex `RR`, Cursor `CR`)를 돌릴 명령과 결과 파일(`<review_dir>/review.out.final`) 경로."""
     from cascade import cli_steps  # cli_steps가 이 모듈을 먼저 불러오므로 함수 안에서 부른다
 
     cursor = cell["runner"] == REVIEWER_CURSOR
-    script = cli_steps.CURSOR_REVIEW if cursor else cli_steps.RUN_REVIEW
+    script = script or (cli_steps.CURSOR_REVIEW if cursor else cli_steps.RUN_REVIEW)
     if args["kind"] == "doc":
         scope = " ".join(f"--doc {shlex.quote(doc)}" for doc in args["docs"])
     elif args["uncommitted"]:

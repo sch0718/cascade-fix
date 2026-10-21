@@ -4,7 +4,9 @@ import json
 import re
 import shlex
 import subprocess
+import tempfile
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 
 from cascade import assignment
@@ -16,6 +18,7 @@ from cascade.review import (
     CURSOR_SOURCES,
     REVIEWER_AUTO,
     REVIEWER_CLAUDE,
+    first_review_command,
     label,
     read_review_results,
 )
@@ -208,7 +211,23 @@ def estimate(findings: int, mode: str, reviewer: str, workers: dict[str, dict] |
     return out
 
 
-def estimate_line(findings: int, mode: str, reviewer: str, workers: dict[str, dict] | None = None) -> str:
+def _runner_totals(roles: dict, mode: str) -> str:
+    claude: dict[str, int] = {}
+    external = {RUNNER_CODEX: 0, RUNNER_CURSOR: 0}
+    for key in assignment.work_keys(roles, mode):
+        runner = roles[key]["runner"]
+        if runner == RUNNER_CLAUDE:
+            nickname = assignment.model_nickname(roles[key]["model"])
+            claude[nickname] = claude.get(nickname, 0) + 1
+        elif runner in external:
+            external[runner] += 1
+    parts = [f"Claude 최대 {'·'.join(f'{name} {n}' for name, n in claude.items())}/지적"] if claude else []
+    parts += [f"{label(runner)} {n}/지적" for runner, n in external.items() if n]
+    return f" — {', '.join(parts)} + 의견·재검토" if parts else ""
+
+
+def estimate_line(findings: int, mode: str, reviewer: str, workers: dict[str, dict] | None = None,
+                  roles: dict | None = None) -> str:
     e = estimate(findings, mode, reviewer, workers)
     split = e["stage1_by_runner"]
     by_runner = f"(Claude {split[RUNNER_CLAUDE]}·Codex {split[RUNNER_CODEX]}·Cursor {split[RUNNER_CURSOR]})" if has_external(workers) else ""
@@ -220,7 +239,7 @@ def estimate_line(findings: int, mode: str, reviewer: str, workers: dict[str, di
         parts.append(f"의견 최대 {e['opinion_max']}")
     if e["recheck"]:
         parts.append(f"재검토 {e['recheck']}")
-    return f"회차당 에이전트 {e['min']}~{e['max']}개({', '.join(parts)})"
+    return f"회차당 에이전트 {e['min']}~{e['max']}개({', '.join(parts)})" + (_runner_totals(roles, mode) if roles else "")
 
 
 def _config(root: Path, repos_toml: Path) -> tuple[RepoConfig | None, str | None]:
@@ -230,12 +249,38 @@ def _config(root: Path, repos_toml: Path) -> tuple[RepoConfig | None, str | None
         return None, f"검증 설정을 읽지 못했다({repos_toml}): {e}"
 
 
+def _first_review_ready(runner: str, run_review: Path, cursor_ok: bool | Callable[[], bool]) -> bool:
+    if runner == RUNNER_CODEX:
+        return Path(run_review).is_file()
+    if runner == RUNNER_CURSOR:
+        return bool(cursor_ok() if callable(cursor_ok) else cursor_ok)
+    return True
+
+
+def _usable_first_review(roles: dict, substituted: list[dict], key: str, run_review: Path,
+                         cursor_ok: bool | Callable[[], bool]) -> tuple[dict, list[dict]]:
+    cell, tried = roles[key], set()
+    while not _first_review_ready(cell["runner"], run_review, cursor_ok):
+        tried.add(cell["runner"])
+        new = assignment.fallback_target(cell, set(assignment.EXTERNAL_RUNNERS), tried, "reviewer")
+        substituted = [*substituted, {"role": key, "from": cell["runner"], "to": new["runner"],
+                                      "reason": assignment.NO_SCRIPT_REASON}]
+        cell = new
+    return {**roles, key: cell}, substituted
+
+
+def _first_review_scope(kind: str, root: Path, *, base: str | None = None, uncommitted: bool = False,
+                        docs: list[str] | None = None) -> dict:
+    return {"kind": kind, "base": base, "uncommitted": uncommitted, "commit": None, "docs": docs or [], "focus": "",
+            "root": str(root)}
+
+
 def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list[str] | None, profile: Resolved,
            input_path: Path | None = None, pr: str | None = None, reviewer_choice: str = REVIEWER_AUTO,
            root_flag: str = "", docs: list[Path] | None = None, cwd: Path | None = None,
            cursor_ok: bool | Callable[[], bool] = False, workers_choice: str = WORKERS_CLAUDE,
            cursor_model: str = DEFAULT_CURSOR_MODEL, available: dict[str, bool] | None = None,
-           profile_flag: str | None = None) -> dict:
+           profile_flag: str | None = None, codex_model: str = "") -> dict:
     root = Path(root)
     branch = current_branch(root)
     base = default_base(root)
@@ -256,6 +301,7 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
     doc_arg = lambda p: q(str(root / p) if root_flag or not at_root else p)  # noqa: E731
     rec: dict = {"source": None, "mode": None, "steps": [], "reasons": []}
     found = None
+    scope: dict = {}
     if input_path is not None:
         source, found = classify_input(input_path)
         if source is None:
@@ -272,6 +318,7 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
         rec.update(source="claude-doc", mode="doc")
         rec["reasons"].append(f"문서를 직접 지정했다({len(docs)}개) — 문서 모드")
         rec["review_args"] = " ".join(f"--doc {doc_arg(n) if n else q(str(d))}" for d, n in zip(docs, names))
+        scope = _first_review_scope("doc", root, docs=[str(d) for d in docs])
     elif pr_data and pr_data.get("unresolved"):
         found = pr_data["unresolved"]
         rec.update(source="pr-comment", mode="code")
@@ -292,8 +339,10 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
             if not changed_docs:
                 blockers.append("바뀐 문서가 모두 삭제라 문서 검토할 파일이 없다: " + ", ".join(changed[:5]))
             rec["review_args"] = " ".join(f"--doc {doc_arg(p)}" for p in changed_docs)
+            scope = _first_review_scope("doc", root, docs=[str(root / p) for p in changed_docs])
         else:
             rec["review_args"] = rng
+            scope = _first_review_scope("code", root, base=None if uncommitted else base, uncommitted=bool(uncommitted))
             changed_docs = [p for p in changed if p.endswith(DOC_SUFFIXES) and (root / p).is_file()]
             if changed_docs:
                 notes.append(f"문서도 {len(changed_docs)}개 바뀌었다. 코드 검토는 설계 문서로 보지 않으니 문서만 따로 보려면 "
@@ -305,8 +354,21 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
                         " (이미 커밋한 문서는 --doc <문서> 로 지정한다)")
 
     mode = rec["mode"] or "code"
-    roles, substituted = assignment.decide(profile.roles, profile.pinned, rec["source"] or "", run_review, cursor_ok,
-                                           available or {}, cursor_model=cursor_model, name=profile.name)
+    first_key = f"{mode}.review"
+    first_review = "review_args" in rec
+
+    def decide_roles(source: str) -> tuple[dict, list[dict]]:
+        decided, replaced = assignment.decide(profile.roles, profile.pinned, source, run_review, cursor_ok,
+                                              available or {}, cursor_model=cursor_model, name=profile.name)
+        return _usable_first_review(decided, replaced, first_key, run_review, cursor_ok) if first_review else (decided, replaced)
+
+    roles, substituted = decide_roles(rec["source"] or "")
+    if first_review and roles[first_key]["runner"] != RUNNER_CLAUDE:
+        rec["source"] = f"{roles[first_key]['runner']}-{mode}"
+        roles, substituted = decide_roles(rec["source"])
+    roles = assignment.fill_codex_model(roles, codex_model)
+    shown = {key: roles[key] for key in assignment.mode_keys(roles, mode) if first_review or key != first_key}
+    substituted = [r for r in substituted if first_review or not r["role"].startswith(first_key)]
     legacy = assignment.legacy_fields({"roles": roles}, mode, workers_choice)
     reviewer, workers = legacy["reviewer"], legacy["workers"]
     notes.extend(f"대체: {r['role']} {r['from']} → {r['to']} — {r['reason']}" for r in substituted if r["role"].startswith(f"{mode}."))
@@ -322,7 +384,7 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
             approvals.append(f"{REGISTER_APPROVAL}: {repos_toml} 에 [repos.\"{root}\"] 항목을 후보로 적는다(사용자 확인)")
         else:
             blockers.append("코드 모드인데 테스트 명령을 찾지 못했다. 테스트 없는 저장소의 코드 수정은 이 스킬로 하지 않는다")
-    consent = assignment.consent_line(roles, mode)
+    consent = assignment.consent_line(shown, mode)
     if consent:
         approvals.append(consent)
     if workers_choice == WORKERS_EXTERNAL and not has_external(workers):
@@ -342,13 +404,20 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
     workers_flag = f" --workers {workers_choice}" if workers_choice != WORKERS_CLAUDE else ""
     if workers_choice == WORKERS_EXTERNAL and cursor_model != DEFAULT_CURSOR_MODEL:
         workers_flag += f" --cursor-model {q(cursor_model)}"
-    profile_flag = f" --profile {q(profile_flag)}" if profile_flag else ""
-    flags = ("" if reviewer_choice == REVIEWER_AUTO else f" --reviewer {reviewer_choice}") + workers_flag + profile_flag + root_flag
+    profile_arg = f" --profile {q(profile_flag or profile.name)}" if profile.explicit or profile_flag else ""
+    flags = ("" if reviewer_choice == REVIEWER_AUTO else f" --reviewer {reviewer_choice}") + workers_flag + profile_arg + root_flag
     if not blockers and rec["source"]:
-        if rec["source"].startswith("claude-") and input_path is None:
+        if first_review and roles[first_key]["runner"] == RUNNER_CLAUDE:
             rec["first_review"] = 1
-            steps.append(f"{cli} review --kind {rec['mode']} {rec['review_args']}{root_flag}")
+            steps.append(f"{cli} review --kind {rec['mode']} {rec['review_args']}{profile_arg}{root_flag}")
             steps.append("Workflow(첫 검토) → review.json 저장 → review 출력의 init 명령")
+        elif first_review:
+            rec["first_review"] = 1
+            review_dir = Path(tempfile.gettempdir()) / f"cascade-review-{datetime.now():%Y%m%d-%H%M%S}"
+            command, result_path = first_review_command(roles[first_key], scope, review_dir, Path(run_review))
+            steps.append(f"mkdir -p {q(str(review_dir))} && {command}")
+            steps.append(f"{cli} init --source {rec['source']} --input {q(result_path)}"
+                         + "".join(f" --doc {q(d)}" for d in scope["docs"]) + flags)
         elif rec["source"] == "pr-comment":
             steps.append(f"{cli} init --source pr-comment --input {pr_data['number']} --pr-repo {q(pr_data['repo'])}"
                          + (f" --me {q(pr_data['me'])}" if pr_data.get("me") else "") + flags)
@@ -372,7 +441,7 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
         "reviewer_label": label(reviewer),
         "workers": workers,
         "profile": {"name": profile.name, "source": profile.source, "explicit": profile.explicit,
-                    "overrides": profile.overrides, "substituted": substituted},
+                    "overrides": profile.overrides, "substituted": substituted, "roles": shown},
         "config": config,
         "recommendation": rec,
         "approvals": approvals,
@@ -389,6 +458,11 @@ def render(result: dict) -> str:
     pr = result["pr"]
     if pr:
         lines.append(f"PR: #{pr['number']} {pr.get('state', '')} · 해결 안 된 리뷰 스레드 {pr['unresolved'] if pr['unresolved'] is not None else '?'}건")
+    profile = result["profile"]
+    lines.append(f"프로필: {profile['name']} ({profile['source']})")
+    if profile["overrides"]:
+        lines.append(assignment.overrides_line(profile["overrides"]))
+    lines.append(assignment.roles_line(profile["roles"], rec["mode"] or "code"))
     if rec["source"]:
         lines.append(f"추천: --source {rec['source']} · 모드 {rec['mode']} · 검토자 {result['reviewer_label']}")
         lines.extend(f"  근거: {r}" for r in rec["reasons"])

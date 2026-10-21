@@ -307,7 +307,7 @@ class LocalProfileTest(ExternalWorkersBase):
         self.use_fakes()
         p = self.cli("detect", "--json", "--no-gh", "--profile", "local", "--input", str(self.result))
         r = json.loads(p.stdout)
-        self.assertIn("전송 동의: 첫 검토·A·의견·재검토 → OpenAI", r["approvals"])
+        self.assertIn("전송 동의: A·의견·재검토 → OpenAI", r["approvals"])
         self.assertEqual((r["reviewer"], r["workers"]["a"]["runner"]), ("codex", "codex"))
         self.assertIn("--profile local", r["recommendation"]["steps"][0])
         self.assertEqual(r["profile"]["name"], "local")
@@ -318,6 +318,80 @@ class LocalProfileTest(ExternalWorkersBase):
         self.assertFalse(any("OpenAI" in a for a in r["approvals"]))
         self.assertTrue(any("code.a" in n and "codex → claude" in n for n in r["notes"]))
         self.assertEqual(r["workers"], {})
+
+
+class DetectFirstReviewCliTest(ExternalWorkersBase):
+    def setUp(self):
+        super().setUp()
+        self.use_fakes()
+        self.rr = self.tmp / "run-review.sh"
+        self.rr.write_text("#!/bin/sh\n", encoding="utf-8")
+        self.env.update({**NO_LEGACY_ENV, "CASCADE_RUN_REVIEW": str(self.rr)})
+        (self.repo / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+
+    def detect(self, *extra):
+        p = run_cli(["detect", "--no-gh", "--json", *extra], self.repo, env=self.env)
+        return p.returncode, json.loads(p.stdout)
+
+    def test_local_profile_recommends_rr_then_init_with_codex_source(self):
+        code, r = self.detect("--profile", "local")
+        self.assertEqual(code, 0, r)
+        steps = r["recommendation"]["steps"]
+        self.assertIn("run-review.sh --uncommitted", steps[0])
+        self.assertEqual(r["recommendation"]["source"], "codex-code")
+        self.assertIn("--source codex-code", steps[1])
+        self.assertTrue(steps[1].endswith("--profile local"), steps[1])
+        self.assertIn("전송 동의: 첫 검토·A·의견·재검토 → OpenAI", r["approvals"])
+
+    def test_input_file_shows_codex_model_for_workers_and_roles(self):
+        code, r = self.detect("--profile", "local", "--input", str(FIXTURES / "codex-code-e2e.final"))
+        self.assertEqual(code, 0, r)
+        self.assertEqual(r["workers"]["a"]["model"], "gpt-test")
+        self.assertEqual(r["profile"]["roles"]["code.a"]["model"], "gpt-test")
+        self.assertNotIn("code.review", r["profile"]["roles"])
+        self.assertIn("전송 동의: A·의견·재검토 → OpenAI", r["approvals"])
+
+    def test_human_output_prints_profile_and_role_lines(self):
+        p = run_cli(["detect", "--no-gh", "--profile", "local", "--input", str(FIXTURES / "codex-code-e2e.final")],
+                    self.repo, env=self.env)
+        self.assertIn("프로필: local (--profile)", p.stdout)
+        self.assertIn("역할: A=Codex(gpt-test low), B=Claude(Haiku 5.5 low)", p.stdout)
+        self.assertNotIn("첫 검토=", p.stdout)
+
+    def test_environment_profile_is_named_in_the_next_init_line(self):
+        self.env["CASCADE_PROFILE"] = "local"
+        code, r = self.detect("--input", str(FIXTURES / "codex-code-e2e.final"))
+        self.assertTrue(r["recommendation"]["steps"][0].endswith("--profile local"), r["recommendation"]["steps"])
+        self.assertEqual(r["profile"]["source"], "CASCADE_PROFILE")
+
+    def test_detect_init_step_runs(self):
+        code, r = self.detect("--profile", "local", "--input", str(FIXTURES / "codex-code-e2e.final"))
+        words = shlex.split(r["recommendation"]["steps"][0])
+        p = run_cli(words[words.index("init"):], self.repo, env=self.env)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("A=Codex(gpt-test low)", p.stdout)
+
+
+class ScaleLineTest(ExternalWorkersBase):
+    def scale(self, *extra, env=None):
+        p = run_cli(["init", "--source", "codex-code", "--input", str(FIXTURES / "codex-code-e2e.final"), *extra],
+                    self.repo, env={**self.env, **NO_LEGACY_ENV, **(env or {})})
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        return next(x for x in p.stdout.splitlines() if x.startswith("규모:"))
+
+    def test_explicit_profile_scale_line_ends_with_runner_totals(self):
+        self.use_fakes()
+        line = self.scale("--profile", "local")
+        self.assertTrue(line.endswith(" — Claude 최대 Haiku 1·Opus 1/지적, Codex 1/지적 + 의견·재검토"), line)
+
+    def test_claude_only_profile_scale_line_names_models(self):
+        line = self.scale("--profile", "claude-only")
+        self.assertIn(" — Claude 최대 Sonnet 1·Haiku 1·Opus 1/지적 + 의견·재검토", line)
+
+    def test_default_profile_scale_line_is_unchanged(self):
+        line = self.scale()
+        self.assertNotIn(" — ", line)
+        self.assertNotIn("/지적", line)
 
 
 REVIEW_PROFILES = """
@@ -948,6 +1022,34 @@ class FirstReviewTest(ExternalWorkersBase):
         p = self.review("--profile", "local", "--consent", "openai")
         self.assertNotEqual(p.returncode, 0)
         self.assertIn("openai", p.stdout)
+
+    def test_review_next_init_line_carries_consent_option(self):
+        for option, text in (("codex", "--consent codex"), ("codex,cursor", "--consent codex,cursor"),
+                             ("none", "--consent none")):
+            p = self.review("--profile", "local", "--consent", option)
+            self.assertIn(f" {text}", self.init_line(p), (option, p.stdout))
+
+    def test_review_next_init_line_has_no_consent_option_when_not_given(self):
+        p = self.review("--profile", "local")
+        self.assertNotIn("--consent", self.init_line(p))
+        first = self.review_dir(p)
+        self.assertNotIn("consent", self.meta(first))
+
+    def test_consent_is_carried_on_the_claude_first_review_init_line_too(self):
+        p = self.review("--profile", "split", "--consent", "none")
+        self.assertIn(" --profile split --consent none", self.init_line(p))
+
+    def test_fallback_init_line_keeps_the_consent_given_to_the_first_review(self):
+        first = self.review_dir(self.review("--profile", "codex-then-cursor-first", "--consent", "codex"))
+        p = self.fallback(first, "codex")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn(" --consent codex", self.init_line(p))
+        self.assertEqual(self.meta(first)["consent"], ["codex"])
+
+    def test_consent_option_on_review_reaches_init_unchanged(self):
+        p = self.review("--profile", "local", "--consent", "none")
+        line = shlex.split(self.init_line(p))
+        self.assertEqual(line[line.index("--consent") + 1], "none")
 
     def test_codex_code_command_enters_the_root_even_with_a_space(self):
         spaced = make_repo(self.tmp / "my repo", {"x.py": "x = 1\n"})
