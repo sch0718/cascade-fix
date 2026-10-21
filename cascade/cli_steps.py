@@ -9,7 +9,7 @@ from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
-from cascade.assignment import claude_fallback, fallback_target, ledger_profile, legacy_fields
+from cascade.assignment import claude_fallback, fallback_target, ledger_profile
 from cascade.config import ConfigError, ExitCodes, RepoConfig, detect_candidates, is_sensitive_path, load_repo_config
 from cascade.consensus import (
     OUTCOME_ADJUDICATE,
@@ -647,12 +647,19 @@ def carried_findings(rnd: RoundRecord) -> list[Finding]:
 
 EXTERNAL_AUTH_FAILURE = re.compile(r"\b401\b|unauthori[sz]ed|refresh[ _]token|codex login|not logged in|Authentication required", re.IGNORECASE)
 EXTERNAL_USAGE_LIMIT = re.compile(r"usage limit", re.IGNORECASE)
+EXTERNAL_CLASSIFY_TAIL_LINES = 20
 FAILURE_AUTH, FAILURE_LIMIT, FAILURE_ERROR = "auth", "limit", "error"
 FAILURE_REASONS = {FAILURE_LIMIT: "이용 한도", FAILURE_ERROR: "실행 오류"}
 
 
 def review_cell(ledger: Ledger, role: str) -> dict:
-    return ledger_profile(ledger)["roles"][f"{ledger.mode}.{role}"]
+    """role 칸의 지금 값. 실행 중 대체가 있으면 가장 나중 것의 `to` 칸이고, 없으면 init·jobs가 확정한 칸이다."""
+    profile = ledger_profile(ledger)
+    key = f"{ledger.mode}.{role}"
+    for record in reversed(profile.get("runtime_substitutions", [])):
+        if record["role"] == key:
+            return record["to"]
+    return profile["roles"][key]
 
 
 def is_claude(ledger: Ledger, role: str) -> bool:
@@ -660,37 +667,43 @@ def is_claude(ledger: Ledger, role: str) -> bool:
 
 
 def external_failure(result: Path) -> str | None:
-    """외부 검토자 결과(`<로그>.final`)가 없거나 비었을 때의 원인. 결과가 있거나 실행 로그가 없으면(아직 안 돌림) None."""
+    """외부 검토자 결과(`<로그>.final`)가 없거나 비었을 때의 원인. 결과가 있거나 실행 로그가 없으면(아직 안 돌림) None.
+
+    로그 앞부분에는 프롬프트(지적 본문·패치)가 그대로 찍히므로 CLI 자신의 오류 출력이 있는 끝 줄만 본다."""
     result = Path(result)
     if result.is_file() and result.read_text(encoding="utf-8").strip():
         return None
     log = result.with_suffix("") if result.suffix == ".final" else None
     if log is None or not log.is_file():
         return None
-    log_text = log.read_text(encoding="utf-8", errors="replace")
-    if EXTERNAL_AUTH_FAILURE.search(log_text):
+    tail = "\n".join(log.read_text(encoding="utf-8", errors="replace").strip().splitlines()[-EXTERNAL_CLASSIFY_TAIL_LINES:])
+    if EXTERNAL_AUTH_FAILURE.search(tail):
         return FAILURE_AUTH
-    return FAILURE_LIMIT if EXTERNAL_USAGE_LIMIT.search(log_text) else FAILURE_ERROR
+    return FAILURE_LIMIT if EXTERNAL_USAGE_LIMIT.search(tail) else FAILURE_ERROR
 
 
-def review_fallback_event(ledger: Ledger, role: str) -> dict:
-    key = f"{ledger.mode}.{role}"
-    found = [r for r in ledger_profile(ledger)["substituted"] if r["role"] == key]
-    return {"fallback": {k: found[-1][k] for k in ("from", "to", "reason")}} if found else {}
+def review_event_extra(ledger: Ledger, role: str) -> dict:
+    """붙인 의견·재검토 이벤트에 남길 실제 runner·모델과, 실행 중 대체였으면 그 내용."""
+    cell = review_cell(ledger, role)
+    extra = {"runner": cell["runner"], "model": cell["model"]}
+    found = [r for r in ledger_profile(ledger).get("runtime_substitutions", []) if r["role"] == f"{ledger.mode}.{role}"]
+    if found:
+        extra["fallback"] = {"from": found[-1]["from"], "to": found[-1]["to"]["runner"], "reason": found[-1]["reason"]}
+    return extra
 
 
-def substitute_review(ledger: Ledger, role: str, reason: str) -> dict:
-    """검토 칸(opinion·recheck)을 fallback으로 바꿔 원장에 남기고 새 칸을 준다. 동의 밖이거나 같은 CLI면 내장 claude-only 값이다."""
+def substitute_review(ledger: Ledger, role: str, reason: str, round_no: int | None = None) -> dict:
+    """검토 칸(opinion·recheck)의 실행 중 대체를 `profile.runtime_substitutions`에 남기고 새 칸을 준다.
+
+    `profile.roles`·`profile.substituted`(init·jobs가 확정한 배정)는 바꾸지 않는다. 동의 밖이거나 같은 CLI면 내장 claude-only 값이다."""
     record = copy.deepcopy(ledger_profile(ledger))
     key = f"{ledger.mode}.{role}"
-    old = record["roles"][key]
+    old = review_cell(ledger, role)
     new = fallback_target(old, record["consented"], {old["runner"]}, "reviewer")
-    record["roles"][key] = new
-    record["substituted"].append({"role": key, "from": old["runner"], "to": new["runner"], "reason": reason})
+    rnd = ledger.current_round()
+    record.setdefault("runtime_substitutions", []).append(
+        {"role": key, "from": old["runner"], "to": new, "reason": reason, "round": round_no if round_no is not None else rnd.no if rnd else 0})
     ledger.profile = record
-    if role == "opinion":
-        legacy = legacy_fields(record, ledger.mode)
-        ledger.reviewer, ledger.review_model, ledger.review_effort = (legacy[k] for k in ("reviewer", "review_model", "review_effort"))
     return new
 
 

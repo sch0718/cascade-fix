@@ -178,7 +178,8 @@ class CursorReviewerTest(CliTestBase):
         p = self.cli("opinion", "--run-dir", str(self.run_dir), "--round", "1", "--id", "r1-02", "--result", str(final))
         self.assertIn("대체: code.opinion cursor → claude — 이용 한도", p.stdout)
         self.assertNotIn("인증 실패 흔적", p.stdout)
-        self.assertEqual(self.ledger().reviewer, "claude")
+        self.assertEqual(self.ledger().reviewer, "cursor")
+        self.assertEqual([r["to"]["runner"] for r in self.ledger().profile["runtime_substitutions"]], ["claude"])
         self.assertTrue((self.run_dir / "round-1" / "opinion-args.json").is_file())
 
     def test_empty_final_after_usage_limit_stops_with_limit_guidance(self):

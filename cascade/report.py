@@ -204,6 +204,35 @@ def _review_label(ledger: Ledger, role: str) -> str:
     return reviewer_label(review_cell(ledger, role)["runner"])
 
 
+def _recorded_runner(rnd, step: str) -> str | None:
+    found = [e["runner"] for e in rnd.events if e.get("step") == step and e.get("runner")]
+    return found[-1] if found else None
+
+
+def _opinion_runner(ledger: Ledger, fid: str) -> str:
+    for rnd in reversed(ledger.rounds):
+        runner = _recorded_runner(rnd, f"opinion:{fid}")
+        if runner:
+            return runner
+    return review_cell(ledger, "opinion")["runner"]
+
+
+def _recheck_runner(ledger: Ledger, rnd) -> str:
+    return _recorded_runner(rnd, "recheck") or review_cell(ledger, "recheck")["runner"]
+
+
+def _opinion_labels(ledger: Ledger) -> str:
+    runners = list(dict.fromkeys(_opinion_runner(ledger, fid) for fid in ledger.opinions))
+    return "·".join(reviewer_label(r) for r in runners) or _review_label(ledger, "opinion")
+
+
+def _count_rows(runners: list[str], fallback: str, what: str) -> list[str]:
+    counts: dict[str, int] = {}
+    for runner in runners:
+        counts[runner] = counts.get(runner, 0) + 1
+    return [f"| {reviewer_label(r)} {what} | {n} |" for r, n in counts.items()] or [f"| {reviewer_label(fallback)} {what} | 0 |"]
+
+
 def _indent_reasons(lines: list[str]) -> list[str]:
     return [f"  - {line}" for line in lines]
 
@@ -232,7 +261,7 @@ def _bucket_section(name: str, items: list[tuple[int, dict, dict]], ledger: Ledg
                 out.append(f"  - Opus: {opus}")
             opinion = ledger.opinions.get(fid)
             if opinion:
-                out.append(f"  - {_review_label(ledger, 'opinion')} 의견:")
+                out.append(f"  - {reviewer_label(_opinion_runner(ledger, fid))} 의견:")
                 out.extend(f"    > {line}" for line in opinion.splitlines()[:OPINION_MAX_LINES])
             out.append(f"  - 패치 a: round-{round_no}/patch-{fid}-a.diff")
             out.append(f"  - 패치 b: round-{round_no}/patch-{fid}-b.diff")
@@ -409,8 +438,9 @@ def _calls_section(ledger: Ledger, run_dir: Path | None) -> list[str]:
     name = _review_label(ledger, "opinion")
     if ledger.source in CLAUDE_SOURCES:
         out.append(f"| {name} 첫 검토 | 1 |")
-    out.append(f"| {name} 의견 | {len(ledger.opinions)} |")
-    out.append(f"| {_review_label(ledger, 'recheck')} 재검토 | {sum(1 for r in ledger.rounds if r.recheck_opened)} |")
+    out.extend(_count_rows([_opinion_runner(ledger, fid) for fid in ledger.opinions], review_cell(ledger, "opinion")["runner"], "의견"))
+    out.extend(_count_rows([_recheck_runner(ledger, r) for r in ledger.rounds if r.recheck_opened],
+                           review_cell(ledger, "recheck")["runner"], "재검토"))
     out.extend(["", "| 회차 | 소요 |", "| --- | ---: |"])
     out.extend(f"| {rnd.no} | {_elapsed(rnd)} |" for rnd in ledger.rounds)
     out.append("")
@@ -461,12 +491,12 @@ def render(ledger: Ledger, dry_run: bool, run_dir: Path | None = None) -> str:
     out = [f"# cascade-fix 보고서 {ledger.run_id}", ""]
     if dry_run:
         out.extend(["**적용하지 않음(dry-run)**", ""])
-    out.extend([f"출처: {ledger.source} · 모드: {ledger.mode} · 검토자: {_review_label(ledger, 'opinion')} · 상태: {ledger.status}", ""])
+    out.extend([f"출처: {ledger.source} · 모드: {ledger.mode} · 검토자: {_opinion_labels(ledger)} · 상태: {ledger.status}", ""])
     out.extend(
         [
             "## 회차별 지적과 채택 경로",
             "",
-            f"| 회차 | 지적 | 합의 | 판가름 회부 | 판가름 채택 | {_review_label(ledger, 'opinion')} 검토 | 사람 |",
+            f"| 회차 | 지적 | 합의 | 판가름 회부 | 판가름 채택 | {_opinion_labels(ledger)} 검토 | 사람 |",
             "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
             *[_round_row(rnd, ledger) for rnd in ledger.rounds],
             "",

@@ -871,7 +871,7 @@ def _claude_opinions(args, run_dir: Path, ledger: Ledger, rnd: RoundRecord) -> i
             print(f"경고: {fid} Claude 의견이 없다(호출 실패). 「{CALL_FAILED_NOTE}」로 적고 넘어간다")
             text = CALL_FAILED_NOTE
         ledger.opinions[fid] = text.strip()
-        s.mark(rnd, f"opinion:{fid}", **s.review_fallback_event(ledger, "opinion"))
+        s.mark(rnd, f"opinion:{fid}", **s.review_event_extra(ledger, "opinion"))
     s.save_ledger(run_dir, ledger)
     print(f"Claude 의견 {len(pending)}건을 원장에 붙였다(자동 채택하지 않는다)")
     _print_next(ledger, run_dir)
@@ -924,23 +924,23 @@ def cmd_opinion(args) -> int:
         return _opinion_fallback(args, run_dir, ledger, rnd, failure)
     text = _external_result_text(Path(args.result), "의견", runner)
     ledger.opinions[args.id] = text
-    s.mark(rnd, f"opinion:{args.id}", **s.review_fallback_event(ledger, "opinion"))
+    s.mark(rnd, f"opinion:{args.id}", **s.review_event_extra(ledger, "opinion"))
     s.save_ledger(run_dir, ledger)
     print(f"{args.id} {label(runner)} 의견을 원장에 붙였다(자동 채택하지 않는다)")
     _print_next(ledger, run_dir)
     return 0
 
 
-def _substitute_review(ledger: Ledger, role: str, failure: str, what: str, result: str) -> dict:
+def _substitute_review(ledger: Ledger, role: str, failure: str, what: str, result: str, round_no: int) -> dict:
     old = s.review_cell(ledger, role)["runner"]
-    new = s.substitute_review(ledger, role, s.FAILURE_REASONS[failure])
+    new = s.substitute_review(ledger, role, s.FAILURE_REASONS[failure], round_no)
     print(f"{label(old)} {what} 결과가 없다({s.FAILURE_REASONS[failure]} 흔적): {result}")
     print(f"대체: {ledger.mode}.{role} {old} → {new['runner']} — {s.FAILURE_REASONS[failure]}")
     return new
 
 
 def _opinion_fallback(args, run_dir: Path, ledger: Ledger, rnd: RoundRecord, failure: str) -> int:
-    new = _substitute_review(ledger, "opinion", failure, "의견", args.result)
+    new = _substitute_review(ledger, "opinion", failure, "의견", args.result, rnd.no)
     if new["runner"] == REVIEWER_CLAUDE:
         rd = s.round_dir(run_dir, rnd.no)
         fids = [fid for fid in sorted({*s.pending_opinions(ledger, rd), args.id}) if (rd / f"opinion-{fid}.md").is_file()]
@@ -953,7 +953,7 @@ def _opinion_fallback(args, run_dir: Path, ledger: Ledger, rnd: RoundRecord, fai
 
 
 def _recheck_fallback(args, run_dir: Path, ledger: Ledger, rnd: RoundRecord, failure: str) -> int:
-    new = _substitute_review(ledger, "recheck", failure, "재검토", args.result)
+    new = _substitute_review(ledger, "recheck", failure, "재검토", args.result, rnd.no)
     if new["runner"] == REVIEWER_CLAUDE:
         rd = s.round_dir(run_dir, rnd.no)
         repo_file = rd / s.RECHECK_REPO_FILE
@@ -1176,7 +1176,7 @@ def cmd_recheck(args) -> int:
         rnd.hold_findings.append(f.to_dict())
         rnd.decisions.append(Decision(f.id, OUTCOME_UNDECIDABLE, None, [reason]).to_dict())
     s.write_json(rd / "decisions.json", rnd.decisions)
-    s.mark(rnd, "recheck", **s.review_fallback_event(ledger, "recheck"))
+    s.mark(rnd, "recheck", **s.review_event_extra(ledger, "recheck"))
     print(f"해소 {sum(1 for v in resolved.values() if v)}건, 해소 안 됨 {len(unresolved)}건, 새 지적 {len(new)}건")
     next_round += carried
     print(f"다음 회차 {len(next_round)}건(적용 못 해 넘긴 {len(carried)}건 포함), "

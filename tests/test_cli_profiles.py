@@ -10,7 +10,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from cascade import cli_steps, profiles  # noqa: E402
-from cascade.rounds import Ledger  # noqa: E402
+from cascade.report import render  # noqa: E402
+from cascade.rounds import Ledger, RoundRecord  # noqa: E402
 from cascade.snapshot import commit_worktree  # noqa: E402
 from helpers import make_repo, run_cli, write_repos_toml  # noqa: E402
 from test_claude_reviewer import review_results  # noqa: E402
@@ -405,8 +406,19 @@ class ReviewRolesBase(ExternalWorkersBase):
     def cell(self, key):
         return self.ledger().profile["roles"][key]
 
+    def current(self, role):
+        return cli_steps.review_cell(self.ledger(), role)
+
     def substituted(self):
-        return [r for r in self.ledger().profile["substituted"] if r["role"].endswith(("opinion", "recheck"))]
+        return [{"role": r["role"], "from": r["from"], "to": r["to"]["runner"], "reason": r["reason"]}
+                for r in self.ledger().profile.get("runtime_substitutions", [])]
+
+    def external_opinion(self, fid, text):
+        out = self.rd / f"opinion-{fid}.out"
+        out.write_text("codex 시작\n", encoding="utf-8")
+        final = Path(f"{out}.final")
+        final.write_text(text, encoding="utf-8")
+        return self.cli("opinion", "--run-dir", str(self.run_dir), "--round", "1", "--id", fid, "--result", str(final))
 
 
 class ReviewRolesSplitTest(ReviewRolesBase):
@@ -474,8 +486,10 @@ class ReviewRolesFallbackTest(ReviewRolesBase):
         [job] = json.loads((self.rd / "opinion-args.json").read_text(encoding="utf-8"))["jobs"]
         self.assertEqual((job["id"], job["model"], job["effort"]), ("r1-02:opinion", FABLE, "high"))
         self.assertEqual(self.substituted(), [{"role": "code.opinion", "from": "codex", "to": "claude", "reason": "이용 한도"}])
-        self.assertEqual((self.cell("code.opinion")["runner"], self.cell("code.opinion")["model"]), ("claude", FABLE))
-        self.assertEqual(self.ledger().reviewer, "claude")
+        self.assertEqual((self.current("opinion")["runner"], self.current("opinion")["model"]), ("claude", FABLE))
+        self.assertEqual(self.cell("code.opinion")["runner"], "codex")
+        self.assertEqual(self.ledger().profile["substituted"], [])
+        self.assertEqual(self.ledger().reviewer, "codex")
         self.assertNotIn("r1-02", self.ledger().opinions)
         self.assertIn("대체", p.stdout)
         self.assertIn("Workflow 실행", self.next_steps(p)[0])
@@ -494,12 +508,46 @@ class ReviewRolesFallbackTest(ReviewRolesBase):
         self.assertEqual(self.substituted(), [{"role": "code.opinion", "from": "codex", "to": "claude", "reason": "실행 오류"}])
         self.assertTrue((self.rd / "opinion-args.json").is_file())
 
-    def test_opinion_fallback_only_writes_still_pending_opinions(self):
+    def test_opinion_fallback_writes_every_pending_opinion_including_the_failed_one(self):
         self.to_adjudicate("--profile", "codex-opinion")
         (self.rd / "opinion-r1-01.md").write_text("판정 의견 요청\n", encoding="utf-8")
         self.failed_opinion(LIMIT_LOG)
         ids = [j["id"] for j in json.loads((self.rd / "opinion-args.json").read_text(encoding="utf-8"))["jobs"]]
         self.assertEqual(ids, ["r1-01:opinion", "r1-02:opinion"])
+
+    def test_opinion_fallback_keeps_attached_opinions_and_labels_each_by_its_runner(self):
+        self.to_adjudicate("--profile", "codex-opinion")
+        (self.rd / "opinion-r1-01.md").write_text("판정 의견 요청\n", encoding="utf-8")
+        path = self.run_dir / "ledger.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        for d in data["rounds"][0]["decisions"]:
+            if d["finding_id"] == "r1-01":
+                d.update(outcome="판단불가", patch_from=None, reasons=["테스트"])
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        p = self.external_opinion("r1-01", "Codex가 본 의견이다")
+        self.assertIn("r1-02", self.next_steps(p)[0])
+        self.failed_opinion(LIMIT_LOG)
+        ids = [j["id"] for j in json.loads((self.rd / "opinion-args.json").read_text(encoding="utf-8"))["jobs"]]
+        self.assertEqual(ids, ["r1-02:opinion"])
+        ledger = self.ledger()
+        self.assertEqual(ledger.opinions["r1-01"], "Codex가 본 의견이다")
+        self.assertEqual(ledger.profile["roles"]["code.opinion"]["runner"], "codex")
+        self.assertEqual(len(ledger.profile["runtime_substitutions"]), 1)
+        self.opinion_workflow(text="Claude가 본 의견이다")
+        events = {e["step"]: e for e in self.ledger().rounds[0].events if e["step"].startswith("opinion:")}
+        self.assertEqual((events["opinion:r1-01"]["runner"], "fallback" in events["opinion:r1-01"]), ("codex", False))
+        self.assertEqual((events["opinion:r1-02"]["runner"], events["opinion:r1-02"]["model"]), ("claude", FABLE))
+        self.assertEqual(events["opinion:r1-02"]["fallback"], {"from": "codex", "to": "claude", "reason": "이용 한도"})
+        report = render(self.ledger(), False, self.run_dir)
+        self.assertIn("검토자: Codex·Claude", report)
+        lines = report.splitlines()
+        codex_at = lines.index("  - Codex 의견:")
+        claude_at = lines.index("  - Claude 의견:")
+        self.assertIn("Codex가 본 의견이다", lines[codex_at + 1])
+        self.assertIn("Claude가 본 의견이다", lines[claude_at + 1])
+        self.assertLess(codex_at, claude_at)
+        self.assertIn("| Codex 의견 | 1 |", report)
+        self.assertIn("| Claude 의견 | 1 |", report)
 
     def test_opinion_auth_still_stops(self):
         self.to_adjudicate("--profile", "codex-opinion")
@@ -528,8 +576,9 @@ class ReviewRolesFallbackTest(ReviewRolesBase):
         self.assertTrue(line.startswith(shlex.quote(str(self.cr)) + " --opinion"), line)
         self.assertIn("--model composer-9", line)
         self.assertFalse((self.rd / "opinion-args.json").exists())
-        self.assertEqual(self.cell("code.opinion")["fallback"]["runner"], "claude")
-        self.assertEqual(self.ledger().reviewer, "cursor")
+        self.assertEqual(self.current("opinion")["runner"], "cursor")
+        self.assertEqual(self.current("opinion")["fallback"]["runner"], "claude")
+        self.assertEqual(self.cell("code.opinion")["runner"], "codex")
 
     def test_opinion_fallback_outside_consent_is_claude_only(self):
         self.to_adjudicate("--profile", "codex-then-cursor", "--consent", "codex")
@@ -558,6 +607,10 @@ class ReviewRolesFallbackTest(ReviewRolesBase):
         self.assertIn("status=종료", p.stdout)
         p = self.cli("report", "--run-dir", str(self.run_dir))
         self.assertIn("| Claude 재검토 | 1 |", p.stdout)
+        events = [e for e in self.ledger().rounds[0].events if e["step"] == "recheck"]
+        self.assertEqual((events[0]["runner"], events[0]["model"]), ("claude", FABLE))
+        self.assertEqual(events[0]["fallback"], {"from": "codex", "to": "claude", "reason": "이용 한도"})
+        self.assertEqual(self.cell("code.recheck")["runner"], "codex")
 
     def test_recheck_auth_still_stops(self):
         self.to_adjudicate("--profile", "codex-recheck")
@@ -591,8 +644,9 @@ class ReviewRolesFallbackTest(ReviewRolesBase):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         ledger = self.ledger()
         self.assertEqual((ledger.profile["name"], ledger.profile["source"]), ("legacy", "legacy"))
-        self.assertEqual(ledger.profile["roles"]["code.opinion"]["runner"], "claude")
+        self.assertEqual(ledger.profile["roles"]["code.opinion"]["runner"], "codex")
         self.assertEqual(ledger.profile["roles"]["code.recheck"]["runner"], "codex")
+        self.assertEqual(self.current("opinion")["runner"], "claude")
         self.assertEqual(self.substituted(), [{"role": "code.opinion", "from": "codex", "to": "claude", "reason": "이용 한도"}])
         self.assertIn("Workflow 실행", self.next_steps(p)[0])
 
@@ -633,6 +687,16 @@ class ReviewHelpersTest(unittest.TestCase):
         self.assertEqual(cli_steps.external_failure(self.result("Authentication required\n" + LIMIT_LOG)), "auth")
         self.assertIsNone(cli_steps.external_failure(self.tmp / "plain.txt"))
 
+    def test_external_failure_reads_only_the_log_tail(self):
+        prompt = "\n".join(["판정 의견 요청", "calc.py:401 add가 틀리다", "@@ -401,3 +401,3 @@", "unauthorized 접근을 막는다",
+                            "refresh token을 다시 쓴다", "usage limit 문구를 다룬다"] + ["본문"] * 30)
+        self.assertEqual(cli_steps.external_failure(self.result(prompt + "\nYou've hit your usage limit\n", final="")), "limit")
+        self.assertEqual(cli_steps.external_failure(self.result(prompt + "\nERROR: stream disconnected\n", final="")), "error")
+        self.assertEqual(cli_steps.external_failure(
+            self.result(prompt + "\nERROR: unexpected status 401 Unauthorized\n", final="")), "auth")
+        noisy_tail = "\n".join(["ERROR: stream disconnected"] + ["진행"] * 25)
+        self.assertEqual(cli_steps.external_failure(self.result("401 Unauthorized\n" + noisy_tail, final="")), "error")
+
     def test_review_cell_reads_the_mode_cell_and_materializes_legacy(self):
         ledger = self.ledger(reviewer="cursor")
         self.assertEqual(cli_steps.review_cell(ledger, "opinion")["runner"], "cursor")
@@ -647,14 +711,20 @@ class ReviewHelpersTest(unittest.TestCase):
         ledger.profile["roles"]["code.opinion"]["runner"] = "cursor"
         self.assertEqual(cli_steps.review_script(ledger, "opinion"), cli_steps.CURSOR_REVIEW)
 
-    def test_substitute_review_records_and_returns_new_cell(self):
+    def test_substitute_review_records_runtime_substitution_and_keeps_assignment(self):
         ledger = self.ledger(profile=self.profile())
-        new = cli_steps.substitute_review(ledger, "opinion", "이용 한도")
+        new = cli_steps.substitute_review(ledger, "opinion", "이용 한도", 2)
         self.assertEqual((new["runner"], new["model"], new["effort"]), ("claude", FABLE, "high"))
-        self.assertEqual(ledger.profile["roles"]["code.opinion"], new)
-        self.assertEqual(ledger.profile["substituted"],
-                         [{"role": "code.opinion", "from": "codex", "to": "claude", "reason": "이용 한도"}])
-        self.assertEqual((ledger.reviewer, ledger.review_model, ledger.review_effort), ("claude", FABLE, "high"))
+        self.assertEqual(ledger.profile["runtime_substitutions"],
+                         [{"role": "code.opinion", "from": "codex", "to": new, "reason": "이용 한도", "round": 2}])
+        self.assertEqual(ledger.profile["roles"]["code.opinion"]["runner"], "codex")
+        self.assertEqual(ledger.profile["substituted"], [])
+        self.assertEqual(cli_steps.review_cell(ledger, "opinion"), new)
+        self.assertEqual(cli_steps.review_cell(ledger, "recheck")["runner"], "claude")
+        self.assertEqual(cli_steps.review_event_extra(ledger, "opinion"),
+                         {"runner": "claude", "model": FABLE,
+                          "fallback": {"from": "codex", "to": "claude", "reason": "이용 한도"}})
+        self.assertEqual((ledger.reviewer, ledger.review_model), ("codex", ""))
         self.assertEqual(ledger.profile["consented"], ["codex", "cursor"])
 
     def test_substitute_review_materializes_a_legacy_ledger(self):
@@ -663,17 +733,36 @@ class ReviewHelpersTest(unittest.TestCase):
         self.assertEqual(new["runner"], "claude")
         self.assertEqual(ledger.profile["name"], "legacy")
         self.assertEqual(ledger.profile["roles"]["code.opinion"]["runner"], "codex")
-        self.assertEqual(ledger.profile["roles"]["code.recheck"]["runner"], "claude")
-        self.assertEqual(ledger.profile["substituted"],
-                         [{"role": "code.recheck", "from": "codex", "to": "claude", "reason": "실행 오류"}])
+        self.assertEqual(ledger.profile["roles"]["code.recheck"]["runner"], "codex")
+        self.assertEqual(cli_steps.review_cell(ledger, "recheck")["runner"], "claude")
+        self.assertEqual([(r["role"], r["from"], r["to"]["runner"], r["reason"]) for r in ledger.profile["runtime_substitutions"]],
+                         [("code.recheck", "codex", "claude", "실행 오류")])
+        self.assertEqual(ledger.profile["substituted"], [])
         self.assertEqual(ledger.reviewer, "codex")
+
+    def test_report_labels_opinions_without_recorded_runner_by_the_current_cell(self):
+        ledger = self.ledger(reviewer="cursor")
+        ledger.opinions["r1-01"] = "의견"
+        ledger.rounds = [RoundRecord(no=1, findings=[], decisions=[], adopted=[], recheck_opened=True)]
+        report = render(ledger, False)
+        self.assertIn("검토자: Cursor", report)
+        self.assertIn("| Cursor 의견 | 1 |", report)
+        self.assertIn("| Cursor 재검토 | 1 |", report)
+
+    def test_latest_runtime_substitution_wins(self):
+        cursor = {"runner": "cursor", "model": "composer-9", "effort": ""}
+        ledger = self.ledger(profile=self.profile(fallback=cursor))
+        self.assertEqual(cli_steps.substitute_review(ledger, "opinion", "a")["runner"], "cursor")
+        self.assertEqual(cli_steps.review_cell(ledger, "opinion")["runner"], "cursor")
+        self.assertEqual(cli_steps.substitute_review(ledger, "opinion", "b")["runner"], "claude")
+        self.assertEqual(cli_steps.review_cell(ledger, "opinion")["runner"], "claude")
+        self.assertEqual([r["from"] for r in ledger.profile["runtime_substitutions"]], ["codex", "cursor"])
 
     def test_substitute_review_respects_consent_and_exhaustion(self):
         cursor = {"runner": "cursor", "model": "composer-9", "effort": ""}
         ledger = self.ledger(profile=self.profile(fallback=cursor))
         self.assertEqual(cli_steps.substitute_review(ledger, "opinion", "x")["runner"], "cursor")
-        self.assertEqual(ledger.reviewer, "cursor")
-        self.assertEqual(ledger.profile["roles"]["code.opinion"]["fallback"]["runner"], "claude")
+        self.assertEqual(cli_steps.review_cell(ledger, "opinion")["fallback"]["runner"], "claude")
         ledger = self.ledger(profile=self.profile(fallback=cursor, consented=("codex",)))
         self.assertEqual(cli_steps.substitute_review(ledger, "opinion", "x")["runner"], "claude")
         same = {"runner": "codex", "model": "", "effort": ""}
