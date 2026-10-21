@@ -1,5 +1,4 @@
 import re
-import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -7,7 +6,7 @@ from typing import Literal
 from cascade.config import RepoConfig
 from cascade.consensus import VERDICT_UNDECIDED, VERDICTS, WorkerResult
 from cascade.findings import Finding
-from cascade.verify import format_command, related_tests
+from cascade.verify import NO_TESTS_SKIP_TAG, format_command, related_tests, test_commands
 
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
@@ -203,8 +202,8 @@ def _lines(items: list[str]) -> str:
 def _code_verify_cmds(cfg: RepoConfig, worktree: Path, location: str) -> str:
     path = location_file(location)
     files = [path] if path else []
-    tests = " ".join(shlex.quote(t) for t in related_tests(worktree, files)) if files else ""
-    cmds = [c.replace("{files}", tests).rstrip() for c in cfg.tests]
+    tests = related_tests(worktree, files) if files else []
+    cmds = [cmd for _, cmd, tag in test_commands(cfg, tests) if tag != NO_TESTS_SKIP_TAG]
     formats = [format_command(c, files) for c in cfg.format] if files else list(cfg.format)
     return _lines([*cmds, *cfg.build, *cfg.typecheck, *cfg.lint, *formats])
 
@@ -325,7 +324,8 @@ def _format_verify(results: list[dict]) -> str:
         return "(돌린 검증 없음)"
     lines = []
     for r in results:
-        lines.append(f"- {r.get('cmd', '?')}: {'통과' if r.get('ok') else '실패'}")
+        status = "실행 안 함" if r.get("skipped") else "통과" if r.get("ok") else "실패"
+        lines.append(f"- {r.get('cmd', '?')}: {status}")
         tail = (r.get("tail") or "").rstrip("\n")
         if tail:
             lines.extend(f"    {line}" for line in tail.splitlines()[-_TAIL_LINES:])

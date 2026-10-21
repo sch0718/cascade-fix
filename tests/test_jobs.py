@@ -32,6 +32,7 @@ F2 = Finding(
 )
 CFG = RepoConfig(
     tests=["pytest {files}"],
+    full_tests=["pytest"],
     build=["make build"],
     lint=["ruff check ."],
     doc_snippet_check={"python": "python3 -m py_compile {file}"},
@@ -200,6 +201,20 @@ class WorktreeBoundaryTest(unittest.TestCase):
         self.assertIn("- `ruff format m.py`", p)
         self.assertNotIn("<", p.split("## 검증 명령")[1].split("## 규칙")[0])
 
+    def test_verify_cmds_name_full_tests_when_no_related_tests(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = make_repo(Path(td) / "repo", {"m.py": "x = 1\n"})
+            cfg = RepoConfig(tests=['test -z "{files}" || pytest {files}'], full_tests=["pytest -q"])
+            p = jobs.build_stage1_jobs([F1], cfg, {"r1-01": {"a": repo, "b": repo}}, "code")["jobs"][0]["prompt"]
+            cmds = p.split("## 검증 명령")[1].split("## 규칙")[0]
+            self.assertIn("- `pytest -q`", cmds)
+            self.assertNotIn("test -z", cmds)
+            cfg = RepoConfig(tests=['test -z "{files}" || pytest {files}'], lint=["ruff check ."])
+            p = jobs.build_stage1_jobs([F1], cfg, {"r1-01": {"a": repo, "b": repo}}, "code")["jobs"][0]["prompt"]
+            cmds = p.split("## 검증 명령")[1].split("## 규칙")[0]
+            self.assertIn("- `ruff check .`", cmds)
+            self.assertNotIn("test -z", cmds)
+
     def test_write_job_args_moves_prompts_to_files(self):
         args = jobs.build_stage1_jobs([F1], CFG, {"r1-01": {"a": WT_A, "b": WT_B}}, "code")
         with tempfile.TemporaryDirectory() as td:
@@ -309,6 +324,12 @@ class AdjudicatorTest(unittest.TestCase):
             self.assertIn("## 판가름으로 온 이유", p)
             self.assertIn("- 점검자 아니오", p)
             self.assertIn("- 참조 없음: docs/x.md", p)
+
+    def test_adjudicator_prompt_shows_skipped_tests_as_not_run(self):
+        item = adj_input("code")
+        item.verify_b = [{"cmd": '[관련 테스트 없음·실행 안 함] test -z "" || pytest', "ok": False, "tail": "", "skipped": True}]
+        p = jobs.build_adjudicator_jobs([item])["jobs"][0]["prompt"]
+        self.assertIn('- [관련 테스트 없음·실행 안 함] test -z "" || pytest: 실행 안 함', p)
 
     def test_adjinput_new_fields_have_defaults(self):
         item = jobs.AdjInput(finding=F1, a=result(), b=result(role="b"), patch_a="", patch_b="",

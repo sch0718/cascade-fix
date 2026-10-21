@@ -57,13 +57,38 @@ class VerifyTest(unittest.TestCase):
         self.assertTrue(all(x.ok for x in r[1:]))
         self.assertEqual(set(r[0].to_dict()), {"cmd", "ok", "tail"})
 
-    def test_run_verifiers_without_related_tests_still_runs_command(self):
+    def test_without_related_tests_runs_full_tests_once_instead(self):
         repo = make_repo(self.tmp / "repo", {"a.py": "x=1\n"})
-        cfg = RepoConfig(tests=["true {files}"])
+        cfg = RepoConfig(
+            tests=['test -z "{files}" || false {files}', "false {files}"],
+            full_tests=["echo full-ran"],
+            lint=["true"],
+        )
+        r = verify.run_worker_verifiers(repo, cfg, ["a.py"])
+        self.assertEqual([t for t, _ in r], ['test -z "{files}" || false {files}', "true"])
+        self.assertEqual(r[0][1].cmd, verify.NO_TESTS_FULL_TAG + "echo full-ran")
+        self.assertTrue(r[0][1].ok)
+        self.assertFalse(r[0][1].skipped)
+        self.assertIn("full-ran", r[0][1].tail)
+
+    def test_without_related_tests_or_full_tests_skips_and_does_not_count_as_pass(self):
+        repo = make_repo(self.tmp / "repo", {"a.py": "x=1\n"})
+        cfg = RepoConfig(tests=['touch ran; test -z "{files}" || true {files}'])
         r = verify.run_verifiers(repo, cfg, ["a.py"], "worker")
         self.assertEqual(len(r), 1)
-        self.assertTrue(r[0].ok)
+        self.assertTrue(r[0].skipped)
+        self.assertFalse(r[0].ok)
+        self.assertTrue(r[0].cmd.startswith(verify.NO_TESTS_SKIP_TAG))
         self.assertNotIn("{files}", r[0].cmd)
+        self.assertFalse((repo / "ran").exists())
+        self.assertIs(r[0].to_dict()["skipped"], True)
+
+    def test_tests_command_without_files_placeholder_runs_as_is(self):
+        repo = make_repo(self.tmp / "repo", {"a.py": "x=1\n"})
+        cfg = RepoConfig(tests=["echo suite"], full_tests=["echo full"])
+        r = verify.run_verifiers(repo, cfg, ["a.py"], "worker")
+        self.assertEqual([x.cmd for x in r], ["echo suite"])
+        self.assertFalse(r[0].skipped)
 
     def test_final_stage_runs_only_full_tests(self):
         repo = make_repo(self.tmp / "repo", {"a.py": "x=1\n"})

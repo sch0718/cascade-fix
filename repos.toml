@@ -9,7 +9,7 @@
 #
 # [repos."/Users/me/work/example-repo"]
 # setup = ["ln -s {root}/node_modules node_modules"]  # 워크트리마다 한 번 돌리는 명령(만든 파일은 .gitignore 대상이어야 한다)
-# tests = ["pytest {files}"]               # 변경과 관련된 테스트만 돌리는 명령
+# tests = ["pytest {files}"]               # 변경과 관련된 테스트만 돌리는 명령(관련 테스트가 없으면 full_tests로 대신 돈다)
 # full_tests = ["pytest"]                  # 전체 테스트 명령
 # build = ["npm run build"]                # 빌드 명령
 # typecheck = ["mypy ."]                   # 타입 검사 명령

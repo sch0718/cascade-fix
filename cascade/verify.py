@@ -28,6 +28,8 @@ URL = re.compile(r"https?://\S+")
 PATH_LINE = re.compile(r"([\w./-]+):\d+(?:-\d+)?")
 BACKTICK = re.compile(r"`([^`\s]+)`")
 LINE_SUFFIX = re.compile(r":\d+(?:-\d+)?$")
+NO_TESTS_FULL_TAG = "[관련 테스트 없음·전체 테스트로 대신] "
+NO_TESTS_SKIP_TAG = "[관련 테스트 없음·실행 안 함] "
 
 
 @dataclass
@@ -35,9 +37,13 @@ class VerifyResult:
     cmd: str
     ok: bool
     tail: str
+    skipped: bool = False
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        data = asdict(self)
+        if not self.skipped:
+            del data["skipped"]
+        return data
 
 
 def _run(cmd: str, cwd: Path) -> tuple[int, str, bool]:
@@ -170,15 +176,36 @@ def existing(wt: Path, files: list[str]) -> list[str]:
     return [f for f in files if (Path(wt) / f).is_file()]
 
 
-def worker_commands(wt: Path, cfg: RepoConfig, changed: list[str]) -> list[tuple[str, str]]:
+def test_commands(cfg: RepoConfig, tests: list[str]) -> list[tuple[str, str, str]]:
+    commands = []
+    fell_back = False
+    for c in cfg.tests:
+        if FILES not in c or tests:
+            commands.append((c, c.replace(FILES, _quoted(tests)).rstrip(), ""))
+        elif not cfg.full_tests:
+            commands.append((c, c.replace(FILES, "").rstrip(), NO_TESTS_SKIP_TAG))
+        elif not fell_back:
+            commands += [(c, full, NO_TESTS_FULL_TAG) for full in cfg.full_tests]
+            fell_back = True
+    return commands
+
+
+def worker_commands(wt: Path, cfg: RepoConfig, changed: list[str]) -> list[tuple[str, str, str]]:
     wt = Path(wt)
-    tests = _quoted(related_tests(wt, changed))
-    commands = [(c, c.replace(FILES, tests).rstrip()) for c in cfg.tests]
-    commands += [(c, c) for c in (*cfg.build, *cfg.typecheck, *cfg.lint)]
+    commands = test_commands(cfg, related_tests(wt, changed))
+    commands += [(c, c, "") for c in (*cfg.build, *cfg.typecheck, *cfg.lint)]
     targets = existing(wt, changed)
     if targets:
-        commands += [(c, format_command(c, targets)) for c in cfg.format]
+        commands += [(c, format_command(c, targets), "") for c in cfg.format]
     return commands
+
+
+def _tagged_result(cmd: str, tag: str, cwd: Path) -> VerifyResult:
+    if tag == NO_TESTS_SKIP_TAG:
+        return VerifyResult(cmd=tag + cmd, ok=False, tail="", skipped=True)
+    result = _result(cmd, cwd)
+    result.cmd = tag + result.cmd
+    return result
 
 
 def run_verifiers(
@@ -186,14 +213,12 @@ def run_verifiers(
 ) -> list[VerifyResult]:
     wt = Path(wt)
     if stage == "final":
-        commands = list(cfg.full_tests)
-    else:
-        commands = [cmd for _, cmd in worker_commands(wt, cfg, changed)]
-    return [_result(cmd, wt) for cmd in commands]
+        return [_result(cmd, wt) for cmd in cfg.full_tests]
+    return [_tagged_result(cmd, tag, wt) for _, cmd, tag in worker_commands(wt, cfg, changed)]
 
 
 def run_worker_verifiers(wt: Path, cfg: RepoConfig, changed: list[str]) -> list[tuple[str, VerifyResult]]:
-    return [(template, _result(cmd, Path(wt))) for template, cmd in worker_commands(wt, cfg, changed)]
+    return [(template, _tagged_result(cmd, tag, Path(wt))) for template, cmd, tag in worker_commands(wt, cfg, changed)]
 
 
 def run_format(wt: Path, cfg: RepoConfig, files: list[str]) -> None:

@@ -41,6 +41,10 @@ def fail(cmd="pytest"):
     return VerifyResult(cmd=cmd, ok=False, tail="실패")
 
 
+def skipped(cmd='test -z "" || pytest'):
+    return VerifyResult(cmd=cmd, ok=False, tail="", skipped=True)
+
+
 class DecideTest(unittest.TestCase):
     def test_both_no(self):
         a = worker("a", consensus.VERDICT_NO, reason="이미 처리됨")
@@ -162,6 +166,24 @@ class DecideTest(unittest.TestCase):
         self.assertEqual(d.outcome, consensus.OUTCOME_ADJUDICATE)
         self.assertEqual(d.reasons, ["패치가 다름"])
 
+    def test_adopt_on_both_pass_needs_tests_that_ran_on_both_sides(self):
+        for va, vb in (([ok("lint"), skipped()], [ok("lint"), skipped()]), ([ok()], [ok("lint"), skipped()])):
+            d = consensus.decide(worker("a"), worker("b"), va, vb, PATCH_X, PATCH_BIG, adopt_on_both_pass=True)
+            self.assertEqual(d.outcome, consensus.OUTCOME_ADJUDICATE)
+            self.assertEqual(d.reasons, ["패치가 다름", "테스트가 돌지 않음"])
+
+    def test_same_patch_with_tests_not_run_is_still_agreed_with_note(self):
+        d = consensus.decide(worker("a"), worker("b"), [skipped()], [skipped()], PATCH_X, PATCH_X)
+        self.assertEqual(d.outcome, consensus.OUTCOME_AGREED_FACT)
+        self.assertEqual(d.patch_from, "a")
+        self.assertEqual(d.reasons, ["테스트가 돌지 않음"])
+
+    def test_skipped_tests_are_not_failures(self):
+        d = consensus.decide(worker("a"), worker("b"), [ok("lint"), skipped()], [fail()], PATCH_X, PATCH_Y)
+        self.assertEqual(d.outcome, consensus.OUTCOME_ADJUDICATE)
+        self.assertEqual(d.patch_from, "a")
+        self.assertEqual(d.reasons, ["한쪽만 검증 통과", "테스트가 돌지 않음"])
+
     def test_adopt_on_both_pass_leaves_one_pass_to_adjudication(self):
         d = consensus.decide(worker("a"), worker("b"), [fail()], [ok()], PATCH_X, PATCH_BIG, adopt_on_both_pass=True)
         self.assertEqual(d.outcome, consensus.OUTCOME_ADJUDICATE)
@@ -271,6 +293,12 @@ class AfterAdjudicationTest(unittest.TestCase):
         self.assertEqual(d.outcome, consensus.OUTCOME_UNDECIDABLE)
         self.assertIn("판가름 패치 검증 실패", d.reasons)
         self.assertIsNone(d.patch_from)
+
+    def test_adjudicator_patch_with_tests_not_run_is_not_a_failure(self):
+        adj = worker("adjudicator", patch=PATCH_X, reason="a가 맞음")
+        d = consensus.after_adjudication(self.escalated(), adj, [ok("lint"), skipped()])
+        self.assertEqual(d.outcome, consensus.OUTCOME_ADJUDICATE)
+        self.assertEqual(d.patch_from, "adjudicator")
 
     def test_adjudicator_adopts_own_patch(self):
         adj = worker("adjudicator", patch=PATCH_X, reason="a가 맞음")

@@ -130,7 +130,7 @@ Claude·Cursor·`codex-doc` 결과는 형식이 같아 형식으로는 가릴 �
 1. **init** — `CF init --source <종류> --input <결과 파일|PR 번호> [--doc <문서>…] [--dry-run] [--adopt-on-both-pass] [--max-rechecks N] [--severity Critical,Warning] [--reviewer auto|codex|cursor|claude] [--workers claude|external] [--cursor-model M] [--review-model M] [--review-effort E]`
    - 출력의 `run_dir=<경로>`를 이후 모든 명령에 `--run-dir`로 준다. 「규모:」 줄에 회차당 에이전트 수가 나온다(외부 작업자면 Claude·Codex·Cursor 호출 수로 나뉜다).
    - `--severity`로 고르지 않은 등급의 지적은 처리하지 않고 처음부터 보류 후보로 둔다. 나중에 「지금 반영」으로 고르면 `resume`이 회차를 연다. 등급은 검토자가 붙인 것을 그대로 쓴다(다시 매기지 않는다).
-   - `--adopt-on-both-pass`(기본 꺼짐, 코드 모드만): 작업자 둘이 같은 판정(사실)에 둘 다 검증을 통과했는데 패치가 다르면, 판가름 대신 바뀐 줄이 적은 패치를 채택한다(같으면 a). 사유는 「둘 다 검증 통과: …」로 남고 보고서 합의 칸에 센다. 검증 명령이 하나도 안 돌았거나 한쪽 패치가 비었으면 판가름으로 간다. 보안 경로는 채택하지 않고 판단 불가로 보낸다. 측정 전이라 사용자가 요청할 때만 붙인다.
+   - `--adopt-on-both-pass`(기본 꺼짐, 코드 모드만): 작업자 둘이 같은 판정(사실)에 둘 다 검증을 통과했는데 패치가 다르면, 판가름 대신 바뀐 줄이 적은 패치를 채택한다(같으면 a). 사유는 「둘 다 검증 통과: …」로 남고 보고서 합의 칸에 센다. 검증 명령이 하나도 안 돌았거나, 관련 테스트가 없어 테스트를 실제로 돌리지 못했거나, 한쪽 패치가 비었으면 판가름으로 간다. 보안 경로는 채택하지 않고 판단 불가로 보낸다. 측정 전이라 사용자가 요청할 때만 붙인다.
    - 종료 코드 4: 검증 설정 없음(위 「실행 전 확인」 2). 5: 결과 파일을 해석하지 못함 — 출력된 줄을 사용자에게 보이고 멈춘다.
    - 「지적 0건 — 원문을 확인하라」가 나오면 출력된 원문 앞부분을 사용자에게 보이고 끝낸다.
 2. **jobs** — `CF jobs --run-dir <run_dir> --round N` → `round-N/stage1-args.json`. 기준선(수정 전 base 워크트리)에서 build·typecheck·lint 명령을 한 번 돌려 이미 실패하는 명령을 `round-N/baseline.json`에 적는다(판정에서 제외). `tests` 명령은 기준선에서 실패해도 제외하지 않는다(지적이 곧 실패하는 테스트면 수정이 통과시켜야 한다).
@@ -139,6 +139,7 @@ Claude·Cursor·`codex-doc` 결과는 형식이 같아 형식으로는 가릴 �
 4. **judge** — `CF judge --run-dir <run_dir> --round N --results <run_dir>/round-N/stage1.json [--allow-repro <승인한 목록>]`
    - 종료 코드 6: jobs 뒤 사용자 저장소(작업 트리·HEAD·stash·브랜치)가 바뀌었다. 작업자가 워크트리 밖을 건드렸을 수 있다. 출력된 `git diff --stat`을 사용자에게 보이고 멈춘다. `adjudicate`도 같은 검사를 한다.
    - 문서 모드에서 `checker-args.json`이 나오면 같은 방식으로 Workflow를 돌려 `round-N/checker.json`에 저장하고, `CF judge … --results …/stage1.json --checker-results …/checker.json`으로 다시 부른다.
+   - 작업자가 바꾼 파일과 관련된 테스트 파일이 없으면 `{files}`가 든 `tests` 명령 대신 `full_tests`를 돌린다(`verify.json`에 「[관련 테스트 없음·전체 테스트로 대신]」). `full_tests`도 없으면 「[관련 테스트 없음·실행 안 함]」으로 남기고 통과로 세지 않으며 결정 사유에 「테스트가 돌지 않음」이 붙는다. 같은 패치 합의는 그대로 채택한다.
    - 판가름 대상이 있으면 `round-N/adj-args.json`이 생긴다.
 5. **Workflow(판가름)** — `adj-args.json`이 있으면 3과 같은 방식으로 돌려 `round-N/adj.json`에 저장한다.
 6. **adjudicate** — `CF adjudicate --run-dir <run_dir> --round N --results <run_dir>/round-N/adj.json`. 판단 불가마다 `round-N/opinion-<id>.md`가 생긴다.

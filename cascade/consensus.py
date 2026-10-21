@@ -20,6 +20,7 @@ REASON_SENSITIVE = "보안 경로"
 REASON_NO_VERIFIER = "검증기 없음"
 REASON_SENSITIVE_NO_ADOPT = "보안 경로: 자동 채택 안 함"
 REASON_BOTH_PASS = "둘 다 검증 통과"
+REASON_TESTS_NOT_RUN = "테스트가 돌지 않음"
 VERDICTS = (VERDICT_FACT, VERDICT_NO, VERDICT_UNREPRODUCIBLE, VERDICT_UNDECIDED)
 
 
@@ -62,7 +63,7 @@ class Decision:
 
 
 def _all_ok(results: list[VerifyResult]) -> bool:
-    return all(r.ok for r in results)
+    return all(r.ok for r in results if not r.skipped)
 
 
 def _decision(a: WorkerResult, outcome: str, reasons: list[str], patch_from: str | None = None) -> Decision:
@@ -121,6 +122,8 @@ def _decide_facts(
     a: WorkerResult, va: list[VerifyResult], vb: list[VerifyResult], pa: str, pb: str, adopt_on_both_pass: bool
 ) -> Decision:
     notes = [REASON_NO_VERIFIER] if not va or not vb else []
+    if any(r.skipped for r in (*va, *vb)):
+        notes.append(REASON_TESTS_NOT_RUN)
     a_ok = _all_ok(va)
     b_ok = _all_ok(vb)
     if a_ok and b_ok:
