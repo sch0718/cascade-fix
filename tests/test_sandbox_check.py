@@ -138,6 +138,18 @@ class EnsureTest(SandboxCheckBase):
         self.assertEqual((out["a"]["runner"], out["a"]["model"]), ("claude", "claude-sonnet-5-5"))
         self.assertEqual(self.calls("cursor-agent"), 0)
 
+    def test_failed_runner_is_removed_from_other_cells_fallback(self):
+        os.environ["FAKE_CODEX_SANDBOX_EXIT"] = "1"
+        self.addCleanup(os.environ.pop, "FAKE_CODEX_SANDBOX_EXIT", None)
+        self.set_cursor({"result": cursor_reply(["true"])})
+        workers = self.cell_workers({"runner": "codex", "model": "gpt-x", "effort": "low"}, runner="cursor")
+        workers["b"] = {"runner": "codex", "model": "gpt-x", "effort": "low", "fallback": CLAUDE_HAIKU}
+        out, _ = sandbox_check.ensure(self.root, RepoConfig(tests=["true"]), self.wt, workers, [],
+                                      consented={"codex", "cursor"})
+        self.assertEqual(out["b"]["runner"], "claude")
+        self.assertEqual((out["a"]["runner"], out["a"]["fallback"]["runner"], out["a"]["fallback"]["model"]),
+                         ("cursor", "claude", "claude-sonnet-5-5"))
+
     def test_tests_command_failing_inside_and_outside_sandbox_keeps_assignment(self):
         self.set_cursor({"result": cursor_reply(["false"], 1)})
         updated, lines = self.ensure(RepoConfig(tests=["false"]))
@@ -406,6 +418,22 @@ class JobsSandboxCheckTest(CliTestBase):
         self.assertEqual(profile["roles"]["code.a"]["fallback"]["runner"], "claude")
         self.assertEqual(profile["consented"], ["cursor"])
         self.assertEqual(self.stage1_cli_jobs(), ["r1-01:a", "r1-02:a"])
+
+    def test_jobs_sandbox_failure_replaces_other_cells_fallback_and_records_it(self):
+        self.add_profile('"code.a" = { runner = "cursor", fallback = { runner = "codex" } }', '"code.b" = { runner = "codex" }')
+        self.env["FAKE_CODEX_SANDBOX_EXIT"] = "1"
+        self.init("--profile", "mine")
+        self.assertEqual(self.ledger().profile["consented"], ["codex", "cursor"])
+        self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1")
+        profile = self.ledger().profile
+        self.assertEqual((profile["roles"]["code.b"]["runner"], profile["roles"]["code.a"]["runner"]), ("claude", "cursor"))
+        self.assertEqual((profile["roles"]["code.a"]["fallback"]["runner"], profile["roles"]["code.a"]["fallback"]["model"]),
+                         ("claude", "claude-sonnet-5-5"))
+        self.assertEqual(profile["substituted"], [
+            {"role": "code.a(대체)", "from": "codex", "to": "claude", "reason": "샌드박스 점검 실패"},
+            {"role": "code.b", "from": "codex", "to": "claude", "reason": "샌드박스 점검 실패"}])
+        self.assertEqual(profile["consented"], ["cursor"])
+        self.assertEqual(self.ledger().workers["a"]["fallback"]["runner"], "claude")
 
     def test_jobs_sandbox_failure_on_old_ledger_materializes_profile(self):
         self.init("--workers", "external", "--reviewer", "claude")

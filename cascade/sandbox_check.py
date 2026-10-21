@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from cascade.assignment import fallback_target
+from cascade.assignment import claude_only_cell, fallback_target
 from cascade.config import RepoConfig
 from cascade.runners import (
     RUNNER_CODEX,
@@ -154,8 +154,15 @@ def _used(workers: dict) -> list[str]:
 
 
 def _replace(workers: dict, runner: str, consented: set[str], stopped: set[str]) -> dict:
-    return {role: fallback_target(spec, consented, stopped, role) if spec["runner"] == runner else spec
-            for role, spec in workers.items()}
+    out = {}
+    for role, spec in workers.items():
+        if spec["runner"] == runner:
+            out[role] = fallback_target(spec, consented, stopped, role)
+        elif (spec.get("fallback") or {}).get("runner") == runner:
+            out[role] = {**spec, "fallback": claude_only_cell(role)}
+        else:
+            out[role] = spec
+    return out
 
 
 def _replacement(workers: dict, runner: str, after: dict) -> str:

@@ -376,6 +376,20 @@ class ProfileFallbackTest(WorkersTestBase):
         self.assertEqual([j["model"] for j in self.read("stage1-fallback-args.json")["jobs"]], ["claude-sonnet-5-5"] * 2)
         self.assertEqual(self.calls("cursor-agent"), 0)
 
+    def test_sandbox_failed_cli_is_not_the_runtime_fallback_of_another_cell(self):
+        self.add_profile('"code.a" = { runner = "cursor", fallback = { runner = "codex" } }', '"code.b" = { runner = "codex" }')
+        self.use_fakes()
+        self.cursor_results([dict(LIMIT_ENTRY, match="r1-0")])
+        self.env["FAKE_CODEX_SANDBOX_EXIT"] = "1"
+        self.init("--profile", "mine")
+        self.args("jobs")
+        self.assertEqual([j["id"] for j in self.read("stage1-cli-args.json")["jobs"]], ["r1-01:a", "r1-02:a"])
+        self.workers()
+        self.assertEqual([(j["id"], j["model"]) for j in self.read("stage1-fallback-args.json")["jobs"]],
+                         [("r1-01:a", "claude-sonnet-5-5"), ("r1-02:a", "claude-sonnet-5-5")])
+        self.assertEqual(self.event("workers-stage1")["fallback_runs"], {})
+        self.assertEqual(self.calls("codex"), 0)
+
     def test_old_ledger_without_profile_falls_back_to_claude(self):
         self.start()
         path = self.run_dir / "ledger.json"

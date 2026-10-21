@@ -222,6 +222,10 @@ def apply_sandbox_substitution(ledger, before: dict[str, dict], after: dict[str,
         key = keys[role]
         if before[role]["runner"] != spec["runner"]:
             record["substituted"].append({"role": key, "from": before[role]["runner"], "to": spec["runner"], "reason": reason})
+        else:
+            old, new = (before[role].get("fallback") or {}).get("runner"), (spec.get("fallback") or {}).get("runner")
+            if old and old != new:
+                record["substituted"].append({"role": key + FALLBACK_SUFFIX, "from": old, "to": new, "reason": reason})
         record["roles"][key] = copy.deepcopy(spec)
     record["consented"] = [r for r in record["consented"] if r in used_recipients(record["roles"], ledger.mode)]
     ledger.profile = record
