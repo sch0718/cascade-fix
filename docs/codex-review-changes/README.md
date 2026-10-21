@@ -4,7 +4,7 @@ cascade-fix의 Codex 검토자는 `codex-review` 스킬의 `scripts/run-review.s
 
 | 파일 | 내용 |
 | --- | --- |
-| [run-review.sh](run-review.sh) | 지금 쓰는 `run-review.sh` 전체(2026-10-18). `~/.claude/skills/codex-review/scripts/run-review.sh`를 이 파일로 바꾸거나, 지금 파일과 비교해 아래 변경을 옮긴다 |
+| [run-review.sh](run-review.sh) | 지금 쓰는 `run-review.sh` 전체(2026-10-21). `~/.claude/skills/codex-review/scripts/run-review.sh`를 이 파일로 바꾸거나, 지금 파일과 비교해 아래 변경을 옮긴다 |
 | [SKILL.md.diff](SKILL.md.diff) | `codex-review`의 SKILL.md에 재검토·의견 모드 설명을 더한 diff(2026-10-17) |
 
 예전에는 `run-review.sh`도 diff로 보관했다. 그 뒤 다른 변경(`--known` 등)이 쌓여 diff가 지금 스크립트와 맞지 않게 되어, 전체 파일로 바꿨다.
@@ -32,6 +32,13 @@ include_instructions = false
 - `tests/test_run_review_recheck.py`의 `test_codex_home_turns_off_skill_list`가 확인한다. 이 테스트는 고치기 전 스크립트에서는 실패한다.
 
 원래 CODEX_HOME(`~/.codex`)을 함께 쓰는 방식은 쓰지 않는다. `--ignore-user-config`를 줘도 전역 AGENTS.md와 플러그인 스킬 목록이 프롬프트에 들어가는 것을 확인했다. 그래서 임시 CODEX_HOME을 유지한다.
+
+### 문서 모드 출력 형식을 파서에 맞추기 (2026-10-21)
+
+`--doc` 프롬프트의 「출력 형식」에 번호 항목, 들여 쓴 `위치:`/`근거:`/`제안:` 줄, 없는 절의 「없음.」, 예시를 더했다. Cursor 리뷰 스크립트(`docs/cursor-review/run-review.sh`의 `output_format`)와 같은 문구다.
+
+- 전에는 3단계 구분과 위치·근거·제안만 요구했다. Codex가 불릿으로 답하면 `parse_codex_doc`이 번호 항목과 `위치:`를 찾지 못해 지적이 0건으로 읽혔다.
+- `tests/test_run_review_recheck.py`의 `test_doc_output_format_example_matches_finding_parser`가 확인한다. 이 테스트는 고치기 전 스크립트에서는 실패한다.
 
 ## 시험하기
 
