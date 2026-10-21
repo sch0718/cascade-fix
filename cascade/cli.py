@@ -115,6 +115,7 @@ from cascade.workers import (
     fallback_counts,
     has_external,
     usage_totals,
+    workers_flags,
 )
 
 SOURCES = ("codex-doc", "codex-code", "claude-doc", "claude-code", "cursor-doc", "cursor-code", "pr-comment")
@@ -367,6 +368,7 @@ def cmd_detect(args) -> int:
 
 def cmd_review(args) -> int:
     root = Path(args.root).resolve() if args.root else s.git_toplevel(Path.cwd())
+    _check_workers(args.workers)
     if args.kind == "doc":
         if not args.doc:
             raise s.CliError("문서 검토는 --doc <문서> 를 하나 이상 준다")
@@ -401,6 +403,7 @@ def cmd_review(args) -> int:
     print(f"  {s.CLI} init --source {source} --input {shlex.quote(str(result))}{docs_args}"
           + (f" --review-model {shlex.quote(model)}" if args.review_model else "")
           + (f" --review-effort {effort}" if args.review_effort else "")
+          + workers_flags(args.workers, args.cursor_model)
           + _root_flag(args, root))
     return 0
 
@@ -1175,6 +1178,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--root")
     p.add_argument("--review-model")
     p.add_argument("--review-effort", choices=EFFORTS)
+    add_workers_args(p)
     add("jobs", cmd_jobs, round_no=True)
     p = add("workers", cmd_workers, round_no=True)
     p.add_argument("--stage", choices=(s.STAGE1, s.STAGE_CHECKER), required=True)

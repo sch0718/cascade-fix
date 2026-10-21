@@ -1,3 +1,5 @@
+import os
+import shlex
 from pathlib import Path
 
 from cascade.jobs import ROLES, RUNNER_CLAUDE
@@ -58,6 +60,16 @@ def assign_available(choice: str, cursor_model: str) -> dict[str, dict]:
         return {}
     available = {RUNNER_CODEX: codex_available(), RUNNER_CURSOR: cursor_available()}
     return assign(choice, available, codex_model(Path.home() / ".codex"), cursor_model)
+
+
+def workers_flags(choice: str, cursor_model: str) -> str:
+    """후속 명령에 붙일 작업자 옵션. CASCADE_WORKERS가 다른 값이면 claude도 적어 환경 변수가 선택을 뒤집지 않게 한다."""
+    if choice == WORKERS_CLAUDE and (os.environ.get("CASCADE_WORKERS") or WORKERS_CLAUDE) == WORKERS_CLAUDE:
+        return ""
+    flags = f" --workers {choice}"
+    if choice == WORKERS_EXTERNAL and cursor_model != DEFAULT_CURSOR_MODEL:
+        flags += f" --cursor-model {shlex.quote(cursor_model)}"
+    return flags
 
 
 def demote(workers: dict[str, dict], runner: str) -> dict[str, dict]:

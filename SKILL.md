@@ -66,12 +66,12 @@ PYTHONPATH="${CLAUDE_SKILL_DIR}" python3 -m cascade.cli
 ### Claude 단독 첫 검토
 
 1. **review** — 대상 저장소 루트에서
-   - 코드: `CF review --kind code (--base <브랜치> | --uncommitted | --commit <SHA>) [--focus <관점>] [--review-model M] [--review-effort E]`
-   - 문서: `CF review --kind doc --doc <문서> [--doc <문서>…] [--focus <관점>]`
+   - 코드: `CF review --kind code (--base <브랜치> | --uncommitted | --commit <SHA>) [--focus <관점>] [--review-model M] [--review-effort E] [--workers claude|external] [--cursor-model M]`
+   - 문서: `CF review --kind doc --doc <문서> [--doc <문서>…] [--focus <관점>] [--workers claude|external] [--cursor-model M]`
    - 출력의 `review_dir=<경로>` 아래에 `review-args.json`이 생긴다. 검토자는 읽기만 하고, 결과는 `Critical`/`Warning`/`Suggestion` 형식(`위치:`/`근거:`/`제안:`)이다.
 2. **Workflow(첫 검토)** — 절차 3과 같은 방식으로 `RJ`를 `review-args.json`으로 돌려 반환값(완료 알림의 output 파일의 `.result`)을 `<review_dir>/review.json`에 저장한다.
 3. **init** — `CF init --source claude-code --input <review_dir>/review.json`(문서면 `--source claude-doc … --doc <문서>`). `review`가 출력한 명령을 그대로 쓴다. 결과가 비었으면(호출 실패) 종료 코드 5로 멈춘다 — Workflow를 다시 돌린다.
-   - 이 init 줄에는 `--workers`가 붙지 않는다. 외부 작업자를 쓰려면 `CASCADE_WORKERS=external`을 환경에 두거나 줄에 `--workers external`을 더한다.
+   - `review`에 준 `--workers`·`--cursor-model`(없으면 `CASCADE_WORKERS`)은 이 init 줄에 그대로 붙는다. `detect`가 안내하는 `review` 줄에도 붙는다.
 
 ## 설계 단계에서 쓰기
 

@@ -13,7 +13,7 @@ from cascade.consensus import WorkerResult  # noqa: E402
 from cascade.rounds import Ledger  # noqa: E402
 from fake_cli import CODEX_BODY, CURSOR_BODY, fenced, install  # noqa: E402
 from helpers import run_cli  # noqa: E402
-from test_cli_e2e import FIXTURES, CliTestBase  # noqa: E402
+from test_cli_e2e import CALC, FIXTURES, CliTestBase  # noqa: E402
 
 BOTH = {"codex": True, "cursor": True}
 CLAUDE_SONNET = {"runner": "claude", "model": "claude-sonnet-5-5", "effort": "low"}
@@ -213,6 +213,25 @@ class InitWorkersTest(ExternalWorkersBase):
         self.assertEqual(r["workers"], {})
         self.assertNotIn("--workers", r["recommendation"]["steps"][0])
         self.assertFalse(any("작업자 전송 동의" in a for a in r["approvals"]))
+
+    def test_detect_claude_keeps_flag_when_env_selects_external(self):
+        self.use_fakes()
+        self.env["CASCADE_WORKERS"] = "external"
+        r = self.detect("--workers", "claude")
+        self.assertFalse(any("작업자 전송 동의" in a for a in r["approvals"]))
+        self.assertIn("--workers claude", r["recommendation"]["steps"][0])
+
+    def test_first_review_path_carries_workers_to_review_and_init(self):
+        self.use_fakes()
+        (self.repo / "calc.py").write_text(CALC + "\n# 바꿈\n", encoding="utf-8")
+        p = run_cli(["detect", "--json", "--no-gh", "--reviewer", "claude", "--workers", "external",
+                     "--cursor-model", "composer-test"], cwd=self.repo, env=self.env)
+        review = json.loads(p.stdout)["recommendation"]["steps"][0]
+        self.assertIn("review --kind code --uncommitted", review)
+        self.assertIn("--workers external --cursor-model composer-test", review)
+        p = self.cli("review", "--kind", "code", "--uncommitted", "--workers", "external", "--cursor-model", "composer-test")
+        init = next(line for line in p.stdout.splitlines() if " init " in line)
+        self.assertIn("--workers external --cursor-model composer-test", init)
 
 
 class LedgerCompatTest(unittest.TestCase):

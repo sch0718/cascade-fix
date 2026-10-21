@@ -21,7 +21,15 @@ from cascade.review import (
 )
 from cascade.runners import RUNNER_CODEX, RUNNER_CURSOR
 from cascade.snapshot import RUN_DIR_NAME
-from cascade.workers import DEFAULT_CURSOR_MODEL, WORKERS_CLAUDE, WORKERS_EXTERNAL, consent_line, describe, has_external
+from cascade.workers import (
+    DEFAULT_CURSOR_MODEL,
+    WORKERS_CLAUDE,
+    WORKERS_EXTERNAL,
+    consent_line,
+    describe,
+    has_external,
+    workers_flags,
+)
 
 DOC_SUFFIXES = (".md", ".markdown", ".txt", ".rst")
 _LOCATION_FILE = re.compile(r"^(.+?):\d+")
@@ -336,14 +344,12 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
         notes.append("커밋하지 않은 변경이 있다. 채택 패치가 작업 트리에 섞이지 않게 하려면 --dry-run 을 쓴다")
 
     steps = rec["steps"]
-    workers_flag = f" --workers {workers_choice}" if workers_choice != WORKERS_CLAUDE else ""
-    if workers_choice == WORKERS_EXTERNAL and cursor_model != DEFAULT_CURSOR_MODEL:
-        workers_flag += f" --cursor-model {q(cursor_model)}"
+    workers_flag = workers_flags(workers_choice, cursor_model)
     flags = ("" if reviewer_choice == REVIEWER_AUTO else f" --reviewer {reviewer_choice}") + workers_flag + root_flag
     if not blockers and rec["source"]:
         if rec["source"].startswith("claude-") and input_path is None:
             rec["first_review"] = 1
-            steps.append(f"{cli} review --kind {rec['mode']} {rec['review_args']}{root_flag}")
+            steps.append(f"{cli} review --kind {rec['mode']} {rec['review_args']}{workers_flag}{root_flag}")
             steps.append("Workflow(첫 검토) → review.json 저장 → review 출력의 init 명령")
         elif rec["source"] == "pr-comment":
             steps.append(f"{cli} init --source pr-comment --input {pr_data['number']} --pr-repo {q(pr_data['repo'])}"
