@@ -63,6 +63,8 @@ def first_review_command(cell: dict, args: dict, review_dir: Path) -> tuple[str,
     command = (f"{shlex.quote(str(script))} {scope}" + (f" --focus {shlex.quote(args['focus'])}" if args["focus"] else "")
                + f" --repo {shlex.quote(args['root'])} --out {shlex.quote(str(out))}"
                + (f" --model {shlex.quote(cell['model'])}" if cursor and cell["model"] else ""))
+    if args["kind"] == "code" and not cursor:
+        command = f"cd {shlex.quote(args['root'])} && {command}"  # codex-review의 코드 모드는 --repo를 무시하고 현재 디렉터리를 본다
     return command, f"{out}.final"
 
 

@@ -651,6 +651,7 @@ class ReviewRolesFallbackTest(ReviewRolesBase):
         self.assertIn("Workflow 실행", self.next_steps(p)[0])
 
 
+FABLE_CELL = {"runner": "claude", "model": "claude-fable-5-1", "effort": "high"}
 FIRST_REVIEW_PROFILES = """
 [profiles.split]
 "code.review" = { runner = "claude", model = "claude-sonnet-5-5", effort = "low" }
@@ -706,10 +707,11 @@ class FirstReviewTest(ExternalWorkersBase):
         self.assertIn("--profile local", p.stdout)
         self.assertIn("검토자: Codex", p.stdout)
         steps = self.next_lines(p)
-        self.assertTrue(steps[0].startswith(str(self.rr)), steps)
+        self.assertTrue(steps[0].startswith(f"cd {self.repo} && {self.rr} --base main"), steps)
         self.assertEqual(self.meta(review_dir), {
-            "role": "code.review", "requested": {"runner": "codex", "model": "", "effort": ""},
+            "role": "code.review", "requested": {"runner": "codex", "model": "", "effort": "", "fallback": FABLE_CELL},
             "actual": {"runner": "codex", "model": "", "effort": ""}, "fallback_reason": None, "attempts": [],
+            "consented": ["codex"],
             "args": {"kind": "code", "base": "main", "uncommitted": False, "commit": None, "docs": [], "focus": "",
                      "root": str(self.repo)},
             "profile": "local", "explicit": True})
@@ -719,7 +721,7 @@ class FirstReviewTest(ExternalWorkersBase):
         p = self.review("--profile", "local", "--focus", "순서", kind="doc", scope=("--doc", str(self.repo / "plan.md")))
         review_dir = self.review_dir(p)
         command, init = self.next_lines(p)[:2]
-        self.assertIn(f"run-review.sh --doc {self.repo / 'plan.md'}", command)
+        self.assertTrue(command.startswith(f"{self.rr} --doc {self.repo / 'plan.md'}"), command)
         self.assertIn("--focus", command)
         self.assertIn("--source codex-doc", init)
         self.assertIn(f"--doc {self.repo / 'plan.md'}", init)
@@ -768,7 +770,8 @@ class FirstReviewTest(ExternalWorkersBase):
         self.assertEqual((job["model"], job["effort"]), (OPUS, "high"))
         self.assertNotIn("--review-model", self.init_line(p))
         self.assertNotIn("--review-effort", self.init_line(p))
-        self.assertEqual(self.meta(review_dir)["requested"], {"runner": "claude", "model": OPUS, "effort": "high"})
+        self.assertEqual(self.meta(review_dir)["requested"],
+                         {"runner": "claude", "model": OPUS, "effort": "high", "fallback": FABLE_CELL})
 
     def test_env_profile_is_explicit_too(self):
         p = self.review("--review-model", OPUS, env={"CASCADE_PROFILE": "split"})
@@ -799,7 +802,7 @@ class FirstReviewTest(ExternalWorkersBase):
         self.assertNotIn("--profile", init_line)
         meta = self.meta(self.review_dir(p))
         self.assertEqual((meta["profile"], meta["explicit"]), ("default", False))
-        self.assertEqual(meta["requested"], {"runner": "claude", "model": SONNET, "effort": "low"})
+        self.assertEqual(meta["requested"], {"runner": "claude", "model": SONNET, "effort": "low", "fallback": FABLE_CELL})
 
     def test_missing_script_substitutes_the_fallback_and_says_so(self):
         p = self.review("--profile", "local", env={"CASCADE_RUN_REVIEW": str(self.tmp / "none.sh")})
@@ -897,6 +900,114 @@ class FirstReviewTest(ExternalWorkersBase):
                 self.assertNotIn("Traceback", p.stderr)
         self.assertEqual(self.meta(first)["attempts"], [])
 
+    def fallback(self, review_dir, runner, reason="한도", cwd=None):
+        return run_cli(["review", "--review-dir", str(review_dir), "--fallback-from", runner, "--reason", reason],
+                       cwd or self.repo, env=self.env)
+
+    def test_partial_consent_sends_the_first_review_fallback_to_claude(self):
+        first = self.review_dir(self.review("--profile", "codex-then-cursor-first", "--consent", "codex"))
+        meta = self.meta(first)
+        self.assertEqual(meta["consented"], ["codex"])
+        self.assertEqual(meta["requested"]["fallback"]["runner"], "claude")
+        p = self.fallback(first, "codex")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.meta(first)["actual"]["runner"], "claude")
+        self.assertTrue((first / "review-args.json").is_file())
+        self.assertNotIn(str(self.cr), p.stdout)
+
+    def test_consent_none_makes_the_first_review_claude(self):
+        p = self.review("--profile", "local", "--consent", "none")
+        first = self.review_dir(p)
+        self.assertIn("대체: code.review codex → claude — 전송 동의 없음", p.stdout)
+        self.assertTrue((first / "review-args.json").is_file())
+        self.assertNotIn(str(self.rr), p.stdout)
+        meta = self.meta(first)
+        self.assertEqual((meta["requested"]["runner"], meta["actual"]["runner"], meta["fallback_reason"], meta["consented"]),
+                         ("codex", "claude", "전송 동의 없음", []))
+        self.assertEqual(meta["attempts"], [{"runner": "codex", "reason": "전송 동의 없음"}])
+
+    def test_consent_without_first_review_recipient_keeps_claude_cell(self):
+        p = self.review("--profile", "split", "--consent", "none")
+        meta = self.meta(self.review_dir(p))
+        self.assertEqual((meta["actual"]["model"], meta["attempts"], meta["consented"]), (SONNET, [], []))
+
+    def test_consent_covering_the_fallback_allows_it(self):
+        first = self.review_dir(self.review("--profile", "codex-then-cursor-first", "--consent", "codex,cursor"))
+        self.assertEqual(self.meta(first)["consented"], ["codex", "cursor"])
+        self.assertEqual(self.fallback(first, "codex").returncode, 0)
+        self.assertEqual(self.meta(first)["actual"]["runner"], "cursor")
+
+    def test_missing_cli_does_not_reach_an_unconsented_fallback(self):
+        p = self.review("--profile", "codex-then-cursor-first", "--consent", "codex",
+                        env={"CASCADE_CODEX": str(self.tmp / "no-such-cli")})
+        meta = self.meta(self.review_dir(p))
+        self.assertEqual(meta["actual"]["runner"], "claude")
+        self.assertEqual([a["runner"] for a in meta["attempts"]], ["codex"])
+
+    def test_bad_consent_value_is_rejected(self):
+        p = self.review("--profile", "local", "--consent", "openai")
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("openai", p.stdout)
+
+    def test_codex_code_command_enters_the_root_even_with_a_space(self):
+        spaced = make_repo(self.tmp / "my repo", {"x.py": "x = 1\n"})
+        (self.tmp / "t2").mkdir()
+        toml = write_repos_toml(self.tmp / "t2", {str(spaced): {"tests": [], "format": []}})
+        toml.write_text(toml.read_text(encoding="utf-8") + FIRST_REVIEW_PROFILES, encoding="utf-8")
+        p = run_cli(["review", "--kind", "code", "--base", "main", "--profile", "local", "--root", str(spaced)], self.tmp,
+                    env={**self.env, "CASCADE_REPOS_TOML": str(toml)})
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertTrue(self.next_lines(p)[0].startswith(f"cd {shlex.quote(str(spaced))} && {self.rr} --base main"),
+                        self.next_lines(p)[0])
+        self.assertIn(f"--root {shlex.quote(str(spaced))}", self.init_line(p))
+
+    def test_fallback_chain_codex_cursor_claude_and_no_duplicates(self):
+        first = self.review_dir(self.review("--profile", "codex-then-cursor-first"))
+        self.assertEqual(self.fallback(first, "codex", "한도").returncode, 0)
+        self.assertEqual(self.meta(first)["actual"]["runner"], "cursor")
+        again = self.fallback(first, "codex", "한도")
+        self.assertEqual(again.returncode, 5, again.stdout + again.stderr)
+        self.assertEqual(len(self.meta(first)["attempts"]), 1)
+        p = self.fallback(first, "cursor", "오류")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        meta = self.meta(first)
+        self.assertEqual((meta["requested"]["runner"], meta["actual"]["runner"], meta["fallback_reason"]),
+                         ("codex", "claude", "오류"))
+        self.assertEqual(meta["attempts"], [{"runner": "codex", "reason": "한도"}, {"runner": "cursor", "reason": "오류"}])
+        self.assertTrue((first / "review-args.json").is_file())
+        self.assertEqual(self.fallback(first, "cursor").returncode, 5)
+        self.assertEqual(self.fallback(first, "claude").returncode, 5)
+
+    def test_failed_fallback_leaves_meta_untouched(self):
+        first = self.review_dir(self.review("--profile", "local"))
+        before = (first / "review-meta.json").read_text(encoding="utf-8")
+        p = run_cli(["review", "--review-dir", str(first), "--fallback-from", "codex", "--reason", "한도",
+                     "--review-model", "composer-2.5"], self.repo, env=self.env)
+        self.assertEqual(p.returncode, 5, p.stdout + p.stderr)
+        self.assertEqual((first / "review-meta.json").read_text(encoding="utf-8"), before)
+        self.assertFalse((first / "review-args.json").exists())
+
+    def test_fallback_uses_the_recorded_fallback_not_the_current_repos_toml(self):
+        first = self.review_dir(self.review("--profile", "codex-then-cursor-first"))
+        toml = Path(self.env["CASCADE_REPOS_TOML"])
+        toml.write_text(toml.read_text(encoding="utf-8").replace('runner = "cursor", model = "composer-9"',
+                                                                 'runner = "claude", model = "claude-haiku-5-5"'),
+                        encoding="utf-8")
+        p = self.fallback(first, "codex")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual((self.meta(first)["actual"]["runner"], self.meta(first)["actual"]["model"]), ("cursor", "composer-9"))
+        toml.write_text("[repos]\n", encoding="utf-8")
+        self.assertEqual(self.fallback(first, "cursor").returncode, 0)
+        self.assertEqual(self.meta(first)["actual"]["runner"], "claude")
+
+    def test_code_review_with_doc_option_keeps_doc_in_the_init_line(self):
+        (self.repo / "plan.md").write_text("# 계획\n", encoding="utf-8")
+        p = self.review("--doc", str(self.repo / "plan.md"))
+        self.assertIn(f"--doc {self.repo / 'plan.md'}", self.init_line(p))
+        p = self.review("--profile", "local", "--doc", str(self.repo / "plan.md"))
+        self.assertIn(f"--doc {self.repo / 'plan.md'}", self.init_line(p))
+        self.assertNotIn("--doc", self.next_lines(p)[0])
+
     def test_review_without_kind_is_still_a_usage_error(self):
         p = run_cli(["review", "--base", "main"], self.repo, env=self.env)
         self.assertEqual(p.returncode, 2)
@@ -951,17 +1062,20 @@ class FirstReviewCommandTest(unittest.TestCase):
         codex = {"runner": "codex", "model": "", "effort": ""}
         cursor = {"runner": "cursor", "model": "composer-9", "effort": ""}
         command, result = review.first_review_command(codex, args, Path("/d"))
-        self.assertEqual(command, f"{shlex.quote(str(cli_steps.RUN_REVIEW))} --base main --repo '/r p' --out /d/review.out")
+        self.assertEqual(command, f"cd '/r p' && {shlex.quote(str(cli_steps.RUN_REVIEW))} --base main --repo '/r p' "
+                                  "--out /d/review.out")
         self.assertEqual(result, "/d/review.out.final")
         command, _ = review.first_review_command(cursor, {**args, "base": None, "commit": "abc123"}, Path("/d"))
         self.assertEqual(command, f"{shlex.quote(str(cli_steps.CURSOR_REVIEW))} --commit abc123 --repo '/r p' "
                                   "--out /d/review.out --model composer-9")
         command, _ = review.first_review_command(codex, {**args, "base": None, "uncommitted": True, "focus": "보안"},
                                                  Path("/d"))
+        self.assertTrue(command.startswith("cd '/r p' && "), command)
         self.assertIn(" --uncommitted --focus ", command)
         docs = {**args, "kind": "doc", "base": None, "docs": ["/a.md", "/b c.md"]}
         command, _ = review.first_review_command(codex, docs, Path("/d"))
         self.assertIn(" --doc /a.md --doc '/b c.md' --repo ", command)
+        self.assertNotIn("cd ", command)
 
 
 class ReviewHelpersTest(unittest.TestCase):

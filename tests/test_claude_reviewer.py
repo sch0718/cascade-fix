@@ -88,8 +88,10 @@ class ClaudeReviewCommandTest(CliTestBase):
         out = self.review_dir(p)
         meta = json.loads((out / "review-meta.json").read_text(encoding="utf-8"))
         cell = {"runner": "claude", "model": "claude-sonnet-5-5", "effort": review.DEFAULT_EFFORT}
+        fallback = {"runner": "claude", "model": review.DEFAULT_MODEL, "effort": review.DEFAULT_EFFORT}
         self.assertEqual((meta["role"], meta["requested"], meta["actual"], meta["fallback_reason"], meta["attempts"]),
-                         ("code.review", cell, cell, None, []))
+                         ("code.review", {**cell, "fallback": fallback}, cell, None, []))
+        self.assertEqual(meta["consented"], [])
         self.assertEqual((meta["profile"], meta["explicit"]), ("default", False))
         self.assertEqual(meta["args"]["base"], "main")
         init_line = next(x for x in p.stdout.splitlines() if " init --source " in x)

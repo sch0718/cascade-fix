@@ -325,7 +325,11 @@ def _first_review_meta(args, mode: str) -> dict:
         return {}
     if not isinstance(meta, dict) or meta.get("role") != f"{mode}.review":
         return {}
-    return {key: meta[key] for key in FIRST_REVIEW_KEYS if key in meta}
+    first_review = {key: meta[key] for key in FIRST_REVIEW_KEYS if key in meta}
+    if isinstance(first_review.get("requested"), dict):
+        first_review["requested"] = {key: first_review["requested"][key] for key in ("runner", "model", "effort")
+                                     if key in first_review["requested"]}
+    return first_review
 
 
 def _expected_review_model(args, resolved: profiles.Resolved, mode: str, first_review: dict) -> str:
@@ -487,15 +491,13 @@ def cmd_detect(args) -> int:
 
 
 def _review_scope(args, root: Path) -> dict:
-    docs = []
+    docs = [str(Path(raw).resolve()) for raw in args.doc or []]
     if args.kind == "doc":
         if not args.doc:
             raise s.CliError("문서 검토는 --doc <문서> 를 하나 이상 준다")
-        for raw in args.doc:
-            path = Path(raw).resolve()
-            if not path.is_file():
+        for raw, path in zip(args.doc, docs):
+            if not Path(path).is_file():
                 raise s.CliError(f"문서가 없다: {raw}")
-            docs.append(str(path))
     elif sum(bool(x) for x in (args.base, args.uncommitted, args.commit)) != 1:
         raise s.CliError("코드 검토는 --base <브랜치> / --uncommitted / --commit <SHA> 중 하나를 준다")
     return {"kind": args.kind, "base": args.base, "uncommitted": args.uncommitted, "commit": args.commit,
@@ -552,9 +554,15 @@ def _first_review_unusable(runner: str, available: dict[str, bool]) -> str | Non
     return None if script.is_file() else REVIEW_NO_SCRIPT_REASON
 
 
-def _first_review_target(cell: dict, attempts: list[dict], available: dict[str, bool]) -> dict:
-    consented = {r for r in (cell["runner"], cell["fallback"]["runner"]) if r in assignment.EXTERNAL_RUNNERS}
+def _consent_first_review(cell: dict, key: str, mode: str, consent: set[str] | None) -> tuple[dict, list[str], list[dict]]:
+    if consent is None:
+        return cell, assignment.used_recipients({key: cell}, mode), []
+    roles, _ = assignment.apply_consent({key: cell}, consent)
+    attempts = [{"runner": cell["runner"], "reason": assignment.NO_CONSENT_REASON}] if roles[key]["runner"] != cell["runner"] else []
+    return {**cell, "fallback": roles[key]["fallback"]}, assignment.used_recipients(roles, mode), attempts
 
+
+def _first_review_target(cell: dict, consented: set[str], attempts: list[dict], available: dict[str, bool]) -> dict:
     def target() -> dict:
         return assignment.fallback_target(cell, consented, {a["runner"] for a in attempts}, "reviewer")
 
@@ -581,20 +589,22 @@ def _emit_first_review(args, review_dir: Path, meta: dict, new_attempts: list[di
     scope, actual, key = meta["args"], meta["actual"], meta["role"]
     root = Path(scope["root"])
     source = f"{actual['runner']}-{scope['kind']}"
-    print(f"review_dir={review_dir}")
-    for i, attempt in enumerate(new_attempts):
-        to = new_attempts[i + 1]["runner"] if i + 1 < len(new_attempts) else actual["runner"]
-        print(f"대체: {key} {attempt['runner']} → {to} — {attempt['reason']}")
     if actual["runner"] == REVIEWER_CLAUDE:
         model, effort = actual["model"], actual["effort"]
         job = review_job(REVIEW_JOB, f"{scope['kind']} review", claude_prompt(_review_prompt(scope), root), model, effort)
         args_path, result = review_dir / "review-args.json", review_dir / "review.json"
         s.write_json(args_path, write_job_args({"jobs": [job]}, review_dir / "prompts"))
-        print(f"검토자: Claude({model}, {effort})")
+        reviewer = f"Claude({model}, {effort})"
         step = s.workflow_step(args_path, result)
     else:
         step, result = first_review_command(actual, scope, review_dir)
-        print(f"검토자: {label(actual['runner'])}" + (f"({actual['model']})" if actual["model"] else ""))
+        reviewer = label(actual["runner"]) + (f"({actual['model']})" if actual["model"] else "")
+    s.write_json(review_dir / REVIEW_META, meta)
+    print(f"review_dir={review_dir}")
+    for i, attempt in enumerate(new_attempts):
+        to = new_attempts[i + 1]["runner"] if i + 1 < len(new_attempts) else actual["runner"]
+        print(f"대체: {key} {attempt['runner']} → {to} — {attempt['reason']}")
+    print(f"검토자: {reviewer}")
     if meta["explicit"]:
         carried = f" --profile {shlex.quote(meta['profile'])}"
     else:
@@ -612,8 +622,8 @@ def _load_review_meta(review_dir: Path) -> dict:
         raise s.CliError(f"{path}가 없다. CF review가 만든 첫 검토 폴더를 --review-dir로 준다", ExitCodes.PARSE_ERROR)
     meta = s.read_json(path)
     try:
-        [meta[name] for name in ("role", "actual", "attempts", "profile", "explicit")]
-        meta["requested"]["runner"], meta["args"]["root"]
+        [meta[name] for name in ("role", "actual", "attempts", "profile", "explicit", "consented")]
+        meta["actual"]["runner"], meta["requested"]["fallback"]["runner"], meta["args"]["root"]
     except (KeyError, TypeError):
         raise s.CliError(f"{path}의 형식이 맞지 않는다", ExitCodes.PARSE_ERROR) from None
     return meta
@@ -626,17 +636,15 @@ def _review_fallback(args) -> int:
         raise s.CliError("--fallback-from은 처음 첫 검토 폴더를 가리키는 --review-dir과 함께 쓴다", ExitCodes.PARSE_ERROR)
     review_dir = Path(args.review_dir).resolve()
     meta = _load_review_meta(review_dir)
-    requested = meta["requested"]["runner"]
-    if args.fallback_from not in assignment.EXTERNAL_RUNNERS or requested != args.fallback_from:
-        raise s.CliError(f"--fallback-from {args.fallback_from}가 처음 요청한 runner({requested})와 다르다", ExitCodes.PARSE_ERROR)
+    current = meta["actual"]["runner"]
+    if args.fallback_from not in assignment.EXTERNAL_RUNNERS or current != args.fallback_from:
+        raise s.CliError(f"--fallback-from {args.fallback_from}가 지금 첫 검토를 맡은 runner({current})와 다르다", ExitCodes.PARSE_ERROR)
     scope, key = meta["args"], meta["role"]
-    resolved = _review_profile(args, Path(scope["root"]), args.profile or meta["profile"])
-    cell = {**meta["requested"], "fallback": _first_review_cell(resolved, scope["kind"])["fallback"]}
     attempts = [*meta["attempts"], {"runner": args.fallback_from, "reason": args.reason or REVIEW_DEFAULT_REASON}]
     added = len(meta["attempts"])
-    actual = _apply_review_options(args, meta["profile"], key, _first_review_target(cell, attempts, {}))
+    actual = _apply_review_options(args, meta["profile"], key,
+                                   _first_review_target(meta["requested"], set(meta["consented"]), attempts, {}))
     meta = {**meta, "actual": _runner_values(actual), "fallback_reason": attempts[-1]["reason"], "attempts": attempts}
-    s.write_json(review_dir / REVIEW_META, meta)
     _emit_first_review(args, review_dir, meta, attempts[added:], f" --root {shlex.quote(scope['root'])}")
     return 0
 
@@ -648,18 +656,18 @@ def cmd_review(args) -> int:
         build_parser().error("the following arguments are required: --kind")
     root = Path(args.root).resolve() if args.root else s.git_toplevel(Path.cwd())
     scope = _review_scope(args, root)
+    consent = _consent_option(args.consent)
     resolved = _review_profile(args, root, args.profile)
     key = f"{args.kind}.review"
     requested = _apply_review_options(args, resolved.name, key, _first_review_cell(resolved, args.kind))
-    attempts: list[dict] = []
-    actual = _first_review_target(requested, attempts, {})
+    cell, consented, attempts = _consent_first_review(requested, key, args.kind, consent)
+    actual = _first_review_target(cell, set(consented), attempts, {})
     ensure_excluded(root)
-    review_dir = _new_review_dir(root)
-    meta = {"role": key, "requested": _runner_values(requested), "actual": _runner_values(actual),
-            "fallback_reason": attempts[-1]["reason"] if attempts else None, "attempts": attempts, "args": scope,
-            "profile": resolved.name, "explicit": resolved.explicit}
-    s.write_json(review_dir / REVIEW_META, meta)
-    _emit_first_review(args, review_dir, meta, attempts, _root_flag(args, root))
+    meta = {"role": key, "requested": {**_runner_values(requested), "fallback": _runner_values(cell["fallback"])},
+            "actual": _runner_values(actual), "fallback_reason": attempts[-1]["reason"] if attempts else None,
+            "attempts": attempts, "consented": consented, "args": scope, "profile": resolved.name,
+            "explicit": resolved.explicit}
+    _emit_first_review(args, _new_review_dir(root), meta, attempts, _root_flag(args, root))
     return 0
 
 
@@ -1517,6 +1525,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--profile", help="역할 프로필 이름(기본: 환경 변수 CASCADE_PROFILE, repos.toml, 없으면 내장 default)")
     p.add_argument("--review-model")
     p.add_argument("--review-effort", choices=EFFORTS)
+    p.add_argument("--consent", help="전송에 동의한 외부 수신처(codex,cursor 중 쉼표 구분, 또는 none). 기본: 이 프로필의 첫 검토 칸이 쓰는 수신처 전부")
     p.add_argument("--review-dir", help="--fallback-from으로 이력을 고칠 처음 첫 검토 폴더(review_dir=로 찍힌 곳)")
     p.add_argument("--fallback-from", help="실패한 첫 검토 runner(codex·cursor). 처음 요청한 runner와 같아야 한다")
     p.add_argument("--reason", help=f"--fallback-from의 사유(기본 {REVIEW_DEFAULT_REASON})")
