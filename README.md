@@ -45,7 +45,7 @@
 - Python 3.11 이상. 외부 패키지는 필요 없습니다.
 - git
 - (PR 모드) 로그인된 `gh` CLI
-- (선택) Codex를 검토자로 쓰려면 `codex-review` 스킬과 `codex` CLI. 이 스킬은 `run-review.sh`의 `--opinion`·`--recheck` 모드를 씁니다. 원래 `codex-review`에는 없는 모드라 [docs/codex-review-changes/](docs/codex-review-changes/README.md)에 보관한 `run-review.sh`로 바꿔야 합니다. 이 스크립트는 임시 CODEX_HOME에서 스킬 목록을 꺼 Codex 프롬프트도 줄입니다. 없으면 첫 검토 칸은 fallback으로 바뀌고, init은 의견·재검토 칸에 대해 경고만 냅니다(`--reviewer claude`나 다른 프로필로 다시 init합니다).
+- (선택) Codex를 검토자로 쓰려면 `codex-review` 스킬과 `codex` CLI. 이 스킬은 `run-review.sh`의 `--opinion`·`--recheck` 모드를 씁니다. 원래 `codex-review`에는 없는 모드라 [docs/codex-review-changes/](docs/codex-review-changes/README.md)에 보관한 `run-review.sh`로 바꿔야 합니다. 이 스크립트는 임시 CODEX_HOME에서 스킬 목록을 꺼 Codex 프롬프트도 줄입니다. 없으면 그 칸은 fallback(기본 Claude)으로 바뀝니다.
 - (선택) Cursor를 검토자나 작업자로 쓰려면 `cursor-review` 스킬(`~/.claude/skills/cursor-review/`, 사본은 [docs/cursor-review/](docs/cursor-review/README.md))과 로그인된 `cursor-agent` CLI(`cursor-agent login`). Codex를 작업자로 쓰려면 `codex` CLI와 로그인이 필요합니다.
 
 ## 설치
@@ -203,7 +203,7 @@ Codex 검토 결과(review.final) 반영해줘
 | 값 | 뜻 |
 | --- | --- |
 | `runner` | `claude`·`codex`·`cursor`. 검토 칸(`review`·`opinion`·`recheck`)은 `auto`도 받습니다. `auto`는 init이 정합니다(아래) |
-| `model` | claude면 `claude-`로 시작하는 모델 ID. cursor면 Cursor 모델 ID(`claude-`·`gpt-`로 시작하면 오류). codex면 비우거나 모델 ID. 비우면 `~/.codex/config.toml`의 `model`을 씁니다 |
+| `model` | claude면 `claude-`로 시작하는 모델 ID. cursor면 Cursor 모델 ID(`claude-`·`gpt-`로 시작하면 오류). codex면 비우거나 모델 ID. 비우면 `~/.codex/config.toml`의 `model`을 씁니다. auto는 Claude로 풀릴 수 있어 비우거나 `claude-`로 시작해야 합니다 |
 | `effort` | claude·codex만 씁니다(`low`·`medium`·`high`·`xhigh`·`max`). cursor 칸에 적으면 오류입니다 |
 | `fallback` | 대체 실행 대상 `{ runner, model, effort }` 하나. 생략하면 내장 `claude-only`의 같은 칸 값입니다. `auto`는 받지 않습니다 |
 
@@ -226,7 +226,7 @@ Codex 검토 결과(review.final) 반영해줘
 
 - `default`는 프로필을 고르지 않았을 때 도는 값입니다. 옛 옵션·환경 변수만 쓰면 v1.2.0과 같은 배정·출력·작업 파일이 나옵니다.
 - `claude-only`는 외부 전송이 없습니다. 전송 동의를 거절하거나 fallback을 생략했을 때, 마지막 대체 대상, `--workers claude`가 모두 이 값으로 돌아옵니다.
-- `local`은 측정 전 잠정값입니다. 미설치·로그인 필요로 쓸 수 없는 CLI의 칸은 init이 fallback으로 바꿉니다(검토 스크립트가 없을 때의 처리는 [검토 역할](#검토-역할의견재검토)을 봅니다).
+- `local`은 측정 전 잠정값입니다. 쓸 수 없는 CLI의 칸은 init이 fallback으로 바꿉니다.
 
 ### repos.toml로 덮거나 더하기
 
@@ -333,9 +333,8 @@ tests = ["pytest {files}"]
 | `codex` | `run-review.sh --opinion/--recheck`로 OpenAI에 보냅니다. 호출은 한 번에 하나씩 돌립니다(동시에 토큰을 갱신하면 로그인이 풀릴 수 있습니다) |
 | `cursor` | `cursor-review`의 `run-review.sh --opinion/--recheck`로 Cursor(팀 프라이버시 모드)에 보냅니다. 읽기 전용이고 모델은 기본 `composer-2.5`입니다. 호출은 한 번에 하나씩 돌립니다 |
 
-- init이 칸의 CLI를 쓸 수 없다고 보는 경우는 미설치·로그인 필요뿐입니다. `codex-review`·`cursor-review` 스크립트가 없으면 init은 칸을 바꾸지 않고 `경고: … 스킬이 없다`만 냅니다. 그때는 `--reviewer claude`나 다른 프로필로 다시 init합니다. 스크립트 없음을 사유로 칸을 바꾸는 것은 첫 검토(`CF review`·`detect`)뿐입니다.
-- 한도(종료 코드 75, 로그의 usage limit)·시간 초과·실행 오류가 나면 그 칸의 fallback으로 자동으로 다시 돕니다. **프로필을 고르지 않은 기본 동작에서도 같습니다.** v1.2.0은 한도에서 멈췄습니다.
-- 로그인 만료(종료 코드 77, 401·refresh token)는 대체하지 않고 멈춥니다. 터미널에서 `codex login`(Cursor는 `cursor-agent login`)을 한 뒤 다시 돌립니다.
+- 한도(로그의 usage limit)·시간 초과·실행 오류가 나면 그 칸의 fallback으로 자동으로 다시 돕니다. **프로필을 고르지 않은 기본 동작에서도 같습니다.** v1.2.0은 한도에서 멈췄습니다.
+- 로그인 만료(로그의 401·refresh token)는 대체하지 않고 멈춥니다. CF는 `run-review.sh`의 종료 코드(75·77)를 보지 못하고 실행 로그 끝 20줄로 원인을 가릅니다. 로그에 인증 흔적 없이 77로 끝났으면 실행 오류로 보고 fallback으로 갑니다. 터미널에서 `codex login`(Cursor는 `cursor-agent login`)을 한 뒤 다시 돌립니다.
 - 실행 중 대체는 init이 정한 배정과 따로 `profile.runtime_substitutions`에 남고, 다음 회차에도 이어집니다. 보고서는 의견마다 실제로 맡은 runner를 붙입니다.
 - `cursor-review`의 `run-review.sh`는 환경 변수 `CASCADE_CURSOR_REVIEW`, 이 스킬 옆의 `cursor-review/`, `~/.claude/skills/cursor-review/` 순으로 찾습니다.
 

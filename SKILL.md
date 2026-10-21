@@ -79,7 +79,7 @@ PYTHONPATH="${CLAUDE_SKILL_DIR}" python3 -m cascade.cli
 
 - runner를 정하는 옵션(`--workers`·`--reviewer`·`CASCADE_WORKERS`·`CASCADE_REVIEWER`)이 겨냥한 칸은 고정된다. 쓸 수 없는 CLI여도 init이 fallback으로 바꾸지 않는다(옛 동작). 모델만 바꾸는 옵션은 고정하지 않는다. 덮은 값은 검사를 다시 거치므로 금지 모델이면 어느 옵션 탓인지와 함께 종료 코드 5로 멈춘다.
 - `CASCADE_WORKERS`·`CASCADE_REVIEWER`는 프로필을 명시적으로 고르지 않았을 때(위 ⑤)만 읽고 `init`이 `참고: 폐기 예정: CASCADE_PROFILE 또는 repos.toml profile을 쓴다`를 찍는다(`detect`는 찍지 않는다). 프로필을 명시했으면(①~④) 무시하고 무시했다고 한 줄 알린다. 값이 잘못됐으면 종료 코드 5다.
-- 사용 가능 여부: init이 칸의 runner를 쓸 수 없으면(미설치·로그인 필요뿐이다) fallback으로 바꾸고 `대체: <칸> codex → claude — 미설치 또는 로그인 필요`를 찍는다. 검토 스크립트(`RR`·`CR`)가 없는 경우는 init이 칸을 바꾸지 않고 `경고: … 스킬이 없다. … --reviewer claude 로 다시 init 한다`만 낸다. 그때는 `--reviewer claude`나 다른 프로필로 다시 init한다. 「검토 스크립트 없음」을 사유로 칸을 바꾸는 것은 첫 검토(`CF review`·`detect`)뿐이다. `jobs`의 샌드박스 사전 점검이 한 번 더 바꿀 수 있다(「외부 작업자 칸」).
+- 사용 가능 여부: init이 칸의 runner를 쓸 수 없으면(미설치·로그인 필요·검토 스크립트 없음) fallback으로 바꾸고 `대체: <칸> codex → claude — 미설치 또는 로그인 필요`를 찍는다. `jobs`의 샌드박스 사전 점검이 한 번 더 바꿀 수 있다(「외부 작업자 칸」).
 - 전송 동의는 「실행 전 확인」 1을 따른다.
 
 ### 검토 역할: 의견·재검토
@@ -93,8 +93,8 @@ PYTHONPATH="${CLAUDE_SKILL_DIR}" python3 -m cascade.cli
 | `cursor` | `CR --opinion`·`CR --recheck`로 Cursor(팀 프라이버시 모드)에 보낸다. 읽기 전용이고 `--model` 기본값은 `composer-2.5`다 |
 | `claude` | 의견·재검토를 Workflow 도구의 Claude 에이전트(`kind: review`)로 돌린다. 외부 전송이 없다. 기본 모델 `claude-fable-5-1`(effort `high`)은 판가름자(Opus)와 달라 의견이 판가름을 되풀이하지 않게 한다 |
 
-- 한도(이용 한도·usage limit, `CR` 종료 코드 75)·시간 초과·실행 오류는 멈추지 않고 그 칸의 fallback으로 자동으로 다시 돈다. **프로필을 고르지 않은 기본 동작에서도 같다(v1.2.0은 한도에서 멈췄다).** 로그인 만료(401·refresh token, `CR` 종료 코드 77)는 대체하지 않고 멈추고 `codex login`·`cursor-agent login`을 안내한다. 절차는 7·8·10·11에 있다.
-- 실행 중 대체는 init·jobs가 정한 배정(`profile.roles`·`profile.substituted`)과 따로 `profile.runtime_substitutions`에 칸·사유·회차로 남고 다음 회차에도 이어진다. 보고서는 의견마다 실제로 맡은 runner를 붙인다.
+- 한도(usage limit)·시간 초과·실행 오류는 멈추지 않고 그 칸의 fallback으로 자동으로 다시 돈다. **프로필을 고르지 않은 기본 동작에서도 같다(v1.2.0은 한도에서 멈췄다).** 로그인 만료(401·refresh token)는 대체하지 않고 멈추고 `codex login`·`cursor-agent login`을 안내한다. `CF`는 `RR`·`CR`의 종료 코드(75·77)를 보지 못하고 실행 로그 끝 20줄의 흔적으로 가른다. 그래서 로그에 인증 흔적 없이 77로 끝난 실행은 실행 오류로 보고 fallback으로 간다. 절차는 7·8·10·11에 있다.
+- 실행 중 대체는 init·jobs가 정한 배정(`profile.roles`·`profile.substituted`)과 따로 `profile.runtime_substitutions`에 칸·사유·회차로 남고 다음 회차에도 이어진다. 항목 모양: `profile.substituted`는 `{role, from, to, reason}`, `profile.runtime_substitutions`는 `{role, from, to, cell, reason, round}`다. 두 곳 모두 `from`·`to`는 runner 이름이고, `cell`은 대체 뒤 칸 전체(`{runner, model, effort, fallback}`)다. 보고서는 의견마다 실제로 맡은 runner를 붙인다.
 - Claude 검토자 모델은 `--review-model`(기본 `claude-fable-5-1`), effort는 `--review-effort`(기본 `high`)로 덮는다. 원장에 남고 모델 ID 경고의 기대값이 된다.
 - 첫 검토도 Claude로 하려면 아래 「Claude 단독 첫 검토」로 결과를 만든 뒤 `--source claude-code|claude-doc`으로 init한다. Codex 결과 파일(`codex-*`)·Cursor 결과 파일(`cursor-*`)이나 PR 코멘트를 받아 의견·재검토만 Claude로 돌려도 된다(`--reviewer claude`).
 
@@ -201,8 +201,8 @@ Claude·Cursor·`codex-doc` 결과는 형식이 같아 형식으로는 가릴 �
    - Claude: `adjudicate`가 `round-N/opinion-args.json`을 만든다. 3과 같은 방식으로 Workflow를 돌려 `round-N/opinion.json`에 저장한다(판단 불가 전부를 한 번에 돈다).
 8. **opinion** — 의견은 자동 채택하지 않고 사람 목록에 붙기만 한다.
    - Codex·Cursor: `CF opinion --run-dir <run_dir> --round N --id <id> --result <run_dir>/round-N/opinion-<id>.out.final`. 결과가 없거나 비면 실행 로그(`.out`) 끝 20줄로 원인을 가른다.
-     - 이용 한도(usage limit, `CR` 종료 코드 75)·실행 오류·시간 초과: 멈추지 않는다. `CF`가 그 칸의 fallback으로 바꾸고 `대체: <모드>.opinion codex → … — 이용 한도`와 새 「다음:」을 출력한다. fallback이 Claude면 `opinion-args.json`을 만들어 Workflow(Claude 의견)로 이어 가고, 다른 외부 CLI면 그 `RR`·`CR`부터 돌린다. **프로필을 고르지 않은 기본 동작에서도 같다(v1.2.0은 여기서 멈췄다).** 동의 밖 수신처나 이미 실패한 CLI면 `claude-only` 값(Claude)으로 간다.
-     - 로그인 만료(401·refresh token·Authentication required, `CR` 종료 코드 77): 대체하지 않고 실행 로그 끝부분과 함께 멈춘다. 사용자에게 터미널에서 `codex login`(Cursor는 `cursor-agent login`)을 하라고 알리고 기다린 뒤 그 `RR`·`CR`부터 다시 돌린다.
+     - 이용 한도(로그의 usage limit)·실행 오류·시간 초과: 멈추지 않는다. `CF`가 그 칸의 fallback으로 바꾸고 `대체: <모드>.opinion codex → … — 이용 한도`와 새 「다음:」을 출력한다. fallback이 Claude면 `opinion-args.json`을 만들어 Workflow(Claude 의견)로 이어 가고, 다른 외부 CLI면 그 `RR`·`CR`부터 돌린다. **프로필을 고르지 않은 기본 동작에서도 같다(v1.2.0은 여기서 멈췄다).** 동의 밖 수신처나 이미 실패한 CLI면 `claude-only` 값(Claude)으로 간다.
+     - 로그인 만료(로그의 401·refresh token·Authentication required): 대체하지 않고 실행 로그 끝부분과 함께 멈춘다. 종료 코드(`CR`의 75·77)는 `CF`에 전달되지 않으므로 로그에 이 흔적이 없으면 77로 끝났어도 실행 오류로 보고 fallback으로 간다. 사용자에게 터미널에서 `codex login`(Cursor는 `cursor-agent login`)을 하라고 알리고 기다린 뒤 그 `RR`·`CR`부터 다시 돌린다.
      - 실행 중 대체는 `profile.runtime_substitutions`에 따로 남는다(init·jobs가 정한 배정은 그대로). 보고서 「역할 배정」의 「실행 중 대체」와 의견별 실제 runner로 보인다. 대체가 있었으면 사용자에게 알린다.
    - Claude: `CF opinion --run-dir <run_dir> --round N --results <run_dir>/round-N/opinion.json`. 호출이 실패한 지적은 「호출 실패 — 의견 없음」으로 적고 넘어간다(다시 돌리려면 Workflow 뒤 `--force`).
 9. **apply** — `CF apply --run-dir <run_dir> --round N`. 채택 패치를 작업 트리에 하나씩 적용하고, 그 회차의 작업자·판가름 워크트리를 지운 뒤 전체 테스트를 한 번 돌린다. 앞서 적용한 패치와 같은 파일을 고쳐 적용에 실패한 지적은 「다음 회차」로 넘겨 바뀐 코드에서 작업자가 다시 고친다(지적마다 한 번만, 재검토를 열지 않아도 회차를 연다, 「지금 반영」 회차에서는 넘기지 않는다). 그 밖의 적용 실패와 전체 테스트 실패는 판단 불가로 간다(전체 테스트가 실패하면 넘기려던 지적도 판단 불가). 전체 테스트가 실패하면 기준선(base 워크트리)에서도 돌려 사유를 「전체 테스트 실패(기준선도 실패)」와 「전체 테스트 실패(간섭 의심)」로 나눈다. 작업 트리는 되돌리지 않는다. 적용이 끝난 뒤 중단됐다가 다시 돌리면 적용은 건너뛰고 뒷단계만 한다.
@@ -257,7 +257,7 @@ Claude·Cursor·`codex-doc` 결과는 형식이 같아 형식으로는 가릴 �
 ### 실패와 대체 실행
 
 - 대체 실행 사유: 한도 초과, 로그인 필요, 시간 초과, 실행 오류, 무효 결과(Cursor는 같은 세션에 JSON만 다시 달라고 한 번 요청한 뒤에도 무효), 건너뜀.
-- 한도나 로그인 실패가 한 번 나오면 그 CLI는 그 회차 동안(같은 회차의 `workers --stage checker`·`workers --force`와 외부 fallback 실행 포함) 다시 부르지 않고 남은 작업은 `claude-only` 값의 Claude로 대체 실행된다. 소진 상태는 회차에 남는다. `jobs --force`로 회차를 다시 열면 다시 부른다. 로그인이 풀렸으면 보고서가 `codex login` 또는 `cursor-agent login`을 안내한다. 사용자에게 알리고 로그인 뒤 이어서 돌린다.
+- 한도나 로그인 실패가 한 번 나오면 그 CLI는 그 회차 동안(같은 회차의 `workers --stage checker`·`workers --force`와 외부 fallback 실행 포함) 다시 부르지 않고 남은 작업은 그 칸의 fallback으로 대체 실행된다. fallback이 그 CLI이거나 동의 밖 수신처·쓸 수 없는 CLI일 때만 `claude-only` 값의 Claude로 돈다. 소진 상태는 회차에 남는다. `jobs --force`로 회차를 다시 열면 다시 부른다. 로그인이 풀렸으면 보고서가 `codex login` 또는 `cursor-agent login`을 안내한다. 사용자에게 알리고 로그인 뒤 이어서 돌린다.
 - 읽기 역할(점검자 등)이 워크트리를 바꿨으면 실행기가 되돌린다. 대체 실행 전에도 워크트리를 실행 전 상태로 되돌린다.
 - 보고서의 「역할 배정」 절에 배정 표, 배정 때 바꾼 칸, 실행 중 대체(회차·단계별 CLI 작업 수와 대체 실행 건수, 외부 CLI로 다시 돌린 작업)가 남고, 「역할별 사용량」 표에 칸별 호출 수·대체 실행(사유별)·CLI별 입력·출력·캐시 읽기 토큰이 남는다. 대체 실행이 있으면 사용자에게 건수를 알린다(Claude 비용이 그만큼 돌아온다).
 
