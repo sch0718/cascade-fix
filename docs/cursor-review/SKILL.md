@@ -39,7 +39,7 @@ Cursor CLI(`cursor-agent`)에 리뷰를 맡기고, 결과를 검증한 뒤 반�
 - 스크립트는 임시 `HOME`에서 실행하고 끝나면 지운다. 임시 HOME에는 키체인 링크(`Library/Keychains`)와 권한 설정(`.cursor/cli-config.json`)만 있어 로그인은 유지되고, 로컬 MCP·플러그인·스킬은 실리지 않는다. 권한 설정은 Shell·Write·WebFetch·MCP와 홈의 민감한 경로(`.ssh`, `.codex`, `.cursor`, `.claude`, `.aws`, `.config`, `.gnupg`, `.docker`, `.kube`, `.netrc`, `.npmrc`, `.gitconfig`, 키체인) 읽기를 거부한다.
 - `--approve-mcps`·`--force`·`--yolo`는 넘기지 않는다.
 - 출력의 `git_dirty`가 0(또는 실행 전과 동일)인지 확인한다. 다르면 사용자에게 알린다.
-- `--out <파일>`로 로그 위치를 지정할 수 있다. `<파일>`에는 Cursor가 낸 JSON 원본과 stderr가, `<파일>.final`에는 JSON의 `result`(리뷰 본문)만 들어간다. Cursor가 오류(이용 한도·로그인 필요 등)로 끝나면 `.final`은 비어 있고 오류 본문은 `<파일>`에만 남는다.
+- `--out <파일>`로 로그 위치를 지정할 수 있다. `<파일>`에는 Cursor가 낸 JSON 원본과 stderr가, `<파일>.final`에는 JSON의 `result`(리뷰 본문)만 들어간다. Cursor가 오류(이용 한도·로그인 필요 등)로 끝나거나 0이 아닌 코드로 끝나면 `.final`은 비어 있고 오류 본문은 `<파일>`에만 남는다.
 - `usage=`는 토큰 사용량이다(`input= output= cache_read= cache_write=`).
 - `summary=`는 지적 수의 기계 집계다. 두 모드 모두 Cursor가 적은 `SUMMARY:` 줄의 `critical= warning= suggestion=`이고, 없으면 빈 값이다. 종료 판정은 이 값이 아니라 Claude가 다시 분류한 결과로 한다.
 

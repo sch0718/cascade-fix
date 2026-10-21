@@ -45,6 +45,7 @@ find_cursor() {
   return 1
 }
 CURSOR=$(find_cursor) || { echo "cursor-agent 실행 파일을 찾지 못했다" >&2; exit 69; }
+case "$CURSOR" in /*) ;; *) CURSOR=$(abs "$CURSOR") ;; esac
 
 if [ "$mode" = doc ]; then
   resolved=()
@@ -121,10 +122,25 @@ esac
 output_format() {
   cat <<PROMPT
 출력 형식:
-- Critical / Warning / Suggestion 3단계로 구분한다. 해당 항목이 없으면 "없음"이라고 쓴다.
-- 각 지적에는 문서 위치(파일:행), 근거(직접 확인한 코드 경로나 문서 구절), 제안을 적는다.
+- Critical / Warning / Suggestion 세 절을 이 순서로 모두 쓴다. 각 절의 항목은 번호를 붙이고 들여 쓴 "위치:" / "근거:" / "제안:" 줄을 둔다. 해당 항목이 없는 절은 "없음."이라고 쓴다.
+- "위치:"는 파일과 행(파일:행)이다. "근거:"에는 직접 확인한 코드 경로나 문서 구절을 적는다.
 - 직접 확인하지 못한 것은 "미확인"으로 표시하고 단정하지 않는다. 추측으로 지적하지 않는다.
 - 마지막 줄에 지적 수를 "SUMMARY: critical=<수> warning=<수> suggestion=<수>" 형식으로 적는다.
+
+예:
+Critical
+1. <한 줄 요약>
+   위치: <파일:행>
+   근거: <직접 확인한 내용>
+   제안: <고칠 방법>
+
+Warning
+없음.
+
+Suggestion
+없음.
+
+SUMMARY: critical=1 warning=0 suggestion=0
 PROMPT
 }
 
@@ -270,6 +286,7 @@ if [ "$state" != ok ]; then
   elif [ "$status" -eq 0 ]; then status=1
   fi
 fi
+[ "$status" -eq 0 ] || : > "$out.final"
 
 echo "exit=$status"
 echo "mode=$mode${kind:+ kind=$kind}"

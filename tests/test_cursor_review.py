@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from cascade import runners  # noqa: E402
+from cascade.findings import parse_codex_doc  # noqa: E402
 from helpers import git, make_repo  # noqa: E402
 
 SCRIPT = Path(os.environ.get("CASCADE_CURSOR_REVIEW")
@@ -334,6 +335,32 @@ class CursorReviewTest(unittest.TestCase):
     def test_rerun_with_usage_limit_removes_previous_final(self):
         body = '{"type":"result","is_error":true,"result":"You\'ve hit your usage limit","session_id":"s"}'
         self.assert_rerun_removes_previous_final(75, env={"FAKE_CURSOR_JSON": body, "FAKE_CURSOR_EXIT": "1"})
+
+    def test_relative_agent_path_survives_cd_to_repo(self):
+        caller = self.repo.parent
+        args = ("--opinion", str(self.prompt), "--repo", str(self.repo), "--out", str(self.out))
+        out = self.run_script(*args, cwd=caller, env={"CASCADE_CURSOR_AGENT": "bin/cursor-agent"})
+        self.assertEqual(out.returncode, 0, out.stderr)
+        out = self.run_script(*args, cwd=caller, path=f"bin:{os.environ['PATH']}")
+        self.assertEqual(out.returncode, 0, out.stderr)
+
+    def test_success_envelope_with_nonzero_exit_keeps_final_empty(self):
+        out = self.run_script("--opinion", str(self.prompt), "--repo", str(self.repo), "--out", str(self.out),
+                              env={"FAKE_CURSOR_EXIT": "7"})
+        self.assertEqual(out.returncode, 7)
+        self.assertIn("exit=7", out.stdout)
+        self.assertEqual(self.final_text(), "")
+
+    def test_output_format_example_matches_finding_parser(self):
+        (self.repo / "a.md").write_text("문서 바꿈\n", encoding="utf-8")
+        for args in (("--doc", str(self.repo / "a.md")), ("--uncommitted",)):
+            out = self.run_script(*args, "--out", str(self.out), cwd=self.repo)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            stdin = self.captured_stdin()
+            self.assertIn("번호를 붙이고", stdin)
+            example = stdin.split("예:\n", 1)[1].split("SUMMARY:", 1)[0]
+            [finding] = parse_codex_doc(example, 1)
+            self.assertEqual(finding.severity, "Critical")
 
     def test_relative_out_is_written_and_removed_from_caller_dir(self):
         caller = self.repo.parent
