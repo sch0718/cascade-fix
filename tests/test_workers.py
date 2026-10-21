@@ -53,12 +53,6 @@ class AssignTest(unittest.TestCase):
             model, effort = jobs.ROLES[role]
             self.assertEqual(w[role], {"runner": "claude", "model": model, "effort": effort})
 
-    def test_demote_returns_seat_to_claude(self):
-        w = workers.demote(assigned(), "codex")
-        self.assertEqual((w["a"], w["writer"]), (CLAUDE_SONNET, CLAUDE_SONNET))
-        self.assertEqual(w["b"]["runner"], "cursor")
-        self.assertEqual(assigned()["a"]["runner"], "codex")
-
     def test_expected_model_id(self):
         w = assigned()
         self.assertEqual(workers.expected_model_id(w["a"]), "codex:gpt-x")

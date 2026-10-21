@@ -60,10 +60,6 @@ def assign_available(choice: str, cursor_model: str) -> dict[str, dict]:
     return assign(choice, available, codex_model(Path.home() / ".codex"), cursor_model)
 
 
-def demote(workers: dict[str, dict], runner: str) -> dict[str, dict]:
-    return {role: _claude(role) if spec["runner"] == runner else dict(spec) for role, spec in workers.items()}
-
-
 def expected_model_id(spec: dict) -> str:
     if spec["runner"] == RUNNER_CLAUDE:
         return spec["model"]

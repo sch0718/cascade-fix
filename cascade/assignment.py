@@ -3,7 +3,7 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 
 from cascade import profiles
-from cascade.jobs import RUNNER_CLAUDE
+from cascade.jobs import ROLES, RUNNER_CLAUDE
 from cascade.profiles import ROLE_KEYS, RUNNER_AUTO
 from cascade.review import REVIEWER_AUTO, resolve
 from cascade.runners import RUNNER_CODEX, RUNNER_CURSOR
@@ -186,10 +186,46 @@ def mode_workers(roles: dict, mode: str) -> dict[str, dict]:
 _VALUE_KEYS = ("runner", "model", "effort")
 
 
+def claude_only_cell(role: str) -> dict:
+    model, effort = ROLES[role]
+    return {"runner": RUNNER_CLAUDE, "model": model, "effort": effort}
+
+
+def claude_fallback(cell: dict, role: str) -> dict:
+    fallback = cell.get("fallback")
+    return dict(fallback) if fallback and fallback["runner"] == RUNNER_CLAUDE else claude_only_cell(role)
+
+
+def fallback_target(cell: dict, consented: Iterable[str], exhausted: Iterable[str], role: str) -> dict:
+    fallback = cell.get("fallback") or claude_only_cell(role)
+    runner = fallback["runner"]
+    if runner != RUNNER_CLAUDE and (runner not in set(consented) or runner in set(exhausted)):
+        fallback = claude_only_cell(role)
+    return {**fallback, "fallback": claude_only_cell(role)}
+
+
 def _is_claude_default(workers: dict[str, dict], mode: str) -> bool:
     defaults = profiles.builtin("claude-only")["roles"]
     return all([spec[k] for k in _VALUE_KEYS] == [defaults[_MODE_WORKER_KEYS[mode][role]][k] for k in _VALUE_KEYS]
                for role, spec in workers.items())
+
+
+def job_workers(ledger) -> dict[str, dict] | None:
+    workers = mode_workers(ledger_profile(ledger)["roles"], ledger.mode)
+    return None if _is_claude_default(workers, ledger.mode) else workers
+
+
+def apply_sandbox_substitution(ledger, before: dict[str, dict], after: dict[str, dict], reason: str) -> None:
+    record = copy.deepcopy(ledger_profile(ledger))
+    keys = _MODE_WORKER_KEYS[ledger.mode]
+    for role, spec in after.items():
+        key = keys[role]
+        if before[role]["runner"] != spec["runner"]:
+            record["substituted"].append({"role": key, "from": before[role]["runner"], "to": spec["runner"], "reason": reason})
+        record["roles"][key] = copy.deepcopy(spec)
+    record["consented"] = [r for r in record["consented"] if r in used_recipients(record["roles"], ledger.mode)]
+    ledger.profile = record
+    ledger.workers = copy.deepcopy(after)
 
 
 def legacy_fields(record: dict, mode: str, requested_workers: str | None = None) -> dict:

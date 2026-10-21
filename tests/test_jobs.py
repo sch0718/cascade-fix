@@ -489,6 +489,23 @@ class CliJobsTest(unittest.TestCase):
         self.assertIn(COMMIT_COMMAND, code["jobs"][0]["prompt"])
         self.assertIn("검증을 마친 뒤 규칙의 커밋 명령으로 커밋한다.", code["jobs"][0]["prompt"])
 
+    def test_claude_cell_model_is_used(self):
+        workers = {"a": {"runner": "claude", "model": "claude-haiku-5-5", "effort": "medium"}}
+        job = jobs._job("f1", "a", "p", workers, Path("/wt"))
+        self.assertEqual((job["model"], job["effort"], job["runner"]), ("claude-haiku-5-5", "medium", "claude"))
+
+    def test_claude_cells_keep_claude_prompts_and_hide_cli_keys(self):
+        workers = {"a": {"runner": "claude", "model": "claude-haiku-5-5", "effort": "medium"},
+                   "b": {"runner": "claude", "model": "claude-sonnet-5-5", "effort": "high"}}
+        args = jobs.build_stage1_jobs([F1], CFG, {"r1-01": {"a": WT_A, "b": WT_B}}, "code", workers)
+        self.assertIn(COMMIT_COMMAND, by_id(args)["r1-01:a"]["prompt"])
+        with tempfile.TemporaryDirectory() as td:
+            claude, cli = jobs.split_job_args(args, Path(td) / "prompts")
+        self.assertEqual([(j["id"], j["model"], j["effort"]) for j in claude["jobs"]],
+                         [("r1-01:a", "claude-haiku-5-5", "medium"), ("r1-01:b", "claude-sonnet-5-5", "high")])
+        self.assertEqual(set(claude["jobs"][0]), {"id", "label", "model", "effort", "kind", "promptPath"})
+        self.assertEqual(cli, {"jobs": []})
+
     def test_rules_cli_differs_only_in_commit_rule(self):
         cli = jobs.RULES.replace(jobs._COMMIT_RULE, jobs._CLI_COMMIT_RULE).replace(jobs._VERIFY_RULE, jobs._CLI_VERIFY_RULE)
         self.assertEqual(cli, jobs.RULES_CLI)

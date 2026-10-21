@@ -38,6 +38,7 @@ from cascade.findings import (
     write_findings,
 )
 from cascade.jobs import (
+    RUNNER_CLAUDE,
     build_adjudicator_jobs,
     build_checker_jobs,
     build_stage1_jobs,
@@ -128,6 +129,7 @@ REASON_INTERFERENCE = "전체 테스트 실패(간섭 의심)"
 REASON_FINAL_BASELINE_FAILED = "전체 테스트 실패(기준선도 실패)"
 REASON_OUT_OF_SCOPE = "재검토 범위 밖"
 REASON_SEVERITY_DEFERRED = "등급 선택(--severity)으로 이번 실행에서 뺌"
+SANDBOX_REASON = "샌드박스 점검 실패"
 RAW_PREVIEW_LINES = 5
 FINAL_TAIL_CHARS = 2000
 
@@ -508,12 +510,16 @@ def cmd_jobs(args) -> int:
         failed = s.write_baseline(rd, base_wt, cfg, located)
         if failed:
             print(f"기준선에서 이미 실패하는 검증 명령(판정에서 제외): {', '.join(failed)}")
-    if ledger.mode == "code" and has_external(ledger.workers):
-        ledger.workers, notices = ensure_sandbox(Path(ledger.root), cfg, base_wt, ledger.workers, failed)
+    job_workers = assignment.job_workers(ledger)
+    if ledger.mode == "code" and has_external(job_workers):
+        checked, notices = ensure_sandbox(Path(ledger.root), cfg, base_wt, job_workers, failed,
+                                          consented=assignment.ledger_profile(ledger)["consented"])
         for notice in notices:
             print(notice)
         if notices:
+            assignment.apply_sandbox_substitution(ledger, job_workers, checked, SANDBOX_REASON)
             s.save_ledger(run_dir, ledger)
+            job_workers = assignment.job_workers(ledger)
     if ledger.source == s.SOURCE_PR:
         listed = {f.id: repro_cmds(f) for f in findings}
         s.write_json(rd / s.REPRO_FILE, listed)
@@ -524,7 +530,7 @@ def cmd_jobs(args) -> int:
                     print(f"  {fid}: {cmd}")
     out = rd / "stage1-args.json"
     claude_args, cli_args = split_job_args(
-        build_stage1_jobs(findings, cfg, wts, ledger.mode, ledger.workers or None), rd / "prompts")
+        build_stage1_jobs(findings, cfg, wts, ledger.mode, job_workers), rd / "prompts")
     s.write_json(out, claude_args)
     cli_out = rd / "stage1-cli-args.json"
     had_cli = cli_out.is_file()
@@ -566,6 +572,25 @@ def _cli_runners(jobs: list[CliJob]) -> dict[str, object]:
     return runners
 
 
+def _rerun_with_fallbacks(entries: list[dict], first: list, cells: dict[str, dict], consented: set[str],
+                          exhausted: dict[str, dict]) -> tuple[dict[str, dict], dict[str, object]]:
+    by_id = {e["id"]: e for e in entries}
+    targets: dict[str, dict] = {}
+    for outcome in first:
+        if outcome.status == STATUS_OK:
+            continue
+        role = by_id[outcome.id]["role"]
+        target = assignment.fallback_target(cells.get(role, {}), consented, set(exhausted), role)
+        if target["runner"] != RUNNER_CLAUDE:
+            targets[outcome.id] = target
+    jobs = [CliJob(i, by_id[i]["role"], by_id[i]["kind"], t["runner"], t["model"], t["effort"],
+                   Path(by_id[i]["promptPath"]), Path(by_id[i]["worktree"]), by_id[i]["writable"])
+            for i, t in targets.items()]
+    if not jobs:
+        return {}, {}
+    return targets, {o.id: o for o in run_all(jobs, _cli_runners(jobs), exhausted=exhausted)}
+
+
 def cmd_workers(args) -> int:
     run_dir = Path(args.run_dir)
     ledger = s.load_ledger(run_dir)
@@ -585,28 +610,40 @@ def cmd_workers(args) -> int:
         raise s.CliError(f"CLI 작업이 없다: {cli_args.name} 가 없다(jobs 단계가 CLI 작업을 만든 회차에서만 쓴다)")
     entries = s.read_json(cli_args)["jobs"]
     jobs = [_cli_job(e) for e in entries]
+    profile = assignment.ledger_profile(ledger)
+    cells = assignment.mode_workers(profile["roles"], ledger.mode)
     exhausted = s.exhausted_runners(rnd)
-    outcomes = run_all(jobs, _cli_runners(jobs), exhausted=exhausted)
+    first = run_all(jobs, _cli_runners(jobs), exhausted=exhausted)
+    reruns, second = _rerun_with_fallbacks(entries, first, cells, set(profile["consented"]), exhausted)
+    outcomes = [second.get(o.id, o) for o in first]
     out = rd / f"{args.stage}-cli.json"
     s.write_json(out, {"results": [{"id": o.id, "output": o.output} for o in outcomes],
-                       "outcomes": [o.to_dict() for o in outcomes]})
-    failed = [o.id for o in outcomes if o.status != STATUS_OK]
+                       "outcomes": [o.to_dict() for o in outcomes],
+                       "fallback_runs": {job_id: {k: spec[k] for k in ("runner", "model", "effort")}
+                                         for job_id, spec in reruns.items()},
+                       "replaced": [o.to_dict() for o in first if o.id in reruns]})
+    failed = [o.id for o in first if o.status != STATUS_OK]
+    unresolved = {o.id for o in outcomes if o.status != STATUS_OK}
     fallback_args = rd / f"{args.stage}-fallback-args.json"
     (rd / f"{args.stage}-fallback.json").unlink(missing_ok=True)
     if args.stage == s.STAGE1:
         s.clear_cli_outputs(rd, s.STAGE_CHECKER)
-    if failed:
-        s.write_json(fallback_args, {"jobs": [s.fallback_job(e) for e in entries if e["id"] in failed]})
+    if unresolved:
+        s.write_json(fallback_args, {"jobs": [s.fallback_job(e, cells.get(e["role"], {}))
+                                              for e in entries if e["id"] in unresolved]})
     else:
         fallback_args.unlink(missing_ok=True)
-    counts = dict(Counter(o.status for o in outcomes))
+    counts = dict(Counter(o.status for o in first))
     ledger = s.load_ledger(run_dir)
     rnd = s.get_round(ledger, args.round)
-    s.mark(rnd, step, counts=counts, usage=usage_totals(outcomes), fallback=failed,
+    s.mark(rnd, step, counts=counts, usage=usage_totals([*first, *second.values()]), fallback=failed,
+           fallback_runs={job_id: spec["runner"] for job_id, spec in reruns.items()},
            **({"exhausted": exhausted} if exhausted else {}))
     s.save_ledger(run_dir, ledger)
     n, reasons = fallback_counts(counts)
     print(f"CLI 작업 {len(outcomes)}건: 성공 {counts.get(STATUS_OK, 0)}, 대체 실행 {n}" + (f"({reasons})" if n else ""))
+    if reruns:
+        print(f"외부 CLI로 다시 돌린 작업 {len(reruns)}건: " + ", ".join(f"{i}→{spec['runner']}" for i, spec in reruns.items()))
     print(f"결과: {out}")
     _print_next(ledger, run_dir)
     return 0
@@ -698,7 +735,7 @@ def cmd_judge(args) -> int:
         if pending and checker_results is None:
             out = rd / "checker-args.json"
             wts = {f.id: {"writer": s.worktree(snap, f.id, "writer")} for f in pending}
-            jobs = build_checker_jobs(s.prompt_findings(ledger, pending), wts, writer_patches, ledger.workers or None)
+            jobs = build_checker_jobs(s.prompt_findings(ledger, pending), wts, writer_patches, assignment.job_workers(ledger))
             claude_args, cli_args = split_job_args(jobs, rd / "prompts")
             s.write_json(out, claude_args)
             if cli_args["jobs"]:

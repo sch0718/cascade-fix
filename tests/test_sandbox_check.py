@@ -18,6 +18,8 @@ from helpers import git, make_repo, run_cli  # noqa: E402
 from test_cli_e2e import FIXTURES, CliTestBase  # noqa: E402
 
 BOTH = {"codex": True, "cursor": True}
+CLAUDE_HAIKU = {"runner": "claude", "model": "claude-haiku-5-5", "effort": "low"}
+CURSOR_FALLBACK = {"runner": "cursor", "model": "composer-2.5", "effort": ""}
 
 
 def cursor_reply(cmds, exit_code=0, probe_exit=0):
@@ -92,6 +94,49 @@ class EnsureTest(SandboxCheckBase):
         self.assertEqual(updated["b"]["runner"], "cursor")
         self.assertEqual(len(lines), 1)
         self.assertIn("codex 샌드박스에서 검증 명령이 실패해 이 저장소에서는 Claude 작업자를 쓴다: true", lines[0])
+
+    def cell_workers(self, fallback, runner="codex"):
+        return {"a": {"runner": runner, "model": "gpt-x" if runner == "codex" else "composer-2.5", "effort": "low",
+                      "fallback": fallback},
+                "b": {"runner": "claude", "model": "claude-haiku-5-5", "effort": "low", "fallback": CLAUDE_HAIKU}}
+
+    def test_sandbox_failure_uses_cell_fallback(self):
+        workers = self.cell_workers(CLAUDE_HAIKU)
+        out, notices = sandbox_check.ensure(self.root, RepoConfig(tests=["true"]), self.wt, workers, [],
+                                            checks={"codex": lambda wt, cmds: {c: 1 for c in cmds}})
+        self.assertEqual((out["a"]["runner"], out["a"]["model"]), ("claude", "claude-haiku-5-5"))
+        self.assertEqual(out["b"], workers["b"])
+        self.assertIn("codex 샌드박스에서 검증 명령이 실패해 이 저장소에서는 Claude 작업자를 쓴다", notices[0])
+
+    def test_sandbox_failure_moves_to_consented_external_fallback_and_checks_it(self):
+        os.environ["FAKE_CODEX_SANDBOX_EXIT"] = "1"
+        self.addCleanup(os.environ.pop, "FAKE_CODEX_SANDBOX_EXIT", None)
+        self.set_cursor({"result": cursor_reply(["true"])})
+        workers = self.cell_workers(CURSOR_FALLBACK)
+        out, notices = sandbox_check.ensure(self.root, RepoConfig(tests=["true"]), self.wt, workers, [],
+                                            consented={"codex", "cursor"})
+        self.assertEqual((out["a"]["runner"], out["a"]["model"], out["a"]["effort"]), ("cursor", "composer-2.5", ""))
+        self.assertEqual(out["a"]["fallback"]["runner"], "claude")
+        self.assertIn("대체 작업자(cursor)", notices[0])
+        self.assertEqual(self.calls("cursor-agent"), 1)
+
+    def test_failing_external_fallback_goes_claude_only(self):
+        os.environ["FAKE_CODEX_SANDBOX_EXIT"] = "1"
+        self.addCleanup(os.environ.pop, "FAKE_CODEX_SANDBOX_EXIT", None)
+        self.set_cursor({"result": cursor_reply(["true"], 1)})
+        out, notices = sandbox_check.ensure(self.root, RepoConfig(tests=["true"]), self.wt,
+                                            self.cell_workers(CURSOR_FALLBACK), [], consented={"codex", "cursor"})
+        self.assertEqual((out["a"]["runner"], out["a"]["model"]), ("claude", "claude-sonnet-5-5"))
+        self.assertEqual(len(notices), 2)
+        self.assertIn("cursor 샌드박스에서 검증 명령이 실패해", notices[1])
+
+    def test_fallback_outside_consent_goes_claude_only_without_checking_it(self):
+        os.environ["FAKE_CODEX_SANDBOX_EXIT"] = "1"
+        self.addCleanup(os.environ.pop, "FAKE_CODEX_SANDBOX_EXIT", None)
+        out, notices = sandbox_check.ensure(self.root, RepoConfig(tests=["true"]), self.wt,
+                                            self.cell_workers(CURSOR_FALLBACK), [], consented={"codex"})
+        self.assertEqual((out["a"]["runner"], out["a"]["model"]), ("claude", "claude-sonnet-5-5"))
+        self.assertEqual(self.calls("cursor-agent"), 0)
 
     def test_tests_command_failing_inside_and_outside_sandbox_keeps_assignment(self):
         self.set_cursor({"result": cursor_reply(["false"], 1)})
@@ -328,6 +373,54 @@ class JobsSandboxCheckTest(CliTestBase):
         self.assertIn("codex 샌드박스에서 검증 명령이 실패해 이 저장소에서는 Claude 작업자를 쓴다: python3 -m unittest {files}", p.stdout)
         claude = json.loads((self.run_dir / "round-1" / "stage1-args.json").read_text(encoding="utf-8"))
         self.assertEqual([j["id"] for j in claude["jobs"]], ["r1-01:a", "r1-02:a"])
+
+    def add_profile(self, *lines):
+        path = Path(self.env["CASCADE_REPOS_TOML"])
+        path.write_text(path.read_text(encoding="utf-8") + "\n[profiles.mine]\nbase = \"claude-only\"\n" + "\n".join(lines) + "\n",
+                        encoding="utf-8")
+
+    def test_jobs_sandbox_failure_updates_profile_roles_and_substituted(self):
+        self.add_profile('"code.a" = { runner = "codex", fallback = { model = "claude-haiku-5-5" } }')
+        self.env["FAKE_CODEX_SANDBOX_EXIT"] = "1"
+        self.init("--profile", "mine")
+        self.assertEqual(self.ledger().profile["consented"], ["codex"])
+        p = self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1")
+        profile = self.ledger().profile
+        self.assertEqual((profile["roles"]["code.a"]["runner"], profile["roles"]["code.a"]["model"]), ("claude", "claude-haiku-5-5"))
+        self.assertEqual(profile["substituted"],
+                         [{"role": "code.a", "from": "codex", "to": "claude", "reason": "샌드박스 점검 실패"}])
+        self.assertEqual(profile["consented"], [])
+        self.assertEqual(self.ledger().workers["a"]["model"], "claude-haiku-5-5")
+        self.assertEqual(self.stage1_cli_jobs(), [])
+        claude = json.loads((self.run_dir / "round-1" / "stage1-args.json").read_text(encoding="utf-8"))
+        self.assertEqual([(j["id"], j["model"]) for j in claude["jobs"]][0], ("r1-01:a", "claude-haiku-5-5"))
+        self.assertIn("codex 샌드박스에서 검증 명령이 실패해", p.stdout)
+
+    def test_jobs_sandbox_failure_moves_to_external_fallback_in_profile(self):
+        self.add_profile('"code.a" = { runner = "codex", fallback = { runner = "cursor" } }')
+        self.env["FAKE_CODEX_SANDBOX_EXIT"] = "1"
+        self.init("--profile", "mine")
+        self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1")
+        profile = self.ledger().profile
+        self.assertEqual(profile["roles"]["code.a"]["runner"], "cursor")
+        self.assertEqual(profile["roles"]["code.a"]["fallback"]["runner"], "claude")
+        self.assertEqual(profile["consented"], ["cursor"])
+        self.assertEqual(self.stage1_cli_jobs(), ["r1-01:a", "r1-02:a"])
+
+    def test_jobs_sandbox_failure_on_old_ledger_materializes_profile(self):
+        self.init("--workers", "external", "--reviewer", "claude")
+        path = self.run_dir / "ledger.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        del data["profile"]
+        path.write_text(json.dumps(data), encoding="utf-8")
+        self.env["FAKE_CODEX_SANDBOX_EXIT"] = "1"
+        self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1")
+        profile = self.ledger().profile
+        self.assertEqual(profile["name"], "legacy")
+        self.assertEqual(profile["roles"]["code.a"]["runner"], "claude")
+        self.assertEqual(profile["roles"]["code.b"]["runner"], "cursor")
+        self.assertEqual([r["role"] for r in profile["substituted"]], ["code.a"])
+        self.assertEqual(self.stage1_cli_jobs(), ["r1-01:b", "r1-02:b"])
 
     def test_jobs_keeps_assignment_when_sandbox_passes(self):
         self.init("--workers", "external", "--reviewer", "claude")

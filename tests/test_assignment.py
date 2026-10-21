@@ -337,5 +337,106 @@ class LedgerProfileTest(unittest.TestCase):
             self.assertEqual(self.ledger().profile, {})
 
 
+class FallbackTargetTest(unittest.TestCase):
+    CODEX_THEN_CURSOR = {"runner": "codex", "model": "gpt-x", "effort": "low", "fallback": dict(CURSOR_FALLBACK)}
+    CODEX_THEN_CODEX = {"runner": "codex", "model": "gpt-x", "effort": "low",
+                        "fallback": {"runner": "codex", "model": "gpt-y", "effort": "low"}}
+    CODEX_THEN_HAIKU = {"runner": "codex", "model": "gpt-x", "effort": "low",
+                        "fallback": {"runner": "claude", "model": "claude-haiku-5-5", "effort": "low"}}
+    CLAUDE_A = {"runner": "claude", "model": "claude-sonnet-5-5", "effort": "low"}
+
+    def target(self, cell, consented=("codex", "cursor"), exhausted=(), role="a"):
+        return assignment.fallback_target(cell, set(consented), set(exhausted), role)
+
+    def test_consented_external_fallback_is_kept(self):
+        out = self.target(self.CODEX_THEN_CURSOR)
+        self.assertEqual({k: out[k] for k in ("runner", "model", "effort")}, CURSOR_FALLBACK)
+        self.assertEqual(out["fallback"], self.CLAUDE_A)
+
+    def test_fallback_outside_consent_goes_claude_only(self):
+        self.assertEqual(self.target(self.CODEX_THEN_CURSOR, consented={"codex"}),
+                         {**self.CLAUDE_A, "fallback": self.CLAUDE_A})
+
+    def test_exhausted_fallback_runner_goes_claude_only(self):
+        self.assertEqual(self.target(self.CODEX_THEN_CURSOR, exhausted={"cursor"})["runner"], "claude")
+        out = self.target(self.CODEX_THEN_CODEX, exhausted={"codex"}, role="b")
+        self.assertEqual((out["runner"], out["model"]), ("claude", "claude-haiku-5-5"))
+        self.assertEqual(self.target(self.CODEX_THEN_CODEX)["model"], "gpt-y")
+
+    def test_claude_fallback_is_used_even_when_runners_are_exhausted(self):
+        out = self.target(self.CODEX_THEN_HAIKU, consented=(), exhausted={"codex", "cursor"})
+        self.assertEqual((out["runner"], out["model"]), ("claude", "claude-haiku-5-5"))
+
+    def test_cell_without_fallback_is_claude_only(self):
+        legacy = {"runner": "codex", "model": "", "effort": "low"}
+        self.assertEqual(self.target(legacy, role="writer")["model"], "claude-sonnet-5-5")
+
+    def test_claude_fallback_picks_claude_cell_or_claude_only(self):
+        self.assertEqual(assignment.claude_fallback(self.CODEX_THEN_HAIKU, "a")["model"], "claude-haiku-5-5")
+        self.assertEqual(assignment.claude_fallback(self.CODEX_THEN_CURSOR, "b")["model"], "claude-haiku-5-5")
+        self.assertEqual(assignment.claude_fallback({}, "a")["model"], "claude-sonnet-5-5")
+
+
+class JobWorkersTest(unittest.TestCase):
+    def ledger(self, roles, **kw):
+        record = {"name": "x", "source": "builtin", "explicit": True, "roles": roles, "overrides": [], "substituted": [],
+                  "consented": ["codex"], "first_review": {}}
+        return Ledger(run_id="r", source="codex-code", mode="code", root="/x", snapshot={}, dry_run=True, profile=record, **kw)
+
+    def test_all_default_claude_cells_give_none(self):
+        self.assertIsNone(assignment.job_workers(self.ledger(profiles.builtin("claude-only")["roles"])))
+
+    def test_custom_claude_cell_keeps_workers(self):
+        roles = profiles.builtin("claude-only")["roles"]
+        roles["code.a"] = profiles.merge_cell("code.a", roles["code.a"], {"model": "claude-haiku-5-5", "effort": "medium"})
+        out = assignment.job_workers(self.ledger(roles))
+        self.assertEqual((out["a"]["model"], out["a"]["effort"], set(out)), ("claude-haiku-5-5", "medium", {"a", "b"}))
+
+    def test_external_cell_keeps_workers(self):
+        out = assignment.job_workers(self.ledger(profiles.builtin("local")["roles"]))
+        self.assertEqual((out["a"]["runner"], out["b"]["runner"]), ("codex", "claude"))
+
+    def test_old_ledger_without_profile_uses_its_workers(self):
+        workers = {"a": {"runner": "codex", "model": "gpt-x", "effort": "low"},
+                   "b": {"runner": "claude", "model": "claude-haiku-5-5", "effort": "low"}}
+        ledger = Ledger(run_id="r", source="codex-code", mode="code", root="/x", snapshot={}, dry_run=True, workers=workers)
+        self.assertEqual(assignment.job_workers(ledger)["a"]["model"], "gpt-x")
+        self.assertIsNone(assignment.job_workers(Ledger(run_id="r", source="codex-code", mode="code", root="/x",
+                                                        snapshot={}, dry_run=True)))
+
+
+class SandboxSubstitutionTest(unittest.TestCase):
+    def ledger(self, **kw):
+        return Ledger(run_id="r", source="codex-code", mode="code", root="/x", snapshot={}, dry_run=True, **kw)
+
+    def test_records_changed_cells_and_trims_consent(self):
+        roles = profiles.builtin("claude-only")["roles"]
+        roles["code.a"] = profiles.merge_cell("code.a", roles["code.a"], {"runner": "codex", "fallback": {"runner": "cursor"}})
+        record = {"name": "mine", "source": "builtin", "explicit": True, "roles": roles, "overrides": [], "substituted": [],
+                  "consented": ["codex", "cursor"], "first_review": {}}
+        ledger = self.ledger(profile=record)
+        before = assignment.mode_workers(roles, "code")
+        after = {**before, "a": assignment.fallback_target(before["a"], {"codex", "cursor"}, {"codex"}, "a")}
+        assignment.apply_sandbox_substitution(ledger, before, after, "샌드박스 점검 실패")
+        self.assertEqual(ledger.profile["roles"]["code.a"]["runner"], "cursor")
+        self.assertEqual(ledger.profile["substituted"],
+                         [{"role": "code.a", "from": "codex", "to": "cursor", "reason": "샌드박스 점검 실패"}])
+        self.assertEqual(ledger.workers["a"]["runner"], "cursor")
+        self.assertEqual(ledger.profile["consented"], ["cursor"])
+        self.assertEqual(record["roles"]["code.a"]["runner"], "codex")
+
+    def test_old_ledger_is_materialized_first(self):
+        workers = {"a": {"runner": "codex", "model": "gpt-x", "effort": "low"},
+                   "b": {"runner": "claude", "model": "claude-haiku-5-5", "effort": "low"}}
+        ledger = self.ledger(workers=workers)
+        before = assignment.job_workers(ledger)
+        after = {**before, "a": assignment.fallback_target(before["a"], set(), set(), "a")}
+        assignment.apply_sandbox_substitution(ledger, before, after, "샌드박스 점검 실패")
+        self.assertEqual(ledger.profile["name"], "legacy")
+        self.assertEqual(ledger.profile["roles"]["code.a"]["runner"], "claude")
+        self.assertEqual(ledger.profile["substituted"][0]["from"], "codex")
+        self.assertEqual(len(ledger.profile["roles"]), 14)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -8,6 +8,7 @@ from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
+from cascade.assignment import claude_fallback
 from cascade.config import ConfigError, ExitCodes, RepoConfig, detect_candidates, is_sensitive_path, load_repo_config
 from cascade.consensus import (
     OUTCOME_ADJUDICATE,
@@ -310,8 +311,9 @@ def has_jobs(path: Path) -> bool:
     return Path(path).is_file() and bool(read_json(path).get("jobs"))
 
 
-def fallback_job(entry: dict) -> dict:
-    model, effort = ROLES[entry["role"]]
+def fallback_job(entry: dict, cell: dict) -> dict:
+    target = claude_fallback(cell, entry["role"])
+    model, effort = target["model"], target["effort"]
     return {"id": entry["id"], "label": entry["id"].replace(":", " "), "model": model, "effort": effort,
             "kind": entry["kind"], "promptPath": entry["promptPath"]}
 
@@ -332,11 +334,16 @@ def load_stage_results(rd: Path, stage: str, claude: Path | None) -> tuple[dict,
         data = read_json(cli)
         ok = {o["id"] for o in data.get("outcomes", []) if o.get("status") == STATUS_OK}
         merged.update({item["id"]: item for item in data.get("results", []) if item["id"] in ok})
-        expected.update({job["id"]: expected_model_id(job) for job in read_json(cli_args)["jobs"] if job["id"] in ok})
+        reruns = data.get("fallback_runs", {})
+        expected.update({job["id"]: expected_model_id(reruns.get(job["id"], job))
+                         for job in read_json(cli_args)["jobs"] if job["id"] in ok})
     if fallback.is_file():
         items = read_json(fallback).get("results", [])
         merged.update({item["id"]: item for item in items})
-        expected.update({item["id"]: ROLES[_role_of(item["id"])][0] for item in items if _role_of(item["id"]) in ROLES})
+        fallback_args = rd / f"{stage}-fallback-args.json"
+        models = {job["id"]: job["model"] for job in read_json(fallback_args).get("jobs", [])} if fallback_args.is_file() else {}
+        expected.update({item["id"]: models.get(item["id"]) or ROLES[_role_of(item["id"])][0]
+                         for item in items if item["id"] in models or _role_of(item["id"]) in ROLES})
     return {"results": list(merged.values())}, expected
 
 
