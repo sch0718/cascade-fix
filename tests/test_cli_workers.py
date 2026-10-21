@@ -362,6 +362,39 @@ class DocWorkersTest(WorkersTestBase):
         self.args("judge")
         self.assertEqual([d["outcome"] for d in self.ledger().rounds[0].decisions], ["합의-사실"])
 
+    def cursor_calls(self):
+        return len(list((self.tmp / "log").glob("cursor-agent-*.args.json")))
+
+    def test_runner_exhausted_in_stage1_is_not_called_again_in_checker_stage(self):
+        self.cursor_results([dict(LIMIT_ENTRY, match="r1-01-b")])
+        self.start_doc("--workers", "external")
+        p = self.workers()
+        self.assertIn("대체 실행 1(한도 1)", p.stdout)
+        results_json(self.rd() / "stage1-fallback.json", [("r1-01:b", worker_output("사실", "claude-haiku-5-5"))])
+        self.args("judge")
+        calls = self.cursor_calls()
+
+        p = self.workers("checker")
+        self.assertEqual(self.cursor_calls(), calls)
+        self.assertIn("CLI 작업 1건: 성공 0, 대체 실행 1(건너뜀 1)", p.stdout)
+        outcome = self.read("checker-cli.json")["outcomes"][0]
+        self.assertEqual((outcome["id"], outcome["status"]), ("r1-01:checker", "skipped"))
+        self.assertIn("r1-01:b에서 limit", outcome["detail"])
+        self.assertEqual([j["id"] for j in self.read("checker-fallback-args.json")["jobs"]], ["r1-01:checker"])
+        report = self.cli("report", "--run-dir", str(self.run_dir)).stdout
+        section = section_of(report, "## 외부 작업자")
+        self.assertIn("회차 1 stage1: CLI 작업 3건, 대체 실행 1건(한도 1)", section)
+        self.assertIn("회차 1 checker: CLI 작업 1건, 대체 실행 1건(건너뜀 1)", section)
+
+    def test_jobs_force_forgets_exhausted_runners(self):
+        self.cursor_results([dict(LIMIT_ENTRY, match="r1-01-b")])
+        self.start_doc("--workers", "external")
+        self.workers()
+        self.args("jobs", "--force")
+        self.cursor_results([{"match": "r1-01-b", "result": fenced(result_json())}])
+        p = self.workers()
+        self.assertIn("CLI 작업 3건: 성공 3, 대체 실행 0", p.stdout)
+
     def test_checker_workers_force_is_refused_after_final_judge(self):
         self.start_doc("--workers", "external")
         self.workers()
@@ -445,6 +478,26 @@ class ReportWorkersTest(WorkersTestBase):
         self.assertIn("대체 실행 2건(로그인 1, 건너뜀 1)", section)
         self.assertIn("codex login", section)
         self.assertNotIn("cursor-agent login", section)
+
+    def test_report_keeps_login_hint_after_forced_rerun_skips_exhausted_runner(self):
+        self.start()
+        (self.home / ".codex" / "auth.json").unlink()
+        self.workers()
+        self.args("workers", "--stage", "stage1", "--force")
+        self.assertEqual({o["status"] for o in self.read("stage1-cli.json")["outcomes"] if o["runner"] == "codex"},
+                         {"skipped"})
+        self.assertIn("codex login", self.section())
+
+    def test_report_drops_login_hint_after_jobs_force_and_successful_rerun(self):
+        self.start()
+        auth = self.home / ".codex" / "auth.json"
+        auth.unlink()
+        self.workers()
+        auth.write_text("{}", encoding="utf-8")
+        self.args("jobs", "--force")
+        p = self.workers()
+        self.assertIn("대체 실행 0", p.stdout)
+        self.assertNotIn("codex login", self.section())
 
     def test_report_without_external_workers_has_no_section(self):
         self.init("--reviewer", "claude")

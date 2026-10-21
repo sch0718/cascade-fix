@@ -613,18 +613,20 @@ def restore_tree(wt: Path, tree: str) -> None:
 class _Exhaustion:
     """한도·인증으로 멈춘 runner와 그 원인. 아직 시작하지 않은 작업이 건너뛸 때 읽는다."""
 
-    def __init__(self):
+    def __init__(self, stopped: dict[str, dict] | None = None):
         self._lock = threading.Lock()
-        self._reason: dict[str, str] = {}
+        self._stopped = stopped if stopped is not None else {}
 
     def reason(self, runner: str) -> str | None:
         with self._lock:
-            return self._reason.get(runner)
+            entry = self._stopped.get(runner)
+            return entry["reason"] if entry else None
 
     def record(self, outcome: Outcome) -> None:
         if outcome.status in _STOPPING:
             with self._lock:
-                self._reason.setdefault(outcome.runner, f"{outcome.id}에서 {outcome.status}: {outcome.detail}")
+                self._stopped.setdefault(outcome.runner, {
+                    "status": outcome.status, "reason": f"{outcome.id}에서 {outcome.status}: {outcome.detail}"})
 
 
 def _skipped(job: CliJob, reason: str) -> Outcome:
@@ -703,14 +705,15 @@ def _run_group(group: list[tuple[int, CliJob]], runner: object, runners: dict[st
 
 
 def run_all(jobs: list[CliJob], runners: dict[str, object], max_parallel: int = MAX_PARALLEL,
-            now: datetime | None = None) -> list[Outcome]:
-    """runner별로 작업을 동시에 돌린다. 반환 순서는 입력과 같다."""
+            now: datetime | None = None, exhausted: dict[str, dict] | None = None) -> list[Outcome]:
+    """runner별로 작업을 동시에 돌린다. 반환 순서는 입력과 같다.
+    exhausted({runner: {"status", "reason"}})에 든 runner는 부르지 않고 건너뛰며, 이번에 한도·인증으로 멈춘 runner를 거기에 더한다."""
     now = now or datetime.now(timezone.utc)
     results: list[Outcome | None] = [None] * len(jobs)
     groups: dict[str, list[tuple[int, CliJob]]] = {}
     for index, job in enumerate(jobs):
         groups.setdefault(job.runner, []).append((index, job))
-    exhausted = _Exhaustion()
+    exhausted = _Exhaustion(exhausted)
     with ThreadPoolExecutor(max(len(groups), 1)) as outer:
         futures = [outer.submit(_run_group, group, runners.get(name), runners, exhausted, max_parallel, now, results)
                    for name, group in groups.items()]

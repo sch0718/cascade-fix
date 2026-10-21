@@ -585,6 +585,18 @@ class RunAllTest(RunnerTestBase):
         self.assertIn("auth", outcomes[1].detail)
         self.assertEqual(self.calls("cursor-agent"), 1)
 
+    def test_exhausted_runner_from_earlier_call_is_skipped_and_new_one_is_recorded(self):
+        self.env(FAKE_CURSOR_RESULTS=json.dumps([LIMIT_ENTRY]))
+        exhausted = {"codex": {"status": STATUS_LIMIT, "reason": "F0:a에서 limit: 앞선 호출"}}
+        jobs = [self.job(id="C1:a"), self.cursor_job(id="K1:a")]
+        outcomes = run_all(jobs, self.runners, max_parallel=1, exhausted=exhausted)
+        self.assertEqual([o.status for o in outcomes], [STATUS_SKIPPED, STATUS_LIMIT])
+        self.assertIn("F0:a에서 limit", outcomes[0].detail)
+        self.assertEqual(self.calls("codex"), 0)
+        self.assertEqual(set(exhausted), {"codex", "cursor"})
+        self.assertEqual(exhausted["cursor"]["status"], STATUS_LIMIT)
+        self.assertIn("K1:a에서 limit", exhausted["cursor"]["reason"])
+
     def test_running_jobs_finish_after_limit(self):
         self.env(FAKE_CURSOR_RESULTS=json.dumps([LIMIT_ENTRY, fenced(result_json())]), FAKE_CURSOR_SLEEP="0.5")
         outcomes = run_all(self.cursor_jobs(2), self.runners, max_parallel=2)
