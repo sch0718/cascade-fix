@@ -91,7 +91,8 @@ RECHECK_RESULTS = "recheck.json"
 STAGE1, STAGE_CHECKER = "stage1", "checker"
 STAGE_ARGS = {STAGE1: "stage1-args.json", STAGE_CHECKER: "checker-args.json"}
 STAGE_OUTPUTS = {STAGE1: "stage1.json", STAGE_CHECKER: "checker.json"}
-FINGERPRINT_PARTS = {"tree": "작업 트리", "head": "HEAD", "stash": "stash", "branches": "브랜치"}
+STOP_PARTS = {"tree": "작업 트리", "head": "HEAD", "head_ref": "현재 브랜치", "stash": "stash",
+              "attached": "작업자 워크트리 브랜치"}
 
 
 class CliError(Exception):
@@ -474,22 +475,30 @@ def check_user_tree(ledger: Ledger, rnd: RoundRecord) -> None:
         return
     snap = snapshot_of(ledger)
     now = user_tree_fingerprint(snap.root, snap.run_dir)
-    changed = [k for k in FINGERPRINT_PARTS if before.get(k) != now.get(k)]
+    changed = [k for k in STOP_PARTS if k in before and before[k] != now.get(k)]
+    old, new = set(before.get("branches", [])), set(now.get("branches", []))
+    branch_lines = [f"- {b}" for b in sorted(old - new)] + [f"+ {b}" for b in sorted(new - old)]
     if not changed:
+        if branch_lines:
+            print("경고: jobs 이후 사용자 저장소의 브랜치 목록이 바뀌었다(다른 세션의 fetch·삭제일 수 있다). "
+                  "작업 트리·HEAD·stash는 그대로라 계속한다")
+            print("\n".join(branch_lines))
         return
     lines = [
         "jobs 이후 사용자 저장소가 바뀌었다(작업자가 워크트리 밖을 건드렸을 수 있다): "
-        + ", ".join(FINGERPRINT_PARTS[k] for k in changed),
+        + ", ".join(STOP_PARTS[k] for k in changed),
     ]
     if "tree" in changed:
         lines += ["", f"git diff --stat {before['tree']} {now['tree']}", tree_diff_stat(snap.root, before["tree"], now["tree"])]
     if "head" in changed:
         lines.append(f"HEAD: {before['head']} → {now['head']}")
+    if "head_ref" in changed:
+        lines.append(f"현재 브랜치: {before['head_ref']} → {now['head_ref']}")
     if "stash" in changed:
         lines.append(f"refs/stash: {before['stash'] or '(없음)'} → {now['stash'] or '(없음)'}")
-    if "branches" in changed:
-        old, new = set(before.get("branches", [])), set(now.get("branches", []))
-        lines += [f"- {b}" for b in sorted(old - new)] + [f"+ {b}" for b in sorted(new - old)]
+    if "attached" in changed:
+        lines += ["브랜치에 붙은 작업자 워크트리(jobs는 --detach로 만든다):", *now["attached"]]
+    lines += branch_lines
     lines += ["", "사람이 확인한다. 의도한 변경이면 되돌리거나 jobs --force 로 다시 시작한다."]
     raise CliError("\n".join(lines), ExitCodes.NEEDS_USER)
 

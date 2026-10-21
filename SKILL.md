@@ -133,7 +133,7 @@ PYTHONPATH="${CLAUDE_SKILL_DIR}" python3 -m cascade.cli
 - **계획 확인** — 초안(스펙)은 「설계 결정」이 많이 나온다고 미리 알린다. 지적이 많으면 「Critical·Warning만」을 권한다. 관점이 있으면 `review --focus`로 준다.
 - **잘 맞는 문서와 덜 맞는 문서** — 구현 직전의 계획서(파일명·단계 순서·명령·저장소 코드와의 모순)는 지적이 구체적이라 자동 채택이 많다. 초기 스펙은 「정하지 않은 결정」 지적이 많아 사람 목록으로 쏠린다. 이것이 정상 결과다.
 - **설계 결정** — 판정자 둘이 「설계 결정 필요」에 합의하면 고치지 않는다. 문서 모드의 작성자는 그때 선택지 2~3개와 장단점을 내고, 보고서 「설계 결정」 칸에 판정자 근거와 함께 붙는다. 작성자가 선택지 대신 안 하나를 골라 고쳤으면 그 칸에 「작성자 수정안(채택 안 함)」과 패치 경로(`round-N/patch-<id>-writer.diff`)가 붙는다. 이 스킬은 결정을 대신 내리지 않고 결정을 문서에 반영하는 회차도 열지 않는다. 사용자가 고르면 그 결정대로 문서를 고친 뒤(사용자가 고치거나, 사용자가 맡기면 이 세션이 고친다) `CF detect --doc <문서>`로 다시 검토한다. 「작성자 안 채택」이면 이 세션이 대상 저장소 루트에서 `git apply <run_dir>/round-N/patch-<id>-writer.diff`로 적용한다. 앞 회차 수정과 겹쳐 적용되지 않으면 패치 내용을 보고 같은 결정을 직접 반영한다.
-- **새로 만들 파일** — 설계서가 아직 없는 파일을 가리키는 것은 정상이다. 다만 수정이 그런 경로를 새로 더하면 참조 실존 검사가 「참조 없음」으로 판가름에 보낸다. 보고서에서 그런 판단 불가는 이 이유인지 먼저 본다.
+- **새로 만들 파일** — 설계서가 아직 없는 파일을 가리키는 것은 정상이다. 다만 수정이 그런 경로를 새로 더하면 참조 실존 검사가 「참조 없음」으로 판가름에 보낸다. 보고서에서 그런 판단 불가는 이 이유인지 먼저 본다. 이 검사는 확장자(`.md`·`.py`·`.yaml` 등)로 끝나거나 첫 조각이 저장소에 있는 `a/b` 꼴만 경로로 보고, 저장소 루트에 없으면 끝부분이 같은 파일·폴더를 저장소 안에서 찾는다. 그래서 문서가 새로 정하는 이름(`execute-left/right`), 라벨 키(`example.io/name`), 줄여 쓴 파일 이름(`values-local.yaml`)은 막지 않는다.
 
 ## 사용 조건
 
@@ -189,7 +189,8 @@ Claude·Cursor·`codex-doc` 결과는 형식이 같아 형식으로는 가릴 �
    - `pr-comment`이면 코멘트에서 뽑은 재현 명령을 `round-N/repro-cmds.json`에 쓰고 출력한다. 이 명령은 사용자 셸에서 돈다. 사용자에게 명령 목록을 보이고 승인받은 뒤 `judge`에 `--allow-repro <run_dir>/round-N/repro-cmds.json`으로 넘긴다. 승인이 없으면 재현 검증을 건너뛴다(경고만 낸다).
 3. **Workflow(1단계)** — (`CF jobs`가 `stage1-cli-args.json`을 만들었으면, 곧 작업자 칸에 외부 runner가 있으면 아래 「외부 작업자 칸」의 동시 실행을 따른다.) `RJ`(`scripts/run-jobs.js`, 「다음:」 줄에 절대 경로가 나온다)를 Read로 읽어 그 내용을 Workflow 도구의 `script` 입력으로 통째로 넘긴다(`RJ` 경로를 `scriptPath`로 주면 작업 디렉터리 밖이라 거부된다). 첫 실행 결과에 나오는 `Script file:` 경로(Workflow가 저장해 둔 사본)는 `scriptPath`로 받으므로, 이 세션의 둘째 Workflow부터는 그 경로를 `scriptPath`로 넘긴다. `args`는 `stage1-args.json`의 내용(JSON 객체)이다. 작업마다 `{id, label, model, effort, kind, promptPath}`만 있고 프롬프트 본문은 `round-N/prompts/`의 파일에 있다. 프롬프트를 읽어 옮겨 적지 않는다. 반환값 `{results: [...]}`는 완료 알림의 `<output-file>` JSON에서 `.result`를 꺼내 그대로 `round-N/stage1.json`에 저장한다(예: `python3 -c 'import json,sys; json.dump(json.load(open(sys.argv[1]))["result"], open(sys.argv[2], "w"), ensure_ascii=False)' <output-file> <저장 경로>`). 알림 본문의 `<result>`는 `<`·`>`가 `&lt;`·`&gt;`로 바뀌어 보이므로 옮겨 적지 않는다.
 4. **judge** — `CF judge --run-dir <run_dir> --round N --results <run_dir>/round-N/stage1.json [--allow-repro <승인한 목록>]`
-   - 종료 코드 6: jobs 뒤 사용자 저장소(작업 트리·HEAD·stash·브랜치)가 바뀌었다. 작업자가 워크트리 밖을 건드렸을 수 있다. 출력된 `git diff --stat`을 사용자에게 보이고 멈춘다. `adjudicate`도 같은 검사를 한다.
+   - 종료 코드 6: jobs 뒤 사용자 저장소(작업 트리·HEAD·현재 브랜치·stash)가 바뀌었거나 작업자 워크트리가 브랜치에 붙었다. 작업자가 워크트리 밖을 건드렸을 수 있다. 출력된 `git diff --stat`을 사용자에게 보이고 멈춘다. `adjudicate`도 같은 검사를 한다.
+   - 브랜치 목록만 바뀌었으면(다른 세션의 fetch·삭제 등) 경고와 바뀐 브랜치를 출력하고 계속한다.
    - 문서 모드에서 `checker-args.json`이 나오면 같은 방식으로 Workflow를 돌려 `round-N/checker.json`에 저장하고, `CF judge … --results …/stage1.json --checker-results …/checker.json`으로 다시 부른다.
    - 작업자가 바꾼 파일과 관련된 테스트 파일이 없으면 `{files}`가 든 `tests` 명령 대신 `full_tests`를 돌린다(`verify.json`에 「[관련 테스트 없음·전체 테스트로 대신]」). `full_tests`도 없으면 「[관련 테스트 없음·실행 안 함]」으로 남기고 통과로 세지 않으며 결정 사유에 「테스트가 돌지 않음」이 붙는다. 같은 패치 합의는 그대로 채택한다.
    - 판가름 대상이 있으면 `round-N/adj-args.json`이 생긴다.

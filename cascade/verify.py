@@ -244,8 +244,23 @@ def _strip_fences(text: str) -> str:
     return FENCE.sub("", text)
 
 
-def _looks_like_path(token: str) -> bool:
-    return "/" in token or token.endswith(DOC_EXTENSIONS)
+def _looks_like_path(wt: Path, token: str) -> bool:
+    if token.endswith(DOC_EXTENSIONS):
+        return True
+    return "/" in token and (wt / token.split("/", 1)[0]).exists()
+
+
+def _repo_paths(wt: Path) -> set[str]:
+    paths = set()
+    for f in _iter_files(wt):
+        rel = f.relative_to(wt)
+        paths.add(rel.as_posix())
+        paths.update(p.as_posix() for p in rel.parents if p != Path("."))
+    return paths
+
+
+def _ends_with(paths: set[str], ref: str) -> bool:
+    return any(p == ref or p.endswith("/" + ref) for p in paths)
 
 
 def check_doc_refs(wt: Path, doc: Path) -> list[str]:
@@ -255,8 +270,9 @@ def check_doc_refs(wt: Path, doc: Path) -> list[str]:
     candidates = [m.group(1) for m in PATH_LINE.finditer(text)]
     candidates += [LINE_SUFFIX.sub("", m.group(1)).rstrip(".,;)") for m in BACKTICK.finditer(text)]
     missing = set()
+    repo_paths = None
     for path in candidates:
-        if not path or not _looks_like_path(path):
+        if not path or not _looks_like_path(wt, path):
             continue
         if path.startswith(("http://", "https://", EXTERNAL_PREFIX)) or "*" in path:
             continue
@@ -265,7 +281,11 @@ def check_doc_refs(wt: Path, doc: Path) -> list[str]:
         target = (wt / path).resolve()
         if not target.is_relative_to(wt_root):
             continue
-        if not target.exists():
+        if target.exists():
+            continue
+        if repo_paths is None:
+            repo_paths = _repo_paths(wt)
+        if not _ends_with(repo_paths, path.strip("/")):
             missing.add(path)
     return sorted(missing)
 

@@ -242,6 +242,24 @@ class VerifyTest(unittest.TestCase):
         doc.write_text("`../outside.py` `/nonexistent/abs.py` `ghost.py` http://h/x.py:3\n", encoding="utf-8")
         self.assertEqual(verify.check_doc_refs(repo, doc), ["ghost.py"])
 
+    def test_check_doc_refs_skips_new_names_and_finds_shortened_paths(self):
+        repo = make_repo(self.tmp / "repo", {
+            "20. Helm/replay-runner/values-local.yaml": "x: 1\n",
+            "docs/real.md": "r\n",
+        })
+        doc = repo / "docs" / "design.md"
+        doc.write_text(
+            "라벨 `replay.example.com/description`, `replay.example.com/display-name` 을 붙인다.\n"
+            "`values-local.yaml` 과 `replay-runner/values-local.yaml` 을 고친다.\n"
+            "DAG 노드는 `execute-left/right`, `finalize-left/right` 이다.\n"
+            "`docs/없는파일.md` 와 `docs/real.md`, `docs/없는폴더`, `ghost.yaml`, `nope/values-local.yaml` 을 본다.\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            verify.check_doc_refs(repo, doc),
+            ["docs/없는파일.md", "docs/없는폴더", "ghost.yaml", "nope/values-local.yaml"],
+        )
+
     def test_run_repro_requires_fail_before_and_pass_after(self):
         base = self.tmp / "base"
         fix = self.tmp / "fix"

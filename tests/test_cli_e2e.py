@@ -687,6 +687,42 @@ class CliDocModeTest(CliTestBase):
         self.assertIn("add가 더하게", (self.repo / "plan.md").read_text(encoding="utf-8"))
         self.assertTrue((self.run_dir / "round-1" / "recheck-prompt.md").is_file())
 
+    def _judge_doc_writer_line(self, line):
+        (self.repo / "helm").mkdir()
+        (self.repo / "helm" / "values-local.yaml").write_text("x: 1\n", encoding="utf-8")
+        (self.repo / "plan.md").write_text(self.PLAN, encoding="utf-8")
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-qm", "plan")
+        raw = self.tmp / "doc.final"
+        raw.write_text("Warning\n1. 단계가 모호하다\n   위치: plan.md:3\n   근거: 무엇을 고치는지 없다\n", encoding="utf-8")
+        p = self.cli("init", "--source", "codex-doc", "--input", str(raw), "--doc", str(self.repo / "plan.md"))
+        self.run_dir = Path(next(x for x in p.stdout.splitlines() if x.startswith("run_dir=")).split("=", 1)[1])
+        self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1")
+        wt = self.wt("r1-01-writer")
+        (wt / "plan.md").write_text(self.PLAN + line, encoding="utf-8")
+        commit_worktree(wt, "writer")
+        stage1 = results_json(self.run_dir / "round-1" / "stage1.json", [
+            ("r1-01:a", worker_output("사실", "claude-sonnet-5-5")),
+            ("r1-01:b", worker_output("사실", "claude-haiku-5-5")),
+            ("r1-01:writer", worker_output("사실", "claude-sonnet-5-5")),
+        ])
+        self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1))
+
+    def test_doc_new_names_and_shortened_paths_reach_checker(self):
+        self._judge_doc_writer_line(
+            "\n노드 `execute-left/right`, `finalize-left/right`에 라벨 `replay.example.com/description`을 단다."
+            " `values-local.yaml`도 고친다.\n"
+        )
+        checker_args = json.loads((self.run_dir / "round-1" / "checker-args.json").read_text(encoding="utf-8"))
+        self.assertEqual([j["id"] for j in checker_args["jobs"]], ["r1-01:checker"])
+        self.assertEqual(self.ledger().rounds[0].decisions, [])
+
+    def test_doc_missing_file_path_still_escalates(self):
+        self._judge_doc_writer_line("\n자세한 내용은 `docs/없는파일.md`에 둔다.\n")
+        self.assertFalse((self.run_dir / "round-1" / "checker-args.json").exists())
+        decisions = self.ledger().rounds[0].decisions
+        self.assertEqual([d["outcome"] for d in decisions], ["판가름"])
+        self.assertIn("참조 없음: docs/없는파일.md", decisions[0]["reasons"])
 
     def test_doc_mode_writer_patch_touching_non_doc_file_is_not_adopted(self):
         (self.repo / "plan.md").write_text(self.PLAN, encoding="utf-8")
@@ -922,12 +958,41 @@ class CliSafetyTest(CliTestBase):
         self.assertFalse(cli_steps.step_done(self.ledger().rounds[0], "judge"))
 
         (self.repo / "calc.py").write_text(CALC, encoding="utf-8")
-        git(self.repo, "branch", "stray")
+        self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1))
+
+    def _jobs_then_stage1(self):
+        self.init()
+        self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1")
+        stage1 = self.run_dir / "round-1" / "stage1.json"
+        shutil.copyfile(FIXTURES / "workflow-stage1.json", stage1)
+        return stage1
+
+    def test_judge_warns_and_continues_when_only_branches_change(self):
+        git(self.repo, "branch", "other-session")
+        stage1 = self._jobs_then_stage1()
+        git(self.repo, "branch", "-D", "other-session")
+        git(self.repo, "branch", "fetched")
+        p = self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1))
+        self.assertIn("경고", p.stdout)
+        self.assertIn("- refs/heads/other-session", p.stdout)
+        self.assertIn("+ refs/heads/fetched", p.stdout)
+        self.assertTrue(cli_steps.step_done(self.ledger().rounds[0], "judge"))
+
+    def test_judge_stops_when_user_checkout_switches_branch(self):
+        stage1 = self._jobs_then_stage1()
+        git(self.repo, "switch", "-q", "-c", "side")
         p = self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1), ok=False)
         self.assertEqual(p.returncode, 6, p.stdout)
-        self.assertIn("+ refs/heads/stray", p.stdout)
-        git(self.repo, "branch", "-D", "stray")
-        self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1))
+        self.assertIn("refs/heads/main → refs/heads/side", p.stdout)
+        self.assertFalse(cli_steps.step_done(self.ledger().rounds[0], "judge"))
+
+    def test_judge_stops_when_worker_worktree_attaches_to_branch(self):
+        stage1 = self._jobs_then_stage1()
+        git(self.wt("r1-01-a"), "switch", "-q", "-c", "worker-branch")
+        p = self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1), ok=False)
+        self.assertEqual(p.returncode, 6, p.stdout)
+        self.assertIn("r1-01-a refs/heads/worker-branch", p.stdout)
+        self.assertFalse(cli_steps.step_done(self.ledger().rounds[0], "judge"))
 
     def test_baseline_failures_are_excluded_and_setup_runs_in_worktrees(self):
         lint = "python3 -c 'import sys; sys.exit(1)'"
