@@ -177,14 +177,18 @@ def _carried_note(f: Finding) -> str:
     )
 
 
+def _data_text(text: str) -> str:
+    return text.replace("<<<", "‹‹‹").replace(">>>", "›››")
+
+
 def _finding_values(f: Finding, role: str, worktree: Path) -> dict[str, str]:
     return {
         "finding_id": f.id,
         "role": role,
         "severity": f.severity,
         "location": worktree_location(f.location, worktree),
-        "finding_body": f.body,
-        "evidence": f.evidence or "(없음)",
+        "finding_body": _data_text(f.body),
+        "evidence": _data_text(f.evidence or "(없음)"),
         "worktree": str(worktree),
         "doc_target": _doc_target(f, worktree),
         "carried": _carried_note(f),

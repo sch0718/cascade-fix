@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -66,6 +67,16 @@ class ConfigTest(unittest.TestCase):
     def test_returns_none_when_root_missing(self):
         cfg = write_repos_toml(self.tmp, {"/some/other/repo": {"tests": ["pytest"]}})
         self.assertIsNone(config.load_repo_config(self.repo, cfg))
+
+    def test_key_through_symlink_or_home_matches_resolved_root(self):
+        link = self.tmp / "link"
+        link.symlink_to(self.tmp)
+        cfg = write_repos_toml(self.tmp, {str(link / "repo"): {"tests": ["pytest"]}})
+        self.assertEqual(config.load_repo_config(self.repo, cfg).tests, ["pytest"])
+        self.assertEqual(config.load_repo_config(link / "repo", cfg).tests, ["pytest"])
+        cfg = write_repos_toml(self.tmp, {"~/repo": {"tests": ["make test"]}})
+        with mock.patch.dict(os.environ, {"HOME": str(link)}):
+            self.assertEqual(config.load_repo_config(self.repo, cfg).tests, ["make test"])
 
     def test_returns_none_when_file_missing(self):
         self.assertIsNone(config.load_repo_config(self.repo, self.tmp / "nope.toml"))

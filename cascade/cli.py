@@ -29,12 +29,14 @@ from cascade.consensus import (
 from cascade.detect import detect, estimate_line
 from cascade.detect import render as render_detect
 from cascade.findings import (
+    GH_TIMEOUT,
     SEVERITIES,
     Finding,
     ParseError,
     fetch_pr_findings,
     parse_codex_code,
     parse_codex_doc,
+    unparsed_code_items,
     write_findings,
 )
 from cascade.jobs import (
@@ -209,9 +211,15 @@ def _load_findings_json(path: str, source: str) -> list[Finding]:
     return findings
 
 
+def _run_gh(argv: list[str]) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=GH_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(argv, 1, "", f"시간 초과({GH_TIMEOUT}초)")
+
+
 def _warn_pr_head(root: Path, gh: list[str], owner: str, name: str, number: str) -> None:
-    p = subprocess.run([*gh, "pr", "view", number, "-R", f"{owner}/{name}", "--json", "headRefOid", "--jq", ".headRefOid"],
-                       capture_output=True, text=True)
+    p = _run_gh([*gh, "pr", "view", number, "-R", f"{owner}/{name}", "--json", "headRefOid", "--jq", ".headRefOid"])
     pr_head = p.stdout.strip() if p.returncode == 0 else ""
     local = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True).stdout.strip()
     if not pr_head:
@@ -234,14 +242,18 @@ def _parse_input(args, root: Path, expected_model: str):
         gh = shlex.split(os.environ.get("CASCADE_GH", "gh"))
         me = args.me
         if me is None:
-            p = subprocess.run([*gh, "api", "user", "--jq", ".login"], capture_output=True, text=True)
+            p = _run_gh([*gh, "api", "user", "--jq", ".login"])
             me = p.stdout.strip() if p.returncode == 0 else ""
             if not me:
                 print("경고: 내 계정을 알 수 없어 본인 코멘트를 거르지 못한다(--me 로 준다)")
         if not args.input.isdigit():
             raise s.CliError(f"pr-comment의 --input은 PR 번호다: {args.input}")
         _warn_pr_head(root, gh, owner, name, args.input)
-        return fetch_pr_findings(owner, name, int(args.input), me, gh, 1), ""
+        warnings: list[str] = []
+        found = fetch_pr_findings(owner, name, int(args.input), me, gh, 1, warnings)
+        for warning in warnings:
+            print(warning)
+        return found, ""
     if args.source in CLAUDE_SOURCES:
         return _parse_claude_review(args, expected_model)
     raw = s.read_text(Path(args.input))
@@ -357,12 +369,16 @@ def cmd_init(args) -> int:
     mode = "doc" if args.source in s.DOC_SOURCES else "code"
     first_review = _first_review_meta(args, mode)
     findings, raw = _parse_input(args, root, _expected_review_model(args, resolved, mode, first_review))
+    skipped = unparsed_code_items(raw) if args.source == "codex-code" else []
     if not findings:
         print("지적 0건 — 원문을 확인하라")
         for line in raw.splitlines()[:RAW_PREVIEW_LINES]:
             print(f"  | {line}")
-        if "[P" in raw:
+        if "[P" in raw and not skipped:
             print("경고: 원문에 「[P」가 있다. 파서가 항목을 놓쳤을 수 있다")
+    if skipped:
+        print(f"경고: 형식을 읽지 못한 항목 {len(skipped)}건: {' / '.join(skipped)}")
+    if not findings:
         print(f"status={STATUS_DONE}")
         return 0
     keep = _severity_filter(args.severity)
@@ -922,6 +938,7 @@ def _judge_code(ledger, rnd, f, results, snap, cfg, baseline, repro):
     sensitive = s.is_sensitive(changed_files(pa) + changed_files(pb), cfg)
     d = decide(a, b, va, vb, pa, pb, sensitive, ledger.adopt_on_both_pass)
     d = s.without_empty_patch(d, {"a": pa, "b": pb}, adjudicated=False)
+    d = s.without_lossy_patch(d, {"a": pa, "b": pb})
     workers = {"a": a, "b": b}
     return d, workers, {"a": [r.to_dict() for r in ra], "b": [r.to_dict() for r in rb]}
 
@@ -1006,7 +1023,9 @@ def cmd_judge(args) -> int:
             a, b = s.worker_from(merged, f.id, "a"), s.worker_from(merged, f.id, "b")
             checker = s.worker_from(merged, f.id, "checker") if f"{f.id}:checker" in merged else None
             d = decide_doc(a, b, checker, doc_problems[f.id])
-            decisions.append(s.without_empty_patch(d, {"writer": writer_patches[f.id]}, adjudicated=False))
+            d = s.without_empty_patch(d, {"writer": writer_patches[f.id]}, adjudicated=False)
+            d = s.without_lossy_patch(d, {"writer": writer_patches[f.id]})
+            decisions.append(s.without_outside_docs(d, {"writer": writer_patches[f.id]}, ledger.docs))
 
     by_id = {f.id: f for f in s.prompt_findings(ledger, findings)}
     adj_items = []
@@ -1078,7 +1097,10 @@ def cmd_adjudicate(args) -> int:
         if ledger.mode == "code" and s.is_sensitive(changed_files(adj.patch), cfg) and REASON_SENSITIVE not in d.reasons:
             d.reasons.append(REASON_SENSITIVE)
         patches = {role: s.worker_from(merged, f.id, role).patch for role in ("a", "b", "writer")}
-        new = s.without_empty_patch(after_adjudication(d, adj, vadj), {**patches, "adjudicator": adj.patch}, adjudicated=True)
+        patches["adjudicator"] = adj.patch
+        new = s.without_lossy_patch(s.without_empty_patch(after_adjudication(d, adj, vadj), patches, adjudicated=True), patches)
+        if ledger.mode == "doc":
+            new = s.without_outside_docs(new, patches, ledger.docs)
         if adj.patch.strip():
             s.patch_path(rd, f.id, "adjudicator").write_text(adj.patch, encoding="utf-8")
         merged[f"{f.id}:adjudicator"] = adj.to_dict()
@@ -1270,9 +1292,14 @@ def _patch_dry_run(run_dir, ledger, rnd, rd, patches) -> Path:
 
 def _patch_user_tree(run_dir, ledger, rnd, rd, patches, root) -> None:
     report = apply_all(root, patches, s.external_docs(ledger))
-    rnd.result_commit = snapshot_tree(s.snapshot_of(ledger), list(s.external_docs(ledger).values()))
     _record_apply(run_dir, ledger, rnd, rd, report, report.to_dict(), patches)
     print(f"적용 {len(report.applied)}건, 실패 {len(report.failed)}건")
+    _snapshot_result(run_dir, ledger, rnd)
+
+
+def _snapshot_result(run_dir, ledger, rnd) -> None:
+    rnd.result_commit = snapshot_tree(s.snapshot_of(ledger), list(s.external_docs(ledger).values()))
+    s.save_ledger(run_dir, ledger)
 
 
 def _remove_round_worktrees(ledger: Ledger, rnd: RoundRecord) -> None:
@@ -1301,6 +1328,8 @@ def cmd_apply(args) -> int:
         data = s.read_json(rd / "apply.json")
         if ledger.dry_run:
             recheck_repo = data.get("result_worktree", recheck_repo)
+        elif not rnd.result_commit:
+            _snapshot_result(run_dir, ledger, rnd)
     else:
         patches = _adopted_patches(rnd, rd)
         if ledger.dry_run:
@@ -1402,12 +1431,13 @@ def cmd_recheck(args) -> int:
         resolved, new = parse_recheck(text, rnd.no + 1)
     except ParseError as e:
         raise s.CliError(f"재검토 결과 {e}", ExitCodes.PARSE_ERROR) from None
-    if not any(line.strip() == RESOLUTION_HEADER for line in text.splitlines()):
+    has_header = any(line.strip() == RESOLUTION_HEADER for line in text.splitlines())
+    if not has_header:
         print(f"경고: 「{RESOLUTION_HEADER}」 절이 없다. 고친 지적을 모두 해소 안 됨으로 본다")
         resolved = {}
     adopted = [f for f in s.findings_of(rnd) if f.id in rnd.adopted]
     missing = [f.id for f in adopted if f.id not in resolved]
-    if resolved and missing:
+    if has_header and missing:
         print(f"경고: 해소 여부가 없는 지적은 해소 안 됨으로 본다: {', '.join(missing)}")
     unresolved = [s.unresolved_copy(f) for f in adopted if resolved.get(f.id) is not True]
     numbered = s.renumber(unresolved + new + s.carried_findings(rnd), rnd.no + 1, ledger.source)

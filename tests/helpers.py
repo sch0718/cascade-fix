@@ -17,6 +17,7 @@ def make_repo(tmp, files):
     git(repo, "init", "-q", "-b", "main")
     git(repo, "config", "user.email", "test@example.com")
     git(repo, "config", "user.name", "test")
+    git(repo, "config", "commit.gpgsign", "false")
     for name, content in files.items():
         path = repo / name
         path.parent.mkdir(parents=True, exist_ok=True)

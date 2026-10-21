@@ -176,7 +176,7 @@ def tree_diff_stat(root: Path, old_tree: str, new_tree: str) -> str:
 
 def commit_worktree(wt: Path, message: str) -> str | None:
     wt = Path(wt)
-    no_hooks = _no_hooks(wt.parent.parent)
+    no_hooks = ["-c", "core.hooksPath=/dev/null"]
     _git(wt, *no_hooks, "add", "-A")
     if _git(wt, *no_hooks, "status", "--porcelain") == "":
         return None

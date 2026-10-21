@@ -488,6 +488,35 @@ class CliEndToEndTest(CliTestBase):
         self.assertIn("이번 실행은 --adopt-on-both-pass 로 돌았다", p.stdout)
         self.assertIn("이 규칙으로 채택한 지적 1건", p.stdout)
 
+    def _recheck(self, text):
+        self.run_to_apply()
+        result = self.tmp / "recheck.final"
+        result.write_text(text, encoding="utf-8")
+        return self.cli("recheck", "--run-dir", str(self.run_dir), "--round", "1", "--result", str(result))
+
+    def test_recheck_without_resolution_section_warns_once(self):
+        p = self._recheck(RECHECK_RESULT.split("Critical", 1)[1].join(["Critical", ""]))
+        self.assertIn("절이 없다", p.stdout)
+        self.assertNotIn("해소 여부가 없는 지적", p.stdout)
+
+    def test_recheck_with_unreadable_resolution_lines_warns(self):
+        p = self._recheck(RECHECK_RESULT.replace("r1-01: 해소됨", "r1-01 해소됨").replace("r1-02: 해소됨", "r1-02 해소됨"))
+        self.assertIn("경고: 해소 여부가 없는 지적은 해소 안 됨으로 본다: r1-01, r1-02", p.stdout)
+
+    def test_non_utf8_patch_is_not_adopted(self):
+        self.init()
+        self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1")
+        for name in ("r1-01-a", "r1-01-b"):
+            wt = self.wt(name)
+            (wt / "calc.py").write_text(fix(CALC, "return a - b", "return a + b"), encoding="utf-8")
+            (wt / "notes.txt").write_bytes(b"na\xefve\n")
+        stage1 = self.run_dir / "round-1" / "stage1.json"
+        shutil.copyfile(FIXTURES / "workflow-stage1.json", stage1)
+        self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1))
+        d = {x["finding_id"]: x for x in self.ledger().rounds[0].decisions}
+        self.assertEqual((d["r1-01"]["outcome"], d["r1-01"]["patch_from"]), ("판단불가", None))
+        self.assertEqual(d["r1-01"]["reasons"][-1], "UTF-8 아닌 패치")
+
     def test_missing_full_tests_falls_back_to_tests_with_warning(self):
         toml = write_repos_toml(self.tmp, {str(self.repo): {"tests": ["python3 -m unittest {files}"]}})
         self.env["CASCADE_REPOS_TOML"] = str(toml)
@@ -659,6 +688,33 @@ class CliDocModeTest(CliTestBase):
         self.assertTrue((self.run_dir / "round-1" / "recheck-prompt.md").is_file())
 
 
+    def test_doc_mode_writer_patch_touching_non_doc_file_is_not_adopted(self):
+        (self.repo / "plan.md").write_text(self.PLAN, encoding="utf-8")
+        raw = self.tmp / "doc.final"
+        raw.write_text("Warning\n1. 단계가 모호하다\n   위치: plan.md:3\n   근거: 무엇을 고치는지 없다\n", encoding="utf-8")
+        p = self.cli("init", "--source", "codex-doc", "--input", str(raw), "--doc", str(self.repo / "plan.md"))
+        self.run_dir = Path(next(x for x in p.stdout.splitlines() if x.startswith("run_dir=")).split("=", 1)[1])
+        self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1")
+        wt = self.wt("r1-01-writer")
+        (wt / "plan.md").write_text(self.PLAN.replace("고친다", "고쳐 add가 더하게 한다"), encoding="utf-8")
+        (wt / "auth.py").write_text("TOKEN = 1\n", encoding="utf-8")
+        stage1 = results_json(self.run_dir / "round-1" / "stage1.json", [
+            ("r1-01:a", worker_output("사실", "claude-sonnet-5-5")),
+            ("r1-01:b", worker_output("사실", "claude-haiku-5-5")),
+            ("r1-01:writer", worker_output("사실", "claude-sonnet-5-5")),
+        ])
+        self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1))
+        checker = results_json(self.run_dir / "round-1" / "checker.json", [
+            ("r1-01:checker", {**worker_output("사실", "claude-haiku-5-5"), "checker_ok": True}),
+        ])
+        self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1),
+                 "--checker-results", str(checker))
+        d = self.ledger().rounds[0].decisions[0]
+        self.assertEqual((d["outcome"], d["patch_from"]), ("판단불가", None))
+        self.assertEqual(d["reasons"][-1], "문서 밖 파일 수정: auth.py")
+        self.cli("apply", "--run-dir", str(self.run_dir), "--round", "1")
+        self.assertFalse((self.repo / "auth.py").exists())
+
     def _run_doc_to_apply(self, doc, location):
         doc.write_text(self.PLAN, encoding="utf-8")
         raw = self.tmp / "doc.final"
@@ -803,13 +859,20 @@ class CliPrCommentTest(CliTestBase):
 class CliInitTest(CliTestBase):
     def test_zero_findings_warns_and_ends(self):
         raw = self.tmp / "empty.final"
-        raw.write_text("검토 결과\n- [P2] 위치에 공백 — some file.py:3\n", encoding="utf-8")
+        raw.write_text("검토 결과\n- [P2] 위치가 빠진 항목\n", encoding="utf-8")
         p = self.cli("init", "--source", "codex-code", "--input", str(raw))
         self.assertIn("지적 0건 — 원문을 확인하라", p.stdout)
         self.assertIn("검토 결과", p.stdout)
-        self.assertIn("[P", p.stdout)
+        self.assertIn("경고: 형식을 읽지 못한 항목 1건: - [P2] 위치가 빠진 항목", p.stdout)
         self.assertIn("status=종료", p.stdout)
         self.assertFalse((self.repo / ".cascade-fix").exists())
+
+    def test_partly_unparsed_code_items_warn(self):
+        raw = self.tmp / "code.final"
+        raw.write_text("- [P2] add가 뺀다 — calc.py:2\n  본문.\n- [P2] 위치가 빠진 항목\n  본문.\n", encoding="utf-8")
+        p = self.cli("init", "--source", "codex-code", "--input", str(raw))
+        self.assertIn("경고: 형식을 읽지 못한 항목 1건: - [P2] 위치가 빠진 항목", p.stdout)
+        self.assertIn("run_dir=", p.stdout)
 
     def test_doc_parse_error_exits_5_with_line(self):
         raw = self.tmp / "doc.final"
@@ -963,6 +1026,31 @@ class CliSafetyTest(CliTestBase):
         self.assertEqual(self.ledger().rounds[0].adopted, ["r1-01", "r1-02"])
         self.assertEqual(sum(1 for e in self.ledger().rounds[0].events if e["step"] == "apply-patched"), 1)
 
+    def test_apply_rerun_after_snapshot_failure_keeps_patched_record(self):
+        state = {}
+
+        def break_snapshot_branch():
+            state["branch"] = self.ledger().snapshot["branch"]
+            state["commit"] = git(self.repo, "rev-parse", state["branch"])
+            git(self.repo, "branch", "-D", state["branch"])
+
+        cli = self.cli
+        self.cli = lambda *args, ok=True: cli(*args, ok=ok and args[0] != "apply")
+        p = self.run_to_apply(before_apply=break_snapshot_branch)
+        self.cli = cli
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("return a * b", (self.repo / "calc.py").read_text(encoding="utf-8"))
+        self.assertTrue(any(e["step"] == "apply-patched" for e in self.ledger().rounds[0].events))
+        git(self.repo, "branch", state["branch"], state["commit"])
+        p = self.cli("apply", "--run-dir", str(self.run_dir), "--round", "1")
+        self.assertIn("적용을 건너뛰고", p.stdout)
+        apply = json.loads((self.run_dir / "round-1" / "apply.json").read_text(encoding="utf-8"))
+        self.assertEqual((apply["applied"], apply["failed"]), (["r1-01", "r1-02"], []))
+        rnd = self.ledger().rounds[0]
+        self.assertEqual(rnd.adopted, ["r1-01", "r1-02"])
+        self.assertTrue(rnd.result_commit)
+        self.assertNotEqual(rnd.result_commit, state["commit"])
+
     def test_recheck_diff_excludes_test_artifacts_and_other_user_edits(self):
         toml = write_repos_toml(self.tmp, {str(self.repo): {
             "tests": ["python3 -m unittest {files}"],
@@ -1066,6 +1154,17 @@ class CliResumeTest(unittest.TestCase):
 
 
 class CliStepsTest(unittest.TestCase):
+    def test_gh_call_that_hangs_is_a_failed_call(self):
+        from cascade import cli
+        old = cli.GH_TIMEOUT
+        cli.GH_TIMEOUT = 1
+        try:
+            p = cli._run_gh([sys.executable, "-c", "import time; time.sleep(30)"])
+        finally:
+            cli.GH_TIMEOUT = old
+        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(p.stdout, "")
+
     def _ledger(self, severity):
         done = [RoundRecord(no=n, findings=[], decisions=[], adopted=[], recheck_opened=True) for n in (1, 2)]
         rnd = RoundRecord(no=3, findings=[{"id": "r3-01", "severity": severity}], decisions=[],

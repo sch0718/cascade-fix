@@ -103,7 +103,23 @@ def full_ledger():
         decision("F6", OUTCOME_HOLD, None, ["제안 수준"]),
         decision("F7", OUTCOME_ADJUDICATE, None, ["패치가 다름", "판가름: 아님 — 이미 있음"]),
     ]
-    return make_ledger(findings, decisions, opinions={"F5": "Codex 의견 1\nCodex 의견 2"})
+    return make_ledger(findings, decisions, opinions={"F5": "Codex 의견 1\nCodex 의견 2"}, events=[{"step": "opinion:F5"}])
+
+
+def rerun_ledger(r2_decision, r3_decision, source="pr-comment", opinions=None, r3_events=None):
+    f = finding("r1-03", thread_id="T3", body="같은 지적")
+    r1 = RoundRecord(no=1, findings=[], decisions=[decision("r1-03", OUTCOME_HOLD, None, ["등급 선택"])],
+                     adopted=[], recheck_opened=False, hold_findings=[f])
+    r2 = RoundRecord(no=2, findings=[f], decisions=[r2_decision], adopted=[], recheck_opened=False, final=True)
+    r3 = RoundRecord(no=3, findings=[f], decisions=[r3_decision], adopted=[], recheck_opened=False, final=True,
+                     events=r3_events or [])
+    return Ledger(run_id="run-1", source=source, mode="code", root="/tmp/x", snapshot={}, dry_run=False,
+                  rounds=[r1, r2, r3], opinions=opinions or {})
+
+
+def write_round_file(run_dir, no, name, payload):
+    (run_dir / f"round-{no}").mkdir(exist_ok=True)
+    (run_dir / f"round-{no}" / name).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
 
 class RenderTest(unittest.TestCase):
@@ -127,7 +143,8 @@ class RenderTest(unittest.TestCase):
             decision("R2", OUTCOME_ADJUDICATE, None, ["판정이 갈림: a=아님, b=사실", "판가름: 아님", "판가름: 원문 그대로"]),
             decision("R3", OUTCOME_DESIGN, None, ["설계 결정 필요 여부 갈림", "판가름: 작성자가 정한다"]),
         ]
-        text = report.render(make_ledger(findings, decisions, opinions={"R1": "의견"}), dry_run=True)
+        ledger = make_ledger(findings, decisions, opinions={"R1": "의견"}, events=[{"step": "opinion:R1"}])
+        text = report.render(ledger, dry_run=True)
         table = section(text, "## 회차별 지적과 채택 경로")
         self.assertIn("| 1 | 3 | 0 | 3 | 0 | 1 | 3 |", table)
 
@@ -339,7 +356,8 @@ class RenderTest(unittest.TestCase):
         self.assertIn("확인 결과", replies)
         self.assertIn("코드에 없음", replies)
         self.assertIn("thread T4:", replies)
-        self.assertIn("검토 중입니다. 설계결정", replies)
+        self.assertIn("thread T4:\n검토 중입니다.\n", replies)
+        self.assertNotIn("설계결정", replies)
         self.assertNotIn("F5", replies)
         resolve = section(text, "### resolve 대상")
         self.assertIn("T1", resolve)
@@ -755,6 +773,141 @@ class PreparedTest(unittest.TestCase):
             report.write_prepared(run_dir, ledger)
             self.assertEqual(json.loads((run_dir / "prepared" / "replies.json").read_text(encoding="utf-8")), {})
             self.assertEqual(json.loads((run_dir / "prepared" / "resolve.json").read_text(encoding="utf-8")), [])
+
+
+class ReplyDraftTest(unittest.TestCase):
+    def _replies(self, findings, decisions, results=None, apply=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            if results is not None:
+                write_round_file(run_dir, 1, "results.json", results)
+            if apply is not None:
+                write_round_file(run_dir, 1, "apply.json", apply)
+            report.write_prepared(run_dir, make_ledger(findings, decisions, source="pr-comment"))
+            prepared = run_dir / "prepared"
+            return (json.loads((prepared / "replies.json").read_text(encoding="utf-8")),
+                    json.loads((prepared / "resolve.json").read_text(encoding="utf-8")))
+
+    def test_replies_hide_internal_reasons(self):
+        findings = [finding(f"F{i}", thread_id=f"T{i}", body=f"지적 {i}\n둘째 줄") for i in range(1, 8)]
+        decisions = [
+            decision("F1", OUTCOME_AGREED_FACT, "a", ["검증기 없음"]),
+            decision("F2", OUTCOME_ADJUDICATE, "adjudicator", ["패치가 다름", "판가름: b가 맞다"]),
+            decision("F3", OUTCOME_ADJUDICATE, None, ["판정이 갈림: a=사실, b=아님", "판가름: 아님", "판가름: 이미 있다"]),
+            decision("F4", OUTCOME_UNDECIDABLE, None, ["보안 경로"]),
+            decision("F5", OUTCOME_AGREED_NO, None, ["a: 짧은 a", "b: 짧은 b"]),
+            decision("F6", OUTCOME_AGREED_NO, None, ["a: 코드에 없음", "b: 코드에 없음"]),
+            decision("F7", OUTCOME_ADJUDICATE, None, ["판정이 갈림: a=사실, b=아님", "판가름: 아님"]),
+        ]
+        results = {
+            "F3:a": worker("F3", "a", "고쳐야 한다"),
+            "F3:b": worker("F3", "b", "이미 있다"),
+            "F5:a": worker("F5", "a", "A 근거 상세"),
+            "F5:b": worker("F5", "b", "B 근거 상세"),
+        }
+        replies, _ = self._replies(findings, decisions, results)
+        self.assertEqual(replies, {
+            "T1": "반영했습니다. 지적 1",
+            "T2": "반영했습니다. 지적 2",
+            "T3": "확인 결과 고치지 않았습니다. 이미 있다",
+            "T4": "검토 중입니다.",
+            "T5": "확인 결과 고치지 않았습니다. A 근거 상세 / B 근거 상세",
+            "T6": "확인 결과 고치지 않았습니다. 코드에 없음",
+            "T7": "확인 결과 고치지 않았습니다.",
+        })
+
+    def test_rebuttal_reply_prefers_adjudicator_result(self):
+        findings = [finding("F1", thread_id="T1")]
+        decisions = [decision("F1", OUTCOME_ADJUDICATE, None, ["패치가 다름", "판가름: 아님", "판가름: 짧은 판가름"])]
+        results = {"F1:adjudicator": worker("F1", "adjudicator", "판가름 상세 근거\n")}
+        replies, _ = self._replies(findings, decisions, results)
+        self.assertEqual(replies["T1"], "확인 결과 고치지 않았습니다. 판가름 상세 근거")
+
+    def test_one_thread_with_two_findings_merges_replies(self):
+        findings = [finding("F1", thread_id="T1", body="고칠 것"), finding("F2", thread_id="T1", body="아닌 것")]
+        decisions = [decision("F1", OUTCOME_AGREED_FACT, "a", []),
+                     decision("F2", OUTCOME_AGREED_NO, None, ["a: 코드에 없음", "b: 코드에 없음"])]
+        replies, resolve = self._replies(findings, decisions)
+        self.assertEqual(replies, {"T1": "> 고칠 것\n반영했습니다.\n\n> 아닌 것\n확인 결과 고치지 않았습니다. 코드에 없음"})
+        self.assertEqual(resolve, [])
+
+    def test_thread_resolved_only_when_every_finding_applied(self):
+        findings = [finding("F1", thread_id="T1", body="고칠 것 1"), finding("F2", thread_id="T1", body="고칠 것 2"),
+                    finding("F3", thread_id="T2", body="고칠 것 3"), finding("F4", thread_id="T2", body="고칠 것 4")]
+        decisions = [decision(fid, OUTCOME_AGREED_FACT, "a", []) for fid in ("F1", "F2", "F3", "F4")]
+        replies, resolve = self._replies(findings, decisions, apply={"applied": ["F1", "F2", "F3"],
+                                                                     "failed": [["F4", "충돌"]]})
+        self.assertEqual(resolve, ["T1"])
+        self.assertEqual(replies["T2"], "> 고칠 것 3\n반영했습니다.\n\n> 고칠 것 4\n적용 실패: 충돌. 검토 중입니다.")
+
+
+class RerunRoundsTest(unittest.TestCase):
+    def test_resolve_follows_final_decision(self):
+        ledger = rerun_ledger(decision("r1-03", OUTCOME_AGREED_FACT, "a", []),
+                              decision("r1-03", OUTCOME_UNDECIDABLE, None, ["둘 다 검증 실패"]))
+        text = report.render(ledger, False)
+        self.assertIn("thread T3:\n검토 중입니다.\n", section(text, "### PR 답글 초안"))
+        self.assertNotIn("- T3", section(text, "### resolve 대상"))
+        readopted = rerun_ledger(decision("r1-03", OUTCOME_UNDECIDABLE, None, ["둘 다 검증 실패"]),
+                                 decision("r1-03", OUTCOME_AGREED_FACT, "a", []))
+        self.assertIn("- T3", section(report.render(readopted, False), "### resolve 대상"))
+
+    def test_reviewer_column_counts_only_round_with_opinion_event(self):
+        ledger = rerun_ledger(decision("r1-03", OUTCOME_AGREED_FACT, "a", []),
+                              decision("r1-03", OUTCOME_UNDECIDABLE, None, ["판가름 못 정함"]),
+                              source="codex-code", opinions={"r1-03": "회차 3 의견"},
+                              r3_events=[{"step": "opinion:r1-03", "at": "2026-10-17T10:00:00+00:00"}])
+        table = section(report.render(ledger, False), "## 회차별 지적과 채택 경로")
+        self.assertIn("| 2 | 1 | 1 | 0 | 0 | 0 | 0 |", table)
+        self.assertIn("| 3 | 1 | 0 | 1 | 0 | 1 | 1 |", table)
+
+    def test_apply_failure_in_later_round_keeps_earlier_applied_commit(self):
+        ledger = rerun_ledger(decision("r1-03", OUTCOME_AGREED_FACT, "a", []), decision("r1-03", OUTCOME_AGREED_FACT, "a", []))
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            write_round_file(run_dir, 2, "apply.json", {"applied": ["r1-03"], "failed": []})
+            write_round_file(run_dir, 3, "apply.json", {"applied": [], "failed": [["r1-03", "patch failed"]]})
+            report.write_prepared(run_dir, ledger)
+            prepared = run_dir / "prepared"
+            message = (prepared / "commit-message.txt").read_text(encoding="utf-8")
+            replies = json.loads((prepared / "replies.json").read_text(encoding="utf-8"))
+            resolve = json.loads((prepared / "resolve.json").read_text(encoding="utf-8"))
+        self.assertEqual(message, "fix: 같은 지적\n\n- r1-03 src/a.py:10: 같은 지적\n")
+        self.assertEqual(replies, {"T3": "적용 실패: patch failed. 검토 중입니다."})
+        self.assertEqual(resolve, [])
+
+
+class ReportMinorTest(unittest.TestCase):
+    def test_commit_bullet_without_body_has_no_trailing_space(self):
+        ledger = make_ledger([finding("F1", body=""), finding("F2", body="둘째")],
+                             [decision("F1", OUTCOME_AGREED_FACT, "a"), decision("F2", OUTCOME_AGREED_FACT, "a")])
+        bullets = [line for line in report._commit_message(ledger, {}).splitlines() if line.startswith("- ")]
+        self.assertEqual(bullets, ["- F1 src/a.py:10", "- F2 src/a.py:10: 둘째"])
+
+    def _undecidable(self, mode, adj_patch):
+        ledger = make_ledger([finding("r1-01", location="plan.md:3")],
+                             [decision("r1-01", OUTCOME_UNDECIDABLE, None, ["점검자 아니오", "판가름 패치 검증 실패"])])
+        ledger.mode = mode
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "round-1").mkdir()
+            if adj_patch:
+                (run_dir / "round-1" / "patch-r1-01-adj.diff").write_text("--- a/x\n+++ b/x\n", encoding="utf-8")
+            return section(report.render(ledger, False, run_dir=run_dir), "### 판단 불가")
+
+    def test_undecidable_patch_paths_follow_mode_and_adjudicator_patch(self):
+        doc = self._undecidable("doc", adj_patch=False)
+        self.assertIn("  - 패치 작성자: round-1/patch-r1-01-writer.diff", doc)
+        self.assertNotIn("patch-r1-01-a.diff", doc)
+        self.assertNotIn("patch-r1-01-b.diff", doc)
+        self.assertNotIn("patch-r1-01-adj.diff", doc)
+        self.assertIn("  - 패치 판가름: round-1/patch-r1-01-adj.diff", self._undecidable("doc", adj_patch=True))
+        code = self._undecidable("code", adj_patch=True)
+        self.assertIn("  - 패치 a: round-1/patch-r1-01-a.diff", code)
+        self.assertIn("  - 패치 b: round-1/patch-r1-01-b.diff", code)
+        self.assertIn("  - 패치 판가름: round-1/patch-r1-01-adj.diff", code)
+        self.assertNotIn("writer.diff", code)
+        self.assertNotIn("adj.diff", self._undecidable("code", adj_patch=False))
 
 
 class BaselineAndTimingTest(unittest.TestCase):

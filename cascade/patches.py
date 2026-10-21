@@ -12,10 +12,11 @@ INHERITED_GIT_ENV = ("GIT_INDEX_FILE", "GIT_DIR", "GIT_WORK_TREE")
 NO_HOOKS = ["-c", "core.hooksPath=/dev/null"]
 STDERR_TAIL = 500
 DROPPED_PREFIXES = ("index ", "similarity index ", "dissimilarity index ")
-GIT_HEADER = "diff --git a/"
-DIFF_FLAGS = ["--no-color", "--src-prefix=a/", "--dst-prefix=b/", "--no-renames", "--no-ext-diff", "--no-textconv", "--binary"]
+GIT_HEADER = "diff --git "
+DIFF_FLAGS = ["-U3", "--no-color", "--src-prefix=a/", "--dst-prefix=b/", "--no-renames", "--no-ext-diff", "--no-textconv", "--binary"]
 HUNK_HEADER = re.compile(r"^(@@ -\S+ \+\S+ @@).*$")
 SETUP_PATHS = "cascade-setup-paths"
+C_ESCAPES = {"a": "\a", "b": "\b", "t": "\t", "n": "\n", "v": "\v", "f": "\f", "r": "\r"}
 
 
 @dataclass
@@ -34,6 +35,10 @@ def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
 
 def _decode(data: bytes) -> str:
     return data.decode("utf-8", errors="replace")
+
+
+def is_lossy(diff: str) -> bool:
+    return "\ufffd" in diff
 
 
 def _git_checked(cwd: Path, *args: str) -> str:
@@ -102,8 +107,34 @@ def same(a: str, b: str) -> bool:
     return normalize(a) == normalize(b)
 
 
+def _unquote(rest: str) -> tuple[str, str] | None:
+    out = bytearray()
+    i = 1
+    while i < len(rest):
+        c = rest[i]
+        if c == '"':
+            return out.decode("utf-8", errors="replace"), rest[i + 1:]
+        if c != "\\":
+            out += c.encode("utf-8")
+            i += 1
+        elif rest[i + 1:i + 4].isdigit():
+            out.append(int(rest[i + 1:i + 4], 8))
+            i += 4
+        else:
+            out += C_ESCAPES.get(rest[i + 1:i + 2], rest[i + 1:i + 2]).encode("utf-8")
+            i += 2
+    return None
+
+
 def _git_header_path(line: str) -> str | None:
     rest = line[len(GIT_HEADER):]
+    if rest.startswith('"'):
+        first = _unquote(rest)
+        second = _unquote(first[1][1:]) if first and first[1].startswith(' "') else None
+        if second and not second[1] and first[0].startswith("a/") and second[0] == "b/" + first[0][2:]:
+            return first[0][2:]
+        return None
+    rest = rest[len("a/"):] if rest.startswith("a/") else ""
     size = (len(rest) - len(" b/")) // 2
     if size > 0 and rest[:size] == rest[size + len(" b/"):] and rest[size:size + 3] == " b/":
         return rest[:size]

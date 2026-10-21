@@ -51,7 +51,8 @@ def toml_value(value) -> str:
 
 def write_worktree_toml(src: Path, repo: Path, wt: Path, dest: Path) -> None:
     data = tomllib.loads(src.read_text(encoding="utf-8")) if src.is_file() else {}
-    entry = data.get("repos", {}).get(str(repo.resolve()))
+    root = repo.resolve()
+    entry = next((v for k, v in data.get("repos", {}).items() if Path(k).expanduser().resolve() == root), None)
     lines = ["[repos]"]
     if entry is not None:
         key = json.dumps(str(wt))

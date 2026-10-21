@@ -23,7 +23,7 @@ from cascade.consensus import (
 )
 from cascade.findings import Finding
 from cascade.jobs import ROLES, AdjInput, location_file, split_location, write_job_args
-from cascade.patches import DIFF_FLAGS, changed_files, record_setup_paths
+from cascade.patches import DIFF_FLAGS, changed_files, is_lossy, record_setup_paths
 from cascade.review import REVIEWER_CLAUDE, REVIEWER_CURSOR, claude_prompt, review_job
 from cascade.rounds import STATUS_DONE, Ledger, RoundRecord, ledger_path, needs_recheck
 from cascade.runners import STATUS_OK, cursor_available
@@ -76,6 +76,8 @@ DOC_SOURCES = (SOURCE_DOC, "claude-doc", "cursor-doc")
 SOURCE_PR = "pr-comment"
 EXTERNAL_PREFIX = "외부/"
 REASON_NO_PATCH = "패치 없음"
+REASON_NON_UTF8 = "UTF-8 아닌 패치"
+REASON_OUTSIDE_DOCS = "문서 밖 파일 수정"
 CALL_FAILED = "호출 실패"
 BASELINE_TAG = "[기준선 실패·판정 제외] "
 REPRO_FILE = "repro-cmds.json"
@@ -611,6 +613,21 @@ def without_empty_patch(d: Decision, patches: dict[str, str], adjudicated: bool)
     if adjudicated or d.outcome != OUTCOME_AGREED_FACT:
         return Decision(d.finding_id, OUTCOME_UNDECIDABLE, None, [*d.reasons, REASON_NO_PATCH])
     return Decision(d.finding_id, OUTCOME_ADJUDICATE, None, [*d.reasons, REASON_NO_PATCH])
+
+
+def without_lossy_patch(d: Decision, patches: dict[str, str]) -> Decision:
+    if not is_adopted(d.to_dict()) or not is_lossy(patches.get(d.patch_from, "")):
+        return d
+    return Decision(d.finding_id, OUTCOME_UNDECIDABLE, None, [*d.reasons, REASON_NON_UTF8])
+
+
+def without_outside_docs(d: Decision, patches: dict[str, str], docs: dict[str, str]) -> Decision:
+    if not is_adopted(d.to_dict()):
+        return d
+    outside = [p for p in changed_files(patches.get(d.patch_from, "")) if p not in docs]
+    if not outside:
+        return d
+    return Decision(d.finding_id, OUTCOME_UNDECIDABLE, None, [*d.reasons, f"{REASON_OUTSIDE_DOCS}: {', '.join(outside)}"])
 
 
 def final_suite_cfg(cfg: RepoConfig | None, mode: str, root: Path, changed: list[str]) -> tuple[RepoConfig | None, str | None]:

@@ -41,7 +41,8 @@ def load_repo_config(root: Path, config_path: Path) -> RepoConfig | None:
         return None
     with config_path.open("rb") as f:
         data = tomllib.load(f)
-    entry = data.get("repos", {}).get(str(Path(root).resolve()))
+    root = Path(root).resolve()
+    entry = next((v for k, v in data.get("repos", {}).items() if Path(k).expanduser().resolve() == root), None)
     if entry is None:
         return None
     known = {f.name for f in fields(RepoConfig)}

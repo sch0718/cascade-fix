@@ -253,6 +253,73 @@ class VerifyTest(unittest.TestCase):
         self.assertIn("수정 전 rc=1 / 수정 후 rc=0", r[0].tail)
         self.assertIn("수정 전 rc=0 / 수정 후 rc=0", r[1].tail)
 
+    def test_repro_cmds_skip_comment_lines(self):
+        bare = "**확인한 내용**: 재현\n```sh\n# 재현 절차\npytest tests/test_a.py\n```\n"
+        self.assertEqual(verify.repro_cmds(finding(bare)), ["pytest tests/test_a.py"])
+        prompted = "**확인한 내용**: 재현\n```sh\n$ # 준비\n$ pytest tests/test_a.py\n# 출력\n```\n"
+        self.assertEqual(verify.repro_cmds(finding(prompted)), ["pytest tests/test_a.py"])
+        only = "**확인한 내용**: 재현\n```sh\n# 설명만 있다\n```\n"
+        self.assertEqual(verify.repro_cmds(finding(only)), [])
+
+    def test_related_tests_parenthesized_multiline_import(self):
+        repo = make_repo(self.tmp / "repo", {
+            "pkg/__init__.py": "",
+            "pkg/mod.py": "x = 1\n",
+            "tests/test_paren.py": "from pkg import (\n    other,\n    mod,\n)\n",
+            "tests/test_paren_other.py": "from pkg import (\n    other,\n)\nmod = 1\n",
+        })
+        self.assertEqual(verify.related_tests(repo, ["pkg/mod.py"]), ["tests/test_paren.py"])
+
+    def test_related_tests_ignores_stem_in_import_comment(self):
+        repo = make_repo(self.tmp / "repo", {
+            "pkg/mod.py": "x = 1\n",
+            "tests/test_other.py": "from pkg import other  # mod 대신 other를 쓴다\n",
+            "tests/test_paren_comment.py": "from pkg import (\n    other,  # mod 대신\n)\n",
+        })
+        self.assertEqual(verify.related_tests(repo, ["pkg/mod.py"]), [])
+
+    def test_related_tests_reads_each_test_file_once(self):
+        repo = make_repo(self.tmp / "repo", {
+            "src/a.py": "x\n", "src/b.py": "x\n", "src/c.py": "x\n",
+            "tests/test_x.py": "import os\n", "tests/test_y.py": "from src import b\n",
+        })
+        reads = []
+        orig = Path.read_text
+
+        def spy(path, *args, **kwargs):
+            reads.append(path.name)
+            return orig(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", spy):
+            found = verify.related_tests(repo, ["src/a.py", "src/b.py", "src/c.py"])
+        self.assertEqual(found, ["tests/test_y.py"])
+        self.assertEqual(sorted(reads), ["test_x.py", "test_y.py"])
+
+    def test_result_tail_keeps_last_tail_chars(self):
+        repo = make_repo(self.tmp / "repo", {"a.py": "x\n"})
+        r = verify.run_commands(repo, ["python3 -c \"print('A' * 3000 + 'END')\""])
+        self.assertEqual(len(r[0].tail), verify.TAIL_CHARS)
+        self.assertTrue(r[0].tail.endswith("END\n"))
+
+    def test_run_repro_reports_timeout_as_failure(self):
+        base = self.tmp / "base"
+        fix = self.tmp / "fix"
+        base.mkdir()
+        fix.mkdir()
+        with mock.patch.object(verify, "TIMEOUT", 0.2):
+            r = verify.run_repro(base, fix, ["sleep 5"])
+        self.assertFalse(r[0].ok)
+        self.assertIn("수정 전 rc=시간 초과 / 수정 후 rc=시간 초과", r[0].tail)
+
+    def test_check_doc_refs_checks_local_paths_starting_with_http(self):
+        repo = make_repo(self.tmp / "repo", {"a.py": "x\n", "http/real.py": "x\n"})
+        doc = repo / "doc.md"
+        doc.write_text(
+            "`httpx_client.py` 와 `http/server.py`, `http/real.py` 를 본다. https://h/a.py http://h/b.py\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(verify.check_doc_refs(repo, doc), ["http/server.py", "httpx_client.py"])
+
 
 if __name__ == "__main__":
     unittest.main()
