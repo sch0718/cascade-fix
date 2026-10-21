@@ -8,7 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from cascade import cli_steps  # noqa: E402
+from cascade import cli, cli_steps  # noqa: E402
 from cascade.rounds import Ledger, RoundRecord  # noqa: E402
 from cascade.snapshot import commit_worktree  # noqa: E402
 from helpers import git, make_repo, run_cli, write_repos_toml  # noqa: E402
@@ -534,12 +534,23 @@ class CliCodexResultTest(CliTestBase):
         log.write_text("codex 시작\nERROR: stream disconnected\n", encoding="utf-8")
         final = Path(f"{log}.final")
         final.write_text("\n", encoding="utf-8")
-        p = self.opinion(final)
-        self.assertNotEqual(p.returncode, 0)
-        self.assertIn("비어 있다", p.stdout)
-        self.assertIn("stream disconnected", p.stdout)
-        self.assertNotIn("인증 실패 흔적", p.stdout)
-        self.assertIn("codex login", p.stdout)
+        with self.assertRaises(cli_steps.CliError) as ctx:
+            cli._external_result_text(final, "의견", "codex")
+        message = str(ctx.exception)
+        self.assertIn("비어 있다", message)
+        self.assertIn("stream disconnected", message)
+        self.assertNotIn("인증 실패 흔적", message)
+        self.assertIn("codex login", message)
+
+    def test_empty_opinion_final_after_run_error_falls_back_to_claude(self):
+        log = self.run_to_opinion()
+        log.write_text("codex 시작\nERROR: stream disconnected\n", encoding="utf-8")
+        final = Path(f"{log}.final")
+        final.write_text("\n", encoding="utf-8")
+        p = self.cli("opinion", "--run-dir", str(self.run_dir), "--round", "1", "--id", "r1-02", "--result", str(final))
+        self.assertIn("대체: code.opinion codex → claude — 실행 오류", p.stdout)
+        self.assertNotIn("r1-02", self.ledger().opinions)
+        self.assertTrue((self.run_dir / "round-1" / "opinion-args.json").is_file())
 
     def test_missing_log_is_reported(self):
         log = self.run_to_opinion()

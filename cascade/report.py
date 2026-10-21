@@ -2,7 +2,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-from cascade.cli_steps import exhausted_runners
+from cascade.cli_steps import exhausted_runners, review_cell
 from cascade.consensus import (
     OUTCOME_ADJUDICATE,
     OUTCOME_AGREED_FACT,
@@ -200,6 +200,10 @@ def _has_adjudication_note(reasons: list[str], opus: str) -> bool:
     return any(r.startswith(prefix) and r[len(prefix):].strip() == opus for r in reasons)
 
 
+def _review_label(ledger: Ledger, role: str) -> str:
+    return reviewer_label(review_cell(ledger, role)["runner"])
+
+
 def _indent_reasons(lines: list[str]) -> list[str]:
     return [f"  - {line}" for line in lines]
 
@@ -228,7 +232,7 @@ def _bucket_section(name: str, items: list[tuple[int, dict, dict]], ledger: Ledg
                 out.append(f"  - Opus: {opus}")
             opinion = ledger.opinions.get(fid)
             if opinion:
-                out.append(f"  - {reviewer_label(ledger.reviewer)} 의견:")
+                out.append(f"  - {_review_label(ledger, 'opinion')} 의견:")
                 out.extend(f"    > {line}" for line in opinion.splitlines()[:OPINION_MAX_LINES])
             out.append(f"  - 패치 a: round-{round_no}/patch-{fid}-a.diff")
             out.append(f"  - 패치 b: round-{round_no}/patch-{fid}-b.diff")
@@ -402,11 +406,11 @@ def _calls_section(ledger: Ledger, run_dir: Path | None) -> list[str]:
     out = ["## 호출 수와 시간", "", "| 역할 | 호출 수 |", "| --- | ---: |"]
     for role in WORKER_ROLES:
         out.append(f"| {role} | {counts[role] if found else '-'} |")
-    name = reviewer_label(ledger.reviewer)
+    name = _review_label(ledger, "opinion")
     if ledger.source in CLAUDE_SOURCES:
         out.append(f"| {name} 첫 검토 | 1 |")
     out.append(f"| {name} 의견 | {len(ledger.opinions)} |")
-    out.append(f"| {name} 재검토 | {sum(1 for r in ledger.rounds if r.recheck_opened)} |")
+    out.append(f"| {_review_label(ledger, 'recheck')} 재검토 | {sum(1 for r in ledger.rounds if r.recheck_opened)} |")
     out.extend(["", "| 회차 | 소요 |", "| --- | ---: |"])
     out.extend(f"| {rnd.no} | {_elapsed(rnd)} |" for rnd in ledger.rounds)
     out.append("")
@@ -457,12 +461,12 @@ def render(ledger: Ledger, dry_run: bool, run_dir: Path | None = None) -> str:
     out = [f"# cascade-fix 보고서 {ledger.run_id}", ""]
     if dry_run:
         out.extend(["**적용하지 않음(dry-run)**", ""])
-    out.extend([f"출처: {ledger.source} · 모드: {ledger.mode} · 검토자: {reviewer_label(ledger.reviewer)} · 상태: {ledger.status}", ""])
+    out.extend([f"출처: {ledger.source} · 모드: {ledger.mode} · 검토자: {_review_label(ledger, 'opinion')} · 상태: {ledger.status}", ""])
     out.extend(
         [
             "## 회차별 지적과 채택 경로",
             "",
-            f"| 회차 | 지적 | 합의 | 판가름 회부 | 판가름 채택 | {reviewer_label(ledger.reviewer)} 검토 | 사람 |",
+            f"| 회차 | 지적 | 합의 | 판가름 회부 | 판가름 채택 | {_review_label(ledger, 'opinion')} 검토 | 사람 |",
             "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
             *[_round_row(rnd, ledger) for rnd in ledger.rounds],
             "",

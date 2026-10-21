@@ -382,16 +382,24 @@ def cmd_init(args) -> int:
         print("dry-run: 채택 패치를 작업 트리에 적용하지 않는다")
     if ledger.adopt_on_both_pass:
         print("한쪽 채택: 같은 판정에 패치가 달라도 둘 다 검증을 통과하면 작은 패치를 채택한다(판가름 안 함)")
-    if reviewer == REVIEWER_CLAUDE:
-        print(f"의견·재검토: Claude 단독({ledger.review_model}, {ledger.review_effort}) — 외부 전송 없음")
-    else:
-        script = s.review_script(ledger)
-        print(f"의견·재검토: {label(reviewer)}({script})")
-        if not script.is_file():
-            skill = "cursor-review" if reviewer == REVIEWER_CURSOR else "codex-review"
-            print(f"경고: {skill} 스킬이 없다. Claude 단독으로 돌리려면 --reviewer claude 로 다시 init 한다")
+    _print_review_cells(ledger)
     _print_next(ledger, snap.run_dir)
     return 0
+
+
+def _print_review_cells(ledger: Ledger) -> None:
+    opinion, recheck = (s.review_cell(ledger, role) for role in ("opinion", "recheck"))
+    same = all(opinion[k] == recheck[k] for k in ("runner", "model", "effort"))
+    for what, role in (("의견·재검토", "opinion"),) if same else (("의견", "opinion"), ("재검토", "recheck")):
+        cell = s.review_cell(ledger, role)
+        if cell["runner"] == REVIEWER_CLAUDE:
+            print(f"{what}: Claude 단독({cell['model']}, {cell['effort']}) — 외부 전송 없음")
+            continue
+        script = s.review_script(ledger, role)
+        print(f"{what}: {label(cell['runner'])}({script})")
+        if not script.is_file():
+            skill = "cursor-review" if cell["runner"] == REVIEWER_CURSOR else "codex-review"
+            print(f"경고: {skill} 스킬이 없다. Claude 단독으로 돌리려면 --reviewer claude 로 다시 init 한다")
 
 
 def _print_assignment(resolved: profiles.Resolved, roles: dict, substituted: list[dict], mode: str) -> None:
@@ -835,8 +843,8 @@ def cmd_adjudicate(args) -> int:
                                  snap.worktrees.get(s.base_name(rnd)) or ledger.root))
         new_decisions.append(new.to_dict())
     rnd.decisions = new_decisions
-    if opinion_jobs and s.is_claude(ledger):
-        s.write_review_args(rd, s.OPINION_ARGS, ledger, opinion_jobs)
+    if opinion_jobs and s.is_claude(ledger, "opinion"):
+        s.write_review_args(rd, s.OPINION_ARGS, ledger, opinion_jobs, "opinion")
     s.write_json(rd / "results.json", merged)
     s.write_json(rd / "verify.json", verify)
     s.write_json(rd / "decisions.json", rnd.decisions)
@@ -856,22 +864,20 @@ def _claude_opinions(args, run_dir: Path, ledger: Ledger, rnd: RoundRecord) -> i
     results = read_review_results(s.read_json(Path(args.results)))
     for fid in pending:
         text, model_id = results.get(s.opinion_job_id(fid), ("", None))
-        warning = model_warning(s.opinion_job_id(fid), model_id, ledger.review_model)
+        warning = model_warning(s.opinion_job_id(fid), model_id, s.review_cell(ledger, "opinion")["model"])
         if warning:
             print(warning)
         if not text.strip():
             print(f"경고: {fid} Claude 의견이 없다(호출 실패). 「{CALL_FAILED_NOTE}」로 적고 넘어간다")
             text = CALL_FAILED_NOTE
         ledger.opinions[fid] = text.strip()
-        s.mark(rnd, f"opinion:{fid}")
+        s.mark(rnd, f"opinion:{fid}", **s.review_fallback_event(ledger, "opinion"))
     s.save_ledger(run_dir, ledger)
     print(f"Claude 의견 {len(pending)}건을 원장에 붙였다(자동 채택하지 않는다)")
     _print_next(ledger, run_dir)
     return 0
 
 
-EXTERNAL_AUTH_FAILURE = re.compile(r"\b401\b|unauthori[sz]ed|refresh[ _]token|codex login|not logged in|Authentication required", re.IGNORECASE)
-EXTERNAL_USAGE_LIMIT = re.compile(r"usage limit", re.IGNORECASE)
 EXTERNAL_LOG_TAIL_LINES = 5
 LOGIN_COMMANDS = {REVIEWER_CODEX: "codex login", REVIEWER_CURSOR: "cursor-agent login"}
 
@@ -891,9 +897,9 @@ def _external_result_text(result: Path, what: str, reviewer: str) -> str:
         tail = log_text.strip().splitlines()[-EXTERNAL_LOG_TAIL_LINES:]
         lines.append(f"실행 로그: {log}")
         lines.extend(f"  | {line}" for line in tail)
-        if EXTERNAL_AUTH_FAILURE.search(log_text):
+        if s.EXTERNAL_AUTH_FAILURE.search(log_text):
             lines.append("로그에 인증 실패 흔적이 있다(401·refresh token·Authentication required).")
-        if EXTERNAL_USAGE_LIMIT.search(log_text):
+        if s.EXTERNAL_USAGE_LIMIT.search(log_text):
             lines.append("로그에 이용 한도 도달 흔적이 있다(usage limit). 한도가 풀린 뒤 RR을 다시 돌린다.")
     lines.append(f"인증 실패면 터미널에서 `{LOGIN_COMMANDS.get(reviewer, LOGIN_COMMANDS[REVIEWER_CODEX])}`으로 다시 로그인한 뒤 RR을 다시 돌린다.")
     if reviewer == REVIEWER_CODEX:
@@ -912,11 +918,50 @@ def cmd_opinion(args) -> int:
     s.guard(rnd, f"opinion:{args.id}", args.force)
     if args.id not in {d["finding_id"] for d in rnd.decisions}:
         raise s.CliError(f"회차 {rnd.no}에 {args.id} 판정이 없다")
-    text = _external_result_text(Path(args.result), "의견", ledger.reviewer)
+    runner = s.review_cell(ledger, "opinion")["runner"]
+    failure = s.external_failure(Path(args.result))
+    if failure in s.FAILURE_REASONS and runner != REVIEWER_CLAUDE:
+        return _opinion_fallback(args, run_dir, ledger, rnd, failure)
+    text = _external_result_text(Path(args.result), "의견", runner)
     ledger.opinions[args.id] = text
-    s.mark(rnd, f"opinion:{args.id}")
+    s.mark(rnd, f"opinion:{args.id}", **s.review_fallback_event(ledger, "opinion"))
     s.save_ledger(run_dir, ledger)
-    print(f"{args.id} {label(ledger.reviewer)} 의견을 원장에 붙였다(자동 채택하지 않는다)")
+    print(f"{args.id} {label(runner)} 의견을 원장에 붙였다(자동 채택하지 않는다)")
+    _print_next(ledger, run_dir)
+    return 0
+
+
+def _substitute_review(ledger: Ledger, role: str, failure: str, what: str, result: str) -> dict:
+    old = s.review_cell(ledger, role)["runner"]
+    new = s.substitute_review(ledger, role, s.FAILURE_REASONS[failure])
+    print(f"{label(old)} {what} 결과가 없다({s.FAILURE_REASONS[failure]} 흔적): {result}")
+    print(f"대체: {ledger.mode}.{role} {old} → {new['runner']} — {s.FAILURE_REASONS[failure]}")
+    return new
+
+
+def _opinion_fallback(args, run_dir: Path, ledger: Ledger, rnd: RoundRecord, failure: str) -> int:
+    new = _substitute_review(ledger, "opinion", failure, "의견", args.result)
+    if new["runner"] == REVIEWER_CLAUDE:
+        rd = s.round_dir(run_dir, rnd.no)
+        fids = [fid for fid in sorted({*s.pending_opinions(ledger, rd), args.id}) if (rd / f"opinion-{fid}.md").is_file()]
+        repo = s.snapshot_of(ledger).worktrees.get(s.base_name(rnd)) or ledger.root
+        items = [(s.opinion_job_id(fid), f"{fid} opinion", s.read_text(rd / f"opinion-{fid}.md"), repo) for fid in fids]
+        s.write_review_args(rd, s.OPINION_ARGS, ledger, items, "opinion")
+    s.save_ledger(run_dir, ledger)
+    _print_next(ledger, run_dir)
+    return 0
+
+
+def _recheck_fallback(args, run_dir: Path, ledger: Ledger, rnd: RoundRecord, failure: str) -> int:
+    new = _substitute_review(ledger, "recheck", failure, "재검토", args.result)
+    if new["runner"] == REVIEWER_CLAUDE:
+        rd = s.round_dir(run_dir, rnd.no)
+        repo_file = rd / s.RECHECK_REPO_FILE
+        repo = repo_file.read_text(encoding="utf-8").strip() if repo_file.is_file() else ledger.root
+        prompt = s.read_text(rd / "recheck-prompt.md")
+        s.write_review_args(rd, s.RECHECK_ARGS, ledger, [(s.recheck_job_id(rnd.no), f"회차 {rnd.no} recheck", prompt, repo)],
+                            "recheck")
+    s.save_ledger(run_dir, ledger)
     _print_next(ledger, run_dir)
     return 0
 
@@ -1044,8 +1089,9 @@ def cmd_apply(args) -> int:
         prompt = build_recheck_prompt(adopted, diff, ledger.mode)
         (rd / "recheck-prompt.md").write_text(prompt, encoding="utf-8")
         (rd / s.RECHECK_REPO_FILE).write_text(recheck_repo + "\n", encoding="utf-8")
-        if s.is_claude(ledger):
-            s.write_review_args(rd, s.RECHECK_ARGS, ledger, [(s.recheck_job_id(rnd.no), f"회차 {rnd.no} recheck", prompt, recheck_repo)])
+        if s.is_claude(ledger, "recheck"):
+            s.write_review_args(rd, s.RECHECK_ARGS, ledger,
+                                [(s.recheck_job_id(rnd.no), f"회차 {rnd.no} recheck", prompt, recheck_repo)], "recheck")
         s.write_json(rd / s.RECHECK_SCOPE_FILE, scope)
         rnd.recheck_opened = True
         print(f"재검토 필요: {rd / 'recheck-prompt.md'} (--repo {recheck_repo})")
@@ -1088,14 +1134,18 @@ def cmd_recheck(args) -> int:
     if not rnd.recheck_opened:
         raise s.CliError(f"회차 {rnd.no}은 재검토를 열지 않았다")
     is_json = args.result.endswith(".json")
+    cell = s.review_cell(ledger, "recheck")
     if not is_json:
-        _external_result_text(Path(args.result), "재검토", ledger.reviewer)
+        failure = s.external_failure(Path(args.result))
+        if failure in s.FAILURE_REASONS and cell["runner"] != REVIEWER_CLAUDE:
+            return _recheck_fallback(args, run_dir, ledger, rnd, failure)
+        _external_result_text(Path(args.result), "재검토", cell["runner"])
     elif not Path(args.result).is_file():
         raise s.CliError(f"파일이 없다: {args.result}")
     text, model_id = load_text(Path(args.result), s.recheck_job_id(rnd.no) if is_json else None)
     if not text.strip():
         raise s.CliError(f"재검토 결과가 비어 있다(Workflow 호출 실패일 수 있다). 재검토 Workflow를 다시 돌린다: {args.result}")
-    warning = model_warning(s.recheck_job_id(rnd.no), model_id, ledger.review_model)
+    warning = model_warning(s.recheck_job_id(rnd.no), model_id, cell["model"])
     if warning:
         print(warning)
     rd = s.round_dir(run_dir, rnd.no)
@@ -1126,7 +1176,7 @@ def cmd_recheck(args) -> int:
         rnd.hold_findings.append(f.to_dict())
         rnd.decisions.append(Decision(f.id, OUTCOME_UNDECIDABLE, None, [reason]).to_dict())
     s.write_json(rd / "decisions.json", rnd.decisions)
-    s.mark(rnd, "recheck")
+    s.mark(rnd, "recheck", **s.review_fallback_event(ledger, "recheck"))
     print(f"해소 {sum(1 for v in resolved.values() if v)}건, 해소 안 됨 {len(unresolved)}건, 새 지적 {len(new)}건")
     next_round += carried
     print(f"다음 회차 {len(next_round)}건(적용 못 해 넘긴 {len(carried)}건 포함), "
