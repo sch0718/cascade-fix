@@ -9,6 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from cascade.findings import parse_codex_doc  # noqa: E402
 from helpers import make_repo  # noqa: E402
 
 # CASCADE_RUN_REVIEW를 주면 그 스크립트를 시험한다(예: docs/codex-review-changes/run-review.sh)
@@ -160,6 +161,17 @@ class RunReviewModesTest(unittest.TestCase):
         self.assertEqual(args[args.index("-C") + 1], str(self.repo))
         self.assertIn("설계 문서를 리뷰하라", args[-1])
         self.assertIn("mode=doc kind=spec", proc.stdout)
+
+    def test_doc_output_format_example_matches_finding_parser(self):
+        doc = self.repo / "a.md"
+        for kind in ("spec", "plan"):
+            proc = self.run_script("--doc", str(doc), "--kind", kind, "--out", str(self.out))
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            prompt = self.captured_args()[-1]
+            self.assertIn("번호를 붙이고", prompt)
+            example = prompt.split("예:\n", 1)[1].split("SUMMARY:", 1)[0]
+            [finding] = parse_codex_doc(example, 1)
+            self.assertEqual(finding.severity, "Critical")
 
     def test_usage_lists_new_modes(self):
         proc = self.run_script()
