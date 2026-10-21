@@ -32,7 +32,7 @@ PYTHONPATH="${CLAUDE_SKILL_DIR}" python3 -m cascade.cli
 1. **상황 판정** — 대상 저장소 루트에서 `CF detect`(읽기만 한다). 결과 파일을 받았으면 `--input <파일>`, PR 번호를 들었으면 `--pr <번호>`, 검토할 설계·계획 문서를 들었으면 `--doc <문서>`(여러 개면 반복)를 붙인다. `--json`이면 기계로 읽기 좋다.
    - `ok=아니오`(종료 코드 6)면 「멈춤:」 줄을 사용자에게 보이고 끝낸다. 「처리할 것이 없다」면 무엇을 검토할지(브랜치·커밋·문서) 묻는다. 이미 커밋한 문서는 변경으로 잡히지 않으니 `--doc`으로 다시 판정한다.
    - 추천 근거: 결과 파일 > 지정한 문서(`--doc`) > 해결 안 된 PR 리뷰 스레드 > 커밋하지 않은 변경 > 기준 브랜치보다 앞선 커밋. 바뀐 파일이 모두 문서면 문서 모드. 코드와 문서가 섞였으면 코드 모드로 가고, 문서만 따로 보는 `detect --doc` 명령을 「참고:」로 낸다.
-2. **계획 확인(한 번)** — AskUserQuestion 한 번으로 계획을 보이고 고르게 한다. 내용: 입력(`--source`)·모드·프로필(`프로필:`·`역할:`·`덮음:`·`대체:` 줄), `detect`의 규모(Claude 첫 검토가 있으면 그 1개 + 지적 1건당 에이전트 수), 「확인 필요:」 항목(검증 명령 등록 후보, 전송 동의), 「참고:」 항목. 선택지는 「진행(권장)」, 「Critical·Warning만」(→ `init --severity Critical,Warning`), 「dry-run」(→ `init --dry-run`, 작업 트리를 건드리지 않음), 그리고 직접 입력.
+2. **계획 확인(한 번)** — AskUserQuestion 한 번으로 계획을 보이고 고르게 한다. 내용: 입력(`--source`)·모드·프로필(`detect`의 `프로필:`·`덮음:`·`역할:` 줄, `참고: 대체: …`), `detect`의 규모(Claude 첫 검토가 있으면 그 1개 + 지적 1건당 에이전트 수), 「확인 필요:」 항목(검증 명령 등록 후보, 전송 동의), 「참고:」 항목. 선택지는 「진행(권장)」, 「Critical·Warning만」(→ `init --severity Critical,Warning`), 「dry-run」(→ `init --dry-run`, 작업 트리를 건드리지 않음), 그리고 직접 입력.
    - `전송 동의:` 줄이 있으면 같은 질문에서 수신처별로 동의를 받는다(「실행 전 확인」 1). 받은 동의는 `CF review`·`init`에 `--consent`로 넘긴다.
    - 검증 명령 등록이 필요하면 같은 질문에서 `detect`가 낸 후보 명령을 보이고 확인받는다. 승인되면 `~/.claude/cascade-fix/repos.toml`(없으면 만든다)에 `[repos."<저장소 루트>"]` 항목을 적는다. 형식은 스킬 디렉터리의 `repos.toml` 머리 주석에 있다.
    - 사용자가 처음부터 `/cascade-fix`로 부르며 옵션까지 정했거나 「묻지 말고 진행」이라고 했으면 이 질문을 건너뛴다.
@@ -61,7 +61,7 @@ PYTHONPATH="${CLAUDE_SKILL_DIR}" python3 -m cascade.cli
 | `local`(측정 전 잠정값) | Codex | `code.a`만 Codex(`~/.codex/config.toml` 모델, low), 나머지 `default`와 같음 | 같음 | Codex | 켜짐 |
 
 - 칸마다 fallback이 있다. 내장 프로필의 fallback은 모두 `claude-only`의 같은 칸이다.
-- 고르는 순서: ① `--profile` ② 환경 변수 `CASCADE_PROFILE` ③ repos.toml 저장소 항목의 `profile` ④ repos.toml 최상위 `default_profile` ⑤ 내장 `default`. `init`·`detect`는 `프로필: <이름> (<출처>)`를 찍는다(출처: `--profile`·`CASCADE_PROFILE`·`repos.toml:repo`·`repos.toml:default_profile`·`builtin`). 이어서 `덮음:`(옛 옵션이 덮은 칸)·`대체:`(init이 바꾼 칸)·`역할:`(이 모드의 칸별 배정)이 나온다. 계획 확인 때 이 줄들을 보인다.
+- 고르는 순서: ① `--profile` ② 환경 변수 `CASCADE_PROFILE` ③ repos.toml 저장소 항목의 `profile` ④ repos.toml 최상위 `default_profile` ⑤ 내장 `default`. `init`·`detect`는 `프로필: <이름> (<출처>)`를 찍는다(출처: `--profile`·`CASCADE_PROFILE`·`repos.toml:repo`·`repos.toml:default_profile`·`builtin`). `init`은 이어서 `참고:`(폐기 예정 알림)·`덮음:`(옛 옵션이 덮은 칸)·`대체:`(바꾼 칸)·`역할:`(이 모드의 칸별 배정)·`전송 동의:`를 찍는다. `detect`는 `프로필:`·`덮음:`·`역할:`을 찍고 바꾼 칸은 `참고: 대체: …`로, 전송 동의는 `확인 필요: 전송 동의: …`로 보이며 폐기 예정 알림은 찍지 않는다. 계획 확인 때 `detect`의 이 줄들을 보인다.
 - 사용자 정의는 `~/.claude/cascade-fix/repos.toml`(또는 `CASCADE_REPOS_TOML`)의 `[profiles.<이름>]`이다. 칸 키에는 점이 있어 따옴표로 감싸고(`"code.a" = { runner = "codex", effort = "low" }`), 인라인 표는 반드시 한 줄에 적는다(TOML이 여러 줄 인라인 표를 받지 않아 파일을 읽지 못한다). 내장 이름과 같은 표는 그 프로필을 칸 단위로 덮고 `base`를 쓸 수 없다(오류). 새 이름은 `base = "<다른 프로필>"`로 시작하고 없으면 `default`에서 시작한다. **`[profiles.claude-only]`는 덮을 수 없다(오류).** 바꾸려면 `base = "claude-only"`로 새 이름을 만든다. 형식은 스킬 디렉터리의 `repos.toml`에 있다.
 - 프로필 설정 오류(모르는 이름·칸 키·값 키, 받지 않는 runner, runner와 모델 불일치, cursor의 effort, codex 검토 칸의 model·effort)는 종료 코드 5로 끝나고 어느 프로필·칸·키인지 한 줄을 낸다. 그 줄을 사용자에게 보이고 멈춘다. 프로필 이름이 틀렸으면 알려진 이름이 함께 나온다.
 - 칸의 runner를 바꾸면 모델·effort는 새 runner에 맞게 다시 정해진다(claude는 `claude-only` 값, codex는 모델 비움에 작업자는 effort `low`·검토 칸은 비움, cursor는 `--cursor-model`·effort 비움).
@@ -78,8 +78,8 @@ PYTHONPATH="${CLAUDE_SKILL_DIR}" python3 -m cascade.cli
 | `--adopt-on-both-pass` | `adopt_on_both_pass`를 참으로 |
 
 - runner를 정하는 옵션(`--workers`·`--reviewer`·`CASCADE_WORKERS`·`CASCADE_REVIEWER`)이 겨냥한 칸은 고정된다. 쓸 수 없는 CLI여도 init이 fallback으로 바꾸지 않는다(옛 동작). 모델만 바꾸는 옵션은 고정하지 않는다. 덮은 값은 검사를 다시 거치므로 금지 모델이면 어느 옵션 탓인지와 함께 종료 코드 5로 멈춘다.
-- `CASCADE_WORKERS`·`CASCADE_REVIEWER`는 프로필을 명시적으로 고르지 않았을 때(위 ⑤)만 읽고 `참고: 폐기 예정: CASCADE_PROFILE 또는 repos.toml profile을 쓴다`를 찍는다. 프로필을 명시했으면(①~④) 무시하고 무시했다고 한 줄 알린다. 값이 잘못됐으면 종료 코드 5다.
-- 사용 가능 여부: init이 칸의 runner를 쓸 수 없으면(미설치·로그인 필요·검토 스크립트 없음) fallback으로 바꾸고 `대체: <칸> codex → claude — 미설치 또는 로그인 필요`를 찍는다. `jobs`의 샌드박스 사전 점검이 한 번 더 바꿀 수 있다(「외부 작업자 칸」).
+- `CASCADE_WORKERS`·`CASCADE_REVIEWER`는 프로필을 명시적으로 고르지 않았을 때(위 ⑤)만 읽고 `init`이 `참고: 폐기 예정: CASCADE_PROFILE 또는 repos.toml profile을 쓴다`를 찍는다(`detect`는 찍지 않는다). 프로필을 명시했으면(①~④) 무시하고 무시했다고 한 줄 알린다. 값이 잘못됐으면 종료 코드 5다.
+- 사용 가능 여부: init이 칸의 runner를 쓸 수 없으면(미설치·로그인 필요뿐이다) fallback으로 바꾸고 `대체: <칸> codex → claude — 미설치 또는 로그인 필요`를 찍는다. 검토 스크립트(`RR`·`CR`)가 없는 경우는 init이 칸을 바꾸지 않고 `경고: … 스킬이 없다. … --reviewer claude 로 다시 init 한다`만 낸다. 그때는 `--reviewer claude`나 다른 프로필로 다시 init한다. 「검토 스크립트 없음」을 사유로 칸을 바꾸는 것은 첫 검토(`CF review`·`detect`)뿐이다. `jobs`의 샌드박스 사전 점검이 한 번 더 바꿀 수 있다(「외부 작업자 칸」).
 - 전송 동의는 「실행 전 확인」 1을 따른다.
 
 ### 검토 역할: 의견·재검토
@@ -117,9 +117,9 @@ PYTHONPATH="${CLAUDE_SKILL_DIR}" python3 -m cascade.cli
 1. **review** — 위와 같은 `CF review …`. 이 칸에 `--review-model`·`--review-effort`를 주면 종료 코드 5로 거절한다(두 옵션은 claude 칸에만 쓴다). 출력의 `검토자:` 줄이 실제 runner다. 쓸 수 없는 runner(미설치·검토 스크립트 없음)나 동의 밖 수신처면 `대체: <칸> codex → … — <사유>`와 함께 fallback으로 바뀐 명령이 나온다.
 2. **RR·CR** — 출력된 명령을 그대로 돌린다. codex 코드 모드는 `cd <저장소 루트> && RR …` 형태다. 한 번에 하나씩 돌린다(「규칙」).
 3. **실패하면** — 결과(`review.out.final`)가 없으면 로그(`review.out`) 끝을 본다.
-   - 한도(이용 한도·`CR` 종료 코드 75)·시간 초과·실행 오류: 멈추지 않고 `CF review --review-dir <처음 review_dir> --fallback-from <실패한 runner> --reason <사유> [--consent …]`를 돌린다. `--fallback-from`은 마지막으로 시도한 runner(`codex`·`cursor`)와 같아야 한다. 사유 기본값은 「실행 오류」다. 같은 폴더에 fallback 칸의 작업이 만들어지고 새 「다음:」이 나온다. 그 칸의 fallback도 외부 CLI면 또 실패할 수 있고, 그러면 같은 명령으로 이어 간다(예: codex → cursor → claude). 동의 밖이거나 이미 실패한 runner로는 가지 않는다. 마지막은 Claude(`claude-only` 값)다.
+   - 한도(이용 한도·`CR` 종료 코드 75)·시간 초과·실행 오류: 멈추지 않고 `CF review --review-dir <처음 review_dir> --fallback-from <실패한 runner> --reason <사유>`를 돌린다(동의 범위는 처음 `CF review`에 준 `--consent`가 `review-meta.json`에 남아 이어지므로 다시 주지 않는다). `--fallback-from`은 마지막으로 시도한 runner(`codex`·`cursor`)와 같아야 한다. 사유 기본값은 「실행 오류」다. 같은 폴더에 fallback 칸의 작업이 만들어지고 새 「다음:」이 나온다. 그 칸의 fallback도 외부 CLI면 또 실패할 수 있고, 그러면 같은 명령으로 이어 간다(예: codex → cursor → claude). 동의 밖이거나 이미 실패한 runner로는 가지 않는다. 마지막은 Claude(`claude-only` 값)다.
    - 로그인 만료(401·refresh token, `CR` 종료 코드 77): 대체하지 않고 멈춘다. 사용자에게 `codex login`(Cursor는 `cursor-agent login`)을 하라고 알리고 로그인 뒤 그 `RR`·`CR`부터 다시 돌린다.
-4. **init** — `CF init --source codex-code|cursor-code|… --input <review_dir>/review.out.final`. `review`의 「다음:」 줄을 그대로 쓴다. init은 같은 폴더의 `review-meta.json`을 읽어 첫 검토 이력(요청한 runner·실제 runner·시도 사슬)을 원장 `profile.first_review`에 넣고 보고서 「역할 배정」의 「첫 검토 이력」에 보인다. 이미 끝난 첫 검토라 첫 검토 칸은 init의 동의 줄·역할 줄에서 빠진다.
+4. **init** — `CF init --source codex-code|cursor-code|… --input <review_dir>/review.out.final`. `review`의 「다음:」 줄을 그대로 쓴다. init은 같은 폴더의 `review-meta.json`을 읽어 첫 검토 이력(요청한 runner·실제 runner·시도 사슬)을 원장 `profile.first_review`에 넣고 보고서 「역할 배정」의 「첫 검토 이력」에 보인다. 이미 끝난 첫 검토라 첫 검토 칸은 init의 동의 줄에서 빠지고, `review-meta.json`이 있으면 역할 줄에 `첫 검토(완료)=<runner 사슬>`(예: `Codex → Claude`)이 이력으로 보인다.
 
 ## 설계 단계에서 쓰기
 
@@ -182,7 +182,7 @@ Claude·Cursor·`codex-doc` 결과는 형식이 같아 형식으로는 가릴 �
 1. **init** — `CF init --source <종류> --input <결과 파일|PR 번호> [--doc <문서>…] [--dry-run] [--adopt-on-both-pass] [--max-rechecks N] [--severity Critical,Warning] [--profile <이름>] [--consent <codex,cursor|none>] [--reviewer auto|codex|cursor|claude] [--workers claude|external] [--cursor-model M] [--review-model M] [--review-effort E]`
    - 출력의 `run_dir=<경로>`를 이후 모든 명령에 `--run-dir`로 준다. 「규모:」 줄에 회차당 에이전트 수가 나온다(외부 runner를 쓰면 Claude·Codex·Cursor 호출 수로 나뉘고, 프로필을 명시했으면 끝에 runner별 합계가 붙는다). `프로필:`·`참고:`·`덮음:`·`대체:`·`역할:`·`전송 동의:` 줄이 먼저 나온다(「역할 배정」). `--profile`·`--consent`는 「첫 검토」의 `CF review`에 준 것과 같은 값을 준다.
    - `--severity`로 고르지 않은 등급의 지적은 처리하지 않고 처음부터 보류 후보로 둔다. 나중에 「지금 반영」으로 고르면 `resume`이 회차를 연다. 등급은 검토자가 붙인 것을 그대로 쓴다(다시 매기지 않는다).
-   - `--adopt-on-both-pass`(기본 꺼짐, 코드 모드만): 작업자 둘이 같은 판정(사실)에 둘 다 검증을 통과했는데 패치가 다르면, 판가름 대신 바뀐 줄이 적은 패치를 채택한다(같으면 a). 사유는 「둘 다 검증 통과: …」로 남고 보고서 합의 칸에 센다. 검증 명령이 하나도 안 돌았거나, 관련 테스트가 없어 테스트를 실제로 돌리지 못했거나, 한쪽 패치가 비었으면 판가름으로 간다. 보안 경로는 채택하지 않고 판단 불가로 보낸다. 측정 전이라 사용자가 요청할 때만 붙인다.
+   - `--adopt-on-both-pass`(내장 `default`는 꺼짐, `claude-only`·`local`은 켠 채로 시작, 코드 모드만): 작업자 둘이 같은 판정(사실)에 둘 다 검증을 통과했는데 패치가 다르면, 판가름 대신 바뀐 줄이 적은 패치를 채택한다(같으면 a). 사유는 「둘 다 검증 통과: …」로 남고 보고서 합의 칸에 센다. 검증 명령이 하나도 안 돌았거나, 관련 테스트가 없어 테스트를 실제로 돌리지 못했거나, 한쪽 패치가 비었으면 판가름으로 간다. 보안 경로는 채택하지 않고 판단 불가로 보낸다. 측정 전이라 사용자가 요청할 때만 붙인다.
    - 종료 코드 4: 검증 설정 없음(위 「실행 전 확인」 2). 5: 결과 파일·프로필 설정을 해석하지 못함 — 출력된 줄을 사용자에게 보이고 멈춘다.
    - 「지적 0건 — 원문을 확인하라」가 나오면 출력된 원문 앞부분을 사용자에게 보이고 끝낸다.
 2. **jobs** — `CF jobs --run-dir <run_dir> --round N` → `round-N/stage1-args.json`. 기준선(수정 전 base 워크트리)에서 build·typecheck·lint 명령을 한 번 돌려 이미 실패하는 명령을 `round-N/baseline.json`에 적는다(판정에서 제외). `tests` 명령은 기준선에서 실패해도 제외하지 않는다(지적이 곧 실패하는 테스트면 수정이 통과시켜야 한다).

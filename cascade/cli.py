@@ -1531,7 +1531,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--review-effort", choices=EFFORTS)
     p.add_argument("--consent", help="전송에 동의한 외부 수신처(codex,cursor 중 쉼표 구분, 또는 none). 기본: 이 프로필의 첫 검토 칸이 쓰는 수신처 전부")
     p.add_argument("--review-dir", help="--fallback-from으로 이력을 고칠 처음 첫 검토 폴더(review_dir=로 찍힌 곳)")
-    p.add_argument("--fallback-from", help="실패한 첫 검토 runner(codex·cursor). 처음 요청한 runner와 같아야 한다")
+    p.add_argument("--fallback-from", help="실패한 첫 검토 runner(codex·cursor). 마지막으로 시도한 runner와 같아야 한다")
     p.add_argument("--reason", help=f"--fallback-from의 사유(기본 {REVIEW_DEFAULT_REASON})")
     add("jobs", cmd_jobs, round_no=True)
     p = add("workers", cmd_workers, round_no=True)
