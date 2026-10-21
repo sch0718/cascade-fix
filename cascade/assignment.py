@@ -108,7 +108,9 @@ def resolve_auto(roles: dict, source: str, run_review: Path, cursor_ok: bool | C
             continue
         runner = RUNNER_CLAUDE if _role(key) == "review" else resolve(REVIEWER_AUTO, source, run_review, cursor_ok)
         if runner == RUNNER_CLAUDE:
-            cell["runner"] = RUNNER_CLAUDE
+            default = profiles.builtin("claude-only")["roles"][key]
+            cell.update(runner=RUNNER_CLAUDE, model=cell["model"] or default["model"],
+                        effort=cell["effort"] or default["effort"])
         else:
             out[key] = {**profiles.reset_cell(key, runner, cursor_model), "fallback": cell["fallback"]}
     profiles.validate(name, {"adopt_on_both_pass": True, "roles": out})

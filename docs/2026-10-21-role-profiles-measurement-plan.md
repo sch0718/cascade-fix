@@ -197,6 +197,8 @@ base = "claude-only"
   - 재현율 = 그 검토자가 찾은 「사실」 / 합친 목록의 「사실」 전체
   - 등급별(Critical·Warning·Suggestion)로도 나눈다. 비용(Fable 토큰, Codex·Cursor 토큰)도 함께 적는다.
 - **코드 모드 첫 검토**도 같은 방식으로 실제 코드 검토(`--base`·`--uncommitted`) 때 세 검토자를 돌려 모은다. 코드 작업자 비교는 1·2단계가 맡으므로 여기서는 첫 검토 지표만 본다(내가 정함).
+  - 명령: Claude(`CF review --profile claude-only --root <저장소> --kind code --base <브랜치>`), Codex(`cd <저장소> && RR --base <브랜치>`), Cursor(`CR --repo <저장소> --base <브랜치> --model composer-2.5`). `--uncommitted`도 같은 꼴이다.
+  - Codex만 `cd`로 들어간다. codex-review의 코드 모드는 `--repo`를 무시하고 현재 디렉터리의 저장소를 검토하기 때문이다(문서 모드와 cursor-review는 `--repo`를 따른다). `CF review`가 외부 첫 검토를 안내할 때도 같은 접두를 붙인다.
 - **의견·재검토**는 이 단계의 실제 실행에서 생기는 대로 기록만 한다. 기록할 것은 의견이 판가름과 다른 비율과 재검토가 새 지적을 낸 비율이다. 판정 기준에는 넣지 않는다(내가 정함. 표본이 판단 불가 항목에서만 생겨 적다).
 - 비용(추정): 지적 1건에 `claude-only` 약 28만, `doc-mix` 약 12만, Fable 첫 검토가 문서당 약 20만이다. 30건과 문서 5개 정도면 Claude 약 1,300만이다. 이 중 실제 검토 한 번에 원래 드는 몫을 빼면 추가분은 약 절반이다.
 

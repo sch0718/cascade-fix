@@ -203,7 +203,7 @@ Codex 검토 결과(review.final) 반영해줘
 | 값 | 뜻 |
 | --- | --- |
 | `runner` | `claude`·`codex`·`cursor`. 검토 칸(`review`·`opinion`·`recheck`)은 `auto`도 받습니다. `auto`는 init이 정합니다(아래) |
-| `model` | claude면 `claude-`로 시작하는 모델 ID. cursor면 Cursor 모델 ID(`claude-`·`gpt-`로 시작하면 오류). codex면 비우거나 모델 ID. 비우면 `~/.codex/config.toml`의 `model`을 씁니다. auto는 Claude로 풀릴 수 있어 비우거나 `claude-`로 시작해야 합니다 |
+| `model` | claude면 `claude-`로 시작하는 모델 ID. cursor면 Cursor 모델 ID(`claude-`·`gpt-`로 시작하면 오류). codex면 비우거나 모델 ID. 비우면 `~/.codex/config.toml`의 `model`을 씁니다. auto는 Claude로 풀릴 수 있어 비우거나 `claude-`로 시작해야 합니다. 비운 auto 칸이 Claude로 풀리면 `claude-only`의 같은 칸 모델·effort를 씁니다 |
 | `effort` | claude·codex만 씁니다(`low`·`medium`·`high`·`xhigh`·`max`). cursor 칸에 적으면 오류입니다 |
 | `fallback` | 대체 실행 대상 `{ runner, model, effort }` 하나. 생략하면 내장 `claude-only`의 같은 칸 값입니다. `auto`는 받지 않습니다 |
 
