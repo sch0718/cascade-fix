@@ -617,13 +617,8 @@ def _substitution_line(record: dict, to: str) -> str:
 
 
 def _first_review_line(first_review: dict) -> str:
-    attempts = first_review.get("attempts") or []
-    actual = (first_review.get("actual") or {}).get("runner", "")
-    if not attempts:
-        return f"첫 검토 {reviewer_label(actual)} — 대체 없음"
-    runners = [a["runner"] for a in attempts] + [actual]
-    chain = "".join(f" → {reviewer_label(runners[i + 1])}({attempts[i].get('reason', '')})" for i in range(len(attempts)))
-    return f"첫 검토 {reviewer_label(runners[0])}{chain}"
+    suffix = "" if first_review.get("attempts") else " — 대체 없음"
+    return f"첫 검토 {assignment.first_review_chain(first_review)}{suffix}"
 
 
 def _runtime_lines(ledger: Ledger, profile: dict) -> list[str]:

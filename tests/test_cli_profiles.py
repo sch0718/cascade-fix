@@ -87,7 +87,8 @@ class CliProfilesTest(unittest.TestCase):
         script.write_text("#!/bin/sh\n", encoding="utf-8")
         p = self.init(env={"CASCADE_RUN_REVIEW": str(script)})
         self.old_behaviour(p, reviewer="codex", review_model="", review_effort="")
-        self.assertIn("역할: 첫 검토=Claude(Fable 5.1 high)", p.stdout)
+        self.assertNotIn("첫 검토", p.stdout)
+        self.assertIn("역할: A=Claude(Sonnet 5.5 low)", p.stdout)
         self.assertIn("의견=Codex, 재검토=Codex", p.stdout)
         self.assertIn("전송 동의: 의견·재검토 → OpenAI", p.stdout)
 
@@ -229,9 +230,9 @@ class LocalProfileTest(ExternalWorkersBase):
         self.assertEqual(ledger["profile"]["first_review"], {})
         self.assertEqual(len(ledger["profile"]["roles"]), 14)
         self.assertIn("프로필: local (--profile)", p.stdout)
-        self.assertIn("역할: 첫 검토=Codex", p.stdout)
-        self.assertIn("A=Codex(gpt-test low)", p.stdout)
-        self.assertIn("전송 동의: 첫 검토·A·의견·재검토 → OpenAI", p.stdout)
+        self.assertIn("역할: A=Codex(gpt-test low)", p.stdout)
+        self.assertNotIn("첫 검토", p.stdout)
+        self.assertIn("전송 동의: A·의견·재검토 → OpenAI", p.stdout)
         self.assertIn("한쪽 채택", p.stdout)
 
     def test_init_local_jobs_use_the_profile_workers(self):
@@ -254,7 +255,8 @@ class LocalProfileTest(ExternalWorkersBase):
         self.assertEqual((ledger["reviewer"], ledger["workers_choice"], ledger["workers"]), ("claude", "claude", {}))
         self.assertIn("대체: code.a codex → claude — 전송 동의 없음", p.stdout)
         self.assertNotIn("전송 동의:", p.stdout)
-        self.assertIn("역할: 첫 검토=Claude(Fable 5.1 high), A=Claude(Sonnet 5.5 low)", p.stdout)
+        self.assertIn("역할: A=Claude(Sonnet 5.5 low)", p.stdout)
+        self.assertNotIn("첫 검토", p.stdout)
 
     def test_init_partial_consent_keeps_only_consented_recipients(self):
         self.use_fakes()
@@ -333,15 +335,21 @@ class DetectFirstReviewCliTest(ExternalWorkersBase):
         p = run_cli(["detect", "--no-gh", "--json", *extra], self.repo, env=self.env)
         return p.returncode, json.loads(p.stdout)
 
-    def test_local_profile_recommends_rr_then_init_with_codex_source(self):
+    def test_local_profile_recommends_cf_review_not_a_direct_rr(self):
         code, r = self.detect("--profile", "local")
         self.assertEqual(code, 0, r)
         steps = r["recommendation"]["steps"]
-        self.assertIn("run-review.sh --uncommitted", steps[0])
-        self.assertEqual(r["recommendation"]["source"], "codex-code")
-        self.assertIn("--source codex-code", steps[1])
-        self.assertTrue(steps[1].endswith("--profile local"), steps[1])
+        self.assertTrue(steps[0].endswith("review --kind code --uncommitted --profile local"), steps[0])
+        self.assertFalse(any("run-review.sh" in s for s in steps), steps)
         self.assertIn("전송 동의: 첫 검토·A·의견·재검토 → OpenAI", r["approvals"])
+
+    def test_detect_review_step_prints_rr_and_init_through_cf_review(self):
+        code, r = self.detect("--profile", "local")
+        words = shlex.split(r["recommendation"]["steps"][0])
+        p = run_cli(words[words.index("review"):], self.repo, env=self.env)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("run-review.sh --uncommitted", p.stdout)
+        self.assertIn("--source codex-code", p.stdout)
 
     def test_input_file_shows_codex_model_for_workers_and_roles(self):
         code, r = self.detect("--profile", "local", "--input", str(FIXTURES / "codex-code-e2e.final"))
@@ -370,6 +378,46 @@ class DetectFirstReviewCliTest(ExternalWorkersBase):
         p = run_cli(words[words.index("init"):], self.repo, env=self.env)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertIn("A=Codex(gpt-test low)", p.stdout)
+
+
+class InitFirstReviewHistoryTest(ExternalWorkersBase):
+    def setUp(self):
+        super().setUp()
+        self.use_fakes()
+        self.rr = self.tmp / "run-review.sh"
+        self.rr.write_text("#!/bin/sh\n", encoding="utf-8")
+        self.env.update({**NO_LEGACY_ENV, "CASCADE_RUN_REVIEW": str(self.rr)})
+
+    def init_with_meta(self, first_review, *extra):
+        src = self.tmp / "rev"
+        src.mkdir()
+        result = src / "review.out.final"
+        result.write_text((FIXTURES / "codex-code-e2e.final").read_text(encoding="utf-8"), encoding="utf-8")
+        (src / "review-meta.json").write_text(json.dumps({"role": "code.review", **first_review}), encoding="utf-8")
+        p = run_cli(["init", "--source", "codex-code", "--input", str(result), "--profile", "local", *extra],
+                    self.repo, env=self.env)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        return p
+
+    def test_completed_first_review_is_history_not_assignment(self):
+        p = self.init_with_meta({"requested": {"runner": "codex", "model": "", "effort": ""},
+                                 "actual": {"runner": "claude", "model": "claude-fable-5-1", "effort": "high"},
+                                 "fallback_reason": "한도", "attempts": [{"runner": "codex", "reason": "한도"}]})
+        self.assertIn("역할: 첫 검토(완료)=Codex → Claude(한도), A=Codex(gpt-test low)", p.stdout)
+        self.assertIn("전송 동의: A·의견·재검토 → OpenAI", p.stdout)
+        self.assertNotIn("첫 검토·", p.stdout)
+
+    def test_completed_first_review_without_fallback_names_the_runner(self):
+        p = self.init_with_meta({"requested": {"runner": "codex", "model": "", "effort": ""},
+                                 "actual": {"runner": "codex", "model": "", "effort": ""},
+                                 "fallback_reason": None, "attempts": []})
+        self.assertIn("역할: 첫 검토(완료)=Codex, A=Codex(gpt-test low)", p.stdout)
+
+    def test_first_review_fallback_is_not_listed_in_the_consent_line(self):
+        p = run_cli(["init", "--source", "codex-code", "--input", str(FIXTURES / "codex-code-e2e.final"),
+                     "--profile", "local", "--consent", "codex"], self.repo, env=self.env)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertNotIn("첫 검토", p.stdout)
 
 
 class ScaleLineTest(ExternalWorkersBase):

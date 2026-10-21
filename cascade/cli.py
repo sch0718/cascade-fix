@@ -407,7 +407,7 @@ def cmd_init(args) -> int:
     print(f"지적 {len(findings)}건: " + ", ".join(f"{k} {v}" for k, v in counts.items()))
     if deferred:
         print(f"등급 선택으로 뺀 지적 {len(deferred)}건은 보류 후보로 둔다(나중에 resume 「지금 반영」으로 돌릴 수 있다)")
-    _print_assignment(resolved, roles, substituted, mode)
+    _print_assignment(resolved, roles, substituted, mode, first_review)
     print(f"규모: {estimate_line(len(findings), ledger.mode, reviewer, workers, roles if resolved.explicit else None)}")
     if workers_choice == WORKERS_EXTERNAL:
         if has_external(workers):
@@ -438,7 +438,8 @@ def _print_review_cells(ledger: Ledger) -> None:
             print(f"경고: {skill} 스킬이 없다. Claude 단독으로 돌리려면 --reviewer claude 로 다시 init 한다")
 
 
-def _print_assignment(resolved: profiles.Resolved, roles: dict, substituted: list[dict], mode: str) -> None:
+def _print_assignment(resolved: profiles.Resolved, roles: dict, substituted: list[dict], mode: str,
+                      first_review: dict | None = None) -> None:
     print(f"프로필: {resolved.name} ({resolved.source})")
     for notice in resolved.notices:
         print(f"참고: {notice}")
@@ -447,8 +448,9 @@ def _print_assignment(resolved: profiles.Resolved, roles: dict, substituted: lis
     for record in substituted:
         if record["role"].startswith(f"{mode}."):
             print(f"대체: {record['role']} {record['from']} → {record['to']} — {record['reason']}")
-    print(assignment.roles_line(roles, mode))
-    consent = assignment.consent_line(roles, mode)
+    pending = {key: cell for key, cell in roles.items() if key != f"{mode}.review"}
+    print(assignment.roles_line(pending, mode, first_review))
+    consent = assignment.consent_line(pending, mode)
     if consent:
         print(consent)
 

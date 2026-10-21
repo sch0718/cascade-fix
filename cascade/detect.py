@@ -4,9 +4,7 @@ import json
 import re
 import shlex
 import subprocess
-import tempfile
 from collections.abc import Callable
-from datetime import datetime
 from pathlib import Path
 
 from cascade import assignment
@@ -18,7 +16,6 @@ from cascade.review import (
     CURSOR_SOURCES,
     REVIEWER_AUTO,
     REVIEWER_CLAUDE,
-    first_review_command,
     label,
     read_review_results,
 )
@@ -269,12 +266,6 @@ def _usable_first_review(roles: dict, substituted: list[dict], key: str, run_rev
     return {**roles, key: cell}, substituted
 
 
-def _first_review_scope(kind: str, root: Path, *, base: str | None = None, uncommitted: bool = False,
-                        docs: list[str] | None = None) -> dict:
-    return {"kind": kind, "base": base, "uncommitted": uncommitted, "commit": None, "docs": docs or [], "focus": "",
-            "root": str(root)}
-
-
 def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list[str] | None, profile: Resolved,
            input_path: Path | None = None, pr: str | None = None, reviewer_choice: str = REVIEWER_AUTO,
            root_flag: str = "", docs: list[Path] | None = None, cwd: Path | None = None,
@@ -301,7 +292,6 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
     doc_arg = lambda p: q(str(root / p) if root_flag or not at_root else p)  # noqa: E731
     rec: dict = {"source": None, "mode": None, "steps": [], "reasons": []}
     found = None
-    scope: dict = {}
     if input_path is not None:
         source, found = classify_input(input_path)
         if source is None:
@@ -318,7 +308,6 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
         rec.update(source="claude-doc", mode="doc")
         rec["reasons"].append(f"문서를 직접 지정했다({len(docs)}개) — 문서 모드")
         rec["review_args"] = " ".join(f"--doc {doc_arg(n) if n else q(str(d))}" for d, n in zip(docs, names))
-        scope = _first_review_scope("doc", root, docs=[str(d) for d in docs])
     elif pr_data and pr_data.get("unresolved"):
         found = pr_data["unresolved"]
         rec.update(source="pr-comment", mode="code")
@@ -339,10 +328,8 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
             if not changed_docs:
                 blockers.append("바뀐 문서가 모두 삭제라 문서 검토할 파일이 없다: " + ", ".join(changed[:5]))
             rec["review_args"] = " ".join(f"--doc {doc_arg(p)}" for p in changed_docs)
-            scope = _first_review_scope("doc", root, docs=[str(root / p) for p in changed_docs])
         else:
             rec["review_args"] = rng
-            scope = _first_review_scope("code", root, base=None if uncommitted else base, uncommitted=bool(uncommitted))
             changed_docs = [p for p in changed if p.endswith(DOC_SUFFIXES) and (root / p).is_file()]
             if changed_docs:
                 notes.append(f"문서도 {len(changed_docs)}개 바뀌었다. 코드 검토는 설계 문서로 보지 않으니 문서만 따로 보려면 "
@@ -407,17 +394,11 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
     profile_arg = f" --profile {q(profile_flag or profile.name)}" if profile.explicit or profile_flag else ""
     flags = ("" if reviewer_choice == REVIEWER_AUTO else f" --reviewer {reviewer_choice}") + workers_flag + profile_arg + root_flag
     if not blockers and rec["source"]:
-        if first_review and roles[first_key]["runner"] == RUNNER_CLAUDE:
+        if first_review:
             rec["first_review"] = 1
             steps.append(f"{cli} review --kind {rec['mode']} {rec['review_args']}{profile_arg}{root_flag}")
-            steps.append("Workflow(첫 검토) → review.json 저장 → review 출력의 init 명령")
-        elif first_review:
-            rec["first_review"] = 1
-            review_dir = Path(tempfile.gettempdir()) / f"cascade-review-{datetime.now():%Y%m%d-%H%M%S}"
-            command, result_path = first_review_command(roles[first_key], scope, review_dir, Path(run_review))
-            steps.append(f"mkdir -p {q(str(review_dir))} && {command}")
-            steps.append(f"{cli} init --source {rec['source']} --input {q(result_path)}"
-                         + "".join(f" --doc {q(d)}" for d in scope["docs"]) + flags)
+            steps.append("Workflow(첫 검토) → review.json 저장 → review 출력의 init 명령" if roles[first_key]["runner"] == RUNNER_CLAUDE
+                         else "review 출력의 RR·CR 명령 실행 → review 출력의 init 명령")
         elif rec["source"] == "pr-comment":
             steps.append(f"{cli} init --source pr-comment --input {pr_data['number']} --pr-repo {q(pr_data['repo'])}"
                          + (f" --me {q(pr_data['me'])}" if pr_data.get("me") else "") + flags)

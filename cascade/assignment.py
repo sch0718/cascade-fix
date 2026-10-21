@@ -76,8 +76,18 @@ def model_nickname(model: str) -> str:
     return _claude_name(model).split()[0]
 
 
-def roles_line(roles: dict, mode: str) -> str:
-    return "역할: " + ", ".join(f"{_cell_label(key)}={_runner_label(roles[key])}" for key in mode_keys(roles, mode))
+def first_review_chain(first_review: dict) -> str:
+    attempts = first_review.get("attempts") or []
+    runners = [a["runner"] for a in attempts] + [(first_review.get("actual") or {}).get("runner", "")]
+    chain = "".join(f" → {_RUNNER_LABELS.get(runners[i + 1], runners[i + 1])}({attempts[i].get('reason', '')})"
+                    for i in range(len(attempts)))
+    return _RUNNER_LABELS.get(runners[0], runners[0]) + chain
+
+
+def roles_line(roles: dict, mode: str, first_review: dict | None = None) -> str:
+    parts = [f"첫 검토(완료)={first_review_chain(first_review)}"] if first_review else []
+    parts += [f"{_cell_label(key)}={_runner_label(roles[key])}" for key in mode_keys(roles, mode)]
+    return "역할: " + ", ".join(parts)
 
 
 def _external_runners(cell: dict) -> set[str]:

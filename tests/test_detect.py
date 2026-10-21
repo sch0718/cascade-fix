@@ -312,36 +312,25 @@ class DetectProfileTest(unittest.TestCase):
     def test_detect_recommends_profile_first_review(self):
         result = self.call("local")
         steps = result["recommendation"]["steps"]
-        self.assertTrue(any("run-review.sh --uncommitted" in s for s in steps), steps)
+        self.assertEqual(steps[0], "CF review --kind code --uncommitted --profile local")
+        self.assertFalse(any("run-review.sh" in s for s in steps), steps)
         self.assertEqual(result["recommendation"]["source"], "codex-code")
-        review_step = next(s for s in steps if "run-review.sh" in s)
-        self.assertIn(f"cd {self.repo} && {self.rr} --uncommitted --repo {self.repo} --out ", review_step)
-        out = review_step.split("--out ")[1]
-        init = next(s for s in steps if " init " in s)
-        self.assertEqual(init, f"CF init --source codex-code --input {out}.final --profile local")
-        self.assertFalse(any(" review --kind" in s for s in steps))
         self.assertIn("전송 동의: 첫 검토·A·의견·재검토 → OpenAI", result["approvals"])
 
-    def test_detect_recommends_cursor_first_review_with_cell_model(self):
+    def test_cursor_first_review_is_also_a_cf_review_step(self):
         result = self.call("cursor-first")
         steps = result["recommendation"]["steps"]
-        self.assertEqual(result["recommendation"]["source"], "cursor-code")
-        review_step = next(s for s in steps if "--out " in s)
-        self.assertIn("--uncommitted", review_step)
-        self.assertIn("--model composer-9", review_step)
-        self.assertIn("--source cursor-code", next(s for s in steps if " init " in s))
+        self.assertEqual(steps[0], "CF review --kind code --uncommitted --profile cursor-first")
+        self.assertFalse(any("--model" in s for s in steps), steps)
         self.assertTrue(any("→ Cursor" in a for a in result["approvals"]))
 
-    def test_doc_first_review_uses_doc_scope_and_passes_docs_to_init(self):
+    def test_doc_first_review_is_a_cf_review_step_with_the_docs(self):
         result = self.call("local", docs=[self.repo / "README.md"])
         steps = result["recommendation"]["steps"]
         self.assertEqual(result["recommendation"]["source"], "codex-doc")
-        review_step = next(s for s in steps if "run-review.sh" in s)
-        self.assertIn(f"--doc {self.repo / 'README.md'}", review_step)
-        self.assertNotIn(" --uncommitted", review_step)
-        init = next(s for s in steps if " init " in s)
-        self.assertIn("--source codex-doc", init)
-        self.assertIn(f"--doc {self.repo / 'README.md'}", init)
+        self.assertTrue(steps[0].startswith("CF review --kind doc --doc "), steps[0])
+        self.assertTrue(steps[0].endswith("README.md --profile local"), steps[0])
+        self.assertFalse(any("run-review.sh" in s for s in steps), steps)
 
     def test_claude_first_review_follows_the_explicit_profile(self):
         result = self.call("split")
@@ -357,8 +346,8 @@ class DetectProfileTest(unittest.TestCase):
 
     def test_explicit_profile_from_environment_is_carried_to_init(self):
         result = self.call("local", env={"CASCADE_PROFILE": "local"})
-        init = next(s for s in result["recommendation"]["steps"] if " init " in s)
-        self.assertTrue(init.endswith("--profile local"), init)
+        steps = result["recommendation"]["steps"]
+        self.assertTrue(steps[0].endswith("review --kind code --uncommitted --profile local"), steps[0])
 
     def test_unavailable_first_review_cli_falls_back_and_is_noted(self):
         result = self.call("local", available={"codex": False, "cursor": False})
