@@ -25,7 +25,13 @@ while [ $# -gt 0 ]; do
     *) usage ;;
   esac
 done
-[ -z "$out" ] || rm -f "$out.final"
+abs() { (cd "$(dirname "$1")" && printf '%s/%s' "$(pwd -P)" "$(basename "$1")"); }
+
+if [ -n "$out" ]; then
+  [ -d "$(dirname "$out")" ] || { echo "--out 의 디렉터리를 찾지 못했다: $out" >&2; exit 64; }
+  case "$out" in /*) ;; *) out=$(abs "$out") ;; esac
+  rm -f "$out.final"
+fi
 [ -n "$mode" ] || usage
 
 find_cursor() {
@@ -39,8 +45,6 @@ find_cursor() {
   return 1
 }
 CURSOR=$(find_cursor) || { echo "cursor-agent 실행 파일을 찾지 못했다" >&2; exit 69; }
-
-abs() { (cd "$(dirname "$1")" && printf '%s/%s' "$(pwd -P)" "$(basename "$1")"); }
 
 if [ "$mode" = doc ]; then
   resolved=()

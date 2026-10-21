@@ -335,6 +335,29 @@ class CursorReviewTest(unittest.TestCase):
         body = '{"type":"result","is_error":true,"result":"You\'ve hit your usage limit","session_id":"s"}'
         self.assert_rerun_removes_previous_final(75, env={"FAKE_CURSOR_JSON": body, "FAKE_CURSOR_EXIT": "1"})
 
+    def test_relative_out_is_written_and_removed_from_caller_dir(self):
+        caller = self.repo.parent
+        args = ("--opinion", str(self.prompt), "--repo", str(self.repo), "--out", "out.log")
+        first = self.run_script(*args, cwd=caller)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIn(f"full_log={caller / 'out.log'}\n", first.stdout)
+        self.assertIn(f"final={caller / 'out.log.final'}\n", first.stdout)
+        self.assertNotEqual((caller / "out.log.final").read_text(encoding="utf-8"), "")
+        self.assertFalse((self.repo / "out.log.final").exists())
+        unrelated = self.repo / "out.log.final"
+        unrelated.write_text("저장소에 있던 다른 파일\n", encoding="utf-8")
+        again = self.run_script(*args, cwd=caller, env={"FAKE_CURSOR_STATUS": "Not logged in"})
+        self.assertEqual(again.returncode, 77, again.stderr)
+        self.assertFalse((caller / "out.log.final").exists())
+        self.assertEqual(unrelated.read_text(encoding="utf-8"), "저장소에 있던 다른 파일\n")
+
+    def test_out_in_missing_directory_exits_64_without_calling_cursor(self):
+        for out_path in ("no-such-dir/out.log", str(self.repo.parent / "no-such-dir" / "out.log")):
+            out = self.run_script("--doc", str(self.repo / "a.md"), "--out", out_path, cwd=self.repo.parent)
+            self.assertEqual(out.returncode, 64, out.stderr)
+            self.assertIn("no-such-dir", out.stderr)
+            self.assertFalse(self.capture.exists())
+
     def test_known_list_is_included_for_doc(self):
         known = self.repo.parent / "known.md"
         known.write_text("- a.md:1 — 이미 기각한 지적: 아님\n", encoding="utf-8")
