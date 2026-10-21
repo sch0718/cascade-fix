@@ -35,11 +35,6 @@ def _cell_label(key: str) -> str:
     return _CELL_LABELS[_role(key)]
 
 
-def overridden_cells(overrides: Iterable[str]) -> set[str]:
-    cells = (note.split(_OVERRIDE_SEPARATOR, 1)[0] for note in overrides)
-    return {cell for cell in cells if cell in ROLE_KEYS}
-
-
 def overrides_line(overrides: Iterable[str]) -> str:
     grouped: dict[str, list[str]] = {}
     for note in overrides:
@@ -75,9 +70,9 @@ def _external_runners(cell: dict) -> set[str]:
     return {r for r in (cell["runner"], cell["fallback"]["runner"]) if r in EXTERNAL_RUNNERS}
 
 
-def runners_to_check(roles: dict, overrides: Iterable[str]) -> set[str]:
-    kept = overridden_cells(overrides)
-    return {r for key, cell in roles.items() if key not in kept and cell["runner"] != RUNNER_AUTO
+def runners_to_check(roles: dict, pinned: Iterable[str]) -> set[str]:
+    pinned = set(pinned)
+    return {r for key, cell in roles.items() if key not in pinned and cell["runner"] != RUNNER_AUTO
             for r in _external_runners(cell)}
 
 
@@ -118,11 +113,10 @@ def substitute_unavailable(roles: dict, available: dict[str, bool], reason: str)
     return out, records
 
 
-def decide(roles: dict, overrides: Iterable[str], source: str, run_review: Path,
+def decide(roles: dict, pinned: Iterable[str], source: str, run_review: Path,
            cursor_ok: bool | Callable[[], bool], available: dict[str, bool],
            *, cursor_model: str = DEFAULT_CURSOR_MODEL, name: str = "auto 해석") -> tuple[dict, list[dict]]:
-    overrides = list(overrides)
-    kept = overridden_cells(overrides) | {key for key, cell in roles.items() if cell["runner"] == RUNNER_AUTO}
+    kept = set(pinned) | {key for key, cell in roles.items() if cell["runner"] == RUNNER_AUTO}
     resolved = resolve_auto(roles, source, run_review, cursor_ok, cursor_model=cursor_model, name=name)
     replaced, records = substitute_unavailable({k: c for k, c in resolved.items() if k not in kept},
                                                available, UNAVAILABLE_REASON)

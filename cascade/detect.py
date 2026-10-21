@@ -305,7 +305,7 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
                         " (이미 커밋한 문서는 --doc <문서> 로 지정한다)")
 
     mode = rec["mode"] or "code"
-    roles, substituted = assignment.decide(profile.roles, profile.overrides, rec["source"] or "", run_review, cursor_ok,
+    roles, substituted = assignment.decide(profile.roles, profile.pinned, rec["source"] or "", run_review, cursor_ok,
                                            available or {}, cursor_model=cursor_model, name=profile.name)
     legacy = assignment.legacy_fields({"roles": roles}, mode, workers_choice)
     reviewer, workers = legacy["reviewer"], legacy["workers"]

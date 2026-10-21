@@ -214,7 +214,53 @@ class OverridesLineTest(unittest.TestCase):
                          "덮음: code.a·doc.writer ← --workers external / code.opinion ← CASCADE_REVIEWER=codex"
                          " / adopt_on_both_pass ← --adopt-on-both-pass")
         self.assertEqual(assignment.overrides_line([]), "")
-        self.assertEqual(assignment.overridden_cells(notes), {"code.a", "doc.writer", "code.opinion"})
+
+
+class PinnedCellsTest(unittest.TestCase):
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.tmp = Path(self._td.name).resolve()
+        self.toml = self.tmp / "repos.toml"
+        self.toml.write_text('[profiles.mine]\nbase = "claude-only"\n"code.b" = { runner = "cursor" }\n', encoding="utf-8")
+        self.none = self.tmp / "none.sh"
+
+    def resolve(self, flag="mine", **cli):
+        return profiles.resolve(self.tmp, self.toml, flag=flag, cli=profiles.LegacyOptions(**cli), env={},
+                                available={"codex": True, "cursor": True}, codex_model="")
+
+    def decide(self, resolved, available):
+        return assignment.decide(resolved.roles, resolved.pinned, "codex-code", self.none, False, available)
+
+    def test_model_only_option_does_not_disable_availability_check(self):
+        for opts in ({}, {"cursor_model": "composer-9"}, {"review_model": "claude-opus-5-5"},
+                     {"review_effort": "low"}, {"adopt_on_both_pass": True}):
+            resolved = self.resolve(**opts)
+            self.assertEqual(resolved.pinned, [], opts)
+            self.assertEqual(assignment.runners_to_check(resolved.roles, resolved.pinned), {"cursor"}, opts)
+            roles, subs = self.decide(resolved, {"cursor": False})
+            self.assertEqual(roles["code.b"]["runner"], "claude", opts)
+            self.assertEqual([r["role"] for r in subs], ["code.b"], opts)
+            self.assertEqual(assignment.consent_line(roles, "code"), "", opts)
+
+    def test_runner_options_pin_their_cells_even_when_unchanged(self):
+        reviewer = self.resolve(flag="local", reviewer="codex")
+        self.assertEqual(reviewer.overrides, [])
+        self.assertEqual(reviewer.pinned, ["code.opinion", "code.recheck", "doc.opinion", "doc.recheck"])
+        workers = self.resolve(flag="local", workers="claude")
+        self.assertEqual(workers.pinned, ["code.a", "code.b", "doc.judge_a", "doc.judge_b", "doc.writer", "doc.checker"])
+        self.assertEqual(self.resolve().pinned, [])
+
+    def test_local_and_default_treat_reviewer_codex_the_same(self):
+        for flag in ("local", "default"):
+            resolved = self.resolve(flag=flag, reviewer="codex")
+            roles, subs = self.decide(resolved, {"codex": False, "cursor": False})
+            self.assertEqual((roles["code.opinion"]["runner"], roles["code.recheck"]["runner"]), ("codex", "codex"), flag)
+            self.assertNotIn("code.opinion", [r["role"] for r in subs], flag)
+            self.assertIn("의견·재검토 → OpenAI", assignment.consent_line(roles, "code"), flag)
+        local, subs = self.decide(self.resolve(flag="local", reviewer="codex"), {"codex": False, "cursor": False})
+        self.assertEqual(local["code.a"], CLAUDE_ONLY["code.a"])
+        self.assertIn("code.a", [r["role"] for r in subs])
 
 
 class RolesLineTest(unittest.TestCase):

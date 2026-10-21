@@ -252,10 +252,10 @@ class LocalProfileTest(ExternalWorkersBase):
         self.use_fakes()
         p = self.init_cli("--profile", "local", "--consent", "cursor")
         ledger = self.ledger_json(p)
-        self.assertEqual(ledger["profile"]["consented"], ["cursor"])
+        self.assertEqual(ledger["profile"]["consented"], [])
         self.assertTrue(all(c["runner"] == "claude" for c in ledger["profile"]["roles"].values()))
         p = self.init_cli("--profile", "local", "--consent", "codex,cursor")
-        self.assertEqual(self.ledger_json(p)["profile"]["consented"], ["codex", "cursor"])
+        self.assertEqual(self.ledger_json(p)["profile"]["consented"], ["codex"])
         self.assertEqual(self.ledger_json(p)["profile"]["roles"]["code.a"]["runner"], "codex")
 
     def test_init_local_without_codex_substitutes_with_notice(self):

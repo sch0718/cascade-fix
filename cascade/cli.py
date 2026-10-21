@@ -281,13 +281,13 @@ def _resolve_profile(args, root: Path, available: dict[str, bool]) -> profiles.R
                                     codex_model=codex_model(Path.home() / ".codex"))
     except ConfigError as e:
         raise s.CliError(str(e), ExitCodes.PARSE_ERROR) from None
-    _probe(available, assignment.runners_to_check(resolved.roles, resolved.overrides))
+    _probe(available, assignment.runners_to_check(resolved.roles, resolved.pinned))
     return resolved
 
 
 def _decide_roles(args, resolved: profiles.Resolved, source: str, available: dict[str, bool]) -> tuple[dict, list[dict]]:
     try:
-        return assignment.decide(resolved.roles, resolved.overrides, source, s.RUN_REVIEW, _cursor_reviewer_ok(available),
+        return assignment.decide(resolved.roles, resolved.pinned, source, s.RUN_REVIEW, _cursor_reviewer_ok(available),
                                  available, cursor_model=args.cursor_model or DEFAULT_CURSOR_MODEL, name=resolved.name)
     except profiles.ProfileError as e:
         raise s.CliError(str(profiles.explain_overrides(e, resolved.overrides)), ExitCodes.PARSE_ERROR) from None
@@ -328,11 +328,10 @@ def cmd_init(args) -> int:
     mode = "doc" if args.source in s.DOC_SOURCES else "code"
     roles, substituted = _decide_roles(args, resolved, args.source, available)
     roles = assignment.fill_codex_model(roles, codex_model(Path.home() / ".codex"))
-    if consent is None:
-        consented = assignment.used_recipients(roles, mode)
-    else:
+    if consent is not None:
         roles, dropped = assignment.apply_consent(roles, consent)
-        substituted, consented = [*substituted, *dropped], sorted(consent)
+        substituted = [*substituted, *dropped]
+    consented = assignment.used_recipients(roles, mode)
     record = {"name": resolved.name, "source": resolved.source, "explicit": resolved.explicit, "roles": roles,
               "overrides": resolved.overrides, "substituted": substituted, "consented": consented, "first_review": {}}
     requested = args.workers or (None if resolved.explicit else os.environ.get("CASCADE_WORKERS") or None)

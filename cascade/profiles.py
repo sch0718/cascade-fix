@@ -2,6 +2,7 @@ import copy
 import tomllib
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
+from dataclasses import field as dataclass_field
 from pathlib import Path
 
 from cascade.config import ConfigError
@@ -291,6 +292,7 @@ class Resolved:
     roles: dict[str, dict]
     overrides: list[str]
     notices: list[str]
+    pinned: list[str] = dataclass_field(default_factory=list)
 
 
 def select(*, flag: str | None, env: Mapping[str, str], repo_profile: str | None,
@@ -367,6 +369,15 @@ def apply_overrides(profile: dict, opts: LegacyOptions, available: dict[str, boo
     return out, notes
 
 
+def pinned_cells(opts: LegacyOptions) -> list[str]:
+    pinned = []
+    if opts.workers is not None:
+        pinned += _WORKER_KEYS
+    if opts.reviewer is not None:
+        pinned += [f"{mode}.{role}" for mode in ("code", "doc") for role in ("opinion", "recheck")]
+    return pinned
+
+
 def _config_text(value, what: str) -> str | None:
     if value is not None and not isinstance(value, str):
         raise ProfileError(f"{what}은 문자열이어야 한다: {value!r}")
@@ -401,4 +412,5 @@ def resolve(root: Path, repos_toml: Path, *, flag: str | None, cli: LegacyOption
         if used:
             notices.append(DEPRECATED_ENV_NOTICE)
     profile, overrides = apply_overrides(found[name], opts, available, codex_model, name=name, labels=labels)
-    return Resolved(name, source, explicit, profile["adopt_on_both_pass"], profile["roles"], overrides, notices)
+    return Resolved(name, source, explicit, profile["adopt_on_both_pass"], profile["roles"], overrides, notices,
+                    pinned_cells(opts))
