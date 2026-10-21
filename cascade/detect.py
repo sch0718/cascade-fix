@@ -7,17 +7,17 @@ import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
+from cascade import assignment
 from cascade.config import ConfigError, RepoConfig, detect_candidates, is_sensitive_path, load_repo_config
 from cascade.findings import ParseError, fetch_pr_findings, parse_codex_code, parse_codex_doc
 from cascade.jobs import RUNNER_CLAUDE
+from cascade.profiles import Resolved
 from cascade.review import (
     CURSOR_SOURCES,
     REVIEWER_AUTO,
     REVIEWER_CLAUDE,
-    REVIEWER_CURSOR,
     label,
     read_review_results,
-    resolve,
 )
 from cascade.runners import RUNNER_CODEX, RUNNER_CURSOR
 from cascade.snapshot import RUN_DIR_NAME
@@ -25,7 +25,6 @@ from cascade.workers import (
     DEFAULT_CURSOR_MODEL,
     WORKERS_CLAUDE,
     WORKERS_EXTERNAL,
-    consent_line,
     describe,
     has_external,
     workers_flags,
@@ -216,7 +215,23 @@ def estimate(findings: int, mode: str, reviewer: str, workers: dict[str, dict] |
     return out
 
 
-def estimate_line(findings: int, mode: str, reviewer: str, workers: dict[str, dict] | None = None) -> str:
+def _runner_totals(roles: dict, mode: str) -> str:
+    claude: dict[str, int] = {}
+    external = {RUNNER_CODEX: 0, RUNNER_CURSOR: 0}
+    for key in assignment.work_keys(roles, mode):
+        runner = roles[key]["runner"]
+        if runner == RUNNER_CLAUDE:
+            nickname = assignment.model_nickname(roles[key]["model"])
+            claude[nickname] = claude.get(nickname, 0) + 1
+        elif runner in external:
+            external[runner] += 1
+    parts = [f"Claude 최대 {'·'.join(f'{name} {n}' for name, n in claude.items())}/지적"] if claude else []
+    parts += [f"{label(runner)} {n}/지적" for runner, n in external.items() if n]
+    return f" — {', '.join(parts)} + 의견·재검토" if parts else ""
+
+
+def estimate_line(findings: int, mode: str, reviewer: str, workers: dict[str, dict] | None = None,
+                  roles: dict | None = None) -> str:
     e = estimate(findings, mode, reviewer, workers)
     split = e["stage1_by_runner"]
     by_runner = f"(Claude {split[RUNNER_CLAUDE]}·Codex {split[RUNNER_CODEX]}·Cursor {split[RUNNER_CURSOR]})" if has_external(workers) else ""
@@ -228,7 +243,7 @@ def estimate_line(findings: int, mode: str, reviewer: str, workers: dict[str, di
         parts.append(f"의견 최대 {e['opinion_max']}")
     if e["recheck"]:
         parts.append(f"재검토 {e['recheck']}")
-    return f"회차당 에이전트 {e['min']}~{e['max']}개({', '.join(parts)})"
+    return f"회차당 에이전트 {e['min']}~{e['max']}개({', '.join(parts)})" + (_runner_totals(roles, mode) if roles else "")
 
 
 def _config(root: Path, repos_toml: Path) -> tuple[RepoConfig | None, str | None]:
@@ -238,11 +253,32 @@ def _config(root: Path, repos_toml: Path) -> tuple[RepoConfig | None, str | None
         return None, f"검증 설정을 읽지 못했다({repos_toml}): {e}"
 
 
-def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list[str] | None,
+def _first_review_ready(runner: str, run_review: Path, cursor_ok: bool | Callable[[], bool]) -> bool:
+    if runner == RUNNER_CODEX:
+        return Path(run_review).is_file()
+    if runner == RUNNER_CURSOR:
+        return bool(cursor_ok() if callable(cursor_ok) else cursor_ok)
+    return True
+
+
+def _usable_first_review(roles: dict, substituted: list[dict], key: str, run_review: Path,
+                         cursor_ok: bool | Callable[[], bool]) -> tuple[dict, list[dict]]:
+    cell, tried = roles[key], set()
+    while not _first_review_ready(cell["runner"], run_review, cursor_ok):
+        tried.add(cell["runner"])
+        new = assignment.fallback_target(cell, set(assignment.EXTERNAL_RUNNERS), tried, "reviewer")
+        substituted = [*substituted, {"role": key, "from": cell["runner"], "to": new["runner"],
+                                      "reason": assignment.NO_SCRIPT_REASON}]
+        cell = new
+    return {**roles, key: cell}, substituted
+
+
+def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list[str] | None, profile: Resolved,
            input_path: Path | None = None, pr: str | None = None, reviewer_choice: str = REVIEWER_AUTO,
            root_flag: str = "", docs: list[Path] | None = None, cwd: Path | None = None,
            cursor_ok: bool | Callable[[], bool] = False, workers_choice: str = WORKERS_CLAUDE,
-           cursor_model: str = DEFAULT_CURSOR_MODEL, workers: dict[str, dict] | None = None) -> dict:
+           cursor_model: str = DEFAULT_CURSOR_MODEL, available: dict[str, bool] | None = None,
+           profile_flag: str | None = None, codex_model: str = "") -> dict:
     root = Path(root)
     branch = current_branch(root)
     base = default_base(root)
@@ -311,7 +347,26 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
         blockers.append("처리할 것이 없다: 결과 파일·PR 리뷰 스레드·커밋하지 않은 변경·앞선 커밋이 모두 없다"
                         " (이미 커밋한 문서는 --doc <문서> 로 지정한다)")
 
-    reviewer = resolve(reviewer_choice, rec["source"] or "", run_review, cursor_ok)
+    mode = rec["mode"] or "code"
+    first_key = f"{mode}.review"
+    first_review = "review_args" in rec
+
+    def decide_roles(source: str) -> tuple[dict, list[dict]]:
+        decided, replaced = assignment.decide(profile.roles, profile.pinned, source, run_review, cursor_ok,
+                                              available or {}, cursor_model=cursor_model, name=profile.name)
+        return _usable_first_review(decided, replaced, first_key, run_review, cursor_ok) if first_review else (decided, replaced)
+
+    original_source = rec["source"]
+    roles, substituted = decide_roles(rec["source"] or "")
+    if first_review and roles[first_key]["runner"] != RUNNER_CLAUDE:
+        rec["source"] = f"{roles[first_key]['runner']}-{mode}"
+        roles, substituted = decide_roles(rec["source"])
+    roles = assignment.fill_codex_model(roles, codex_model)
+    shown = {key: roles[key] for key in assignment.mode_keys(roles, mode) if first_review or key != first_key}
+    substituted = [r for r in substituted if first_review or not r["role"].startswith(first_key)]
+    legacy = assignment.legacy_fields({"roles": roles}, mode, workers_choice)
+    reviewer, workers = legacy["reviewer"], legacy["workers"]
+    notes.extend(f"대체: {r['role']} {r['from']} → {r['to']} — {r['reason']}" for r in substituted if r["role"].startswith(f"{mode}."))
     cfg, cfg_error = _config(root, repos_toml)
     if cfg_error:
         blockers.append(cfg_error)
@@ -324,13 +379,10 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
             approvals.append(f"{REGISTER_APPROVAL}: {repos_toml} 에 [repos.\"{root}\"] 항목을 후보로 적는다(사용자 확인)")
         else:
             blockers.append("코드 모드인데 테스트 명령을 찾지 못했다. 테스트 없는 저장소의 코드 수정은 이 스킬로 하지 않는다")
-    if reviewer == REVIEWER_CURSOR:
-        approvals.append("Cursor 전송 동의: 의견·재검토에 코드·문서를 Cursor(팀 프라이버시 모드)로 보낸다")
-    elif reviewer != REVIEWER_CLAUDE:
-        approvals.append("Codex 전송 동의: 의견·재검토에 코드·문서를 OpenAI로 보낸다")
-    if has_external(workers):
-        approvals.append(consent_line(workers))
-    elif workers_choice == WORKERS_EXTERNAL:
+    consent = assignment.consent_line(shown, mode)
+    if consent:
+        approvals.append(consent)
+    if workers_choice == WORKERS_EXTERNAL and not has_external(workers):
         notes.append("--workers external 이지만 쓸 수 있는 외부 CLI가 없다. 작업자는 모두 Claude로 돈다")
     if rec["source"] == "pr-comment":
         approvals.append("PR 코멘트의 재현 명령이 있으면 jobs 뒤에 목록을 보이고 승인받는다")
@@ -340,17 +392,19 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
     sensitive = [p for p in changed_all if is_sensitive_path(p, patterns)]
     if sensitive:
         notes.append("보안·인증·삭제 경로가 바뀌었다. 이 경로를 고친 지적은 채택하지 않고 판단 불가로 보낸다: " + ", ".join(sensitive[:5]))
-    if uncommitted and rec["source"] in ("pr-comment", "codex-code", "codex-doc", *CURSOR_SOURCES):
+    if uncommitted and original_source in ("pr-comment", "codex-code", "codex-doc", *CURSOR_SOURCES):
         notes.append("커밋하지 않은 변경이 있다. 채택 패치가 작업 트리에 섞이지 않게 하려면 --dry-run 을 쓴다")
 
     steps = rec["steps"]
-    workers_flag = workers_flags(workers_choice, cursor_model)
-    flags = ("" if reviewer_choice == REVIEWER_AUTO else f" --reviewer {reviewer_choice}") + workers_flag + root_flag
+    workers_flag = workers_flags(workers_choice, cursor_model, {} if profile.explicit else None)
+    profile_arg = f" --profile {q(profile_flag or profile.name)}" if profile.explicit or profile_flag else ""
+    flags = ("" if reviewer_choice == REVIEWER_AUTO else f" --reviewer {reviewer_choice}") + workers_flag + profile_arg + root_flag
     if not blockers and rec["source"]:
-        if rec["source"].startswith("claude-") and input_path is None:
+        if first_review:
             rec["first_review"] = 1
-            steps.append(f"{cli} review --kind {rec['mode']} {rec['review_args']}{workers_flag}{root_flag}")
-            steps.append("Workflow(첫 검토) → review.json 저장 → review 출력의 init 명령")
+            steps.append(f"{cli} review --kind {rec['mode']} {rec['review_args']}{workers_flag}{profile_arg}{root_flag}")
+            steps.append("Workflow(첫 검토) → review.json 저장 → review 출력의 init 명령" if roles[first_key]["runner"] == RUNNER_CLAUDE
+                         else "review 출력의 RR·CR 명령 실행 → review 출력의 init 명령")
         elif rec["source"] == "pr-comment":
             steps.append(f"{cli} init --source pr-comment --input {pr_data['number']} --pr-repo {q(pr_data['repo'])}"
                          + (f" --me {q(pr_data['me'])}" if pr_data.get("me") else "") + flags)
@@ -372,7 +426,9 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
         "pr": pr_data,
         "reviewer": reviewer,
         "reviewer_label": label(reviewer),
-        "workers": workers or {},
+        "workers": workers,
+        "profile": {"name": profile.name, "source": profile.source, "explicit": profile.explicit,
+                    "overrides": profile.overrides, "substituted": substituted, "roles": shown},
         "config": config,
         "recommendation": rec,
         "approvals": approvals,
@@ -389,6 +445,11 @@ def render(result: dict) -> str:
     pr = result["pr"]
     if pr:
         lines.append(f"PR: #{pr['number']} {pr.get('state', '')} · 해결 안 된 리뷰 스레드 {pr['unresolved'] if pr['unresolved'] is not None else '?'}건")
+    profile = result["profile"]
+    lines.append(f"프로필: {profile['name']} ({profile['source']})")
+    if profile["overrides"]:
+        lines.append(assignment.overrides_line(profile["overrides"]))
+    lines.append(assignment.roles_line(profile["roles"], rec["mode"] or "code"))
     if rec["source"]:
         lines.append(f"추천: --source {rec['source']} · 모드 {rec['mode']} · 검토자 {result['reviewer_label']}")
         lines.extend(f"  근거: {r}" for r in rec["reasons"])

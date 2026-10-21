@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 import re
@@ -8,6 +9,7 @@ from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
+from cascade.assignment import claude_fallback, fallback_target, ledger_profile
 from cascade.config import ConfigError, ExitCodes, RepoConfig, detect_candidates, is_sensitive_path, load_repo_config
 from cascade.consensus import (
     OUTCOME_ADJUDICATE,
@@ -310,8 +312,9 @@ def has_jobs(path: Path) -> bool:
     return Path(path).is_file() and bool(read_json(path).get("jobs"))
 
 
-def fallback_job(entry: dict) -> dict:
-    model, effort = ROLES[entry["role"]]
+def fallback_job(entry: dict, cell: dict) -> dict:
+    target = claude_fallback(cell, entry["role"])
+    model, effort = target["model"], target["effort"]
     return {"id": entry["id"], "label": entry["id"].replace(":", " "), "model": model, "effort": effort,
             "kind": entry["kind"], "promptPath": entry["promptPath"]}
 
@@ -332,11 +335,16 @@ def load_stage_results(rd: Path, stage: str, claude: Path | None) -> tuple[dict,
         data = read_json(cli)
         ok = {o["id"] for o in data.get("outcomes", []) if o.get("status") == STATUS_OK}
         merged.update({item["id"]: item for item in data.get("results", []) if item["id"] in ok})
-        expected.update({job["id"]: expected_model_id(job) for job in read_json(cli_args)["jobs"] if job["id"] in ok})
+        reruns = data.get("fallback_runs", {})
+        expected.update({job["id"]: expected_model_id(reruns.get(job["id"], job))
+                         for job in read_json(cli_args)["jobs"] if job["id"] in ok})
     if fallback.is_file():
         items = read_json(fallback).get("results", [])
         merged.update({item["id"]: item for item in items})
-        expected.update({item["id"]: ROLES[_role_of(item["id"])][0] for item in items if _role_of(item["id"]) in ROLES})
+        fallback_args = rd / f"{stage}-fallback-args.json"
+        models = {job["id"]: job["model"] for job in read_json(fallback_args).get("jobs", [])} if fallback_args.is_file() else {}
+        expected.update({item["id"]: models.get(item["id"]) or ROLES[_role_of(item["id"])][0]
+                         for item in items if item["id"] in models or _role_of(item["id"]) in ROLES})
     return {"results": list(merged.values())}, expected
 
 
@@ -637,8 +645,67 @@ def carried_findings(rnd: RoundRecord) -> list[Finding]:
     return [replace(f, carried_from=f.id, carried_after=applied) for f in findings_of(rnd) if f.id in ids]
 
 
-def is_claude(ledger: Ledger) -> bool:
-    return ledger.reviewer == REVIEWER_CLAUDE
+EXTERNAL_AUTH_FAILURE = re.compile(r"\b401\b|unauthori[sz]ed|refresh[ _]token|codex login|not logged in|Authentication required", re.IGNORECASE)
+EXTERNAL_USAGE_LIMIT = re.compile(r"usage limit", re.IGNORECASE)
+EXTERNAL_CLASSIFY_TAIL_LINES = 20
+FAILURE_AUTH, FAILURE_LIMIT, FAILURE_ERROR = "auth", "limit", "error"
+FAILURE_REASONS = {FAILURE_LIMIT: "이용 한도", FAILURE_ERROR: "실행 오류"}
+
+
+def review_cell(ledger: Ledger, role: str) -> dict:
+    """role 칸의 지금 값. 실행 중 대체가 있으면 가장 나중 것의 `cell`이고, 없으면 init·jobs가 확정한 칸이다."""
+    profile = ledger_profile(ledger)
+    key = f"{ledger.mode}.{role}"
+    for record in reversed(profile.get("runtime_substitutions", [])):
+        if record["role"] == key:
+            return record["cell"]
+    return profile["roles"][key]
+
+
+def is_claude(ledger: Ledger, role: str) -> bool:
+    return review_cell(ledger, role)["runner"] == REVIEWER_CLAUDE
+
+
+def external_failure(result: Path) -> str | None:
+    """외부 검토자 결과(`<로그>.final`)가 없거나 비었을 때의 원인. 결과가 있거나 실행 로그가 없으면(아직 안 돌림) None.
+
+    로그 앞부분에는 프롬프트(지적 본문·패치)가 그대로 찍히므로 CLI 자신의 오류 출력이 있는 끝 줄만 본다."""
+    result = Path(result)
+    if result.is_file() and result.read_text(encoding="utf-8").strip():
+        return None
+    log = result.with_suffix("") if result.suffix == ".final" else None
+    if log is None or not log.is_file():
+        return None
+    tail = "\n".join(log.read_text(encoding="utf-8", errors="replace").strip().splitlines()[-EXTERNAL_CLASSIFY_TAIL_LINES:])
+    if EXTERNAL_AUTH_FAILURE.search(tail):
+        return FAILURE_AUTH
+    return FAILURE_LIMIT if EXTERNAL_USAGE_LIMIT.search(tail) else FAILURE_ERROR
+
+
+def review_event_extra(ledger: Ledger, role: str) -> dict:
+    """붙인 의견·재검토 이벤트에 남길 실제 runner·모델과, 실행 중 대체였으면 그 내용."""
+    cell = review_cell(ledger, role)
+    extra = {"runner": cell["runner"], "model": cell["model"]}
+    found = [r for r in ledger_profile(ledger).get("runtime_substitutions", []) if r["role"] == f"{ledger.mode}.{role}"]
+    if found:
+        extra["fallback"] = {"from": found[-1]["from"], "to": found[-1]["to"], "reason": found[-1]["reason"]}
+    return extra
+
+
+def substitute_review(ledger: Ledger, role: str, reason: str, round_no: int | None = None) -> dict:
+    """검토 칸(opinion·recheck)의 실행 중 대체를 `profile.runtime_substitutions`에 남기고 새 칸을 준다.
+
+    `profile.roles`·`profile.substituted`(init·jobs가 확정한 배정)는 바꾸지 않는다. 동의 밖이거나 같은 CLI면 내장 claude-only 값이다."""
+    record = copy.deepcopy(ledger_profile(ledger))
+    key = f"{ledger.mode}.{role}"
+    old = review_cell(ledger, role)
+    new = fallback_target(old, record["consented"], {old["runner"]}, "reviewer")
+    rnd = ledger.current_round()
+    record.setdefault("runtime_substitutions", []).append(
+        {"role": key, "from": old["runner"], "to": new["runner"], "cell": new, "reason": reason,
+         "round": round_no if round_no is not None else rnd.no if rnd else 0})
+    ledger.profile = record
+    return new
 
 
 def opinion_job_id(fid: str) -> str:
@@ -649,9 +716,10 @@ def recheck_job_id(no: int) -> str:
     return f"round-{no}:recheck"
 
 
-def write_review_args(rd: Path, name: str, ledger: Ledger, items: list[tuple[str, str, str, str]]) -> Path:
-    """items: (job id, 표시 이름, 프롬프트, 참고 저장소). Claude 검토자 Workflow 입력을 rd/name 에 쓴다."""
-    jobs = [review_job(job_id, text, claude_prompt(prompt, repo), ledger.review_model, ledger.review_effort)
+def write_review_args(rd: Path, name: str, ledger: Ledger, items: list[tuple[str, str, str, str]], role: str) -> Path:
+    """items: (job id, 표시 이름, 프롬프트, 참고 저장소). role 칸의 모델·effort로 Claude 검토자 Workflow 입력을 rd/name 에 쓴다."""
+    cell = review_cell(ledger, role)
+    jobs = [review_job(job_id, text, claude_prompt(prompt, repo), cell["model"], cell["effort"])
             for job_id, text, prompt, repo in items]
     out = Path(rd) / name
     write_json(out, write_job_args({"jobs": jobs}, Path(rd) / "prompts"))
@@ -681,12 +749,18 @@ def cursor_reviewer_available() -> bool:
     return CURSOR_REVIEW.is_file() and cursor_available()
 
 
-def review_script(ledger: Ledger) -> Path:
-    return CURSOR_REVIEW if ledger.reviewer == REVIEWER_CURSOR else RUN_REVIEW
+def review_script(ledger: Ledger, role: str) -> Path:
+    return CURSOR_REVIEW if review_cell(ledger, role)["runner"] == REVIEWER_CURSOR else RUN_REVIEW
 
 
-def run_review_cmd(mode: str, prompt: Path, root: str, out: Path, script: Path = RUN_REVIEW) -> str:
-    return f"{_q(script)} --{mode} {_q(prompt)} --repo {_q(root)} --out {_q(out)}"
+def run_review_cmd(mode: str, prompt: Path, root: str, out: Path, script: Path = RUN_REVIEW, model: str = "") -> str:
+    return f"{_q(script)} --{mode} {_q(prompt)} --repo {_q(root)} --out {_q(out)}" + (f" --model {_q(model)}" if model else "")
+
+
+def review_cmd(ledger: Ledger, role: str, prompt: Path, root: str, out: Path) -> str:
+    cell = review_cell(ledger, role)
+    model = cell["model"] if cell["runner"] == REVIEWER_CURSOR else ""
+    return run_review_cmd(role, prompt, root, out, review_script(ledger, role), model)
 
 
 def _cmd(name: str, run_dir: Path, *rest: str) -> str:
@@ -751,7 +825,7 @@ def next_steps(ledger: Ledger, run_dir: Path) -> list[str]:
             _cmd("adjudicate", run_dir, n, f"--results {_q(rd / 'adj.json')}"),
         ]
     pending = pending_opinions(ledger, rd)
-    if pending and is_claude(ledger):
+    if pending and is_claude(ledger, "opinion"):
         return [
             workflow_step(rd / OPINION_ARGS, rd / OPINION_RESULTS),
             _cmd("opinion", run_dir, n, f"--results {_q(rd / OPINION_RESULTS)}"),
@@ -760,12 +834,12 @@ def next_steps(ledger: Ledger, run_dir: Path) -> list[str]:
         fid = pending[0]
         out = rd / f"opinion-{fid}.out"
         return [
-            run_review_cmd("opinion", rd / f"opinion-{fid}.md", ledger.root, out, review_script(ledger)),
+            review_cmd(ledger, "opinion", rd / f"opinion-{fid}.md", ledger.root, out),
             _cmd("opinion", run_dir, n, f"--id {fid}", f"--result {_q(str(out) + '.final')}"),
         ]
     if not step_done(rnd, "apply"):
         return [_cmd("apply", run_dir, n)]
-    if rnd.recheck_opened and not step_done(rnd, "recheck") and is_claude(ledger):
+    if rnd.recheck_opened and not step_done(rnd, "recheck") and is_claude(ledger, "recheck"):
         return [
             workflow_step(rd / RECHECK_ARGS, rd / RECHECK_RESULTS),
             _cmd("recheck", run_dir, n, f"--result {_q(rd / RECHECK_RESULTS)}"),
@@ -775,7 +849,7 @@ def next_steps(ledger: Ledger, run_dir: Path) -> list[str]:
         repo_file = rd / RECHECK_REPO_FILE
         repo = repo_file.read_text(encoding="utf-8").strip() if repo_file.is_file() else ledger.root
         return [
-            run_review_cmd("recheck", rd / "recheck-prompt.md", repo, out, review_script(ledger)),
+            review_cmd(ledger, "recheck", rd / "recheck-prompt.md", repo, out),
             _cmd("recheck", run_dir, n, f"--result {_q(str(out) + '.final')}"),
         ]
     return [_cmd("report", run_dir)]

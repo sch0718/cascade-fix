@@ -16,6 +16,8 @@ CURSOR_SOURCES = ("cursor-code", "cursor-doc")
 DEFAULT_MODEL, DEFAULT_EFFORT = ROLES["reviewer"]
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 REVIEW_JOB = "review:reviewer"
+REVIEW_META = "review-meta.json"
+REVIEW_OUT = "review.out"
 CALL_FAILED_NOTE = "(Claude 검토자 호출 실패 — 의견 없음)"
 
 _CLAUDE_SUFFIX = """
@@ -41,6 +43,29 @@ def resolve(choice: str, source: str, run_review: Path, cursor_ok: bool | Callab
         return REVIEWER_CODEX
     available = cursor_ok() if callable(cursor_ok) else cursor_ok
     return REVIEWER_CURSOR if available else REVIEWER_CLAUDE
+
+
+def first_review_command(cell: dict, args: dict, review_dir: Path) -> tuple[str, str]:
+    """외부 첫 검토(Codex `RR`, Cursor `CR`)를 돌릴 명령과 결과 파일(`<review_dir>/review.out.final`) 경로."""
+    from cascade import cli_steps  # cli_steps가 이 모듈을 먼저 불러오므로 함수 안에서 부른다
+
+    cursor = cell["runner"] == REVIEWER_CURSOR
+    script = cli_steps.CURSOR_REVIEW if cursor else cli_steps.RUN_REVIEW
+    if args["kind"] == "doc":
+        scope = " ".join(f"--doc {shlex.quote(doc)}" for doc in args["docs"])
+    elif args["uncommitted"]:
+        scope = "--uncommitted"
+    elif args["commit"]:
+        scope = f"--commit {shlex.quote(args['commit'])}"
+    else:
+        scope = f"--base {shlex.quote(args['base'])}"
+    out = Path(review_dir) / REVIEW_OUT
+    command = (f"{shlex.quote(str(script))} {scope}" + (f" --focus {shlex.quote(args['focus'])}" if args["focus"] else "")
+               + f" --repo {shlex.quote(args['root'])} --out {shlex.quote(str(out))}"
+               + (f" --model {shlex.quote(cell['model'])}" if cursor and cell["model"] else ""))
+    if args["kind"] == "code" and not cursor:
+        command = f"cd {shlex.quote(args['root'])} && {command}"  # codex-review의 코드 모드는 --repo를 무시하고 현재 디렉터리를 본다
+    return command, f"{out}.final"
 
 
 def claude_prompt(prompt: str, repo: str | Path) -> str:

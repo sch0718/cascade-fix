@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import replay  # noqa: E402
 import score  # noqa: E402
+from cascade.consensus import REASON_BOTH_PASS, REASON_SENSITIVE  # noqa: E402
 from fake_cli import fenced, result_json  # noqa: E402
 from helpers import git, make_repo, run_cli, write_repos_toml  # noqa: E402
 from test_cli_workers import LIMIT_ENTRY, WorkersTestBase  # noqa: E402
@@ -102,7 +103,7 @@ class ScoreTest(unittest.TestCase):
         self.assertEqual((m["agree"], m["judged"]), (2, 2))
         self.assertEqual((m["opus_calls"], m["baseline_calls"]), (2, 3))
         self.assertAlmostEqual(m["opus_ratio"], 2 / 3)
-        self.assertEqual(m["paths"], {"합의": 1, "판가름": 1, "Codex 검토": 0, "사람": 1})
+        self.assertEqual(m["paths"], {"합의": 1, "규칙 채택": 0, "판가름": 1, "Codex 검토": 0, "사람": 1})
         self.assertEqual(m["patch_differs"], 1)
         self.assertEqual(m["items"], 3)
         self.assertEqual(m["regressions"], 0)
@@ -163,7 +164,19 @@ class ScoreTest(unittest.TestCase):
         m = score.compute(self.runs, score.load_sample(self.sample))
         self.assertEqual(m["predicted"], {"s1": "판정 없음", "s2": "재현 불가", "s3": "아님"})
         self.assertEqual((m["agree"], m["judged"]), (1, 2))
-        self.assertEqual(m["paths"], {"합의": 0, "판가름": 1, "Codex 검토": 1, "사람": 1})
+        self.assertEqual(m["paths"], {"합의": 0, "규칙 채택": 0, "판가름": 1, "Codex 검토": 1, "사람": 1})
+
+    def test_adopt_on_both_pass_counts_rule_path_and_patch_differs(self):
+        make_run(self.runs, "s1", [decision("합의-사실", "b", [f"{REASON_BOTH_PASS}: 작은 패치 b 채택"])])
+        make_run(self.runs, "s2", [decision("판단불가", None, [f"{REASON_BOTH_PASS}: 크기가 같아 a 채택", REASON_SENSITIVE])])
+        make_run(self.runs, "s3", [decision("합의-아님")])
+        m = score.compute(self.runs, score.load_sample(self.sample))
+        self.assertEqual(m["paths"], {"합의": 1, "규칙 채택": 1, "판가름": 0, "Codex 검토": 0, "사람": 1})
+        self.assertEqual(m["patch_differs"], 2)
+        self.assertEqual(m["predicted"], {"s1": "사실", "s2": "판정 없음", "s3": "아님"})
+        text = score.render(m)
+        self.assertIn("| 채택 경로 분포 | 합의 1, 규칙 채택 1, 판가름 0, Codex 검토 0, 사람 1 |", text)
+        self.assertIn("| 패치 다르지만 둘 다 통과 | 2/3 (66.7%) |", text)
 
     def test_doc_checker_accuracy(self):
         make_run(self.runs, "s1", [decision("판가름", "writer", ["점검자 아니오", "판가름: 고친다"])],
@@ -361,6 +374,26 @@ class ReplayTest(unittest.TestCase):
         self.assertEqual(git(self.repo, "status", "--porcelain"), "")
         m = score.compute(self.out, score.load_sample(sample))
         self.assertEqual((m["agree"], m["judged"]), (1, 1))
+
+    def test_replay_fake_skips_adjudicate_without_adj_args(self):
+        sample = self.write_sample([self.item("item-01")])
+        fake = self.write_fake("item-01")
+        write_json(fake / "item-01" / "adj.json", {"results": [
+            {"id": "r1-01:adjudicator", "output": {"verdict": "사실", "needs_design_decision": False, "reason": "x",
+                                                   "verify": [], "model_id": "claude-opus-5-5"}}]})
+        self.assertEqual(self.run_replay(sample, "--fake-results", str(fake)), 0)
+        base = self.out / "item-01"
+        self.assertNotIn("error", json.loads((base / "meta.json").read_text(encoding="utf-8")))
+        ledger = json.loads((base / "ledger.json").read_text(encoding="utf-8"))
+        self.assertEqual(ledger["rounds"][0]["decisions"][0]["outcome"], "합의-아님")
+        self.assertFalse((base / "run" / "round-1" / "adj.json").exists())
+
+    def test_replay_passes_adopt_on_both_pass_to_init(self):
+        sample = self.write_sample([self.item("item-01")])
+        fake = self.write_fake("item-01")
+        self.assertEqual(self.run_replay(sample, "--fake-results", str(fake), "--adopt-on-both-pass"), 0)
+        ledger = json.loads((self.out / "item-01" / "ledger.json").read_text(encoding="utf-8"))
+        self.assertIs(ledger["adopt_on_both_pass"], True)
 
     def test_replay_worktree_add_skips_user_hooks(self):
         marker = self.tmp / "hook-ran"

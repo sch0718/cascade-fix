@@ -16,7 +16,7 @@
                                                                           └─ 판단 불가 → 검토자 의견 + 사람 목록
 ```
 
-작업자 자리(A·B, 문서 모드의 writer·checker)는 옵션으로 Codex·Cursor CLI에 맡길 수 있습니다(`--workers external`). 기본값은 Claude 작업자이고, [측정 계획](docs/2026-10-18-workers-measurement-plan.md)의 기준을 통과하기 전까지는 옵션으로만 둡니다. 판가름(Opus)과 Claude 검토자는 그대로 Claude입니다. 자세한 내용은 [외부 작업자](#외부-작업자-옵션)에 있습니다.
+역할(첫 검토, 작업자 A·B와 문서 모드의 판정자·작성자·점검자, 의견, 재검토)마다 Claude·Codex·Cursor 중 누가 맡을지, 모델, effort, 대체 실행 대상을 **프로필**로 고를 수 있습니다. 프로필을 고르지 않으면 Claude 작업자가 돌고, [측정 계획](docs/2026-10-18-workers-measurement-plan.md)의 기준을 통과하기 전까지 외부 runner는 프로필이나 `--workers external`로만 켭니다. 판가름(Opus)은 항상 Claude입니다. 자세한 내용은 [프로필](#프로필)에 있습니다.
 
 ## 무엇을 고칠 수 있나
 
@@ -37,13 +37,15 @@
 
 보안·인증·삭제 경로(`**/auth*`, `**/security*`, `**/*delete*`, `**/migrations/**`)를 고친 지적은 채택하지 않고 사람 목록으로 보냅니다.
 
+코드 모드에서 작업자 둘이 같은 판정(사실)을 내고 둘 다 검증을 통과했지만 패치가 다르면, 기본은 Opus 판가름으로 보냅니다. `init --adopt-on-both-pass`를 주면 판가름 없이 바뀐 줄이 적은 패치를 채택합니다(같으면 작업자 A). 검증 명령이 하나도 돌지 않았거나, 관련 테스트가 없어 테스트를 실제로 돌리지 못했거나, 한쪽 패치가 비었으면 이 옵션을 줘도 판가름으로 갑니다. 보안 경로는 이때도 채택하지 않고 사람 목록으로 보냅니다. 효과를 아직 측정하지 않아 내장 `default`에서는 꺼져 있습니다. 내장 `claude-only`와 `local`은 켠 채로 시작합니다.
+
 ## 요구 사항
 
 - Claude Code. 여러 에이전트를 띄우는 **Workflow 도구**를 쓸 수 있어야 합니다.
 - Python 3.11 이상. 외부 패키지는 필요 없습니다.
 - git
 - (PR 모드) 로그인된 `gh` CLI
-- (선택) Codex를 검토자로 쓰려면 `codex-review` 스킬과 `codex` CLI. 이 스킬은 `run-review.sh`의 `--opinion`·`--recheck` 모드를 씁니다. 원래 `codex-review`에는 없는 모드라 [docs/codex-review-changes/](docs/codex-review-changes/README.md)에 보관한 `run-review.sh`로 바꿔야 합니다. 이 스크립트는 임시 CODEX_HOME에서 스킬 목록을 꺼 Codex 프롬프트도 줄입니다. 없으면 검토자는 자동으로 Claude가 됩니다.
+- (선택) Codex를 검토자로 쓰려면 `codex-review` 스킬과 `codex` CLI. 이 스킬은 `run-review.sh`의 `--opinion`·`--recheck` 모드를 씁니다. 원래 `codex-review`에는 없는 모드라 [docs/codex-review-changes/](docs/codex-review-changes/README.md)에 보관한 `run-review.sh`로 바꿔야 합니다. 이 스크립트는 임시 CODEX_HOME에서 스킬 목록을 꺼 Codex 프롬프트도 줄입니다. 없으면 그 칸은 fallback(기본 Claude)으로 바뀝니다.
 - (선택) Cursor를 검토자나 작업자로 쓰려면 `cursor-review` 스킬(`~/.claude/skills/cursor-review/`, 사본은 [docs/cursor-review/](docs/cursor-review/README.md))과 로그인된 `cursor-agent` CLI(`cursor-agent login`). Codex를 작업자로 쓰려면 `codex` CLI와 로그인이 필요합니다.
 
 ## 설치
@@ -117,6 +119,8 @@ format = ["ruff format {files}"]    # 작업자가 바꾼 파일에만 돈다
 # build / typecheck / setup / sensitive_paths / doc_snippet_check 도 쓸 수 있다
 ```
 
+바뀐 파일과 관련된 테스트 파일이 없으면 `{files}`가 든 `tests` 명령 대신 `full_tests`를 돌립니다. `full_tests`도 없으면 그 명령을 「실행 안 함」으로 남기고 검증 통과로 세지 않습니다(같은 패치 합의는 그대로 채택하고 사유에 「테스트가 돌지 않음」을 남깁니다).
+
 전체 형식은 [repos.toml](repos.toml)의 머리 주석에 있습니다. 다른 파일을 쓰려면 환경 변수 `CASCADE_REPOS_TOML`로 지정합니다.
 
 ## 사용법
@@ -143,11 +147,11 @@ Codex 검토 결과(review.final) 반영해줘
    - 기준 브랜치보다 앞선 커밋이 있는가
 
    바뀐 파일이 모두 문서면 문서 모드로 갑니다. 코드와 문서가 섞였으면 코드 모드로 가고, 문서만 따로 볼 명령을 함께 알려 줍니다. 테스트가 없거나 처리할 것이 없으면 여기서 멈춥니다.
-2. **계획 확인 한 번**: 입력·모드·검토자와 예상 에이전트 수를 보여 줍니다. 「진행 / Critical·Warning만 / dry-run」 중에서 고릅니다. 검증 명령 등록이 필요하면 이때 함께 확인합니다.
+2. **계획 확인 한 번**: 입력·모드·프로필(역할 배정)·검토자와 예상 에이전트 수, 전송 동의 항목을 보여 줍니다. 「진행 / Critical·Warning만 / dry-run」 중에서 고릅니다. 검증 명령 등록이 필요하면 이때 함께 확인합니다.
 3. **끝까지 진행**: 리뷰, 작업자 2명, 검증, 판가름, 적용, 재검토를 차례로 돕니다. 단계마다 다시 묻지 않습니다.
    - 적용 뒤 재검토에서 새 지적이 나오면 다음 회차를 엽니다. 재검토는 실행당 최대 2회입니다(`--max-rechecks`).
    - 앞 패치와 같은 파일을 고쳐 적용하지 못한 지적은 다음 회차에서 바뀐 코드로 다시 고칩니다.
-4. **보고**: 회차별 표와 사람이 볼 목록 네 칸을 보여 줍니다.
+4. **보고**: 회차별 표, 역할 배정(「역할 배정」·「역할별 사용량」), 사람이 볼 목록 네 칸을 보여 줍니다.
    - 반박
    - 설계 결정: 판정자 근거와, 문서 모드면 작성자가 낸 선택지·장단점(작성자가 안 하나를 골라 고쳤으면 그 수정안과 패치 경로)
    - 판단 불가
@@ -177,44 +181,185 @@ Codex 검토 결과(review.final) 반영해줘
 - 플러그인으로 설치했으면 `/cascade-fix:cascade-fix`, 개인 스킬이면 `/cascade-fix`로 부릅니다.
 - 옵션을 함께 말하면("Critical만, dry-run으로, 묻지 말고 진행") 계획 확인을 건너뜁니다.
 
-### 검토자: Codex, Cursor, Claude
+## 프로필
 
-판가름 뒤 「의견」과 적용 뒤 「재검토」를 누가 맡을지 고릅니다.
+역할 14칸(모드마다 7칸)마다 누가 맡을지(Claude·Codex·Cursor), 모델, effort, 대체 실행 대상(fallback)을 프로필 하나로 고릅니다. 프로필을 고르지 않으면 내장 `default`가 돌고, v1.2.0과 같은 배정입니다. 의견·재검토에서 한도·오류가 나면 멈추지 않고 Claude로 대체하는 점만 v1.2.0과 다릅니다([검토 역할](#검토-역할의견재검토)).
 
-| 설정 | 동작 |
+### 역할 칸
+
+| 역할 | 코드 모드 칸 | 문서 모드 칸 | 받는 runner |
+| --- | --- | --- | --- |
+| 첫 검토 | `code.review` | `doc.review` | claude · codex · cursor · auto |
+| 작업자 A / 판정자 a | `code.a` | `doc.judge_a` | claude · codex · cursor |
+| 작업자 B / 판정자 b | `code.b` | `doc.judge_b` | claude · codex · cursor |
+| 작성자 | - | `doc.writer` | claude · codex · cursor |
+| 점검자 | - | `doc.checker` | claude · codex · cursor |
+| 판가름 | `code.adjudicator` | `doc.adjudicator` | claude |
+| 판단 불가 의견 | `code.opinion` | `doc.opinion` | claude · codex · cursor · auto |
+| 수정 재검토 | `code.recheck` | `doc.recheck` | claude · codex · cursor · auto |
+
+칸마다 네 값을 둡니다.
+
+| 값 | 뜻 |
 | --- | --- |
-| `auto` (기본) | 차례로 봅니다. Claude 리뷰로 시작했으면 Claude. 아니면 `codex-review` 스킬이 있으면 Codex. 아니면 `cursor-review` 스킬이 있고 `cursor-agent`가 로그인돼 있으면 Cursor. 모두 아니면 Claude |
-| `claude` | 의견·재검토를 Claude 에이전트가 맡습니다. 외부 전송이 없습니다. |
-| `codex` | `run-review.sh --opinion/--recheck`로 Codex에 보냅니다. 저장소마다 전송 동의를 받습니다. 호출은 한 번에 하나씩 돌립니다(동시에 토큰을 갱신하면 로그인이 풀릴 수 있습니다). 결과가 없으면 실행 로그와 인증 실패 여부를 보여 주고 멈춥니다. |
-| `cursor` | `cursor-review`의 `run-review.sh --opinion/--recheck`로 Cursor(팀 프라이버시 모드)에 보냅니다. 읽기 전용이고 모델은 `composer-2.5`입니다. 저장소마다 전송 동의를 받고 호출은 한 번에 하나씩 돌립니다. 결과가 없으면 실행 로그와 인증·한도 여부를 보여 주고 멈춥니다. 종료 코드 75는 이용 한도, 77은 로그인 필요(`cursor-agent login`)입니다. |
+| `runner` | `claude`·`codex`·`cursor`. 검토 칸(`review`·`opinion`·`recheck`)은 `auto`도 받습니다. `auto`는 init이 정합니다(아래) |
+| `model` | claude면 `claude-`로 시작하는 모델 ID. cursor면 Cursor 모델 ID(`claude-`·`gpt-`로 시작하면 오류). codex면 비우거나 모델 ID. 비우면 `~/.codex/config.toml`의 `model`을 씁니다. auto는 Claude로 풀릴 수 있어 비우거나 `claude-`로 시작해야 합니다 |
+| `effort` | claude·codex만 씁니다(`low`·`medium`·`high`·`xhigh`·`max`). cursor 칸에 적으면 오류입니다 |
+| `fallback` | 대체 실행 대상 `{ runner, model, effort }` 하나. 생략하면 내장 `claude-only`의 같은 칸 값입니다. `auto`는 받지 않습니다 |
 
-- 기본값은 환경 변수 `CASCADE_REVIEWER`로 바꿉니다.
-- `cursor-review`의 `run-review.sh`는 환경 변수 `CASCADE_CURSOR_REVIEW`, 이 스킬 옆의 `cursor-review/`, `~/.claude/skills/cursor-review/` 순으로 찾습니다.
-- Claude 검토자의 기본 모델은 `claude-fable-5-1`(effort `high`)입니다. 판가름을 맡는 Opus와 다른 모델을 써서 같은 판단을 되풀이하지 않게 하려는 것입니다.
-- 모델은 `--review-model`, effort는 `--review-effort`로 바꿉니다.
+- `auto`는 init이 정합니다(`--reviewer auto` 규칙). Claude 리뷰로 시작했으면 Claude, 아니면 `codex-review`가 있으면 Codex, 아니면 로그인된 `cursor-review`면 Cursor, 모두 아니면 Claude입니다. 첫 검토 칸의 `auto`는 Claude입니다.
+- codex 검토 칸(`review`·`opinion`·`recheck`)은 `model`·`effort`를 비워야 합니다. `run-review.sh`에 그 옵션이 없기 때문입니다. cursor 검토 칸은 `CR --model`로 모델을 넘깁니다.
+- 판가름 칸은 `claude`만 받습니다.
+- 프로필 단위 값으로 `adopt_on_both_pass`(참/거짓)가 있습니다. 명령줄에 `--adopt-on-both-pass`를 주면 참이 됩니다.
+- 칸의 `runner`만 바꾸면 모델·effort는 새 runner에 맞게 다시 정합니다. claude는 `claude-only`의 같은 칸 값, codex는 모델을 비우고 effort는 작업자 칸이면 `low`·검토 칸이면 비움, cursor는 `--cursor-model`(기본 `composer-2.5`)과 effort 비움입니다. 같은 칸에 `model`·`effort`를 함께 주면 그 값이 먼저입니다.
 
-### 외부 작업자 (옵션)
+### 내장 프로필
 
-`--workers external`(또는 환경 변수 `CASCADE_WORKERS=external`)을 주면 쓸 수 있는 Codex·Cursor CLI에 작업자 자리를 배정합니다. 기본값은 `claude`입니다.
+| 칸 | `default` | `claude-only` | `local` |
+| --- | --- | --- | --- |
+| 첫 검토(`*.review`) | auto(= Claude Fable 5.1 high) | Claude Fable 5.1 high | Codex |
+| 작업자 6칸(`code.a`·`code.b`·`doc.judge_a`·`doc.judge_b`·`doc.writer`·`doc.checker`) | Sonnet 5.5 low(a·judge_a·writer) / Haiku 5.5 low(b·judge_b·checker) | 같음 | `code.a`만 Codex(`~/.codex/config.toml` 모델, low). 나머지는 `default`와 같음 |
+| 판가름 | Opus 5.5 high | 같음 | 같음 |
+| 의견·재검토 | auto(Claude면 Fable 5.1 high) | Claude Fable 5.1 high | Codex |
+| fallback | `claude-only`의 같은 칸 | - | `claude-only`의 같은 칸 |
+| `adopt_on_both_pass` | 꺼짐 | 켜짐 | 켜짐 |
 
-| 쓸 수 있는 것 | A(코드)·writer(문서) | B(코드)·checker(문서) |
+- `default`는 프로필을 고르지 않았을 때 도는 값입니다. 옛 옵션·환경 변수만 쓰면 v1.2.0과 같은 배정·출력·작업 파일이 나옵니다.
+- `claude-only`는 외부 전송이 없습니다. 전송 동의를 거절하거나 fallback을 생략했을 때, 마지막 대체 대상, `--workers claude`가 모두 이 값으로 돌아옵니다.
+- `local`은 측정 전 잠정값입니다. 쓸 수 없는 CLI의 칸은 init이 fallback으로 바꿉니다.
+
+### repos.toml로 덮거나 더하기
+
+`~/.claude/cascade-fix/repos.toml`(또는 `CASCADE_REPOS_TOML`)에 적습니다.
+
+```toml
+default_profile = "local"            # 최상위. 저장소 항목에 profile이 없을 때 쓴다
+
+[profiles.local]                     # 내장 local을 칸 단위로 덮는다
+adopt_on_both_pass = true
+"code.a" = { runner = "codex", effort = "low" }
+"code.b" = { runner = "claude", model = "claude-haiku-5-5", effort = "low" }
+
+[profiles.mix-sonnet-cursor]         # 새로 만든다
+base = "claude-only"
+"code.b" = { runner = "cursor", model = "composer-2.5" }
+
+[profiles.codex-a-cursor-fallback]
+base = "claude-only"
+"code.a" = { runner = "codex", fallback = { runner = "cursor", model = "composer-2.5" } }
+
+[repos."/Users/me/work/regulations"]
+profile = "claude-only"              # 사내규정 원문이 든 저장소는 Claude만
+tests = ["pytest {files}"]
+```
+
+- 칸 키에는 점이 있어 따옴표로 감쌉니다. 인라인 표는 반드시 한 줄에 적습니다. TOML이 여러 줄 인라인 표를 받지 않아 파일을 읽지 못합니다. `fallback`도 인라인 표 안의 인라인 표로 적습니다.
+- 내장 이름과 같은 `[profiles.<이름>]`은 그 프로필을 칸 단위로 덮습니다. 적지 않은 칸은 내장값입니다. 이 표에는 `base`를 쓸 수 없습니다(오류).
+- 새 이름은 `base = "<다른 프로필>"`로 시작점을 고릅니다. `base`가 없으면 `default`에서 시작합니다. `base`가 순환하거나 없는 이름이면 오류입니다.
+- **`claude-only`는 덮을 수 없습니다.** `[profiles.claude-only]`를 적으면 init이 종료 코드 5로 멈춥니다. 「외부 전송 없이 Claude로」가 늘 지켜지게 하려는 것입니다. Claude 모델·effort를 바꾸고 싶으면 `base = "claude-only"`로 새 이름을 만듭니다(그 프로필에서는 외부 runner도 고를 수 있으므로 안전 경로는 내장 `claude-only`입니다).
+- 설정 오류(모르는 프로필·칸 키·값 키, 받지 않는 runner, runner와 모델 불일치, cursor의 effort, codex 검토 칸의 model·effort, 값 타입 오류)는 트레이스백 없이 어느 프로필·칸·키인지 한 줄로 알리고 종료 코드 5로 멈춥니다. 모르는 프로필 이름이면 알려진 이름 목록을 함께 보입니다.
+- 견본은 [repos.toml](repos.toml)에 있습니다.
+
+### 프로필 고르기
+
+다음 순서로 고릅니다.
+
+1. `init`·`detect`·`review`의 `--profile <이름>`
+2. 환경 변수 `CASCADE_PROFILE`
+3. repos.toml 저장소 항목의 `profile`
+4. repos.toml 최상위 `default_profile`
+5. 내장 `default`
+
+`init`과 `detect`는 고른 프로필과 출처를 `프로필: <이름> (<출처>)`로 찍습니다. 출처는 `--profile`·`CASCADE_PROFILE`·`repos.toml:repo`·`repos.toml:default_profile`·`builtin`입니다. `init`은 이어서 폐기 예정 알림(`참고: …`), 옛 옵션이 덮은 칸(`덮음: …`), 바꾼 칸(`대체: …`), 이 모드의 칸별 배정(`역할: …`), `전송 동의: …`를 찍습니다. `detect`는 `프로필:`·`덮음:`·`역할:`을 찍고, 바꾼 칸은 `참고: 대체: …`로, 전송 동의는 `확인 필요: 전송 동의: …`로 보입니다. `detect`는 폐기 예정 알림을 찍지 않습니다. 원장에는 `profile`(이름·출처·14칸 확정값·덮은 칸·바꾼 칸·동의 목록)이 남습니다.
+
+### 옛 옵션·환경 변수와의 관계
+
+프로필로 배정을 만든 뒤, **명령줄에 준** 옵션만 해당 칸을 덮습니다.
+
+| 옛 옵션 | 덮는 칸 | 동작 |
 | --- | --- | --- |
-| Codex와 Cursor | Codex | Cursor |
-| Codex만 | Codex | Claude Haiku |
+| `--workers claude` | 작업자 6칸 | 모두 `claude-only` 값 |
+| `--workers external` | 작업자 6칸 | 쓸 수 있는 CLI를 보고 A 자리·B 자리에 넣습니다(아래 표) |
+| `--cursor-model M` | runner가 cursor인 모든 칸 | 모델을 M으로 |
+| `--reviewer X` | `<모드>.opinion`·`<모드>.recheck` | runner를 X로(auto 포함). 첫 검토 칸은 덮지 않습니다 |
+| `--review-model M` · `--review-effort E` | `opinion`·`recheck` 중 claude(또는 auto) 칸 | 모델·effort를 M·E로 |
+| `--adopt-on-both-pass` | `adopt_on_both_pass` | 참으로 |
+
+`--workers external`의 자리 배정입니다. A 자리는 `code.a`·`doc.judge_a`·`doc.writer`, B 자리는 `code.b`·`doc.judge_b`·`doc.checker`입니다.
+
+| 쓸 수 있는 CLI | A 자리 | B 자리 |
+| --- | --- | --- |
+| Codex와 Cursor | Codex(`~/.codex/config.toml` 모델, low) | Cursor(`--cursor-model`, 기본 `composer-2.5`) |
+| Codex만 | Codex | Claude Haiku(`claude-only` 값) |
 | Cursor만 | Cursor | Claude Haiku |
-| 둘 다 없음 | Claude Sonnet | Claude Haiku |
+| 둘 다 없음 | Claude Sonnet(init이 알림) | Claude Haiku |
+
+- runner를 정하는 옵션(`--workers`·`--reviewer`와 두 환경 변수)이 겨냥한 칸은 **고정**됩니다. 쓸 수 없는 CLI라고 init이 fallback으로 바꾸지 않습니다(v1.2.0과 같습니다). 모델만 바꾸는 옵션(`--cursor-model`·`--review-model`·`--review-effort`)은 고정하지 않습니다. 덮은 값은 검사를 다시 거치므로, 금지 모델을 넣으면 어느 옵션 탓인지 알리고 종료 코드 5로 멈춥니다.
+- `CASCADE_WORKERS`·`CASCADE_REVIEWER`는 **프로필을 명시적으로 고르지 않았을 때만**(내장 `default`로 떨어졌을 때만) 읽습니다. 읽으면 `init`이 `참고: 폐기 예정: CASCADE_PROFILE 또는 repos.toml profile을 쓴다`를 찍습니다(`detect`는 찍지 않습니다). 프로필을 명시했으면(1~4단계) 두 변수를 무시하고 무시했다고 한 줄 알립니다. 값이 잘못됐으면 종료 코드 5로 멈춥니다(v1.2.0은 1).
+- 옛 옵션은 덮어쓰기 수단으로 계속 쓸 수 있습니다. 없앨지는 다음 메이저에서 정합니다.
+
+### 전송 동의
+
+외부 runner(Codex는 OpenAI, Cursor는 팀 프라이버시 모드)를 쓰는 칸은 코드·문서를 밖으로 보냅니다. `init`과 `detect`가 `전송 동의:` 줄로 수신처별 칸을 보입니다.
+
+```
+전송 동의: A·의견·재검토 → OpenAI / 대체 실행 때 A → Cursor(팀 프라이버시 모드)
+```
+
+- 칸의 fallback이 외부 runner면 그 수신처도 같은 줄에 「대체 실행 때 …」로 따로 적고 동의를 받습니다. 주 runner와 수신처가 같아도 적습니다.
+- 동의는 수신처 단위이고 저장소마다 한 번 받습니다. 사내규정 원문이 든 저장소는 동의하지 않으면 됩니다.
+- `init`과 `CF review`의 `--consent <codex,cursor|none>`이 동의한 수신처를 정합니다. 생략하면 이 프로필이 쓰는 수신처 전부에 동의한 것으로 봅니다. 스킬은 먼저 사용자에게 묻고 일부만(또는 아무것도) 동의했을 때 이 옵션으로 넘깁니다. `detect`는 읽기만 하므로 `--consent`가 없습니다.
+- 동의하지 않은 수신처를 쓰는 칸과 fallback은 내장 `claude-only` 값으로 바뀌고 init이 `대체: … — 전송 동의 없음`으로 알립니다. 모두 거절하면(`--consent none`) 그 실행은 Claude만 씁니다.
+- 원장의 `profile.consented`는 동의한 수신처 중 실제로 쓰는 것만 담습니다. 실행기는 이 목록에 없는 runner로는 대체 실행하지 않고 `claude-only` 값으로 돕니다.
+- `CF review`는 받은 `--consent`를 「다음:」의 init 줄에 그대로 넘깁니다.
+
+### 첫 검토
+
+`CF review --profile …`가 `<모드>.review` 칸을 따릅니다(`--profile`을 생략하면 같은 순서로 고릅니다). `detect`는 첫 검토를 늘 `CF review …`로 권합니다.
+
+- claude 칸: `review-args.json`을 만들고 Workflow를 안내합니다. 모델·effort는 칸 값이고 `--review-model`·`--review-effort`는 이 칸만 덮습니다.
+- codex·cursor 칸: Claude 작업을 만들지 않고 `RR`·`CR` 명령과 그 결과로 이어 갈 init 줄(`--source codex-*`·`cursor-*`, `--input <review_dir>/review.out.final`)을 찍습니다. 코드 모드의 `RR`은 `--repo`를 무시하고 현재 디렉터리 저장소를 보므로 명령이 `cd <저장소 루트> && RR …`로 나옵니다. 이 칸에 `--review-model`·`--review-effort`를 주면 종료 코드 5로 거절합니다.
+- 프로필을 명시했으면 「다음:」의 init 줄에 `--profile <이름>`을 붙이고, 아니면(내장 `default`) 옛 옵션을 그대로 넘깁니다.
+- 외부 첫 검토가 한도·오류로 실패하면 `CF review --review-dir <처음 폴더> --fallback-from <실패한 runner> --reason <사유>`로 fallback 칸 작업을 같은 폴더에 만듭니다. fallback 칸을 따라 codex → cursor → claude로 이어 갈 수 있고, 동의 밖이거나 이미 실패한 runner로는 가지 않습니다. 이력은 `<review_dir>/review-meta.json`에 남고 init이 읽어 보고서에 보입니다.
+- 로그인 만료는 대체하지 않고 멈춥니다(`codex login`·`cursor-agent login`).
+
+### 검토 역할(의견·재검토)
+
+판가름 뒤 「의견」과 적용 뒤 「재검토」는 `<모드>.opinion`·`<모드>.recheck` 칸이 따로 맡습니다.
+
+| runner | 동작 |
+| --- | --- |
+| `claude` | Claude 에이전트가 맡습니다. 외부 전송이 없습니다. 기본 모델은 `claude-fable-5-1`(effort `high`)입니다. 판가름을 맡는 Opus와 다른 모델을 써서 같은 판단을 되풀이하지 않게 하려는 것입니다 |
+| `codex` | `run-review.sh --opinion/--recheck`로 OpenAI에 보냅니다. 호출은 한 번에 하나씩 돌립니다(동시에 토큰을 갱신하면 로그인이 풀릴 수 있습니다) |
+| `cursor` | `cursor-review`의 `run-review.sh --opinion/--recheck`로 Cursor(팀 프라이버시 모드)에 보냅니다. 읽기 전용이고 모델은 기본 `composer-2.5`입니다. 호출은 한 번에 하나씩 돌립니다 |
+
+- 한도(로그의 usage limit)·시간 초과·실행 오류가 나면 그 칸의 fallback으로 자동으로 다시 돕니다. **프로필을 고르지 않은 기본 동작에서도 같습니다.** v1.2.0은 한도에서 멈췄습니다.
+- 로그인 만료(로그의 401·refresh token)는 대체하지 않고 멈춥니다. CF는 `run-review.sh`의 종료 코드(75·77)를 보지 못하고 실행 로그 끝 20줄로 원인을 가릅니다. 로그에 인증 흔적 없이 77로 끝났으면 실행 오류로 보고 fallback으로 갑니다. 터미널에서 `codex login`(Cursor는 `cursor-agent login`)을 한 뒤 다시 돌립니다.
+- 실행 중 대체는 init이 정한 배정과 따로 `profile.runtime_substitutions`에 남고, 다음 회차에도 이어집니다. 보고서는 의견마다 실제로 맡은 runner를 붙입니다.
+- `cursor-review`의 `run-review.sh`는 환경 변수 `CASCADE_CURSOR_REVIEW`, 이 스킬 옆의 `cursor-review/`, `~/.claude/skills/cursor-review/` 순으로 찾습니다.
+
+### 작업자
+
+작업자 칸(`code.a`·`code.b`·`doc.judge_a`·`doc.judge_b`·`doc.writer`·`doc.checker`)을 Codex·Cursor CLI에 맡길 수 있습니다. 측정 계획의 기준을 통과하기 전까지는 내장 `default`가 Claude 작업자이고 외부는 프로필·옵션으로만 켭니다.
 
 - Cursor 모델은 `--cursor-model`로 바꿉니다(기본 `composer-2.5`, 호출당 약 $0.01). Auto·grok-4.7-high는 호출당 약 85배 비싸 쓰지 않습니다. Claude·GPT 계열 Cursor 모델도 쓰지 않습니다.
-- 작업자 CLI는 워크트리 전체를 읽습니다. 코드·문서가 OpenAI(Codex)와 Cursor(팀 프라이버시 모드)로 나가므로 저장소마다 한 번 전송 동의를 받습니다. 사내규정 원문이 든 저장소는 동의하지 않으면 Claude로 돕니다.
-- 코드 모드에서 저장소마다 처음 한 번, 검증 명령을 각 CLI의 샌드박스 안에서 돌려 봅니다. 결과는 `~/.claude/cascade-fix/sandbox-check.json`에 남습니다. 샌드박스 안에서만 실패하는 CLI는 그 저장소에서 쓰지 않고 Claude로 돕니다. 샌드박스 밖에서도 실패하는 명령은 샌드박스 탓으로 보지 않습니다. 저장소 명령 전에 사소한 명령을 먼저 돌려 점검 호출 자체(사용법 오류 등)가 실패하면 결과를 저장하지 않고, 그 실행에서는 Claude로 돌고 다음에 다시 점검합니다. 점검이 base 워크트리에 남긴 변경은 되돌립니다.
+- 작업자 CLI는 워크트리 전체를 읽습니다. 코드·문서가 OpenAI(Codex)와 Cursor(팀 프라이버시 모드)로 나가므로 [전송 동의](#전송-동의)를 저장소마다 한 번 받습니다.
+- 코드 모드에서 저장소마다 처음 한 번, 검증 명령을 각 CLI의 샌드박스 안에서 돌려 봅니다. 결과는 `~/.claude/cascade-fix/sandbox-check.json`에 남습니다. 샌드박스 안에서만 실패하는 CLI는 그 저장소에서 쓰지 않고 그 칸을 fallback으로 바꿉니다(원장 `profile.substituted`에 남습니다). 샌드박스 밖에서도 실패하는 명령은 샌드박스 탓으로 보지 않습니다. 저장소 명령 전에 사소한 명령을 먼저 돌려 점검 호출 자체(사용법 오류 등)가 실패하면 결과를 저장하지 않고, 그 실행에서는 Claude로 돌고 다음에 다시 점검합니다. 점검이 base 워크트리에 남긴 변경은 되돌립니다. 점검은 주 runner만 보고, fallback 전용 CLI는 미리 점검하지 않습니다(실행 중 실패하면 `claude-only` 값으로 돕니다).
 - CLI 작업은 `workers` 명령이 한 번에 돌리고 Claude 작업의 Workflow와 동시에 진행합니다. 메인 세션이 읽는 출력은 요약 몇 줄입니다.
-- 한도 초과·로그인 풀림·시간 초과(작업당 900초)·실행 오류·무효 결과가 나면 그 작업만 원래 Claude 모델로 다시 돕니다(대체 실행). 보고서의 「외부 작업자」 절에 사유별 건수와 CLI별 토큰이 남습니다.
-- 2026-10-18에 진짜 `codex`·`cursor-agent`로 실측했습니다. Cursor 임시 HOME 격리는 로그인을 유지했고 MCP·Web·셸·쓰기와 홈 민감 경로 읽기를 막았습니다. `--workers external` 전체 흐름이 Claude 작업자 호출 없이 돌았습니다. 사전 점검은 `codex sandbox -P :workspace`로 하며, 워크트리 안 쓰기만 되고 저장소 루트·홈 쓰기와 네트워크가 막혀 `exec -s workspace-write`와 같았습니다(codex-cli 0.163.0-alpha.10.2).
+- 한도 초과·로그인 풀림·시간 초과(작업당 900초)·실행 오류·무효 결과가 나면 그 작업만 **그 칸의 fallback**으로 다시 돕니다(칸마다 따로). fallback이 외부 runner면 같은 `CF workers` 호출 안에서 다시 돌립니다. 동의 밖 수신처나, 그 회차에 한도·로그인 실패가 났거나 샌드박스 점검에 실패한 CLI로는 가지 않고 `claude-only` 값으로 돕니다.
+- 보고서의 「역할 배정」 절에 대체 실행 내역이, 「역할별 사용량」 표에 칸별 호출 수·대체 실행 사유별 건수·CLI별 토큰이 남습니다.
+- 2026-10-18에 진짜 `codex`·`cursor-agent`로 실측했습니다. Cursor 임시 HOME 격리는 로그인을 유지했고 MCP·Web·셸·쓰기와 홈 민감 경로 읽기를 막았습니다. 외부 작업자 전체 흐름이 Claude 작업자 호출 없이 돌았습니다. 사전 점검은 `codex sandbox -P :workspace`로 하며, 워크트리 안 쓰기만 되고 저장소 루트·홈 쓰기와 네트워크가 막혀 `exec -s workspace-write`와 같았습니다(codex-cli 0.163.0-alpha.10.2).
 - 아직 실측하지 않은 것: 이용 한도·인증 실패 문구가 나오는 위치, 작업자 프로필에서 Shell로 민감 경로를 읽는 우회, Codex 동시 실행 때 토큰 갱신 경합, 표본 품질·비용 비교.
 - 작업자 프로필은 Shell을 허용하므로 홈 민감 경로의 Read 거부는 Shell(`cat`)로 우회될 수 있습니다. 민감 경로 보호는 cursor-review(검토자, Shell 거부)에서만 실질적입니다.
-- 통과 기준(판정 일치율, Opus 호출 수, 대체 실행 비율, 회귀)과 측정 절차는 [docs/2026-10-18-workers-measurement-plan.md](docs/2026-10-18-workers-measurement-plan.md)에 있습니다.
+- 통과 기준(판정 일치율, Opus 호출 수, 대체 실행 비율, 회귀)과 측정 절차는 [docs/2026-10-18-workers-measurement-plan.md](docs/2026-10-18-workers-measurement-plan.md)에 있습니다. 프로필 구성별 측정은 [docs/2026-10-21-role-profiles-measurement-plan.md](docs/2026-10-21-role-profiles-measurement-plan.md)에 있습니다.
 
-### 비용
+### 보고서의 역할 절
+
+- 「역할 배정」: 프로필 이름·출처, 이 모드의 칸별 runner·모델·effort·fallback 표, 덮은 칸, 배정 때 바꾼 칸(init·jobs), 첫 검토 이력, 실행 중 대체(칸·사유·회차)와 로그인이 풀린 CLI의 안내. 항상 들어갑니다.
+- 「역할별 사용량」: 칸마다 호출 수, 대체 실행 수(사유별), CLI 토큰. 첫 검토·의견·재검토는 실제로 맡은 runner별로 나뉩니다.
+- v1.2.0의 「외부 작업자」·「호출 수와 시간」 절은 이 둘로 대체됐습니다.
+
+## 비용
 
 에이전트 수는 지적 수에 비례합니다. 지적 1건마다 아래만큼 붙습니다.
 
@@ -223,7 +368,7 @@ Codex 검토 결과(review.final) 반영해줘
 | 코드 | 2 | 판가름 최대 1 |
 | 문서 | 3 | 점검자·판가름 최대 1씩 |
 
-Claude 검토자면 판단 불가 1건마다 의견 1이 더 붙고, 재검토는 회차마다 1입니다. `--workers external`이면 작업자 호출이 Claude 대신 Codex·Cursor로 나뉘고, `init`의 「규모:」 줄이 Claude·Codex·Cursor 호출 수를 나눠 보입니다. 대체 실행은 그만큼 Claude 호출로 돌아옵니다.
+판단 불가 1건마다 의견 1이 더 붙고, 재검토는 회차마다 1입니다(Claude·Codex·Cursor 중 칸이 정한 runner). 외부 runner를 쓰면 호출이 Claude 대신 Codex·Cursor로 나뉘고, `init`의 「규모:」 줄이 이를 보입니다. 프로필을 명시했으면 줄 끝에 runner별 합계가 붙습니다(예: `… — Claude 최대 Haiku 1·Opus 1/지적, Codex 1/지적 + 의견·재검토`). 대체 실행은 그만큼 fallback 호출로 돌아옵니다.
 
 - `detect`와 `init`이 예상 개수를 먼저 보여 줍니다.
 - 지적이 많으면 `--severity Critical,Warning`으로 먼저 돌립니다. 빠진 등급은 보류 후보로 남고, 나중에 「지금 반영」으로 이어서 처리할 수 있습니다.
@@ -233,7 +378,7 @@ Claude 검토자면 판단 불가 1건마다 의견 1이 더 붙고, 재검토�
 모든 상태는 대상 저장소의 `.cascade-fix/<run_id>/`에 남습니다. git 추적에서는 자동으로 빠집니다.
 
 - `ledger.json`: 원장. 중단돼도 `status` 명령으로 이어 갈 수 있습니다.
-- `report.md`: 회차별 표와 사람이 볼 목록
+- `report.md`: 회차별 표, 사람이 볼 목록, 「역할 배정」, 「역할별 사용량」
 - `prepared/commit-message.txt`: 커밋 메시지 초안
 - `prepared/replies.json`: PR 답글 초안 (PR 모드)
 - `prepared/resolve.json`: resolve 대상 (PR 모드)
@@ -251,11 +396,12 @@ PYTHONPATH=<스킬 경로> python3 -m cascade.cli <명령> [옵션]
 
 | 명령 | 하는 일 |
 | --- | --- |
-| `detect [--input F] [--doc F…] [--pr N] [--no-gh] [--reviewer R] [--workers W] [--cursor-model M] [--json]` | 상황을 판정하고 추천·규모·멈춤 사유를 보여 줍니다. 읽기만 합니다. `--doc`은 커밋한 문서도 검토 대상으로 지정합니다. `--no-gh`면 PR을 조회하지 않습니다. |
-| `review --kind code\|doc (--base B \| --uncommitted \| --commit SHA \| --doc F…) [--focus 관점] [--review-model M] [--review-effort E]` | Claude 첫 검토용 Workflow 입력을 만듭니다. |
-| `init --source S --input X [--doc F…] [--severity …] [--dry-run] [--max-rechecks N] [--reviewer R] [--workers W] [--cursor-model M] [--review-model M] [--review-effort E]` | 실행을 시작하고 지적을 읽습니다. PR이면 `--input`에 PR 번호를 주고 `--pr-repo owner/name`·`--me <내 로그인>`을 붙일 수 있습니다. `--input` 대신 `--findings-json F`로 정규화한 지적 목록(`id`·`severity`·`location`·`body`)을 바로 줄 수도 있습니다. |
+| `detect [--input F] [--doc F…] [--pr N] [--no-gh] [--profile P] [--reviewer R] [--workers W] [--cursor-model M] [--json]` | 상황을 판정하고 추천·프로필·규모·전송 동의·멈춤 사유를 보여 줍니다. 읽기만 하므로 `--consent`가 없습니다. 첫 검토는 늘 `CF review …`로 권합니다. `--doc`은 커밋한 문서도 검토 대상으로 지정합니다. `--no-gh`면 PR을 조회하지 않습니다. |
+| `review --kind code\|doc (--base B \| --uncommitted \| --commit SHA \| --doc F…) [--focus 관점] [--profile P] [--review-model M] [--review-effort E] [--consent C]` | `<모드>.review` 칸을 따라 첫 검토를 준비합니다. claude 칸이면 Workflow 입력을, codex·cursor 칸이면 `RR`·`CR` 명령을 출력합니다. 외부 칸에는 `--review-model`·`--review-effort`를 줄 수 없습니다. |
+| `review --review-dir D --fallback-from codex\|cursor [--reason 사유]` | 외부 첫 검토가 한도·오류로 실패했을 때 처음 폴더 `D`의 이력을 고치고 fallback 칸 작업을 만듭니다. 실패한 runner는 마지막으로 시도한 runner와 같아야 합니다. |
+| `init --source S --input X [--doc F…] [--severity …] [--dry-run] [--adopt-on-both-pass] [--max-rechecks N] [--profile P] [--consent C] [--reviewer R] [--workers W] [--cursor-model M] [--review-model M] [--review-effort E]` | 실행을 시작하고 지적을 읽습니다. 프로필을 골라 역할을 배정하고 `프로필:`·`역할:`·`전송 동의:` 줄을 찍습니다. `--consent`는 전송에 동의한 수신처(`codex`·`cursor` 쉼표 구분, 또는 `none`)입니다. PR이면 `--input`에 PR 번호를 주고 `--pr-repo owner/name`·`--me <내 로그인>`을 붙일 수 있습니다. `--input` 대신 `--findings-json F`로 정규화한 지적 목록(`id`·`severity`·`location`·`body`)을 바로 줄 수도 있습니다. |
 | `jobs` / `judge` / `adjudicate` / `opinion` / `apply` / `recheck` | 회차 단계(`--run-dir`·`--round`) |
-| `workers --stage stage1\|checker` | `--workers external` 회차에서 CLI 작업(Codex·Cursor)을 돌리고 결과를 `stage1-cli.json`(점검자는 `checker-cli.json`)에 씁니다. 대체 실행할 작업이 있으면 `*-fallback-args.json`을 만듭니다. 한 번에 하나만 돌립니다. |
+| `workers --stage stage1\|checker` | 외부 runner 칸이 있는 회차에서 CLI 작업(Codex·Cursor)을 돌리고 결과를 `stage1-cli.json`(점검자는 `checker-cli.json`)에 씁니다. 실패한 작업은 그 칸의 fallback으로 같은 호출에서 다시 돌리고(외부 fallback), Claude로 대체할 작업이 있으면 `*-fallback-args.json`을 만듭니다. 한 번에 하나만 돌립니다. |
 | `resume --choices F` | 보류 후보마다 「지금 반영 / 구현 때 테스트로 / 보류」를 받습니다. 「지금 반영」이 있으면 회차를 엽니다. |
 | `report` / `status` / `cleanup` | 보고서, 다음 할 일, 정리 |
 
@@ -268,7 +414,7 @@ PYTHONPATH=<스킬 경로> python3 -m cascade.cli <명령> [옵션]
 | 코드 | 뜻 |
 | --- | --- |
 | 4 | 저장소 검증 설정이 없습니다. 후보 명령을 함께 출력합니다. |
-| 5 | 리뷰 결과·설정 파일을 해석하지 못했습니다. |
+| 5 | 리뷰 결과·설정 파일을 해석하지 못했습니다. 프로필 설정 오류(모르는 프로필 이름, 칸 키·값 오류, `[profiles.claude-only]`)와 잘못된 `CASCADE_*` 값도 여기입니다. |
 | 6 | 사람이 봐야 합니다. `detect`가 멈출 사유를 냈거나, 작업 중 사용자 저장소(작업 트리·HEAD·stash·브랜치)가 바뀌었습니다. |
 
 환경 변수:
@@ -276,8 +422,9 @@ PYTHONPATH=<스킬 경로> python3 -m cascade.cli <명령> [옵션]
 | 변수 | 뜻 |
 | --- | --- |
 | `CASCADE_REPOS_TOML` | 검증 설정 파일 경로 |
-| `CASCADE_REVIEWER` | 기본 검토자(`auto`/`claude`/`codex`/`cursor`) |
-| `CASCADE_WORKERS` | 기본 작업자(`claude`/`external`). 기본값은 `claude` |
+| `CASCADE_PROFILE` | 역할 프로필 이름(내장 `default`·`claude-only`·`local` 또는 repos.toml에 정의한 이름) |
+| `CASCADE_REVIEWER` | (폐기 예정) 기본 검토자(`auto`/`claude`/`codex`/`cursor`). 프로필을 명시하지 않았을 때만 읽습니다 |
+| `CASCADE_WORKERS` | (폐기 예정) 기본 작업자(`claude`/`external`). 프로필을 명시하지 않았을 때만 읽습니다 |
 | `CASCADE_RUN_REVIEW` | `codex-review`의 `run-review.sh` 경로 |
 | `CASCADE_CURSOR_REVIEW` | `cursor-review`의 `run-review.sh` 경로 |
 | `CASCADE_SANDBOX_CHECK` | 샌드박스 사전 점검 결과 파일 경로(기본 `~/.claude/cascade-fix/sandbox-check.json`) |
@@ -290,9 +437,9 @@ PYTHONPATH=<스킬 경로> python3 -m cascade.cli <명령> [옵션]
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-- 테스트는 541개입니다. `codex-review` 스킬이 없으면 그 스크립트를 쓰는 테스트는 건너뜁니다. 보관한 스크립트로 돌리려면 `CASCADE_RUN_REVIEW="$PWD/docs/codex-review-changes/run-review.sh"`를 앞에 붙입니다.
+- 테스트는 868개입니다. `codex-review` 스킬이 없으면 그 스크립트를 쓰는 테스트는 건너뜁니다. 보관한 스크립트로 돌리려면 `CASCADE_RUN_REVIEW="$PWD/docs/codex-review-changes/run-review.sh"`를 앞에 붙입니다.
 - 디렉터리: `cascade/`(CLI와 단계 로직), `prompts/`(작업자·판정자·판가름·검토자 프롬프트), `scripts/run-jobs.js`(Workflow 스크립트), `eval/`(측정 도구), `docs/`(설계 검토 기록, 고친 `codex-review` 스크립트, `cursor-review` 사본, 외부 작업자 측정 계획)
 - 측정: `eval/replay.py`가 과거 지적 표본을 그 커밋에서 다시 돌리고, `eval/score.py`가 판정 일치율·채택 경로·Opus 호출 절감을 채점합니다. 표본 형식과 순서는 [eval/sample-format.md](eval/sample-format.md)에 있습니다. `--workers external`과 Claude 작업자를 같은 표본에서 비교하는 절차는 [측정 계획](docs/2026-10-18-workers-measurement-plan.md)에 있습니다.
 - 출력 스키마를 바꾸면 `cascade/jobs.py`의 `SCHEMAS`와 `scripts/run-jobs.js`의 `SCHEMAS` 블록을 같이 고칩니다(테스트가 두 쪽이 같은지 확인합니다).
-- 배포할 때는 `.claude-plugin/plugin.json`의 `version`을 올립니다. 버전이 같으면 설치한 사람에게 업데이트로 보이지 않습니다.
+- 배포할 때는 `.claude-plugin/plugin.json`과 `.claude-plugin/marketplace.json`의 `version`을 함께 올립니다(테스트가 둘이 같은지 확인합니다). 버전이 같으면 설치한 사람에게 업데이트로 보이지 않습니다.
 - 매니페스트 검사: `claude plugin validate .`

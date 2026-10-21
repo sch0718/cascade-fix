@@ -26,7 +26,7 @@ WORKER_ROLES = ("a", "b", "writer", "checker")
 
 _SEATS = {"A·writer": ("a", "writer"), "B·checker": ("b", "checker")}
 _LABELS = {RUNNER_CLAUDE: "Claude", RUNNER_CODEX: "Codex", RUNNER_CURSOR: "Cursor"}
-_RECIPIENTS = {RUNNER_CODEX: "OpenAI", RUNNER_CURSOR: "Cursor(팀 프라이버시 모드)"}
+RECIPIENTS = {RUNNER_CODEX: "OpenAI", RUNNER_CURSOR: "Cursor(팀 프라이버시 모드)"}
 FALLBACK_LABELS = {
     STATUS_LIMIT: "한도", STATUS_INVALID: "무효", STATUS_AUTH: "로그인",
     STATUS_TIMEOUT: "시간 초과", STATUS_ERROR: "오류", STATUS_SKIPPED: "건너뜀",
@@ -62,18 +62,16 @@ def assign_available(choice: str, cursor_model: str) -> dict[str, dict]:
     return assign(choice, available, codex_model(Path.home() / ".codex"), cursor_model)
 
 
-def workers_flags(choice: str, cursor_model: str) -> str:
-    """후속 명령에 붙일 작업자 옵션. CASCADE_WORKERS가 다른 값이면 claude도 적어 환경 변수가 선택을 뒤집지 않게 한다."""
-    if choice == WORKERS_CLAUDE and (os.environ.get("CASCADE_WORKERS") or WORKERS_CLAUDE) == WORKERS_CLAUDE:
+def workers_flags(choice: str, cursor_model: str, env: dict | None = None) -> str:
+    """후속 명령에 붙일 작업자 옵션. CASCADE_WORKERS가 다른 값이면 claude도 적어 환경 변수가 선택을 뒤집지 않게 한다.
+    env는 다음 명령이 읽을 환경 변수다(기본 os.environ, 프로필을 명시해 환경 변수를 읽지 않으면 {})."""
+    env = os.environ if env is None else env
+    if choice == WORKERS_CLAUDE and (env.get("CASCADE_WORKERS") or WORKERS_CLAUDE) == WORKERS_CLAUDE:
         return ""
     flags = f" --workers {choice}"
     if choice == WORKERS_EXTERNAL and cursor_model != DEFAULT_CURSOR_MODEL:
         flags += f" --cursor-model {shlex.quote(cursor_model)}"
     return flags
-
-
-def demote(workers: dict[str, dict], runner: str) -> dict[str, dict]:
-    return {role: _claude(role) if spec["runner"] == runner else dict(spec) for role, spec in workers.items()}
 
 
 def expected_model_id(spec: dict) -> str:
@@ -96,7 +94,7 @@ def has_external(workers: dict[str, dict] | None) -> bool:
 
 def consent_line(workers: dict[str, dict] | None) -> str:
     used = {spec["runner"] for spec in (workers or {}).values()}
-    targets = [_RECIPIENTS[r] for r in (RUNNER_CODEX, RUNNER_CURSOR) if r in used]
+    targets = [RECIPIENTS[r] for r in (RUNNER_CODEX, RUNNER_CURSOR) if r in used]
     return f"작업자 전송 동의: 워크트리의 코드·문서를 {', '.join(targets)}로 보낸다" if targets else ""
 
 

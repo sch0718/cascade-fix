@@ -166,20 +166,41 @@ class CursorReviewerTest(CliTestBase):
         log = self.run_to_opinion()
         final = Path(f"{log}.final")
         log.write_text("You've hit your usage limit\n", encoding="utf-8")
-        p = self.cli("opinion", "--run-dir", str(self.run_dir), "--round", "1", "--id", "r1-02", "--result", str(final), ok=False)
-        self.assertIn("이용 한도", p.stdout)
+        with self.assertRaises(cli_steps.CliError) as ctx:
+            cli._external_result_text(final, "의견", "cursor")
+        self.assertIn("이용 한도", str(ctx.exception))
+        self.assertNotIn("인증 실패 흔적", str(ctx.exception))
+
+    def test_cursor_usage_limit_falls_back_to_the_cell_fallback(self):
+        log = self.run_to_opinion()
+        final = Path(f"{log}.final")
+        log.write_text("You've hit your usage limit\n", encoding="utf-8")
+        p = self.cli("opinion", "--run-dir", str(self.run_dir), "--round", "1", "--id", "r1-02", "--result", str(final))
+        self.assertIn("대체: code.opinion cursor → claude — 이용 한도", p.stdout)
         self.assertNotIn("인증 실패 흔적", p.stdout)
+        self.assertEqual(self.ledger().reviewer, "cursor")
+        self.assertEqual([r["to"] for r in self.ledger().profile["runtime_substitutions"]], ["claude"])
+        self.assertTrue((self.run_dir / "round-1" / "opinion-args.json").is_file())
 
     def test_empty_final_after_usage_limit_stops_with_limit_guidance(self):
         log = self.run_to_opinion()
         final = Path(f"{log}.final")
         final.write_text("", encoding="utf-8")
         log.write_text('{"type":"result","is_error":true,"result":"You\'ve hit your usage limit"}\n', encoding="utf-8")
-        p = self.cli("opinion", "--run-dir", str(self.run_dir), "--round", "1", "--id", "r1-02", "--result", str(final), ok=False)
-        self.assertNotEqual(p.returncode, 0)
-        self.assertIn("비어 있다", p.stdout)
-        self.assertIn("이용 한도", p.stdout)
-        self.assertIn("cursor-agent login", p.stdout)
+        with self.assertRaises(cli_steps.CliError) as ctx:
+            cli._external_result_text(final, "의견", "cursor")
+        message = str(ctx.exception)
+        self.assertIn("비어 있다", message)
+        self.assertIn("이용 한도", message)
+        self.assertIn("cursor-agent login", message)
+
+    def test_empty_final_after_usage_limit_falls_back_without_attaching_an_opinion(self):
+        log = self.run_to_opinion()
+        final = Path(f"{log}.final")
+        final.write_text("", encoding="utf-8")
+        log.write_text('{"type":"result","is_error":true,"result":"You\'ve hit your usage limit"}\n', encoding="utf-8")
+        p = self.cli("opinion", "--run-dir", str(self.run_dir), "--round", "1", "--id", "r1-02", "--result", str(final))
+        self.assertIn("대체: code.opinion cursor → claude — 이용 한도", p.stdout)
         self.assertNotIn("r1-02", self.ledger().opinions)
 
     def test_empty_final_after_login_failure_stops_recheck_with_login_guidance(self):

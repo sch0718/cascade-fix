@@ -10,8 +10,10 @@ from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
+from cascade import assignment
 from cascade import cli_steps as s
-from cascade.config import ExitCodes
+from cascade import profiles
+from cascade.config import ConfigError, ExitCodes
 from cascade.consensus import (
     OUTCOME_ADJUDICATE,
     OUTCOME_CARRIED,
@@ -36,6 +38,7 @@ from cascade.findings import (
     write_findings,
 )
 from cascade.jobs import (
+    RUNNER_CLAUDE,
     build_adjudicator_jobs,
     build_checker_jobs,
     build_stage1_jobs,
@@ -54,6 +57,7 @@ from cascade.review import (
     DEFAULT_MODEL,
     EFFORTS,
     REVIEW_JOB,
+    REVIEW_META,
     REVIEWER_AUTO,
     REVIEWER_CHOICES,
     REVIEWER_CLAUDE,
@@ -61,11 +65,11 @@ from cascade.review import (
     REVIEWER_CURSOR,
     build_review_prompt,
     claude_prompt,
+    first_review_command,
     label,
     load_text,
     model_warning,
     read_review_results,
-    resolve,
     review_job,
 )
 from cascade.rounds import (
@@ -87,6 +91,9 @@ from cascade.runners import (
     CliJob,
     CodexRunner,
     CursorRunner,
+    codex_available,
+    codex_model,
+    cursor_available,
     find_codex,
     find_cursor_agent,
     head_of,
@@ -113,8 +120,6 @@ from cascade.workers import (
     WORKERS_CHOICES,
     WORKERS_CLAUDE,
     WORKERS_EXTERNAL,
-    assign_available,
-    consent_line,
     describe,
     fallback_counts,
     has_external,
@@ -131,6 +136,11 @@ REASON_INTERFERENCE = "전체 테스트 실패(간섭 의심)"
 REASON_FINAL_BASELINE_FAILED = "전체 테스트 실패(기준선도 실패)"
 REASON_OUT_OF_SCOPE = "재검토 범위 밖"
 REASON_SEVERITY_DEFERRED = "등급 선택(--severity)으로 이번 실행에서 뺌"
+SANDBOX_REASON = "샌드박스 점검 실패"
+REVIEW_NO_SCRIPT_REASON = assignment.NO_SCRIPT_REASON
+REVIEW_DEFAULT_REASON = "실행 오류"
+REVIEW_IGNORED_ENVS = ("CASCADE_WORKERS", "CASCADE_REVIEWER")
+FIRST_REVIEW_KEYS = ("role", "requested", "actual", "fallback_reason", "attempts")
 RAW_PREVIEW_LINES = 5
 WORKTREE_INPUTS = "worktree-inputs.json"
 FINAL_TAIL_CHARS = 2000
@@ -210,7 +220,7 @@ def _warn_pr_head(root: Path, gh: list[str], owner: str, name: str, number: str)
         print(f"경고: 로컬 HEAD({local[:12]})가 PR #{number}의 head({pr_head[:12]})와 다르다. PR 브랜치를 받아 온 뒤 실행한다")
 
 
-def _parse_input(args, root: Path):
+def _parse_input(args, root: Path, expected_model: str):
     if args.findings_json:
         return _load_findings_json(args.findings_json, args.source), ""
     if not args.input:
@@ -233,7 +243,7 @@ def _parse_input(args, root: Path):
         _warn_pr_head(root, gh, owner, name, args.input)
         return fetch_pr_findings(owner, name, int(args.input), me, gh, 1), ""
     if args.source in CLAUDE_SOURCES:
-        return _parse_claude_review(args)
+        return _parse_claude_review(args, expected_model)
     raw = s.read_text(Path(args.input))
     try:
         if args.source in CURSOR_SOURCES:
@@ -244,14 +254,14 @@ def _parse_input(args, root: Path):
         raise s.CliError(str(e), ExitCodes.PARSE_ERROR) from None
 
 
-def _parse_claude_review(args):
+def _parse_claude_review(args, expected_model: str):
     path = Path(args.input)
     if not path.is_file():
         raise s.CliError(f"파일이 없다: {path}")
     raw, model_id = load_text(path, REVIEW_JOB if path.suffix == ".json" else None)
     if not raw.strip():
         raise s.CliError(f"Claude 검토 결과가 비어 있다(Workflow 호출 실패일 수 있다): {path}", ExitCodes.PARSE_ERROR)
-    warning = model_warning(REVIEW_JOB, model_id, args.review_model or DEFAULT_MODEL)
+    warning = model_warning(REVIEW_JOB, model_id, expected_model)
     if warning:
         print(warning)
     try:
@@ -261,19 +271,92 @@ def _parse_claude_review(args):
     return [replace(f, source=args.source) for f in findings], raw
 
 
-def _check_workers(choice: str) -> None:
-    if choice not in WORKERS_CHOICES:
-        raise s.CliError(f"알 수 없는 작업자: {choice} ({' / '.join(WORKERS_CHOICES)}, CASCADE_WORKERS 확인)")
+def _probe(available: dict[str, bool], runners) -> dict[str, bool]:
+    for runner in runners:
+        if runner not in available:
+            available[runner] = codex_available() if runner == RUNNER_CODEX else cursor_available()
+    return available
+
+
+def _cursor_reviewer_ok(available: dict[str, bool]):
+    return lambda: s.CURSOR_REVIEW.is_file() and _probe(available, (RUNNER_CURSOR,))[RUNNER_CURSOR]
+
+
+def _resolve_profile(args, root: Path, available: dict[str, bool]) -> profiles.Resolved:
+    env = os.environ
+    if WORKERS_EXTERNAL in (args.workers, env.get("CASCADE_WORKERS")):
+        _probe(available, (RUNNER_CODEX, RUNNER_CURSOR))
+    cli = profiles.LegacyOptions(
+        workers=args.workers, cursor_model=args.cursor_model, reviewer=args.reviewer,
+        review_model=getattr(args, "review_model", None), review_effort=getattr(args, "review_effort", None),
+        adopt_on_both_pass=getattr(args, "adopt_on_both_pass", False))
+    try:
+        resolved = profiles.resolve(root, s.repos_toml(), flag=args.profile, cli=cli, env=env, available=available,
+                                    codex_model=codex_model(Path.home() / ".codex"))
+    except ConfigError as e:
+        raise s.CliError(str(e), ExitCodes.PARSE_ERROR) from None
+    _probe(available, assignment.runners_to_check(resolved.roles, resolved.pinned))
+    return resolved
+
+
+def _decide_roles(args, resolved: profiles.Resolved, source: str, available: dict[str, bool]) -> tuple[dict, list[dict]]:
+    try:
+        return assignment.decide(resolved.roles, resolved.pinned, source, s.RUN_REVIEW, _cursor_reviewer_ok(available),
+                                 available, cursor_model=args.cursor_model or DEFAULT_CURSOR_MODEL, name=resolved.name,
+                                 scripts={RUNNER_CODEX: s.RUN_REVIEW.is_file(), RUNNER_CURSOR: s.CURSOR_REVIEW.is_file()})
+    except profiles.ProfileError as e:
+        raise s.CliError(str(profiles.explain_overrides(e, resolved.overrides)), ExitCodes.PARSE_ERROR) from None
+
+
+def _consent_option(raw: str | None) -> set[str] | None:
+    if raw is None:
+        return None
+    names = [name.strip() for name in raw.split(",") if name.strip()]
+    if names == ["none"]:
+        return set()
+    if not names or any(name not in assignment.EXTERNAL_RUNNERS for name in names):
+        raise s.CliError(f"--consent는 {','.join(assignment.EXTERNAL_RUNNERS)} 중에서 쉼표로 고르거나 none이다: {raw}")
+    return set(names)
+
+
+def _first_review_meta(args, mode: str) -> dict:
+    if args.findings_json or not args.input or args.source == "pr-comment":
+        return {}
+    path = Path(args.input).parent / REVIEW_META
+    if not path.is_file():
+        return {}
+    try:
+        meta = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        print(f"경고: {path}를 읽지 못해 첫 검토 이력을 남기지 못한다")
+        return {}
+    if not isinstance(meta, dict) or meta.get("role") != f"{mode}.review":
+        return {}
+    first_review = {key: meta[key] for key in FIRST_REVIEW_KEYS if key in meta}
+    if isinstance(first_review.get("requested"), dict):
+        first_review["requested"] = {key: first_review["requested"][key] for key in ("runner", "model", "effort")
+                                     if key in first_review["requested"]}
+    return first_review
+
+
+def _expected_review_model(args, resolved: profiles.Resolved, mode: str, first_review: dict) -> str:
+    actual = first_review.get("actual") or {}
+    if actual.get("runner") == REVIEWER_CLAUDE:
+        return actual["model"]
+    if args.review_model and not resolved.explicit:
+        return args.review_model
+    return resolved.roles[f"{mode}.review"]["model"] or DEFAULT_MODEL
 
 
 def cmd_init(args) -> int:
     root = Path(args.root).resolve() if args.root else s.git_toplevel(Path.cwd())
     s.cfg_for(args.source, root)
-    if args.reviewer not in REVIEWER_CHOICES:
-        raise s.CliError(f"알 수 없는 검토자: {args.reviewer} ({' / '.join(REVIEWER_CHOICES)}, CASCADE_REVIEWER 확인)")
-    _check_workers(args.workers)
-    reviewer = resolve(args.reviewer, args.source, s.RUN_REVIEW, s.cursor_reviewer_available)
-    findings, raw = _parse_input(args, root)
+    consent = _consent_option(args.consent)
+    available: dict[str, bool] = {}
+    resolved = _resolve_profile(args, root, available)
+    mode = "doc" if args.source in s.DOC_SOURCES else "code"
+    first_review = _first_review_meta(args, mode)
+    findings, raw = _parse_input(args, root, _expected_review_model(args, resolved, mode, first_review))
     if not findings:
         print("지적 0건 — 원문을 확인하라")
         for line in raw.splitlines()[:RAW_PREVIEW_LINES]:
@@ -288,14 +371,24 @@ def cmd_init(args) -> int:
     if not findings:
         raise s.CliError(f"--severity {args.severity} 에 맞는 지적이 없다(전체 {len(deferred)}건). 등급을 넓힌다")
     docs, external = _split_docs(root, args.doc or [])
-    workers = assign_available(args.workers, args.cursor_model)
+    roles, substituted = _decide_roles(args, resolved, args.source, available)
+    roles = assignment.fill_codex_model(roles, codex_model(Path.home() / ".codex"))
+    if consent is not None:
+        roles, dropped = assignment.apply_consent(roles, consent)
+        substituted = [*substituted, *dropped]
+    consented = assignment.used_recipients(roles, mode)
+    record = {"name": resolved.name, "source": resolved.source, "explicit": resolved.explicit, "roles": roles,
+              "overrides": resolved.overrides, "substituted": substituted, "consented": consented, "first_review": first_review}
+    requested = args.workers or (None if resolved.explicit else os.environ.get("CASCADE_WORKERS") or None)
+    legacy = assignment.legacy_fields({**record, "adopt_on_both_pass": resolved.adopt_on_both_pass}, mode, requested)
+    reviewer, workers, workers_choice = legacy["reviewer"], legacy["workers"], legacy["workers_choice"]
     ensure_excluded(root)
     snap = create_snapshot(root, _new_run_id(root), external)
     stamp = s.now()
     ledger = Ledger(
         run_id=snap.run_id,
         source=args.source,
-        mode="doc" if args.source in s.DOC_SOURCES else "code",
+        mode=mode,
         root=str(root),
         snapshot=snap.to_dict(),
         dry_run=args.dry_run,
@@ -306,10 +399,12 @@ def cmd_init(args) -> int:
                             base_commit=snap.commit, hold_findings=[f.to_dict() for f in deferred])],
         docs=docs,
         reviewer=reviewer,
-        review_model=(args.review_model or DEFAULT_MODEL) if reviewer == REVIEWER_CLAUDE else "",
-        review_effort=(args.review_effort or DEFAULT_EFFORT) if reviewer == REVIEWER_CLAUDE else "",
-        workers_choice=args.workers,
+        review_model=legacy["review_model"],
+        review_effort=legacy["review_effort"],
+        workers_choice=workers_choice,
         workers=workers,
+        adopt_on_both_pass=legacy["adopt_on_both_pass"],
+        profile=record,
     )
     write_findings(s.round_dir(snap.run_dir, 1) / "findings.json", findings)
     s.save_ledger(snap.run_dir, ledger)
@@ -319,25 +414,52 @@ def cmd_init(args) -> int:
     print(f"지적 {len(findings)}건: " + ", ".join(f"{k} {v}" for k, v in counts.items()))
     if deferred:
         print(f"등급 선택으로 뺀 지적 {len(deferred)}건은 보류 후보로 둔다(나중에 resume 「지금 반영」으로 돌릴 수 있다)")
-    print(f"규모: {estimate_line(len(findings), ledger.mode, reviewer, workers)}")
-    if args.workers == WORKERS_EXTERNAL:
+    _print_assignment(resolved, roles, substituted, mode, first_review)
+    print(f"규모: {estimate_line(len(findings), ledger.mode, reviewer, workers, roles if resolved.explicit else None)}")
+    if workers_choice == WORKERS_EXTERNAL:
         if has_external(workers):
             print(f"작업자: {describe(workers)}")
-            print(consent_line(workers))
         else:
             print("작업자: 쓸 수 있는 외부 CLI가 없다. 모두 Claude로 돈다(--workers claude 와 같다)")
     if args.dry_run:
         print("dry-run: 채택 패치를 작업 트리에 적용하지 않는다")
-    if reviewer == REVIEWER_CLAUDE:
-        print(f"의견·재검토: Claude 단독({ledger.review_model}, {ledger.review_effort}) — 외부 전송 없음")
-    else:
-        script = s.review_script(ledger)
-        print(f"의견·재검토: {label(reviewer)}({script})")
-        if not script.is_file():
-            skill = "cursor-review" if reviewer == REVIEWER_CURSOR else "codex-review"
-            print(f"경고: {skill} 스킬이 없다. Claude 단독으로 돌리려면 --reviewer claude 로 다시 init 한다")
+    if ledger.adopt_on_both_pass:
+        print("한쪽 채택: 같은 판정에 패치가 달라도 둘 다 검증을 통과하면 작은 패치를 채택한다(판가름 안 함)")
+    _print_review_cells(ledger)
     _print_next(ledger, snap.run_dir)
     return 0
+
+
+def _print_review_cells(ledger: Ledger) -> None:
+    opinion, recheck = (s.review_cell(ledger, role) for role in ("opinion", "recheck"))
+    same = all(opinion[k] == recheck[k] for k in ("runner", "model", "effort"))
+    for what, role in (("의견·재검토", "opinion"),) if same else (("의견", "opinion"), ("재검토", "recheck")):
+        cell = s.review_cell(ledger, role)
+        if cell["runner"] == REVIEWER_CLAUDE:
+            print(f"{what}: Claude 단독({cell['model']}, {cell['effort']}) — 외부 전송 없음")
+            continue
+        script = s.review_script(ledger, role)
+        print(f"{what}: {label(cell['runner'])}({script})")
+        if not script.is_file():
+            skill = "cursor-review" if cell["runner"] == REVIEWER_CURSOR else "codex-review"
+            print(f"경고: {skill} 스킬이 없다. Claude 단독으로 돌리려면 --reviewer claude 로 다시 init 한다")
+
+
+def _print_assignment(resolved: profiles.Resolved, roles: dict, substituted: list[dict], mode: str,
+                      first_review: dict | None = None) -> None:
+    print(f"프로필: {resolved.name} ({resolved.source})")
+    for notice in resolved.notices:
+        print(f"참고: {notice}")
+    if resolved.overrides:
+        print(assignment.overrides_line(resolved.overrides))
+    for record in substituted:
+        if record["role"].startswith(f"{mode}.") and not record["role"].startswith(f"{mode}.review"):
+            print(f"대체: {record['role']} {record['from']} → {record['to']} — {record['reason']}")
+    pending = {key: cell for key, cell in roles.items() if key != f"{mode}.review"}
+    print(assignment.roles_line(pending, mode, first_review))
+    consent = assignment.consent_line(pending, mode)
+    if consent:
+        print(consent)
 
 
 def _severity_filter(raw: str | None) -> set[str]:
@@ -358,58 +480,220 @@ def _root_flag(args, root: Path) -> str:
 def cmd_detect(args) -> int:
     root = Path(args.root).resolve() if args.root else s.git_toplevel(Path.cwd())
     gh = None if args.no_gh else shlex.split(os.environ.get("CASCADE_GH", "gh"))
-    if args.reviewer not in REVIEWER_CHOICES:
-        raise s.CliError(f"알 수 없는 검토자: {args.reviewer} ({' / '.join(REVIEWER_CHOICES)}, CASCADE_REVIEWER 확인)")
-    _check_workers(args.workers)
-    result = detect(root, repos_toml=s.repos_toml(), run_review=s.RUN_REVIEW, cursor_ok=s.cursor_reviewer_available, cli=s.CLI, gh=gh,
-                    input_path=Path(args.input).resolve() if args.input else None, pr=args.pr,
-                    reviewer_choice=args.reviewer, root_flag=_root_flag(args, root),
-                    docs=[Path(d).resolve() for d in args.doc or []], cwd=Path.cwd(),
-                    workers_choice=args.workers, cursor_model=args.cursor_model,
-                    workers=assign_available(args.workers, args.cursor_model))
+    available: dict[str, bool] = {}
+    resolved = _resolve_profile(args, root, available)
+    env = {} if resolved.explicit else os.environ
+    reviewer_choice = args.reviewer or env.get("CASCADE_REVIEWER") or REVIEWER_AUTO
+    workers_choice = args.workers or env.get("CASCADE_WORKERS") or WORKERS_CLAUDE
+    cursor_model = args.cursor_model or DEFAULT_CURSOR_MODEL
+    try:
+        result = detect(root, repos_toml=s.repos_toml(), run_review=s.RUN_REVIEW, cursor_ok=_cursor_reviewer_ok(available), cli=s.CLI, gh=gh,
+                        input_path=Path(args.input).resolve() if args.input else None, pr=args.pr,
+                        reviewer_choice=reviewer_choice, root_flag=_root_flag(args, root),
+                        docs=[Path(d).resolve() for d in args.doc or []], cwd=Path.cwd(),
+                        workers_choice=workers_choice, cursor_model=cursor_model,
+                        profile=resolved, available=available, profile_flag=args.profile,
+                        codex_model=codex_model(Path.home() / ".codex"))
+    except profiles.ProfileError as e:
+        raise s.CliError(str(profiles.explain_overrides(e, resolved.overrides)), ExitCodes.PARSE_ERROR) from None
     print(json.dumps(result, ensure_ascii=False, indent=2) if args.json else render_detect(result))
     return 0 if result["ok"] else ExitCodes.NEEDS_USER
 
 
-def cmd_review(args) -> int:
-    root = Path(args.root).resolve() if args.root else s.git_toplevel(Path.cwd())
-    _check_workers(args.workers)
+def _review_scope(args, root: Path) -> dict:
+    docs = [str(Path(raw).resolve()) for raw in args.doc or []]
     if args.kind == "doc":
         if not args.doc:
             raise s.CliError("문서 검토는 --doc <문서> 를 하나 이상 준다")
-        docs = []
-        for raw in args.doc:
-            path = Path(raw).resolve()
-            if not path.is_file():
+        for raw, path in zip(args.doc, docs):
+            if not Path(path).is_file():
                 raise s.CliError(f"문서가 없다: {raw}")
-            docs.append(path.relative_to(root).as_posix() if path.is_relative_to(root) else str(path))
-        prompt = build_review_prompt("doc", root, docs=docs, focus=args.focus or "")
-    else:
-        if sum(bool(x) for x in (args.base, args.uncommitted, args.commit)) != 1:
-            raise s.CliError("코드 검토는 --base <브랜치> / --uncommitted / --commit <SHA> 중 하나를 준다")
-        prompt = build_review_prompt("code", root, base=args.base, uncommitted=args.uncommitted,
-                                     commit=args.commit, focus=args.focus or "")
-    ensure_excluded(root)
+    elif sum(bool(x) for x in (args.base, args.uncommitted, args.commit)) != 1:
+        raise s.CliError("코드 검토는 --base <브랜치> / --uncommitted / --commit <SHA> 중 하나를 준다")
+    return {"kind": args.kind, "base": args.base, "uncommitted": args.uncommitted, "commit": args.commit,
+            "docs": docs, "focus": args.focus or "", "root": str(root)}
+
+
+def _review_prompt(scope: dict) -> str:
+    root = Path(scope["root"])
+    if scope["kind"] == "doc":
+        docs = [Path(d).relative_to(root).as_posix() if Path(d).is_relative_to(root) else d for d in scope["docs"]]
+        return build_review_prompt("doc", root, docs=docs, focus=scope["focus"])
+    return build_review_prompt("code", root, base=scope["base"], uncommitted=scope["uncommitted"],
+                               commit=scope["commit"], focus=scope["focus"])
+
+
+def _review_profile(args, root: Path, flag: str | None) -> profiles.Resolved:
+    env = {name: value for name, value in os.environ.items() if name not in REVIEW_IGNORED_ENVS}
+    try:
+        return profiles.resolve(root, s.repos_toml(), flag=flag, cli=profiles.LegacyOptions(), env=env,
+                                available={}, codex_model="")
+    except ConfigError as e:
+        raise s.CliError(str(e), ExitCodes.PARSE_ERROR) from None
+
+
+def _first_review_cell(resolved: profiles.Resolved, mode: str) -> dict:
+    try:
+        roles = assignment.resolve_auto(resolved.roles, f"claude-{mode}", s.RUN_REVIEW, False, name=resolved.name)
+    except profiles.ProfileError as e:
+        raise s.CliError(str(e), ExitCodes.PARSE_ERROR) from None
+    return roles[f"{mode}.review"]
+
+
+def _apply_review_options(args, name: str, key: str, cell: dict) -> dict:
+    options = [(field, flag, value) for field, flag, value
+               in (("model", "--review-model", args.review_model), ("effort", "--review-effort", args.review_effort)) if value]
+    if not options:
+        return cell
+    if cell["runner"] != REVIEWER_CLAUDE:
+        flags = " ".join(f"{flag} {value}" for _, flag, value in options)
+        raise s.CliError(f"{key} 칸의 runner가 {cell['runner']}라 {flags}를 쓸 수 없다. 두 옵션은 claude 칸에만 쓴다",
+                         ExitCodes.PARSE_ERROR)
+    notes = [f"{key} ← {flag} {value}" for _, flag, value in options]
+    out = {**cell, **{field: value for field, _, value in options}}
+    try:
+        profiles.validate(name, {"adopt_on_both_pass": True, "roles": {**profiles.builtin("claude-only")["roles"], key: out}})
+    except profiles.ProfileError as e:
+        raise s.CliError(str(profiles.explain_overrides(e, notes)), ExitCodes.PARSE_ERROR) from None
+    return out
+
+
+def _first_review_unusable(runner: str, available: dict[str, bool]) -> str | None:
+    if runner == REVIEWER_CLAUDE:
+        return None
+    if not _probe(available, (runner,))[runner]:
+        return assignment.UNAVAILABLE_REASON
+    script = s.CURSOR_REVIEW if runner == REVIEWER_CURSOR else s.RUN_REVIEW
+    return None if script.is_file() else REVIEW_NO_SCRIPT_REASON
+
+
+def _consent_first_review(cell: dict, key: str, mode: str, consent: set[str] | None) -> tuple[dict, list[str], list[dict]]:
+    if consent is None:
+        return cell, assignment.used_recipients({key: cell}, mode), []
+    roles, _ = assignment.apply_consent({key: cell}, consent)
+    attempts = [{"runner": cell["runner"], "reason": assignment.NO_CONSENT_REASON}] if roles[key]["runner"] != cell["runner"] else []
+    return {**cell, "fallback": roles[key]["fallback"]}, assignment.used_recipients(roles, mode), attempts
+
+
+def _first_review_target(cell: dict, consented: set[str], attempts: list[dict], available: dict[str, bool]) -> dict:
+    def target() -> dict:
+        return assignment.fallback_target(cell, consented, {a["runner"] for a in attempts}, "reviewer")
+
+    current = target() if attempts else cell
+    while reason := _first_review_unusable(current["runner"], available):
+        attempts.append({"runner": current["runner"], "reason": reason})
+        current = target()
+    return current
+
+
+def _new_review_dir(root: Path) -> Path:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     out_dir, n = root / RUN_DIR_NAME / f"review-{stamp}", 2
     while out_dir.exists():
         out_dir, n = root / RUN_DIR_NAME / f"review-{stamp}-{n}", n + 1
-    model, effort = args.review_model or DEFAULT_MODEL, args.review_effort or DEFAULT_EFFORT
-    job = review_job(REVIEW_JOB, f"{args.kind} review", claude_prompt(prompt, root), model, effort)
-    args_path = out_dir / "review-args.json"
-    s.write_json(args_path, write_job_args({"jobs": [job]}, out_dir / "prompts"))
-    result = out_dir / "review.json"
-    source = "claude-doc" if args.kind == "doc" else "claude-code"
-    docs_args = "".join(f" --doc {shlex.quote(str(Path(d).resolve()))}" for d in args.doc or [])
-    print(f"review_dir={out_dir}")
-    print(f"검토자: Claude({model}, {effort})")
+    return out_dir
+
+
+def _runner_values(cell: dict) -> dict:
+    return {key: cell[key] for key in ("runner", "model", "effort")}
+
+
+def _emit_first_review(args, review_dir: Path, meta: dict, new_attempts: list[dict], root_flag: str) -> None:
+    scope, actual, key = meta["args"], meta["actual"], meta["role"]
+    root = Path(scope["root"])
+    source = f"{actual['runner']}-{scope['kind']}"
+    if actual["runner"] == REVIEWER_CLAUDE:
+        model, effort = actual["model"], actual["effort"]
+        job = review_job(REVIEW_JOB, f"{scope['kind']} review", claude_prompt(_review_prompt(scope), root), model, effort)
+        args_path, result = review_dir / "review-args.json", review_dir / "review.json"
+        s.write_json(args_path, write_job_args({"jobs": [job]}, review_dir / "prompts"))
+        reviewer = f"Claude({model}, {effort})"
+        step = s.workflow_step(args_path, result)
+    else:
+        step, result = first_review_command(actual, scope, review_dir)
+        reviewer = label(actual["runner"]) + (f"({actual['model']})" if actual["model"] else "")
+    s.write_json(review_dir / REVIEW_META, meta)
+    print(f"review_dir={review_dir}")
+    for i, attempt in enumerate(new_attempts):
+        to = new_attempts[i + 1]["runner"] if i + 1 < len(new_attempts) else actual["runner"]
+        print(f"대체: {key} {attempt['runner']} → {to} — {attempt['reason']}")
+    print(f"검토자: {reviewer}")
+    if meta["explicit"]:
+        carried = f" --profile {shlex.quote(meta['profile'])}"
+    else:
+        carried = ((f" --review-model {shlex.quote(args.review_model)}" if args.review_model else "")
+                   + (f" --review-effort {args.review_effort}" if args.review_effort else ""))
+    docs_args = "".join(f" --doc {shlex.quote(d)}" for d in scope["docs"])
+    consent = f" --consent {','.join(meta['consent']) or 'none'}" if "consent" in meta else ""
     print("다음:")
-    print(f"  {s.workflow_step(args_path, result)}")
-    print(f"  {s.CLI} init --source {source} --input {shlex.quote(str(result))}{docs_args}"
-          + (f" --review-model {shlex.quote(model)}" if args.review_model else "")
-          + (f" --review-effort {effort}" if args.review_effort else "")
-          + workers_flags(args.workers, args.cursor_model)
-          + _root_flag(args, root))
+    print(f"  {step}")
+    print(f"  {s.CLI} init --source {source} --input {shlex.quote(str(result))}{docs_args}{carried}"
+          f"{meta.get('workers_flags', '')}{consent}{root_flag}")
+
+
+def _review_workers_flags(args, explicit: bool) -> str:
+    """CF review에 준 작업자 선택을 init 줄로 넘긴다. 환경 변수는 init과 같은 규칙으로 읽는다(프로필을 명시하면 읽지 않는다)."""
+    env = {} if explicit else os.environ
+    choice = args.workers or env.get("CASCADE_WORKERS")
+    if choice not in WORKERS_CHOICES:
+        return ""
+    return workers_flags(choice, args.cursor_model or DEFAULT_CURSOR_MODEL, env)
+
+
+def _load_review_meta(review_dir: Path) -> dict:
+    path = review_dir / REVIEW_META
+    if not path.is_file():
+        raise s.CliError(f"{path}가 없다. CF review가 만든 첫 검토 폴더를 --review-dir로 준다", ExitCodes.PARSE_ERROR)
+    meta = s.read_json(path)
+    try:
+        [meta[name] for name in ("role", "actual", "attempts", "profile", "explicit", "consented")]
+        meta["actual"]["runner"], meta["requested"]["fallback"]["runner"], meta["args"]["root"]
+    except (KeyError, TypeError):
+        raise s.CliError(f"{path}의 형식이 맞지 않는다", ExitCodes.PARSE_ERROR) from None
+    return meta
+
+
+def _review_fallback(args) -> int:
+    if not args.fallback_from:
+        raise s.CliError("--review-dir은 --fallback-from과 함께 쓴다", ExitCodes.PARSE_ERROR)
+    if not args.review_dir:
+        raise s.CliError("--fallback-from은 처음 첫 검토 폴더를 가리키는 --review-dir과 함께 쓴다", ExitCodes.PARSE_ERROR)
+    review_dir = Path(args.review_dir).resolve()
+    meta = _load_review_meta(review_dir)
+    current = meta["actual"]["runner"]
+    if args.fallback_from not in assignment.EXTERNAL_RUNNERS or current != args.fallback_from:
+        raise s.CliError(f"--fallback-from {args.fallback_from}가 지금 첫 검토를 맡은 runner({current})와 다르다", ExitCodes.PARSE_ERROR)
+    scope, key = meta["args"], meta["role"]
+    attempts = [*meta["attempts"], {"runner": args.fallback_from, "reason": args.reason or REVIEW_DEFAULT_REASON}]
+    added = len(meta["attempts"])
+    actual = _apply_review_options(args, meta["profile"], key,
+                                   _first_review_target(meta["requested"], set(meta["consented"]), attempts, {}))
+    meta = {**meta, "actual": _runner_values(actual), "fallback_reason": attempts[-1]["reason"], "attempts": attempts}
+    _emit_first_review(args, review_dir, meta, attempts[added:], f" --root {shlex.quote(scope['root'])}")
+    return 0
+
+
+def cmd_review(args) -> int:
+    if args.review_dir or args.fallback_from:
+        return _review_fallback(args)
+    if not args.kind:
+        build_parser().error("the following arguments are required: --kind")
+    root = Path(args.root).resolve() if args.root else s.git_toplevel(Path.cwd())
+    scope = _review_scope(args, root)
+    consent = _consent_option(args.consent)
+    resolved = _review_profile(args, root, args.profile)
+    key = f"{args.kind}.review"
+    requested = _apply_review_options(args, resolved.name, key, _first_review_cell(resolved, args.kind))
+    cell, consented, attempts = _consent_first_review(requested, key, args.kind, consent)
+    actual = _first_review_target(cell, set(consented), attempts, {})
+    workers = _review_workers_flags(args, resolved.explicit)
+    ensure_excluded(root)
+    meta = {"role": key, "requested": {**_runner_values(requested), "fallback": _runner_values(cell["fallback"])},
+            "actual": _runner_values(actual), "fallback_reason": attempts[-1]["reason"] if attempts else None,
+            "attempts": attempts, "consented": consented, "args": scope, "profile": resolved.name,
+            "explicit": resolved.explicit, **({"workers_flags": workers} if workers else {}),
+            **({"consent": sorted(consent)} if consent is not None else {})}
+    _emit_first_review(args, _new_review_dir(root), meta, attempts, _root_flag(args, root))
     return 0
 
 
@@ -461,12 +745,16 @@ def cmd_jobs(args) -> int:
         failed = s.write_baseline(rd, base_wt, cfg, located)
         if failed:
             print(f"기준선에서 이미 실패하는 검증 명령(판정에서 제외): {', '.join(failed)}")
-    if ledger.mode == "code" and has_external(ledger.workers):
-        ledger.workers, notices = ensure_sandbox(Path(ledger.root), cfg, base_wt, ledger.workers, failed)
+    job_workers = assignment.job_workers(ledger)
+    if ledger.mode == "code" and has_external(job_workers):
+        checked, notices = ensure_sandbox(Path(ledger.root), cfg, base_wt, job_workers, failed,
+                                          consented=assignment.ledger_profile(ledger)["consented"])
         for notice in notices:
             print(notice)
         if notices:
+            assignment.apply_sandbox_substitution(ledger, job_workers, checked, SANDBOX_REASON)
             s.save_ledger(run_dir, ledger)
+            job_workers = assignment.job_workers(ledger)
     if ledger.source == s.SOURCE_PR:
         listed = {f.id: repro_cmds(f) for f in findings}
         s.write_json(rd / s.REPRO_FILE, listed)
@@ -477,7 +765,7 @@ def cmd_jobs(args) -> int:
                     print(f"  {fid}: {cmd}")
     out = rd / "stage1-args.json"
     claude_args, cli_args = split_job_args(
-        build_stage1_jobs(findings, cfg, wts, ledger.mode, ledger.workers or None), rd / "prompts")
+        build_stage1_jobs(findings, cfg, wts, ledger.mode, job_workers), rd / "prompts")
     s.write_json(out, claude_args)
     cli_out = rd / "stage1-cli-args.json"
     had_cli = cli_out.is_file()
@@ -536,6 +824,25 @@ def _pin_worktrees(path: Path, worktrees: list[Path]) -> None:
     s.write_json(path, saved)
 
 
+def _rerun_with_fallbacks(entries: list[dict], first: list, cells: dict[str, dict], consented: set[str],
+                          exhausted: dict[str, dict]) -> tuple[dict[str, dict], dict[str, object]]:
+    by_id = {e["id"]: e for e in entries}
+    targets: dict[str, dict] = {}
+    for outcome in first:
+        if outcome.status == STATUS_OK:
+            continue
+        role = by_id[outcome.id]["role"]
+        target = assignment.fallback_target(cells.get(role, {}), consented, set(exhausted), role)
+        if target["runner"] != RUNNER_CLAUDE:
+            targets[outcome.id] = target
+    jobs = [CliJob(i, by_id[i]["role"], by_id[i]["kind"], t["runner"], t["model"], t["effort"],
+                   Path(by_id[i]["promptPath"]), Path(by_id[i]["worktree"]), by_id[i]["writable"])
+            for i, t in targets.items()]
+    if not jobs:
+        return {}, {}
+    return targets, {o.id: o for o in run_all(jobs, _cli_runners(jobs), exhausted=exhausted)}
+
+
 def cmd_workers(args) -> int:
     run_dir = Path(args.run_dir)
     ledger = s.load_ledger(run_dir)
@@ -556,28 +863,40 @@ def cmd_workers(args) -> int:
     entries = s.read_json(cli_args)["jobs"]
     jobs = [_cli_job(e) for e in entries]
     _pin_worktrees(rd / WORKTREE_INPUTS, [job.worktree for job in jobs if job.writable])
+    profile = assignment.ledger_profile(ledger)
+    cells = assignment.mode_workers(profile["roles"], ledger.mode)
     exhausted = s.exhausted_runners(rnd)
-    outcomes = run_all(jobs, _cli_runners(jobs), exhausted=exhausted)
+    first = run_all(jobs, _cli_runners(jobs), exhausted=exhausted)
+    reruns, second = _rerun_with_fallbacks(entries, first, cells, set(profile["consented"]), exhausted)
+    outcomes = [second.get(o.id, o) for o in first]
     out = rd / f"{args.stage}-cli.json"
     s.write_json(out, {"results": [{"id": o.id, "output": o.output} for o in outcomes],
-                       "outcomes": [o.to_dict() for o in outcomes]})
-    failed = [o.id for o in outcomes if o.status != STATUS_OK]
+                       "outcomes": [o.to_dict() for o in outcomes],
+                       "fallback_runs": {job_id: {k: spec[k] for k in ("runner", "model", "effort")}
+                                         for job_id, spec in reruns.items()},
+                       "replaced": [o.to_dict() for o in first if o.id in reruns]})
+    failed = [o.id for o in first if o.status != STATUS_OK]
+    unresolved = {o.id for o in outcomes if o.status != STATUS_OK}
     fallback_args = rd / f"{args.stage}-fallback-args.json"
     (rd / f"{args.stage}-fallback.json").unlink(missing_ok=True)
     if args.stage == s.STAGE1:
         s.clear_cli_outputs(rd, s.STAGE_CHECKER)
-    if failed:
-        s.write_json(fallback_args, {"jobs": [s.fallback_job(e) for e in entries if e["id"] in failed]})
+    if unresolved:
+        s.write_json(fallback_args, {"jobs": [s.fallback_job(e, cells.get(e["role"], {}))
+                                              for e in entries if e["id"] in unresolved]})
     else:
         fallback_args.unlink(missing_ok=True)
-    counts = dict(Counter(o.status for o in outcomes))
+    counts = dict(Counter(o.status for o in first))
     ledger = s.load_ledger(run_dir)
     rnd = s.get_round(ledger, args.round)
-    s.mark(rnd, step, counts=counts, usage=usage_totals(outcomes), fallback=failed,
+    s.mark(rnd, step, counts=counts, usage=usage_totals([*first, *second.values()]), fallback=failed,
+           fallback_runs={job_id: spec["runner"] for job_id, spec in reruns.items()},
            **({"exhausted": exhausted} if exhausted else {}))
     s.save_ledger(run_dir, ledger)
     n, reasons = fallback_counts(counts)
     print(f"CLI 작업 {len(outcomes)}건: 성공 {counts.get(STATUS_OK, 0)}, 대체 실행 {n}" + (f"({reasons})" if n else ""))
+    if reruns:
+        print(f"외부 CLI로 다시 돌린 작업 {len(reruns)}건: " + ", ".join(f"{i}→{spec['runner']}" for i, spec in reruns.items()))
     print(f"결과: {out}")
     _print_next(ledger, run_dir)
     return 0
@@ -601,7 +920,8 @@ def _judge_code(ledger, rnd, f, results, snap, cfg, baseline, repro):
                 judged += extra
                 recorded += extra
     sensitive = s.is_sensitive(changed_files(pa) + changed_files(pb), cfg)
-    d = s.without_empty_patch(decide(a, b, va, vb, pa, pb, sensitive), {"a": pa, "b": pb}, adjudicated=False)
+    d = decide(a, b, va, vb, pa, pb, sensitive, ledger.adopt_on_both_pass)
+    d = s.without_empty_patch(d, {"a": pa, "b": pb}, adjudicated=False)
     workers = {"a": a, "b": b}
     return d, workers, {"a": [r.to_dict() for r in ra], "b": [r.to_dict() for r in rb]}
 
@@ -668,7 +988,7 @@ def cmd_judge(args) -> int:
         if pending and checker_results is None:
             out = rd / "checker-args.json"
             wts = {f.id: {"writer": s.worktree(snap, f.id, "writer")} for f in pending}
-            jobs = build_checker_jobs(s.prompt_findings(ledger, pending), wts, writer_patches, ledger.workers or None)
+            jobs = build_checker_jobs(s.prompt_findings(ledger, pending), wts, writer_patches, assignment.job_workers(ledger))
             claude_args, cli_args = split_job_args(jobs, rd / "prompts")
             s.write_json(out, claude_args)
             if cli_args["jobs"]:
@@ -697,7 +1017,8 @@ def cmd_judge(args) -> int:
             _pin_worktrees(rd / WORKTREE_INPUTS, [wt])
             adj_items.append(s.adj_input(ledger, by_id[d.finding_id], merged, verify, wt, cfg, d.reasons))
     if adj_items:
-        s.write_json(rd / "adj-args.json", write_job_args(build_adjudicator_jobs(adj_items), rd / "prompts"))
+        adj_jobs = build_adjudicator_jobs(adj_items, assignment.adjudicator_cell(ledger))
+        s.write_json(rd / "adj-args.json", write_job_args(adj_jobs, rd / "prompts"))
     held = {f["id"] for f in rnd.hold_findings}
     rnd.decisions = [d for d in rnd.decisions if d["finding_id"] in held] + [d.to_dict() for d in decisions]
     s.write_json(rd / "decisions.json", rnd.decisions)
@@ -736,7 +1057,8 @@ def cmd_adjudicate(args) -> int:
     snap = s.snapshot_of(ledger)
     rd = s.round_dir(run_dir, rnd.no)
     results = read_results(s.read_json(args.results))
-    for warning in s.model_warnings(results):
+    expected = assignment.adjudicator_cell(ledger)["model"]
+    for warning in s.model_warnings(results, {key: expected for key, r in results.items() if r.role == "adjudicator"}):
         print(warning)
     merged = s.read_json(rd / "results.json")
     verify = s.read_json(rd / "verify.json")
@@ -769,8 +1091,8 @@ def cmd_adjudicate(args) -> int:
                                  snap.worktrees.get(s.base_name(rnd)) or ledger.root))
         new_decisions.append(new.to_dict())
     rnd.decisions = new_decisions
-    if opinion_jobs and s.is_claude(ledger):
-        s.write_review_args(rd, s.OPINION_ARGS, ledger, opinion_jobs)
+    if opinion_jobs and s.is_claude(ledger, "opinion"):
+        s.write_review_args(rd, s.OPINION_ARGS, ledger, opinion_jobs, "opinion")
     s.write_json(rd / "results.json", merged)
     s.write_json(rd / "verify.json", verify)
     s.write_json(rd / "decisions.json", rnd.decisions)
@@ -790,22 +1112,20 @@ def _claude_opinions(args, run_dir: Path, ledger: Ledger, rnd: RoundRecord) -> i
     results = read_review_results(s.read_json(Path(args.results)))
     for fid in pending:
         text, model_id = results.get(s.opinion_job_id(fid), ("", None))
-        warning = model_warning(s.opinion_job_id(fid), model_id, ledger.review_model)
+        warning = model_warning(s.opinion_job_id(fid), model_id, s.review_cell(ledger, "opinion")["model"])
         if warning:
             print(warning)
         if not text.strip():
             print(f"경고: {fid} Claude 의견이 없다(호출 실패). 「{CALL_FAILED_NOTE}」로 적고 넘어간다")
             text = CALL_FAILED_NOTE
         ledger.opinions[fid] = text.strip()
-        s.mark(rnd, f"opinion:{fid}")
+        s.mark(rnd, f"opinion:{fid}", **s.review_event_extra(ledger, "opinion"))
     s.save_ledger(run_dir, ledger)
     print(f"Claude 의견 {len(pending)}건을 원장에 붙였다(자동 채택하지 않는다)")
     _print_next(ledger, run_dir)
     return 0
 
 
-EXTERNAL_AUTH_FAILURE = re.compile(r"\b401\b|unauthori[sz]ed|refresh[ _]token|codex login|not logged in|Authentication required", re.IGNORECASE)
-EXTERNAL_USAGE_LIMIT = re.compile(r"usage limit", re.IGNORECASE)
 EXTERNAL_LOG_TAIL_LINES = 5
 LOGIN_COMMANDS = {REVIEWER_CODEX: "codex login", REVIEWER_CURSOR: "cursor-agent login"}
 
@@ -825,9 +1145,9 @@ def _external_result_text(result: Path, what: str, reviewer: str) -> str:
         tail = log_text.strip().splitlines()[-EXTERNAL_LOG_TAIL_LINES:]
         lines.append(f"실행 로그: {log}")
         lines.extend(f"  | {line}" for line in tail)
-        if EXTERNAL_AUTH_FAILURE.search(log_text):
+        if s.EXTERNAL_AUTH_FAILURE.search(log_text):
             lines.append("로그에 인증 실패 흔적이 있다(401·refresh token·Authentication required).")
-        if EXTERNAL_USAGE_LIMIT.search(log_text):
+        if s.EXTERNAL_USAGE_LIMIT.search(log_text):
             lines.append("로그에 이용 한도 도달 흔적이 있다(usage limit). 한도가 풀린 뒤 RR을 다시 돌린다.")
     lines.append(f"인증 실패면 터미널에서 `{LOGIN_COMMANDS.get(reviewer, LOGIN_COMMANDS[REVIEWER_CODEX])}`으로 다시 로그인한 뒤 RR을 다시 돌린다.")
     if reviewer == REVIEWER_CODEX:
@@ -846,11 +1166,50 @@ def cmd_opinion(args) -> int:
     s.guard(rnd, f"opinion:{args.id}", args.force)
     if args.id not in {d["finding_id"] for d in rnd.decisions}:
         raise s.CliError(f"회차 {rnd.no}에 {args.id} 판정이 없다")
-    text = _external_result_text(Path(args.result), "의견", ledger.reviewer)
+    runner = s.review_cell(ledger, "opinion")["runner"]
+    failure = s.external_failure(Path(args.result))
+    if failure in s.FAILURE_REASONS and runner != REVIEWER_CLAUDE:
+        return _opinion_fallback(args, run_dir, ledger, rnd, failure)
+    text = _external_result_text(Path(args.result), "의견", runner)
     ledger.opinions[args.id] = text
-    s.mark(rnd, f"opinion:{args.id}")
+    s.mark(rnd, f"opinion:{args.id}", **s.review_event_extra(ledger, "opinion"))
     s.save_ledger(run_dir, ledger)
-    print(f"{args.id} {label(ledger.reviewer)} 의견을 원장에 붙였다(자동 채택하지 않는다)")
+    print(f"{args.id} {label(runner)} 의견을 원장에 붙였다(자동 채택하지 않는다)")
+    _print_next(ledger, run_dir)
+    return 0
+
+
+def _substitute_review(ledger: Ledger, role: str, failure: str, what: str, result: str, round_no: int) -> dict:
+    old = s.review_cell(ledger, role)["runner"]
+    new = s.substitute_review(ledger, role, s.FAILURE_REASONS[failure], round_no)
+    print(f"{label(old)} {what} 결과가 없다({s.FAILURE_REASONS[failure]} 흔적): {result}")
+    print(f"대체: {ledger.mode}.{role} {old} → {new['runner']} — {s.FAILURE_REASONS[failure]}")
+    return new
+
+
+def _opinion_fallback(args, run_dir: Path, ledger: Ledger, rnd: RoundRecord, failure: str) -> int:
+    new = _substitute_review(ledger, "opinion", failure, "의견", args.result, rnd.no)
+    if new["runner"] == REVIEWER_CLAUDE:
+        rd = s.round_dir(run_dir, rnd.no)
+        fids = [fid for fid in sorted({*s.pending_opinions(ledger, rd), args.id}) if (rd / f"opinion-{fid}.md").is_file()]
+        repo = s.snapshot_of(ledger).worktrees.get(s.base_name(rnd)) or ledger.root
+        items = [(s.opinion_job_id(fid), f"{fid} opinion", s.read_text(rd / f"opinion-{fid}.md"), repo) for fid in fids]
+        s.write_review_args(rd, s.OPINION_ARGS, ledger, items, "opinion")
+    s.save_ledger(run_dir, ledger)
+    _print_next(ledger, run_dir)
+    return 0
+
+
+def _recheck_fallback(args, run_dir: Path, ledger: Ledger, rnd: RoundRecord, failure: str) -> int:
+    new = _substitute_review(ledger, "recheck", failure, "재검토", args.result, rnd.no)
+    if new["runner"] == REVIEWER_CLAUDE:
+        rd = s.round_dir(run_dir, rnd.no)
+        repo_file = rd / s.RECHECK_REPO_FILE
+        repo = repo_file.read_text(encoding="utf-8").strip() if repo_file.is_file() else ledger.root
+        prompt = s.read_text(rd / "recheck-prompt.md")
+        s.write_review_args(rd, s.RECHECK_ARGS, ledger, [(s.recheck_job_id(rnd.no), f"회차 {rnd.no} recheck", prompt, repo)],
+                            "recheck")
+    s.save_ledger(run_dir, ledger)
     _print_next(ledger, run_dir)
     return 0
 
@@ -978,8 +1337,9 @@ def cmd_apply(args) -> int:
         prompt = build_recheck_prompt(adopted, diff, ledger.mode)
         (rd / "recheck-prompt.md").write_text(prompt, encoding="utf-8")
         (rd / s.RECHECK_REPO_FILE).write_text(recheck_repo + "\n", encoding="utf-8")
-        if s.is_claude(ledger):
-            s.write_review_args(rd, s.RECHECK_ARGS, ledger, [(s.recheck_job_id(rnd.no), f"회차 {rnd.no} recheck", prompt, recheck_repo)])
+        if s.is_claude(ledger, "recheck"):
+            s.write_review_args(rd, s.RECHECK_ARGS, ledger,
+                                [(s.recheck_job_id(rnd.no), f"회차 {rnd.no} recheck", prompt, recheck_repo)], "recheck")
         s.write_json(rd / s.RECHECK_SCOPE_FILE, scope)
         rnd.recheck_opened = True
         print(f"재검토 필요: {rd / 'recheck-prompt.md'} (--repo {recheck_repo})")
@@ -1022,14 +1382,18 @@ def cmd_recheck(args) -> int:
     if not rnd.recheck_opened:
         raise s.CliError(f"회차 {rnd.no}은 재검토를 열지 않았다")
     is_json = args.result.endswith(".json")
+    cell = s.review_cell(ledger, "recheck")
     if not is_json:
-        _external_result_text(Path(args.result), "재검토", ledger.reviewer)
+        failure = s.external_failure(Path(args.result))
+        if failure in s.FAILURE_REASONS and cell["runner"] != REVIEWER_CLAUDE:
+            return _recheck_fallback(args, run_dir, ledger, rnd, failure)
+        _external_result_text(Path(args.result), "재검토", cell["runner"])
     elif not Path(args.result).is_file():
         raise s.CliError(f"파일이 없다: {args.result}")
     text, model_id = load_text(Path(args.result), s.recheck_job_id(rnd.no) if is_json else None)
     if not text.strip():
         raise s.CliError(f"재검토 결과가 비어 있다(Workflow 호출 실패일 수 있다). 재검토 Workflow를 다시 돌린다: {args.result}")
-    warning = model_warning(s.recheck_job_id(rnd.no), model_id, ledger.review_model)
+    warning = model_warning(s.recheck_job_id(rnd.no), model_id, cell["model"])
     if warning:
         print(warning)
     rd = s.round_dir(run_dir, rnd.no)
@@ -1060,7 +1424,7 @@ def cmd_recheck(args) -> int:
         rnd.hold_findings.append(f.to_dict())
         rnd.decisions.append(Decision(f.id, OUTCOME_UNDECIDABLE, None, [reason]).to_dict())
     s.write_json(rd / "decisions.json", rnd.decisions)
-    s.mark(rnd, "recheck")
+    s.mark(rnd, "recheck", **s.review_event_extra(ledger, "recheck"))
     print(f"해소 {sum(1 for v in resolved.values() if v)}건, 해소 안 됨 {len(unresolved)}건, 새 지적 {len(new)}건")
     next_round += carried
     print(f"다음 회차 {len(next_round)}건(적용 못 해 넘긴 {len(carried)}건 포함), "
@@ -1185,10 +1549,10 @@ def build_parser() -> argparse.ArgumentParser:
         return p
 
     def add_workers_args(p):
-        p.add_argument("--workers", choices=WORKERS_CHOICES, default=os.environ.get("CASCADE_WORKERS") or WORKERS_CLAUDE,
+        p.add_argument("--workers", choices=WORKERS_CHOICES,
                        help="1단계 작업자(기본: 환경 변수 CASCADE_WORKERS, 없으면 claude). "
                             "external: 쓸 수 있는 Codex·Cursor CLI에 A·writer, B·checker 자리를 배정")
-        p.add_argument("--cursor-model", default=DEFAULT_CURSOR_MODEL, help=f"Cursor 작업자 모델(기본 {DEFAULT_CURSOR_MODEL})")
+        p.add_argument("--cursor-model", help=f"Cursor 작업자 모델(기본 {DEFAULT_CURSOR_MODEL})")
 
     p = add("init", cmd_init, run_dir=False, force=False)
     p.add_argument("--source", choices=SOURCES, required=True)
@@ -1198,13 +1562,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pr-repo")
     p.add_argument("--me")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--adopt-on-both-pass", action="store_true",
+                   help="코드 모드에서 같은 판정에 패치가 달라도 둘 다 검증을 통과하면 판가름 없이 작은 패치를 채택")
     p.add_argument("--max-rechecks", type=int, default=2)
     p.add_argument("--root")
-    p.add_argument("--reviewer", choices=REVIEWER_CHOICES, default=os.environ.get("CASCADE_REVIEWER") or REVIEWER_AUTO,
+    p.add_argument("--consent", help="전송에 동의한 외부 수신처(codex,cursor 중 쉼표 구분, 또는 none). 기본: 이 프로필이 쓰는 수신처 전부")
+    p.add_argument("--reviewer", choices=REVIEWER_CHOICES,
                    help="판가름 뒤 의견·재검토를 맡을 검토자(기본: 환경 변수 CASCADE_REVIEWER, 없으면 auto). "
                         "auto: claude-* 입력이면 claude, 아니면 codex-review 스킬이 있으면 codex, 없으면 cursor를 쓸 수 있을 때 cursor, 아니면 claude")
     p.add_argument("--review-model", help=f"Claude 검토자 모델(기본 {DEFAULT_MODEL})")
     p.add_argument("--review-effort", choices=EFFORTS, help=f"Claude 검토자 effort(기본 {DEFAULT_EFFORT})")
+    p.add_argument("--profile", help="역할 프로필 이름(기본: 환경 변수 CASCADE_PROFILE, repos.toml, 없으면 내장 default)")
     p.add_argument("--severity", help="이번 실행에서 처리할 등급(쉼표 구분, 예: Critical,Warning). 나머지는 보류 후보")
     add_workers_args(p)
     p = add("detect", cmd_detect, run_dir=False, force=False)
@@ -1214,19 +1582,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--root")
     p.add_argument("--no-gh", action="store_true")
     p.add_argument("--json", action="store_true")
-    p.add_argument("--reviewer", choices=REVIEWER_CHOICES, default=os.environ.get("CASCADE_REVIEWER") or REVIEWER_AUTO)
+    p.add_argument("--reviewer", choices=REVIEWER_CHOICES)
+    p.add_argument("--profile", help="역할 프로필 이름(기본: 환경 변수 CASCADE_PROFILE, repos.toml, 없으면 내장 default)")
     add_workers_args(p)
     p = add("review", cmd_review, run_dir=False, force=False)
-    p.add_argument("--kind", choices=("code", "doc"), required=True)
+    p.add_argument("--kind", choices=("code", "doc"))
     p.add_argument("--base")
     p.add_argument("--uncommitted", action="store_true")
     p.add_argument("--commit")
     p.add_argument("--doc", action="append")
     p.add_argument("--focus")
     p.add_argument("--root")
+    p.add_argument("--profile", help="역할 프로필 이름(기본: 환경 변수 CASCADE_PROFILE, repos.toml, 없으면 내장 default)")
     p.add_argument("--review-model")
     p.add_argument("--review-effort", choices=EFFORTS)
     add_workers_args(p)
+    p.add_argument("--consent", help="전송에 동의한 외부 수신처(codex,cursor 중 쉼표 구분, 또는 none). 기본: 이 프로필의 첫 검토 칸이 쓰는 수신처 전부")
+    p.add_argument("--review-dir", help="--fallback-from으로 이력을 고칠 처음 첫 검토 폴더(review_dir=로 찍힌 곳)")
+    p.add_argument("--fallback-from", help="실패한 첫 검토 runner(codex·cursor). 마지막으로 시도한 runner와 같아야 한다")
+    p.add_argument("--reason", help=f"--fallback-from의 사유(기본 {REVIEW_DEFAULT_REASON})")
     add("jobs", cmd_jobs, round_no=True)
     p = add("workers", cmd_workers, round_no=True)
     p.add_argument("--stage", choices=(s.STAGE1, s.STAGE_CHECKER), required=True)
