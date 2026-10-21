@@ -218,5 +218,177 @@ adopt_on_both_pass = false
         self.assertTrue(issubclass(profiles.ProfileError, ConfigError))
 
 
+class SelectionTest(unittest.TestCase):
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.tmp = Path(self._td.name).resolve()
+        self.root = self.tmp / "repo"
+        self.root.mkdir()
+        self.toml = write_toml(self.tmp, "")
+        self.both = {"codex": True, "cursor": True}
+
+    def resolve(self, toml_text=None, **kw):
+        if toml_text is not None:
+            write_toml(self.tmp, toml_text)
+        args = {"flag": None, "cli": profiles.LegacyOptions(), "env": {}, "available": {}, "codex_model": ""}
+        args.update(kw)
+        return profiles.resolve(self.root, self.toml, **args)
+
+    def test_select_order(self):
+        known = ["default", "claude-only", "local", "mine"]
+        sel = lambda **kw: profiles.select(**{"flag": None, "env": {}, "repo_profile": None, "default_profile": None, "known": known, **kw})
+        self.assertEqual(sel(flag="local", env={"CASCADE_PROFILE": "mine"}), ("local", "--profile", True))
+        self.assertEqual(sel(env={"CASCADE_PROFILE": "mine"}, repo_profile="local"), ("mine", "CASCADE_PROFILE", True))
+        self.assertEqual(sel(repo_profile="local", default_profile="mine"), ("local", "repos.toml:repo", True))
+        self.assertEqual(sel(default_profile="mine"), ("mine", "repos.toml:default_profile", True))
+        self.assertEqual(sel(), ("default", "builtin", False))
+
+    def test_empty_env_profile_is_not_chosen(self):
+        known = ["default", "claude-only", "local"]
+        self.assertEqual(profiles.select(flag=None, env={"CASCADE_PROFILE": ""}, repo_profile=None,
+                                         default_profile=None, known=known), ("default", "builtin", False))
+
+    def test_unknown_env_profile_lists_names(self):
+        with self.assertRaisesRegex(profiles.ProfileError, "claude-only.*local"):
+            profiles.select(flag=None, env={"CASCADE_PROFILE": "nope"}, repo_profile=None, default_profile=None,
+                            known=["default", "claude-only", "local"])
+
+    def test_unknown_flag_and_repo_profile_name_the_source(self):
+        known = ["default", "claude-only", "local"]
+        with self.assertRaisesRegex(profiles.ProfileError, r"--profile.*nope"):
+            profiles.select(flag="nope", env={}, repo_profile=None, default_profile=None, known=known)
+        with self.assertRaisesRegex(profiles.ProfileError, r"repos\.toml:repo.*nope"):
+            profiles.select(flag=None, env={}, repo_profile="nope", default_profile=None, known=known)
+
+    def test_workers_overrides(self):
+        base = profiles.builtin("local")
+        claude, notes = profiles.apply_overrides(base, profiles.LegacyOptions(workers="claude"), {}, "gpt-6.1-sol")
+        self.assertEqual(claude["roles"]["code.a"], profiles.builtin("claude-only")["roles"]["code.a"])
+        self.assertIn("code.a ← --workers claude", notes)
+        self.assertEqual(base, profiles.builtin("local"))
+        ext, _ = profiles.apply_overrides(profiles.builtin("default"), profiles.LegacyOptions(workers="external"),
+                                          {"codex": True, "cursor": True}, "gpt-6.1-sol")
+        self.assertEqual((ext["roles"]["code.a"]["runner"], ext["roles"]["doc.writer"]["runner"]), ("codex", "codex"))
+        self.assertEqual({k: ext["roles"]["code.b"][k] for k in ("runner", "model", "effort")},
+                         {"runner": "cursor", "model": "composer-2.5", "effort": ""})
+        self.assertEqual(ext["roles"]["doc.checker"]["runner"], "cursor")
+        self.assertEqual(ext["roles"]["doc.judge_a"]["runner"], "codex")
+        self.assertEqual(ext["roles"]["code.a"]["effort"], "low")
+        only_cursor, _ = profiles.apply_overrides(profiles.builtin("default"), profiles.LegacyOptions(workers="external"),
+                                                  {"codex": False, "cursor": True}, "")
+        self.assertEqual((only_cursor["roles"]["code.a"]["runner"], only_cursor["roles"]["code.b"]["runner"]), ("cursor", "claude"))
+        only_codex, _ = profiles.apply_overrides(profiles.builtin("default"), profiles.LegacyOptions(workers="external"),
+                                                 {"codex": True, "cursor": False}, "")
+        self.assertEqual((only_codex["roles"]["code.a"]["runner"], only_codex["roles"]["code.b"]["runner"]), ("codex", "claude"))
+        none, _ = profiles.apply_overrides(profiles.builtin("local"), profiles.LegacyOptions(workers="external"), {}, "")
+        self.assertEqual(none["roles"]["code.a"], profiles.builtin("claude-only")["roles"]["code.a"])
+        self.assertEqual(none["roles"]["code.b"], profiles.builtin("claude-only")["roles"]["code.b"])
+
+    def test_cursor_model_overrides_only_cursor_cells(self):
+        out, notes = profiles.apply_overrides(profiles.builtin("default"),
+                                              profiles.LegacyOptions(workers="external", cursor_model="cursor-x"),
+                                              {"codex": True, "cursor": True}, "")
+        self.assertEqual(out["roles"]["code.b"]["model"], "cursor-x")
+        self.assertEqual(out["roles"]["code.a"]["model"], "")
+        self.assertIn("code.b ← --cursor-model cursor-x", notes)
+        self.assertNotIn("code.a ← --cursor-model cursor-x", notes)
+
+    def test_reviewer_overrides_reset_and_order(self):
+        co = profiles.builtin("claude-only")
+        out, _ = profiles.apply_overrides(co, profiles.LegacyOptions(reviewer="codex"), {}, "")
+        self.assertEqual({k: out["roles"]["code.opinion"][k] for k in ("runner", "model", "effort")}, {"runner": "codex", "model": "", "effort": ""})
+        self.assertEqual(out["roles"]["code.review"], co["roles"]["code.review"])
+        self.assertEqual(out["roles"]["doc.recheck"]["runner"], "codex")
+        out, _ = profiles.apply_overrides(profiles.builtin("local"),
+                                          profiles.LegacyOptions(reviewer="claude", review_model="claude-sonnet-5-5"), {}, "")
+        self.assertEqual(out["roles"]["doc.recheck"]["model"], "claude-sonnet-5-5")
+        self.assertEqual(out["roles"]["doc.recheck"]["effort"], "high")
+
+    def test_review_model_skips_non_claude_cells(self):
+        out, _ = profiles.apply_overrides(profiles.builtin("local"),
+                                          profiles.LegacyOptions(review_model="claude-sonnet-5-5", review_effort="low"), {}, "")
+        self.assertEqual(out["roles"]["code.opinion"], profiles.builtin("local")["roles"]["code.opinion"])
+        out, _ = profiles.apply_overrides(profiles.builtin("claude-only"),
+                                          profiles.LegacyOptions(review_effort="low"), {}, "")
+        self.assertEqual((out["roles"]["code.opinion"]["effort"], out["roles"]["code.recheck"]["effort"]), ("low", "low"))
+        self.assertEqual(out["roles"]["code.review"]["effort"], "high")
+
+    def test_adopt_on_both_pass_override(self):
+        out, notes = profiles.apply_overrides(profiles.builtin("default"), profiles.LegacyOptions(adopt_on_both_pass=True), {}, "")
+        self.assertTrue(out["adopt_on_both_pass"])
+        self.assertTrue(any("adopt_on_both_pass" in n for n in notes))
+        out, notes = profiles.apply_overrides(profiles.builtin("default"), profiles.LegacyOptions(), {}, "")
+        self.assertFalse(out["adopt_on_both_pass"])
+        self.assertEqual(notes, [])
+
+    def test_overrides_are_validated(self):
+        with self.assertRaises(profiles.ProfileError):
+            profiles.apply_overrides(profiles.builtin("default"),
+                                     profiles.LegacyOptions(workers="external", cursor_model="claude-sonnet-5-5"),
+                                     {"codex": False, "cursor": True}, "")
+
+    def test_resolve_env_rules(self):
+        r = profiles.resolve(self.root, self.toml, flag=None, cli=profiles.LegacyOptions(),
+                             env={"CASCADE_WORKERS": "external"}, available={"codex": True, "cursor": True}, codex_model="")
+        self.assertEqual(r.roles["code.a"]["runner"], "codex")
+        self.assertTrue(any("폐기 예정" in n for n in r.notices))
+        r = profiles.resolve(self.root, self.toml, flag="claude-only", cli=profiles.LegacyOptions(),
+                             env={"CASCADE_WORKERS": "external"}, available={"codex": True, "cursor": True}, codex_model="")
+        self.assertEqual(r.roles["code.a"]["runner"], "claude")
+        self.assertTrue(any("무시" in n for n in r.notices))
+
+    def test_resolve_reads_env_reviewer_only_for_builtin_default(self):
+        r = self.resolve(env={"CASCADE_REVIEWER": "codex"})
+        self.assertEqual((r.name, r.source, r.explicit), ("default", "builtin", False))
+        self.assertEqual(r.roles["code.opinion"]["runner"], "codex")
+        self.assertEqual(r.roles["code.review"]["runner"], "auto")
+        self.assertTrue(any("폐기 예정" in n for n in r.notices))
+        r = self.resolve(flag="default", env={"CASCADE_REVIEWER": "codex"})
+        self.assertEqual(r.roles["code.opinion"]["runner"], "auto")
+        self.assertTrue(any("무시" in n for n in r.notices))
+
+    def test_resolve_without_env_has_no_notices(self):
+        r = self.resolve()
+        self.assertEqual((r.name, r.source, r.explicit, r.notices, r.overrides), ("default", "builtin", False, [], []))
+        self.assertEqual(r.roles, profiles.builtin("default")["roles"])
+        self.assertFalse(r.adopt_on_both_pass)
+
+    def test_cli_options_beat_env_and_work_on_explicit_profile(self):
+        r = self.resolve(flag="local", cli=profiles.LegacyOptions(workers="claude"), env={"CASCADE_WORKERS": "external"},
+                         available=self.both)
+        self.assertEqual(r.roles["code.a"]["runner"], "claude")
+        self.assertIn("code.a ← --workers claude", r.overrides)
+        r = self.resolve(cli=profiles.LegacyOptions(workers="claude"), env={"CASCADE_WORKERS": "external"}, available=self.both)
+        self.assertEqual(r.roles["code.a"]["runner"], "claude")
+        self.assertFalse(any("폐기 예정" in n for n in r.notices))
+
+    def test_resolve_reads_repo_profile_and_default_profile(self):
+        toml = (f'default_profile = "mine"\n[profiles.mine]\nbase = "claude-only"\nadopt_on_both_pass = false\n'
+                f'[profiles.other]\nbase = "local"\n[repos."{self.root}"]\ntests = ["x"]\nprofile = "other"\n')
+        r = self.resolve(toml)
+        self.assertEqual((r.name, r.source, r.explicit), ("other", "repos.toml:repo", True))
+        self.assertEqual(r.roles["code.a"]["runner"], "codex")
+        r = self.resolve(f'default_profile = "mine"\n[profiles.mine]\nbase = "claude-only"\nadopt_on_both_pass = false\n')
+        self.assertEqual((r.name, r.source, r.explicit), ("mine", "repos.toml:default_profile", True))
+        self.assertFalse(r.adopt_on_both_pass)
+        r = self.resolve(toml, env={"CASCADE_PROFILE": "mine"})
+        self.assertEqual((r.name, r.source), ("mine", "CASCADE_PROFILE"))
+
+    def test_resolve_unknown_names_are_profile_errors(self):
+        with self.assertRaisesRegex(profiles.ProfileError, "nope"):
+            self.resolve(flag="nope")
+        with self.assertRaisesRegex(profiles.ProfileError, "repos.toml:default_profile"):
+            self.resolve('default_profile = "ghost"\n')
+        with self.assertRaisesRegex(profiles.ProfileError, "default_profile"):
+            self.resolve("default_profile = 1\n")
+
+    def test_resolve_adopt_flag(self):
+        r = self.resolve(cli=profiles.LegacyOptions(adopt_on_both_pass=True))
+        self.assertTrue(r.adopt_on_both_pass)
+        r = self.resolve(flag="claude-only")
+        self.assertTrue(r.adopt_on_both_pass)
+
+
 if __name__ == "__main__":
     unittest.main()

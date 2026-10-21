@@ -11,7 +11,8 @@ from datetime import datetime
 from pathlib import Path
 
 from cascade import cli_steps as s
-from cascade.config import ExitCodes
+from cascade import profiles
+from cascade.config import ConfigError, ExitCodes
 from cascade.consensus import (
     OUTCOME_ADJUDICATE,
     OUTCOME_CARRIED,
@@ -87,6 +88,9 @@ from cascade.runners import (
     CliJob,
     CodexRunner,
     CursorRunner,
+    codex_available,
+    codex_model,
+    cursor_available,
     find_codex,
     find_cursor_agent,
     run_all,
@@ -260,13 +264,42 @@ def _check_workers(choice: str) -> None:
         raise s.CliError(f"알 수 없는 작업자: {choice} ({' / '.join(WORKERS_CHOICES)}, CASCADE_WORKERS 확인)")
 
 
+def _workers_choice(args) -> str:
+    return args.workers or os.environ.get("CASCADE_WORKERS") or WORKERS_CLAUDE
+
+
+def _reviewer_choice(args) -> str:
+    return args.reviewer or os.environ.get("CASCADE_REVIEWER") or REVIEWER_AUTO
+
+
+def _cursor_model(args) -> str:
+    return args.cursor_model or DEFAULT_CURSOR_MODEL
+
+
+def _resolve_profile(args, root: Path) -> profiles.Resolved:
+    env = os.environ
+    available = ({RUNNER_CODEX: codex_available(), RUNNER_CURSOR: cursor_available()}
+                 if WORKERS_EXTERNAL in (args.workers, env.get("CASCADE_WORKERS")) else {})
+    cli = profiles.LegacyOptions(
+        workers=args.workers, cursor_model=args.cursor_model, reviewer=args.reviewer,
+        review_model=args.review_model, review_effort=args.review_effort,
+        adopt_on_both_pass=args.adopt_on_both_pass)
+    try:
+        return profiles.resolve(root, s.repos_toml(), flag=args.profile, cli=cli, env=env, available=available,
+                                codex_model=codex_model(Path.home() / ".codex"))
+    except ConfigError as e:
+        raise s.CliError(str(e), ExitCodes.PARSE_ERROR) from None
+
+
 def cmd_init(args) -> int:
     root = Path(args.root).resolve() if args.root else s.git_toplevel(Path.cwd())
     s.cfg_for(args.source, root)
-    if args.reviewer not in REVIEWER_CHOICES:
-        raise s.CliError(f"알 수 없는 검토자: {args.reviewer} ({' / '.join(REVIEWER_CHOICES)}, CASCADE_REVIEWER 확인)")
-    _check_workers(args.workers)
-    reviewer = resolve(args.reviewer, args.source, s.RUN_REVIEW, s.cursor_reviewer_available)
+    reviewer_choice, workers_choice = _reviewer_choice(args), _workers_choice(args)
+    if reviewer_choice not in REVIEWER_CHOICES:
+        raise s.CliError(f"알 수 없는 검토자: {reviewer_choice} ({' / '.join(REVIEWER_CHOICES)}, CASCADE_REVIEWER 확인)")
+    _check_workers(workers_choice)
+    _resolve_profile(args, root)
+    reviewer = resolve(reviewer_choice, args.source, s.RUN_REVIEW, s.cursor_reviewer_available)
     findings, raw = _parse_input(args, root)
     if not findings:
         print("지적 0건 — 원문을 확인하라")
@@ -282,7 +315,7 @@ def cmd_init(args) -> int:
     if not findings:
         raise s.CliError(f"--severity {args.severity} 에 맞는 지적이 없다(전체 {len(deferred)}건). 등급을 넓힌다")
     docs, external = _split_docs(root, args.doc or [])
-    workers = assign_available(args.workers, args.cursor_model)
+    workers = assign_available(workers_choice, _cursor_model(args))
     ensure_excluded(root)
     snap = create_snapshot(root, _new_run_id(root), external)
     stamp = s.now()
@@ -302,7 +335,7 @@ def cmd_init(args) -> int:
         reviewer=reviewer,
         review_model=(args.review_model or DEFAULT_MODEL) if reviewer == REVIEWER_CLAUDE else "",
         review_effort=(args.review_effort or DEFAULT_EFFORT) if reviewer == REVIEWER_CLAUDE else "",
-        workers_choice=args.workers,
+        workers_choice=workers_choice,
         workers=workers,
         adopt_on_both_pass=args.adopt_on_both_pass,
     )
@@ -315,7 +348,7 @@ def cmd_init(args) -> int:
     if deferred:
         print(f"등급 선택으로 뺀 지적 {len(deferred)}건은 보류 후보로 둔다(나중에 resume 「지금 반영」으로 돌릴 수 있다)")
     print(f"규모: {estimate_line(len(findings), ledger.mode, reviewer, workers)}")
-    if args.workers == WORKERS_EXTERNAL:
+    if workers_choice == WORKERS_EXTERNAL:
         if has_external(workers):
             print(f"작업자: {describe(workers)}")
             print(consent_line(workers))
@@ -355,15 +388,16 @@ def _root_flag(args, root: Path) -> str:
 def cmd_detect(args) -> int:
     root = Path(args.root).resolve() if args.root else s.git_toplevel(Path.cwd())
     gh = None if args.no_gh else shlex.split(os.environ.get("CASCADE_GH", "gh"))
-    if args.reviewer not in REVIEWER_CHOICES:
-        raise s.CliError(f"알 수 없는 검토자: {args.reviewer} ({' / '.join(REVIEWER_CHOICES)}, CASCADE_REVIEWER 확인)")
-    _check_workers(args.workers)
+    reviewer_choice, workers_choice, cursor_model = _reviewer_choice(args), _workers_choice(args), _cursor_model(args)
+    if reviewer_choice not in REVIEWER_CHOICES:
+        raise s.CliError(f"알 수 없는 검토자: {reviewer_choice} ({' / '.join(REVIEWER_CHOICES)}, CASCADE_REVIEWER 확인)")
+    _check_workers(workers_choice)
     result = detect(root, repos_toml=s.repos_toml(), run_review=s.RUN_REVIEW, cursor_ok=s.cursor_reviewer_available, cli=s.CLI, gh=gh,
                     input_path=Path(args.input).resolve() if args.input else None, pr=args.pr,
-                    reviewer_choice=args.reviewer, root_flag=_root_flag(args, root),
+                    reviewer_choice=reviewer_choice, root_flag=_root_flag(args, root),
                     docs=[Path(d).resolve() for d in args.doc or []], cwd=Path.cwd(),
-                    workers_choice=args.workers, cursor_model=args.cursor_model,
-                    workers=assign_available(args.workers, args.cursor_model))
+                    workers_choice=workers_choice, cursor_model=cursor_model,
+                    workers=assign_available(workers_choice, cursor_model))
     print(json.dumps(result, ensure_ascii=False, indent=2) if args.json else render_detect(result))
     return 0 if result["ok"] else ExitCodes.NEEDS_USER
 
@@ -1136,10 +1170,10 @@ def build_parser() -> argparse.ArgumentParser:
         return p
 
     def add_workers_args(p):
-        p.add_argument("--workers", choices=WORKERS_CHOICES, default=os.environ.get("CASCADE_WORKERS") or WORKERS_CLAUDE,
+        p.add_argument("--workers", choices=WORKERS_CHOICES,
                        help="1단계 작업자(기본: 환경 변수 CASCADE_WORKERS, 없으면 claude). "
                             "external: 쓸 수 있는 Codex·Cursor CLI에 A·writer, B·checker 자리를 배정")
-        p.add_argument("--cursor-model", default=DEFAULT_CURSOR_MODEL, help=f"Cursor 작업자 모델(기본 {DEFAULT_CURSOR_MODEL})")
+        p.add_argument("--cursor-model", help=f"Cursor 작업자 모델(기본 {DEFAULT_CURSOR_MODEL})")
 
     p = add("init", cmd_init, run_dir=False, force=False)
     p.add_argument("--source", choices=SOURCES, required=True)
@@ -1153,11 +1187,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="코드 모드에서 같은 판정에 패치가 달라도 둘 다 검증을 통과하면 판가름 없이 작은 패치를 채택")
     p.add_argument("--max-rechecks", type=int, default=2)
     p.add_argument("--root")
-    p.add_argument("--reviewer", choices=REVIEWER_CHOICES, default=os.environ.get("CASCADE_REVIEWER") or REVIEWER_AUTO,
+    p.add_argument("--reviewer", choices=REVIEWER_CHOICES,
                    help="판가름 뒤 의견·재검토를 맡을 검토자(기본: 환경 변수 CASCADE_REVIEWER, 없으면 auto). "
                         "auto: claude-* 입력이면 claude, 아니면 codex-review 스킬이 있으면 codex, 없으면 cursor를 쓸 수 있을 때 cursor, 아니면 claude")
     p.add_argument("--review-model", help=f"Claude 검토자 모델(기본 {DEFAULT_MODEL})")
     p.add_argument("--review-effort", choices=EFFORTS, help=f"Claude 검토자 effort(기본 {DEFAULT_EFFORT})")
+    p.add_argument("--profile", help="역할 프로필 이름(기본: 환경 변수 CASCADE_PROFILE, repos.toml, 없으면 내장 default)")
     p.add_argument("--severity", help="이번 실행에서 처리할 등급(쉼표 구분, 예: Critical,Warning). 나머지는 보류 후보")
     add_workers_args(p)
     p = add("detect", cmd_detect, run_dir=False, force=False)
@@ -1167,7 +1202,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--root")
     p.add_argument("--no-gh", action="store_true")
     p.add_argument("--json", action="store_true")
-    p.add_argument("--reviewer", choices=REVIEWER_CHOICES, default=os.environ.get("CASCADE_REVIEWER") or REVIEWER_AUTO)
+    p.add_argument("--reviewer", choices=REVIEWER_CHOICES)
+    p.add_argument("--profile", help="역할 프로필 이름(기본: 환경 변수 CASCADE_PROFILE, repos.toml, 없으면 내장 default)")
     add_workers_args(p)
     p = add("review", cmd_review, run_dir=False, force=False)
     p.add_argument("--kind", choices=("code", "doc"), required=True)
@@ -1177,6 +1213,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--doc", action="append")
     p.add_argument("--focus")
     p.add_argument("--root")
+    p.add_argument("--profile", help="역할 프로필 이름(기본: 환경 변수 CASCADE_PROFILE, repos.toml, 없으면 내장 default)")
     p.add_argument("--review-model")
     p.add_argument("--review-effort", choices=EFFORTS)
     add("jobs", cmd_jobs, round_no=True)

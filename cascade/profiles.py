@@ -1,12 +1,14 @@
 import copy
 import tomllib
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from cascade.config import ConfigError
 from cascade.jobs import ROLES, RUNNER_CLAUDE
 from cascade.review import EFFORTS
 from cascade.runners import RUNNER_CODEX, RUNNER_CURSOR
-from cascade.workers import DEFAULT_CURSOR_MODEL
+from cascade.workers import DEFAULT_CURSOR_MODEL, WORKERS_CHOICES, assign
 
 RUNNER_AUTO = "auto"
 BUILTIN_NAMES = ("default", "claude-only", "local")
@@ -25,6 +27,7 @@ _ROLES_SOURCE = {
     "a": "a", "b": "b", "judge_a": "a", "judge_b": "b",
     "writer": "writer", "checker": "checker", "adjudicator": "adjudicator",
 }
+_WORKER_KEYS = ("code.a", "code.b", "doc.judge_a", "doc.judge_b", "doc.writer", "doc.checker")
 _FOREIGN_MODEL_PREFIXES = ("claude-", "gpt-")
 
 
@@ -252,3 +255,125 @@ def load_profiles(config_path: Path | None) -> tuple[dict[str, dict], dict]:
     for name, profile in found.items():
         validate(name, profile)
     return found, data
+
+
+SOURCE_FLAG, SOURCE_ENV, SOURCE_REPO, SOURCE_DEFAULT, SOURCE_BUILTIN = (
+    "--profile", "CASCADE_PROFILE", "repos.toml:repo", "repos.toml:default_profile", "builtin")
+DEPRECATED_ENV_NOTICE = "폐기 예정: CASCADE_PROFILE 또는 repos.toml profile을 쓴다"
+_LEGACY_ENVS = ("CASCADE_WORKERS", "CASCADE_REVIEWER")
+
+
+@dataclass
+class LegacyOptions:
+    workers: str | None = None
+    cursor_model: str | None = None
+    reviewer: str | None = None
+    review_model: str | None = None
+    review_effort: str | None = None
+    adopt_on_both_pass: bool = False
+
+
+@dataclass
+class Resolved:
+    name: str
+    source: str
+    explicit: bool
+    adopt_on_both_pass: bool
+    roles: dict[str, dict]
+    overrides: list[str]
+    notices: list[str]
+
+
+def select(*, flag: str | None, env: Mapping[str, str], repo_profile: str | None,
+           default_profile: str | None, known: Iterable[str]) -> tuple[str, str, bool]:
+    known = list(known)
+    candidates = ((flag, SOURCE_FLAG), (env.get(SOURCE_ENV) or None, SOURCE_ENV),
+                  (repo_profile, SOURCE_REPO), (default_profile, SOURCE_DEFAULT))
+    for name, source in candidates:
+        if name is None:
+            continue
+        if name not in known:
+            raise ProfileError(f"모르는 프로필이다({source}): {name!r}. 알려진 이름: {', '.join(known)}")
+        return name, source, True
+    return "default", SOURCE_BUILTIN, False
+
+
+def _override_workers(roles: dict, choice: str, available: dict[str, bool], codex_model: str,
+                      cursor_model: str, notes: list[str]) -> None:
+    if choice not in WORKERS_CHOICES:
+        raise ProfileError(f"알 수 없는 작업자: {choice} ({' / '.join(WORKERS_CHOICES)})")
+    seats = assign(choice, available, codex_model, cursor_model)
+    for key in _WORKER_KEYS:
+        runner = seats[_ROLES_SOURCE[_role(key)]]["runner"]
+        if runner == RUNNER_CLAUDE:
+            cell = _claude_only_cell(key)
+        else:
+            cell = {**reset_cell(key, runner, cursor_model), **({"model": codex_model} if runner == RUNNER_CODEX else {})}
+        roles[key] = cell
+        notes.append(f"{key} ← --workers {choice}")
+
+
+def apply_overrides(profile: dict, opts: LegacyOptions, available: dict[str, bool], codex_model: str,
+                    *, name: str = "덮어쓰기") -> tuple[dict, list[str]]:
+    out = copy.deepcopy(profile)
+    roles, notes = out["roles"], []
+    cursor_model = opts.cursor_model or DEFAULT_CURSOR_MODEL
+    if opts.workers is not None:
+        _override_workers(roles, opts.workers, available, codex_model, cursor_model, notes)
+    review_keys = [f"{mode}.{role}" for mode in ("code", "doc") for role in ("opinion", "recheck")]
+    if opts.reviewer is not None:
+        for key in review_keys:
+            roles[key] = merge_cell(key, roles[key], {"runner": opts.reviewer}, cursor_model)
+            notes.append(f"{key} ← --reviewer {opts.reviewer}")
+    if opts.cursor_model is not None:
+        for key in ROLE_KEYS:
+            if roles[key]["runner"] == RUNNER_CURSOR:
+                roles[key]["model"] = opts.cursor_model
+                notes.append(f"{key} ← --cursor-model {opts.cursor_model}")
+    for field, flag, value in (("model", "--review-model", opts.review_model), ("effort", "--review-effort", opts.review_effort)):
+        if value is None:
+            continue
+        for key in review_keys:
+            if roles[key]["runner"] in (RUNNER_CLAUDE, RUNNER_AUTO):
+                roles[key][field] = value
+                notes.append(f"{key} ← {flag} {value}")
+    if opts.adopt_on_both_pass:
+        out["adopt_on_both_pass"] = True
+        notes.append("adopt_on_both_pass ← --adopt-on-both-pass")
+    validate(name, out)
+    return out, notes
+
+
+def _config_text(value, what: str) -> str | None:
+    if value is not None and not isinstance(value, str):
+        raise ProfileError(f"{what}은 문자열이어야 한다: {value!r}")
+    return value
+
+
+def resolve(root: Path, repos_toml: Path, *, flag: str | None, cli: LegacyOptions, env: Mapping[str, str],
+            available: dict[str, bool], codex_model: str) -> Resolved:
+    found, data = load_profiles(repos_toml)
+    repos = data.get("repos", {})
+    entry = repos.get(str(Path(root).resolve())) if isinstance(repos, dict) else None
+    repo_profile = _config_text(entry.get("profile"), "저장소 항목의 profile") if isinstance(entry, dict) else None
+    default_profile = _config_text(data.get("default_profile"), "default_profile")
+    name, source, explicit = select(flag=flag, env=env, repo_profile=repo_profile,
+                                    default_profile=default_profile, known=found)
+    opts, notices = cli, []
+    legacy = {"CASCADE_WORKERS": env.get("CASCADE_WORKERS") or None, "CASCADE_REVIEWER": env.get("CASCADE_REVIEWER") or None}
+    if explicit:
+        ignored = [var for var in _LEGACY_ENVS if legacy[var]]
+        if ignored:
+            notices.append(f"{'·'.join(ignored)}는 프로필을 명시적으로 골랐으므로 무시한다")
+    else:
+        used = []
+        if cli.workers is None and legacy["CASCADE_WORKERS"]:
+            opts = replace(opts, workers=legacy["CASCADE_WORKERS"])
+            used.append("CASCADE_WORKERS")
+        if cli.reviewer is None and legacy["CASCADE_REVIEWER"]:
+            opts = replace(opts, reviewer=legacy["CASCADE_REVIEWER"])
+            used.append("CASCADE_REVIEWER")
+        if used:
+            notices.append(DEPRECATED_ENV_NOTICE)
+    profile, overrides = apply_overrides(found[name], opts, available, codex_model, name=name)
+    return Resolved(name, source, explicit, profile["adopt_on_both_pass"], profile["roles"], overrides, notices)
