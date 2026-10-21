@@ -399,7 +399,7 @@ PYTHONPATH=<스킬 경로> python3 -m cascade.cli <명령> [옵션]
 | 명령 | 하는 일 |
 | --- | --- |
 | `detect [--input F] [--doc F…] [--pr N] [--no-gh] [--profile P] [--reviewer R] [--workers W] [--cursor-model M] [--json]` | 상황을 판정하고 추천·프로필·규모·전송 동의·멈춤 사유를 보여 줍니다. 읽기만 하므로 `--consent`가 없습니다. 첫 검토는 늘 `CF review …`로 권합니다. `--doc`은 커밋한 문서도 검토 대상으로 지정합니다. `--no-gh`면 PR을 조회하지 않습니다. |
-| `review --kind code\|doc (--base B \| --uncommitted \| --commit SHA \| --doc F…) [--focus 관점] [--profile P] [--review-model M] [--review-effort E] [--consent C]` | `<모드>.review` 칸을 따라 첫 검토를 준비합니다. claude 칸이면 Workflow 입력을, codex·cursor 칸이면 `RR`·`CR` 명령을 출력합니다. 외부 칸에는 `--review-model`·`--review-effort`를 줄 수 없습니다. |
+| `review --kind code\|doc (--base B \| --uncommitted \| --commit SHA \| --doc F…) [--focus 관점] [--profile P] [--review-model M] [--review-effort E] [--consent C] [--workers W] [--cursor-model M]` | `<모드>.review` 칸을 따라 첫 검토를 준비합니다. claude 칸이면 Workflow 입력을, codex·cursor 칸이면 `RR`·`CR` 명령을 출력합니다. 외부 칸에는 `--review-model`·`--review-effort`를 줄 수 없습니다. `--workers`·`--cursor-model`은 출력하는 init 줄에 붙습니다. |
 | `review --review-dir D --fallback-from codex\|cursor [--reason 사유]` | 외부 첫 검토가 한도·오류로 실패했을 때 처음 폴더 `D`의 이력을 고치고 fallback 칸 작업을 만듭니다. 실패한 runner는 마지막으로 시도한 runner와 같아야 합니다. |
 | `init --source S --input X [--doc F…] [--severity …] [--dry-run] [--adopt-on-both-pass] [--max-rechecks N] [--profile P] [--consent C] [--reviewer R] [--workers W] [--cursor-model M] [--review-model M] [--review-effort E]` | 실행을 시작하고 지적을 읽습니다. 프로필을 골라 역할을 배정하고 `프로필:`·`역할:`·`전송 동의:` 줄을 찍습니다. `--consent`는 전송에 동의한 수신처(`codex`·`cursor` 쉼표 구분, 또는 `none`)입니다. PR이면 `--input`에 PR 번호를 주고 `--pr-repo owner/name`·`--me <내 로그인>`을 붙일 수 있습니다. `--input` 대신 `--findings-json F`로 정규화한 지적 목록(`id`·`severity`·`location`·`body`)을 바로 줄 수도 있습니다. |
 | `jobs` / `judge` / `adjudicate` / `opinion` / `apply` / `recheck` | 회차 단계(`--run-dir`·`--round`) |
@@ -439,7 +439,7 @@ PYTHONPATH=<스킬 경로> python3 -m cascade.cli <명령> [옵션]
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-- 테스트는 868개입니다. `codex-review` 스킬이 없으면 그 스크립트를 쓰는 테스트는 건너뜁니다. 보관한 스크립트로 돌리려면 `CASCADE_RUN_REVIEW="$PWD/docs/codex-review-changes/run-review.sh"`를 앞에 붙입니다.
+- 테스트는 991개입니다. `codex-review` 스킬이 없으면 그 스크립트를 쓰는 테스트는 건너뜁니다. 보관한 스크립트로 돌리려면 `CASCADE_RUN_REVIEW="$PWD/docs/codex-review-changes/run-review.sh"`를 앞에 붙입니다.
 - 디렉터리: `cascade/`(CLI와 단계 로직), `prompts/`(작업자·판정자·판가름·검토자 프롬프트), `scripts/run-jobs.js`(Workflow 스크립트), `eval/`(측정 도구), `docs/`(설계 검토 기록, 고친 `codex-review` 스크립트, `cursor-review` 사본, 외부 작업자 측정 계획)
 - 측정: `eval/replay.py`가 과거 지적 표본을 그 커밋에서 다시 돌리고, `eval/score.py`가 판정 일치율·채택 경로·Opus 호출 절감을 채점합니다. 표본 형식과 순서는 [eval/sample-format.md](eval/sample-format.md)에 있습니다. `--workers external`과 Claude 작업자를 같은 표본에서 비교하는 절차는 [측정 계획](docs/2026-10-18-workers-measurement-plan.md)에 있습니다.
 - 출력 스키마를 바꾸면 `cascade/jobs.py`의 `SCHEMAS`와 `scripts/run-jobs.js`의 `SCHEMAS` 블록을 같이 고칩니다(테스트가 두 쪽이 같은지 확인합니다).
