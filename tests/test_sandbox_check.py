@@ -322,7 +322,7 @@ class JobsSandboxCheckTest(CliTestBase):
         self.init("--workers", "external", "--reviewer", "claude")
         p = self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1")
         ledger = self.ledger()
-        self.assertEqual((ledger.workers["a"]["runner"], ledger.workers["writer"]["runner"]), ("claude", "claude"))
+        self.assertEqual(ledger.workers["a"]["runner"], "claude")
         self.assertEqual(ledger.workers["b"]["runner"], "cursor")
         self.assertEqual(self.stage1_cli_jobs(), ["r1-01:b", "r1-02:b"])
         self.assertIn("codex 샌드박스에서 검증 명령이 실패해 이 저장소에서는 Claude 작업자를 쓴다: python3 -m unittest {files}", p.stdout)

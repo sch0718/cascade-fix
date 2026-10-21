@@ -32,7 +32,16 @@ _FOREIGN_MODEL_PREFIXES = ("claude-", "gpt-")
 
 
 class ProfileError(ConfigError):
-    pass
+    def __init__(self, message: str, cell: str | None = None):
+        super().__init__(message)
+        self.cell = cell
+
+
+def explain_overrides(error: ProfileError, overrides: Iterable[str]) -> ProfileError:
+    options = [note.split(" ← ", 1)[1] for note in overrides if note.split(" ← ", 1)[0] == error.cell]
+    if not options:
+        return error
+    return ProfileError(f"{error} (덮어쓴 옵션: {', '.join(dict.fromkeys(options))})", error.cell)
 
 
 def _role(key: str) -> str:
@@ -126,7 +135,7 @@ def merge_cell(key: str, base: dict, override: dict, cursor_model: str = DEFAULT
 
 def _fail(name: str, key: str | None, message: str) -> ProfileError:
     where = f"profiles.{name}" if key is None else f'profiles.{name} 칸 "{key}"'
-    return ProfileError(f"{where}: {message}")
+    return ProfileError(f"{where}: {message}", None if key is None else key.removesuffix("의 fallback"))
 
 
 def _check_values(name: str, key: str, cell: dict, *, fallback: bool) -> None:
@@ -298,49 +307,63 @@ def select(*, flag: str | None, env: Mapping[str, str], repo_profile: str | None
     return "default", SOURCE_BUILTIN, False
 
 
-def _override_workers(roles: dict, choice: str, available: dict[str, bool], codex_model: str,
-                      cursor_model: str, notes: list[str]) -> None:
+def _workers_cells(choice: str, available: dict[str, bool], codex_model: str, option: str) -> dict[str, dict]:
     if choice not in WORKERS_CHOICES:
-        raise ProfileError(f"알 수 없는 작업자: {choice} ({' / '.join(WORKERS_CHOICES)})")
-    seats = assign(choice, available, codex_model, cursor_model)
+        raise ProfileError(f"알 수 없는 작업자: {choice} ({' / '.join(WORKERS_CHOICES)}, {option} 확인)")
+    seats = assign(choice, available, codex_model, DEFAULT_CURSOR_MODEL)
+    cells = {}
     for key in _WORKER_KEYS:
         runner = seats[_ROLES_SOURCE[_role(key)]]["runner"]
         if runner == RUNNER_CLAUDE:
-            cell = _claude_only_cell(key)
+            cells[key] = _claude_only_cell(key)
         else:
-            cell = {**reset_cell(key, runner, cursor_model), **({"model": codex_model} if runner == RUNNER_CODEX else {})}
-        roles[key] = cell
-        notes.append(f"{key} ← --workers {choice}")
+            cells[key] = {**reset_cell(key, runner), **({"model": codex_model} if runner == RUNNER_CODEX else {})}
+    return cells
 
 
 def apply_overrides(profile: dict, opts: LegacyOptions, available: dict[str, bool], codex_model: str,
-                    *, name: str = "덮어쓰기") -> tuple[dict, list[str]]:
+                    *, name: str = "덮어쓰기", labels: Mapping[str, str] | None = None) -> tuple[dict, list[str]]:
     out = copy.deepcopy(profile)
     roles, notes = out["roles"], []
+    labels = labels or {}
     cursor_model = opts.cursor_model or DEFAULT_CURSOR_MODEL
+
+    def option(field: str, flag: str, value) -> str:
+        return labels.get(field) or f"{flag} {value}"
+
+    def put(key: str, cell: dict, via: str) -> None:
+        if roles[key] != cell:
+            roles[key] = cell
+            notes.append(f"{key} ← {via}")
+
     if opts.workers is not None:
-        _override_workers(roles, opts.workers, available, codex_model, cursor_model, notes)
+        via = option("workers", "--workers", opts.workers)
+        for key, cell in _workers_cells(opts.workers, available, codex_model, via).items():
+            put(key, cell, via)
     review_keys = [f"{mode}.{role}" for mode in ("code", "doc") for role in ("opinion", "recheck")]
     if opts.reviewer is not None:
+        via = option("reviewer", "--reviewer", opts.reviewer)
         for key in review_keys:
-            roles[key] = merge_cell(key, roles[key], {"runner": opts.reviewer}, cursor_model)
-            notes.append(f"{key} ← --reviewer {opts.reviewer}")
+            put(key, merge_cell(key, roles[key], {"runner": opts.reviewer}, cursor_model), via)
     if opts.cursor_model is not None:
+        via = option("cursor_model", "--cursor-model", opts.cursor_model)
         for key in ROLE_KEYS:
             if roles[key]["runner"] == RUNNER_CURSOR:
-                roles[key]["model"] = opts.cursor_model
-                notes.append(f"{key} ← --cursor-model {opts.cursor_model}")
+                put(key, {**roles[key], "model": opts.cursor_model}, via)
     for field, flag, value in (("model", "--review-model", opts.review_model), ("effort", "--review-effort", opts.review_effort)):
         if value is None:
             continue
+        via = option(f"review_{field}", flag, value)
         for key in review_keys:
             if roles[key]["runner"] in (RUNNER_CLAUDE, RUNNER_AUTO):
-                roles[key][field] = value
-                notes.append(f"{key} ← {flag} {value}")
-    if opts.adopt_on_both_pass:
+                put(key, {**roles[key], field: value}, via)
+    if opts.adopt_on_both_pass and not out["adopt_on_both_pass"]:
         out["adopt_on_both_pass"] = True
         notes.append("adopt_on_both_pass ← --adopt-on-both-pass")
-    validate(name, out)
+    try:
+        validate(name, out)
+    except ProfileError as e:
+        raise explain_overrides(e, notes) from None
     return out, notes
 
 
@@ -359,7 +382,7 @@ def resolve(root: Path, repos_toml: Path, *, flag: str | None, cli: LegacyOption
     default_profile = _config_text(data.get("default_profile"), "default_profile")
     name, source, explicit = select(flag=flag, env=env, repo_profile=repo_profile,
                                     default_profile=default_profile, known=found)
-    opts, notices = cli, []
+    opts, notices, labels = cli, [], {}
     legacy = {"CASCADE_WORKERS": env.get("CASCADE_WORKERS") or None, "CASCADE_REVIEWER": env.get("CASCADE_REVIEWER") or None}
     if explicit:
         ignored = [var for var in _LEGACY_ENVS if legacy[var]]
@@ -369,11 +392,13 @@ def resolve(root: Path, repos_toml: Path, *, flag: str | None, cli: LegacyOption
         used = []
         if cli.workers is None and legacy["CASCADE_WORKERS"]:
             opts = replace(opts, workers=legacy["CASCADE_WORKERS"])
+            labels["workers"] = f"CASCADE_WORKERS={legacy['CASCADE_WORKERS']}"
             used.append("CASCADE_WORKERS")
         if cli.reviewer is None and legacy["CASCADE_REVIEWER"]:
             opts = replace(opts, reviewer=legacy["CASCADE_REVIEWER"])
+            labels["reviewer"] = f"CASCADE_REVIEWER={legacy['CASCADE_REVIEWER']}"
             used.append("CASCADE_REVIEWER")
         if used:
             notices.append(DEPRECATED_ENV_NOTICE)
-    profile, overrides = apply_overrides(found[name], opts, available, codex_model, name=name)
+    profile, overrides = apply_overrides(found[name], opts, available, codex_model, name=name, labels=labels)
     return Resolved(name, source, explicit, profile["adopt_on_both_pass"], profile["roles"], overrides, notices)

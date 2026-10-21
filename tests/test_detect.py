@@ -202,14 +202,14 @@ class DetectCliTest(unittest.TestCase):
         rec = r["recommendation"]
         self.assertEqual((rec["source"], rec["estimate"]["stage1"]), ("codex-code", 4))
         self.assertIn("--reviewer codex", rec["steps"][0])
-        self.assertTrue(any("Codex 전송 동의" in a for a in r["approvals"]))
+        self.assertTrue(any("→ OpenAI" in a for a in r["approvals"]))
 
     def test_detect_cursor_reviewer_asks_cursor_consent(self):
         code, r = self.detect("--input", str(FIXTURES / "codex-code-e2e.final"), "--reviewer", "cursor")
         self.assertEqual(r["reviewer"], "cursor")
         self.assertEqual(r["reviewer_label"], "Cursor")
-        self.assertTrue(any("Cursor 전송 동의" in a and "팀 프라이버시 모드" in a for a in r["approvals"]))
-        self.assertFalse(any("Codex 전송 동의" in a for a in r["approvals"]))
+        self.assertTrue(any("→ Cursor(팀 프라이버시 모드)" in a for a in r["approvals"]))
+        self.assertFalse(any("OpenAI" in a for a in r["approvals"]))
         self.assertIn("--reviewer cursor", r["recommendation"]["steps"][0])
 
     def test_detect_cursor_result_file_recommends_cursor_source(self):

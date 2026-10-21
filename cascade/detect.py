@@ -7,21 +7,21 @@ import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
+from cascade import assignment
 from cascade.config import ConfigError, RepoConfig, detect_candidates, is_sensitive_path, load_repo_config
 from cascade.findings import ParseError, fetch_pr_findings, parse_codex_code, parse_codex_doc
 from cascade.jobs import RUNNER_CLAUDE
+from cascade.profiles import Resolved
 from cascade.review import (
     CURSOR_SOURCES,
     REVIEWER_AUTO,
     REVIEWER_CLAUDE,
-    REVIEWER_CURSOR,
     label,
     read_review_results,
-    resolve,
 )
 from cascade.runners import RUNNER_CODEX, RUNNER_CURSOR
 from cascade.snapshot import RUN_DIR_NAME
-from cascade.workers import DEFAULT_CURSOR_MODEL, WORKERS_CLAUDE, WORKERS_EXTERNAL, consent_line, describe, has_external
+from cascade.workers import DEFAULT_CURSOR_MODEL, WORKERS_CLAUDE, WORKERS_EXTERNAL, describe, has_external
 
 DOC_SUFFIXES = (".md", ".markdown", ".txt", ".rst")
 _LOCATION_FILE = re.compile(r"^(.+?):\d+")
@@ -230,11 +230,12 @@ def _config(root: Path, repos_toml: Path) -> tuple[RepoConfig | None, str | None
         return None, f"검증 설정을 읽지 못했다({repos_toml}): {e}"
 
 
-def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list[str] | None,
+def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list[str] | None, profile: Resolved,
            input_path: Path | None = None, pr: str | None = None, reviewer_choice: str = REVIEWER_AUTO,
            root_flag: str = "", docs: list[Path] | None = None, cwd: Path | None = None,
            cursor_ok: bool | Callable[[], bool] = False, workers_choice: str = WORKERS_CLAUDE,
-           cursor_model: str = DEFAULT_CURSOR_MODEL, workers: dict[str, dict] | None = None) -> dict:
+           cursor_model: str = DEFAULT_CURSOR_MODEL, available: dict[str, bool] | None = None,
+           profile_flag: str | None = None) -> dict:
     root = Path(root)
     branch = current_branch(root)
     base = default_base(root)
@@ -303,7 +304,12 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
         blockers.append("처리할 것이 없다: 결과 파일·PR 리뷰 스레드·커밋하지 않은 변경·앞선 커밋이 모두 없다"
                         " (이미 커밋한 문서는 --doc <문서> 로 지정한다)")
 
-    reviewer = resolve(reviewer_choice, rec["source"] or "", run_review, cursor_ok)
+    mode = rec["mode"] or "code"
+    roles, substituted = assignment.decide(profile.roles, profile.overrides, rec["source"] or "", run_review, cursor_ok,
+                                           available or {}, cursor_model=cursor_model, name=profile.name)
+    legacy = assignment.legacy_fields({"roles": roles}, mode, workers_choice)
+    reviewer, workers = legacy["reviewer"], legacy["workers"]
+    notes.extend(f"대체: {r['role']} {r['from']} → {r['to']} — {r['reason']}" for r in substituted if r["role"].startswith(f"{mode}."))
     cfg, cfg_error = _config(root, repos_toml)
     if cfg_error:
         blockers.append(cfg_error)
@@ -316,13 +322,10 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
             approvals.append(f"{REGISTER_APPROVAL}: {repos_toml} 에 [repos.\"{root}\"] 항목을 후보로 적는다(사용자 확인)")
         else:
             blockers.append("코드 모드인데 테스트 명령을 찾지 못했다. 테스트 없는 저장소의 코드 수정은 이 스킬로 하지 않는다")
-    if reviewer == REVIEWER_CURSOR:
-        approvals.append("Cursor 전송 동의: 의견·재검토에 코드·문서를 Cursor(팀 프라이버시 모드)로 보낸다")
-    elif reviewer != REVIEWER_CLAUDE:
-        approvals.append("Codex 전송 동의: 의견·재검토에 코드·문서를 OpenAI로 보낸다")
-    if has_external(workers):
-        approvals.append(consent_line(workers))
-    elif workers_choice == WORKERS_EXTERNAL:
+    consent = assignment.consent_line(roles, mode)
+    if consent:
+        approvals.append(consent)
+    if workers_choice == WORKERS_EXTERNAL and not has_external(workers):
         notes.append("--workers external 이지만 쓸 수 있는 외부 CLI가 없다. 작업자는 모두 Claude로 돈다")
     if rec["source"] == "pr-comment":
         approvals.append("PR 코멘트의 재현 명령이 있으면 jobs 뒤에 목록을 보이고 승인받는다")
@@ -339,7 +342,8 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
     workers_flag = f" --workers {workers_choice}" if workers_choice != WORKERS_CLAUDE else ""
     if workers_choice == WORKERS_EXTERNAL and cursor_model != DEFAULT_CURSOR_MODEL:
         workers_flag += f" --cursor-model {q(cursor_model)}"
-    flags = ("" if reviewer_choice == REVIEWER_AUTO else f" --reviewer {reviewer_choice}") + workers_flag + root_flag
+    profile_flag = f" --profile {q(profile_flag)}" if profile_flag else ""
+    flags = ("" if reviewer_choice == REVIEWER_AUTO else f" --reviewer {reviewer_choice}") + workers_flag + profile_flag + root_flag
     if not blockers and rec["source"]:
         if rec["source"].startswith("claude-") and input_path is None:
             rec["first_review"] = 1
@@ -366,7 +370,9 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
         "pr": pr_data,
         "reviewer": reviewer,
         "reviewer_label": label(reviewer),
-        "workers": workers or {},
+        "workers": workers,
+        "profile": {"name": profile.name, "source": profile.source, "explicit": profile.explicit,
+                    "overrides": profile.overrides, "substituted": substituted},
         "config": config,
         "recommendation": rec,
         "approvals": approvals,

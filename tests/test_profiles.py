@@ -328,6 +328,59 @@ class SelectionTest(unittest.TestCase):
                                      profiles.LegacyOptions(workers="external", cursor_model="claude-sonnet-5-5"),
                                      {"codex": False, "cursor": True}, "")
 
+    def test_review_model_applies_to_auto_opinion_cell_of_default(self):
+        out, notes = profiles.apply_overrides(profiles.builtin("default"),
+                                              profiles.LegacyOptions(review_model="claude-opus-5-5", review_effort="low"), {}, "")
+        for key in ("code.opinion", "code.recheck", "doc.opinion", "doc.recheck"):
+            self.assertEqual((out["roles"][key]["runner"], out["roles"][key]["model"], out["roles"][key]["effort"]),
+                             ("auto", "claude-opus-5-5", "low"))
+        self.assertEqual(out["roles"]["code.review"], profiles.builtin("default")["roles"]["code.review"])
+        self.assertIn("code.opinion ← --review-model claude-opus-5-5", notes)
+        self.assertIn("doc.recheck ← --review-effort low", notes)
+
+    def test_unchanged_cells_are_not_listed(self):
+        _, notes = profiles.apply_overrides(profiles.builtin("default"), profiles.LegacyOptions(workers="claude"), {}, "")
+        self.assertEqual(notes, [])
+        _, notes = profiles.apply_overrides(profiles.builtin("default"), profiles.LegacyOptions(reviewer="auto"), {}, "")
+        self.assertEqual(notes, [])
+        _, notes = profiles.apply_overrides(profiles.builtin("default"), profiles.LegacyOptions(workers="external"),
+                                            {"codex": True, "cursor": False}, "gpt-x")
+        self.assertIn("code.a ← --workers external", notes)
+        self.assertFalse(any(n.startswith(("code.b", "doc.judge_b", "doc.checker")) for n in notes))
+        _, notes = profiles.apply_overrides(profiles.builtin("claude-only"), profiles.LegacyOptions(adopt_on_both_pass=True), {}, "")
+        self.assertEqual(notes, [])
+
+    def test_validation_error_names_the_legacy_option(self):
+        with self.assertRaisesRegex(profiles.ProfileError, r"--cursor-model claude-sonnet-5-5"):
+            profiles.apply_overrides(profiles.builtin("default"),
+                                     profiles.LegacyOptions(workers="external", cursor_model="claude-sonnet-5-5"),
+                                     {"codex": False, "cursor": True}, "")
+        with self.assertRaisesRegex(profiles.ProfileError, r"--review-model gpt-x"):
+            profiles.apply_overrides(profiles.builtin("claude-only"), profiles.LegacyOptions(review_model="gpt-x"), {}, "")
+        with self.assertRaisesRegex(profiles.ProfileError, r"--reviewer gpt"):
+            profiles.apply_overrides(profiles.builtin("claude-only"), profiles.LegacyOptions(reviewer="gpt"), {}, "")
+
+    def test_unknown_workers_choice_names_the_option(self):
+        with self.assertRaisesRegex(profiles.ProfileError, r"CASCADE_WORKERS=foo"):
+            self.resolve(env={"CASCADE_WORKERS": "foo"})
+
+    def test_env_derived_overrides_are_labelled_with_the_variable(self):
+        r = self.resolve(env={"CASCADE_WORKERS": "external", "CASCADE_REVIEWER": "codex"}, available=self.both)
+        self.assertIn("code.a ← CASCADE_WORKERS=external", r.overrides)
+        self.assertIn("code.opinion ← CASCADE_REVIEWER=codex", r.overrides)
+        self.assertFalse(any("--workers" in n or "--reviewer" in n for n in r.overrides))
+        r = self.resolve(cli=profiles.LegacyOptions(workers="external"), env={"CASCADE_WORKERS": "claude"}, available=self.both)
+        self.assertIn("code.a ← --workers external", r.overrides)
+
+    def test_env_derived_override_error_names_the_variable(self):
+        with self.assertRaisesRegex(profiles.ProfileError, r"CASCADE_REVIEWER=gpt"):
+            self.resolve(env={"CASCADE_REVIEWER": "gpt"})
+
+    def test_explain_overrides_only_touches_matching_cells(self):
+        err = profiles.ProfileError("boom", cell="code.a")
+        self.assertEqual(str(profiles.explain_overrides(err, ["code.b ← --x 1"])), "boom")
+        self.assertIn("--workers external", str(profiles.explain_overrides(err, ["code.a ← --workers external"])))
+
     def test_resolve_env_rules(self):
         r = profiles.resolve(self.root, self.toml, flag=None, cli=profiles.LegacyOptions(),
                              env={"CASCADE_WORKERS": "external"}, available={"codex": True, "cursor": True}, codex_model="")
