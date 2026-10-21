@@ -2,6 +2,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+from cascade.cli_steps import exhausted_runners
 from cascade.consensus import (
     OUTCOME_ADJUDICATE,
     OUTCOME_AGREED_FACT,
@@ -418,13 +419,13 @@ def _worker_events(ledger: Ledger) -> list[tuple[int, str, dict]]:
 
 
 def _auth_runners(ledger: Ledger, run_dir: Path | None) -> list[str]:
-    if run_dir is None:
-        return []
-    found = []
-    for no, stage, _ in _worker_events(ledger):
-        data = _read_json(Path(run_dir) / f"round-{no}" / f"{stage}-cli.json")
-        outcomes = data.get("outcomes", []) if isinstance(data, dict) else []
-        found += [o["runner"] for o in outcomes if o.get("status") == STATUS_AUTH and o.get("runner") in LOGIN_COMMANDS]
+    found = [runner for rnd in ledger.rounds for runner, entry in exhausted_runners(rnd).items()
+             if entry.get("status") == STATUS_AUTH and runner in LOGIN_COMMANDS]
+    if run_dir is not None:
+        for no, stage, _ in _worker_events(ledger):
+            data = _read_json(Path(run_dir) / f"round-{no}" / f"{stage}-cli.json")
+            outcomes = data.get("outcomes", []) if isinstance(data, dict) else []
+            found += [o["runner"] for o in outcomes if o.get("status") == STATUS_AUTH and o.get("runner") in LOGIN_COMMANDS]
     return list(dict.fromkeys(found))
 
 

@@ -585,7 +585,8 @@ def cmd_workers(args) -> int:
         raise s.CliError(f"CLI 작업이 없다: {cli_args.name} 가 없다(jobs 단계가 CLI 작업을 만든 회차에서만 쓴다)")
     entries = s.read_json(cli_args)["jobs"]
     jobs = [_cli_job(e) for e in entries]
-    outcomes = run_all(jobs, _cli_runners(jobs))
+    exhausted = s.exhausted_runners(rnd)
+    outcomes = run_all(jobs, _cli_runners(jobs), exhausted=exhausted)
     out = rd / f"{args.stage}-cli.json"
     s.write_json(out, {"results": [{"id": o.id, "output": o.output} for o in outcomes],
                        "outcomes": [o.to_dict() for o in outcomes]})
@@ -601,7 +602,8 @@ def cmd_workers(args) -> int:
     counts = dict(Counter(o.status for o in outcomes))
     ledger = s.load_ledger(run_dir)
     rnd = s.get_round(ledger, args.round)
-    s.mark(rnd, step, counts=counts, usage=usage_totals(outcomes), fallback=failed)
+    s.mark(rnd, step, counts=counts, usage=usage_totals(outcomes), fallback=failed,
+           **({"exhausted": exhausted} if exhausted else {}))
     s.save_ledger(run_dir, ledger)
     n, reasons = fallback_counts(counts)
     print(f"CLI 작업 {len(outcomes)}건: 성공 {counts.get(STATUS_OK, 0)}, 대체 실행 {n}" + (f"({reasons})" if n else ""))

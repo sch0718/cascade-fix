@@ -279,6 +279,16 @@ def workers_done(rnd: RoundRecord, stage: str) -> bool:
     return _last(rnd, f"workers-{stage}") > _last(rnd, source)
 
 
+def exhausted_runners(rnd: RoundRecord) -> dict[str, dict]:
+    """회차(마지막 jobs 이후)의 workers 단계에서 한도·인증으로 멈춘 runner와 그 상태·사유."""
+    found: dict[str, dict] = {}
+    for e in rnd.events[_last(rnd, "jobs") + 1:]:
+        if str(e.get("step", "")).startswith("workers-"):
+            for runner, entry in (e.get("exhausted") or {}).items():
+                found.setdefault(runner, entry)
+    return found
+
+
 def judged_after_workers_input(rnd: RoundRecord, stage: str) -> bool:
     """workers 단계의 입력(stage1은 jobs, checker는 judge 1차)이 마지막으로 바뀐 뒤에 judge가 이미 끝났다."""
     source = "jobs" if stage == STAGE1 else "judge-checker"
