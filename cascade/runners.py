@@ -97,7 +97,7 @@ class _Run:
 
 
 def _executable(path: Path) -> str | None:
-    return str(path) if path.is_file() and os.access(path, os.X_OK) else None
+    return os.path.abspath(path) if path.is_file() and os.access(path, os.X_OK) else None
 
 
 def find_codex() -> str | None:
@@ -106,7 +106,7 @@ def find_codex() -> str | None:
         return _executable(Path(os.environ["CASCADE_CODEX"]))
     on_path = shutil.which("codex")
     if on_path:
-        return on_path
+        return os.path.abspath(on_path)
     candidates = [Path(p) for p in _CODEX_APP_PATHS] + sorted(Path.home().glob(_CODEX_EXTENSION_GLOB))
     return next((found for found in map(_executable, candidates) if found), None)
 
@@ -117,7 +117,7 @@ def find_cursor_agent() -> str | None:
         return _executable(Path(os.environ["CASCADE_CURSOR_AGENT"]))
     on_path = shutil.which("cursor-agent")
     if on_path:
-        return on_path
+        return os.path.abspath(on_path)
     return _executable(Path.home() / ".local" / "bin" / "cursor-agent")
 
 
@@ -582,7 +582,7 @@ class CursorRunner:
         return Outcome(job.id, job.runner, STATUS_OK, output, usage, "")
 
 
-READONLY_CHANGED = "읽기 역할이 파일을 바꿔 되돌림"
+READONLY_CHANGED = "읽기 역할이 파일을 바꿔 되돌리고 결과를 버림"
 _STOPPING = (STATUS_LIMIT, STATUS_AUTH)
 
 
@@ -604,10 +604,12 @@ def tree_of(wt: Path) -> str:
 
 
 def restore_tree(wt: Path, tree: str) -> None:
-    """워크트리를 tree 내용으로 되돌린다. 먼저 새 파일을 인덱스에 올려 read-tree가 지울 수 있게 한다."""
+    """워크트리를 tree 내용으로 되돌린다. 먼저 새 파일을 인덱스에 올려 read-tree가 지울 수 있게 한다.
+    바뀐 .gitignore에 가려 올라가지 않은 새 파일과 새 중첩 저장소는 되돌린 뒤 추적하지 않는 파일로 드러나므로 지운다(무시 파일은 남긴다)."""
     with _tree_lock(wt):
         _git_checked(wt, *NO_HOOKS, "add", "-A")
         _git_checked(wt, *NO_HOOKS, "read-tree", "-u", "--reset", tree)
+        _git_checked(wt, *NO_HOOKS, "clean", "-f", "-f", "-d", "-q")
 
 
 class _Exhaustion:
@@ -675,7 +677,10 @@ def _run_isolated(job: CliJob, runner: object) -> Outcome:
         changed = (tree_of(job.worktree), head_of(job.worktree)) != before
     except Exception as e:
         return _failed(job, f"실행 뒤 워크트리 상태를 확인하지 못했다: {e}")
-    return _restored(outcome, job.worktree, before, READONLY_CHANGED) if changed else outcome
+    if not changed:
+        return outcome
+    discarded = Outcome(job.id, job.runner, STATUS_INVALID, None, outcome.usage, outcome.detail)
+    return _restored(discarded, job.worktree, before, READONLY_CHANGED)
 
 
 def _run_one(job: CliJob, runners: dict[str, object], exhausted: _Exhaustion) -> Outcome:

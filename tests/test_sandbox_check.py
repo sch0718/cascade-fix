@@ -111,6 +111,18 @@ class EnsureTest(SandboxCheckBase):
         self.assertEqual({spec["runner"] for spec in updated.values()}, {"claude"})
         self.assertEqual(counter.read_text(encoding="utf-8"), "x\n")
 
+    def test_outside_rerun_starts_from_restored_tree(self):
+        cmd = "test ! -e lock"
+        self.set_cursor({"result": cursor_reply([cmd], 1)})
+        os.environ["FAKE_MUTATE"] = "lock=x"
+        self.addCleanup(os.environ.pop, "FAKE_MUTATE", None)
+        initial = workers.assign("external", {"cursor": True}, "gpt-x", "composer-2.5")
+        updated, lines = self.ensure(RepoConfig(tests=[cmd]), initial=initial)
+        self.assertEqual({spec["runner"] for spec in updated.values()}, {"claude"})
+        self.assertEqual(len(lines), 1)
+        self.assertIn("cursor 샌드박스에서 검증 명령이 실패해", lines[0])
+        self.assertFalse((self.wt / "lock").exists())
+
     def test_failing_command_in_cursor_reply_demotes_cursor(self):
         self.set_cursor({"result": cursor_reply(["true"], 1)})
         updated, lines = self.ensure(RepoConfig(tests=["true"]))

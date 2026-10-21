@@ -159,6 +159,8 @@ def ensure(root: Path, cfg: RepoConfig, base_wt: Path, workers: dict, baseline_f
 
     def fails_outside(pending: list[str]) -> set[str]:
         todo = [cmd for cmd in pending if cmd not in outside]
+        if todo:
+            restore_tree(base_wt, before)
         for cmd, result in zip(todo, run_commands(Path(base_wt), [_runnable(c) for c in todo])):
             outside[cmd] = not result.ok
         return {cmd for cmd in pending if outside[cmd]}
@@ -171,6 +173,7 @@ def ensure(root: Path, cfg: RepoConfig, base_wt: Path, workers: dict, baseline_f
             entry = saved.get(key)
             probe_failure = ""
             if not isinstance(entry, dict):
+                restore_tree(base_wt, before)
                 try:
                     exits = checks[runner](Path(base_wt), cmds)
                 except ProbeFailed as e:

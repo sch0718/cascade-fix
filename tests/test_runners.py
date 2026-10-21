@@ -514,6 +514,19 @@ class AvailabilityTest(RunnerTestBase):
         os.environ["CASCADE_CODEX"] = str(self.tmp / "nope")
         self.assertIsNone(runners.find_codex())
 
+    def test_relative_executable_paths_are_made_absolute(self):
+        cwd = os.getcwd()
+        os.chdir(self.tmp)
+        self.addCleanup(os.chdir, cwd)
+        os.environ["CASCADE_CODEX"] = os.path.relpath(self.codex, self.tmp)
+        os.environ["CASCADE_CURSOR_AGENT"] = os.path.relpath(self.cursor, self.tmp)
+        self.assertEqual(runners.find_codex(), self.codex)
+        self.assertEqual(runners.find_cursor_agent(), self.cursor)
+        del os.environ["CASCADE_CODEX"], os.environ["CASCADE_CURSOR_AGENT"]
+        with mock.patch.dict(os.environ, {"PATH": "bin", "HOME": str(self.tmp / "no-home")}):
+            self.assertEqual(runners.find_codex(), self.codex)
+            self.assertEqual(runners.find_cursor_agent(), self.cursor)
+
     def test_path_lookup_is_used_without_env(self):
         with mock.patch.dict(os.environ, {"PATH": str(self.tmp / "bin"), "HOME": str(self.tmp / "no-home")}):
             self.assertEqual(runners.find_cursor_agent(), self.cursor)
@@ -616,8 +629,8 @@ class RunAllTest(RunnerTestBase):
         self.env(FAKE_CODEX_RESULT=CHECKER_RESULT, FAKE_MUTATE="b.txt=새 파일;a.txt=checker가 고침")
         job = self.job(id="F1:checker", role="checker", kind="checker", writable=False)
         [outcome] = run_all([job], self.runners)
-        self.assertEqual(outcome.status, STATUS_OK)
-        self.assertIn("읽기 역할이 파일을 바꿔 되돌림", outcome.detail)
+        self.assertEqual((outcome.status, outcome.output), (STATUS_INVALID, None))
+        self.assertIn("읽기 역할이 파일을 바꿔 되돌리고 결과를 버림", outcome.detail)
         self.assertEqual((self.wt / "a.txt").read_text(encoding="utf-8"), "작성자 수정\n")
         self.assertFalse((self.wt / "b.txt").exists())
 
@@ -674,8 +687,8 @@ class RunAllTest(RunnerTestBase):
         self.env(FAKE_CODEX_RESULT=CHECKER_RESULT, FAKE_MUTATE="a.txt=checker가 고침", FAKE_COMMIT="1")
         job = self.job(id="F1:checker", role="checker", kind="checker", writable=False)
         [outcome] = run_all([job], self.runners)
-        self.assertEqual(outcome.status, STATUS_OK)
-        self.assertIn("읽기 역할이 파일을 바꿔 되돌림", outcome.detail)
+        self.assertEqual((outcome.status, outcome.output), (STATUS_INVALID, None))
+        self.assertIn("읽기 역할이 파일을 바꿔 되돌리고 결과를 버림", outcome.detail)
         self.assertEqual(self.head(), before_head)
         self.assertEqual(tree_of(self.wt), before_tree)
 
@@ -684,7 +697,8 @@ class RunAllTest(RunnerTestBase):
         self.env(FAKE_CODEX_RESULT=CHECKER_RESULT, FAKE_COMMIT="1")
         job = self.job(id="F1:checker", role="checker", kind="checker", writable=False)
         [outcome] = run_all([job], self.runners)
-        self.assertIn("읽기 역할이 파일을 바꿔 되돌림", outcome.detail)
+        self.assertEqual((outcome.status, outcome.output), (STATUS_INVALID, None))
+        self.assertIn("읽기 역할이 파일을 바꿔 되돌리고 결과를 버림", outcome.detail)
         self.assertEqual(self.head(), before_head)
 
     def test_successful_writer_job_keeps_changes(self):
@@ -793,6 +807,28 @@ class TreeTest(RunnerTestBase):
         self.assertEqual((self.wt / "d" / "b.txt").read_text(encoding="utf-8"), "b\n")
         self.assertFalse((self.wt / "new" / "deep" / "x.txt").exists())
         self.assertEqual(tree_of(self.wt), before)
+
+    def test_restore_tree_removes_file_hidden_by_changed_gitignore_and_keeps_ignored(self):
+        (self.wt / ".gitignore").write_text("cache/\n", encoding="utf-8")
+        (self.wt / "cache").mkdir()
+        (self.wt / "cache" / "keep.txt").write_text("keep\n", encoding="utf-8")
+        before = tree_of(self.wt)
+        (self.wt / ".gitignore").write_text("cache/\npartial.py\n", encoding="utf-8")
+        (self.wt / "partial.py").write_text("실패한 작업의 찌꺼기\n", encoding="utf-8")
+        restore_tree(self.wt, before)
+        self.assertFalse((self.wt / "partial.py").exists())
+        self.assertEqual((self.wt / ".gitignore").read_text(encoding="utf-8"), "cache/\n")
+        self.assertEqual((self.wt / "cache" / "keep.txt").read_text(encoding="utf-8"), "keep\n")
+        self.assertEqual(tree_of(self.wt), before)
+
+    def test_restore_tree_removes_nested_repo_created_after_snapshot(self):
+        make_repo(self.wt / "kept", {"k.txt": "k\n"})
+        before = tree_of(self.wt)
+        make_repo(self.wt / "nested", {"n.txt": "n\n"})
+        restore_tree(self.wt, before)
+        self.assertFalse((self.wt / "nested").exists())
+        self.assertEqual((self.wt / "kept" / "k.txt").read_text(encoding="utf-8"), "k\n")
+        self.assertNotIn("nested", git(self.wt, "status", "--porcelain"))
 
 
 if __name__ == "__main__":
