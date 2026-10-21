@@ -18,7 +18,7 @@ from cascade.review import CLAUDE_SOURCES
 from cascade.review import label as reviewer_label
 from cascade.rounds import Ledger
 from cascade.runners import STATUS_AUTH, STATUS_OK
-from cascade.workers import FALLBACK_LABELS, LOGIN_COMMANDS, WORKERS_CLAUDE, describe, fallback_counts
+from cascade.workers import FALLBACK_LABELS, LOGIN_COMMANDS, UNRECORDED, WORKERS_CLAUDE, describe, fallback_counts
 
 SOURCE_PR_COMMENT = "pr-comment"
 BUCKET_REBUTTAL = "반박"
@@ -600,7 +600,7 @@ def _cli_usage(ledger: Ledger) -> dict[str, dict[str, int]]:
     usage: dict[str, dict[str, int]] = {}
     for _, _, event in _worker_events(ledger):
         for runner, tokens in (event.get("usage") or {}).items():
-            sums = usage.setdefault(runner, {"input": 0, "output": 0, "cache_read": 0})
+            sums = usage.setdefault(runner, {"input": 0, "output": 0, "cache_read": 0, UNRECORDED: 0})
             for key in sums:
                 sums[key] += tokens.get(key, 0)
     return usage
@@ -627,8 +627,9 @@ def _calls_section(ledger: Ledger, run_dir: Path | None) -> list[str]:
                             review_cell(ledger, "recheck")["runner"], "재검토"))
     usage = _cli_usage(ledger)
     if usage:
-        out.extend(["", "| CLI | 입력 토큰 | 출력 토큰 | 캐시 읽기 토큰 |", "| --- | ---: | ---: | ---: |"])
-        out.extend(f"| {runner} | {t['input']} | {t['output']} | {t['cache_read']} |" for runner, t in usage.items())
+        out.extend(["", "| CLI | 입력 토큰 | 출력 토큰 | 캐시 읽기 토큰 | 기록 없음(건) |", "| --- | ---: | ---: | ---: | ---: |"])
+        out.extend(f"| {runner} | {t['input']} | {t['output']} | {t['cache_read']} | {t[UNRECORDED]} |"
+                   for runner, t in usage.items())
     out.extend(["", "| 회차 | 소요 |", "| --- | ---: |"])
     out.extend(f"| {rnd.no} | {_elapsed(rnd)} |" for rnd in ledger.rounds)
     out.append("")

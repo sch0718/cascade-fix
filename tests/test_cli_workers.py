@@ -3,11 +3,12 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from cascade import cli_steps  # noqa: E402
+from cascade import cli, cli_steps  # noqa: E402
 from cascade.rounds import RoundRecord  # noqa: E402
 from fake_cli import fenced, result_json  # noqa: E402
 from test_cli_e2e import CALC, FIXTURES, fix, results_json, section_of, worker_output  # noqa: E402
@@ -536,6 +537,20 @@ class DocWorkersTest(WorkersTestBase):
         self.args("apply")
         self.assertIn("add가 더하게", (self.repo / "plan.md").read_text(encoding="utf-8"))
 
+    def test_report_counts_unrecorded_acp_usage(self):
+        self.use_fakes()
+        p = self.cli("init", *self.doc_args, "--workers", "external", "--reviewer", "claude")
+        self.run_dir = Path(next(x for x in p.stdout.splitlines() if x.startswith("run_dir=")).split("=", 1)[1])
+        self.args("jobs")
+        self.workers()
+        self.assertEqual(self.event("workers-stage1")["usage"]["cursor"],
+                         {"input": 0, "output": 0, "cache_read": 0, "unrecorded": 1})
+        report = self.cli("report", "--run-dir", str(self.run_dir)).stdout
+        section = role_sections(report)
+        self.assertIn("| CLI | 입력 토큰 | 출력 토큰 | 캐시 읽기 토큰 | 기록 없음(건) |", section)
+        self.assertIn("| cursor | 0 | 0 | 0 | 1 |", section)
+        self.assertIn("| codex | 22 | 14 | 6 | 0 |", section)
+
 
     def start_doc(self, *workers):
         self.use_fakes()
@@ -706,6 +721,21 @@ class ReportWorkersTest(WorkersTestBase):
         self.assertIn("## 역할 배정", report)
         self.assertNotIn("CLI 작업", report)
         self.assertNotIn("배정: A·writer", report)
+
+
+class RunCliJobsTest(unittest.TestCase):
+    def test_closes_runners_even_when_run_all_fails(self):
+        closed = []
+
+        class Pooled:
+            def close(self):
+                closed.append(True)
+
+        with mock.patch.object(cli, "_cli_runners", return_value={"cursor": Pooled(), "codex": object()}), \
+                mock.patch.object(cli, "run_all", side_effect=RuntimeError("실패")):
+            with self.assertRaises(RuntimeError):
+                cli._run_cli_jobs([], {})
+        self.assertEqual(closed, [True])
 
 
 class StageResultsTest(unittest.TestCase):

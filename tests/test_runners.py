@@ -287,12 +287,15 @@ class CursorRunnerTest(RunnerTestBase):
         self.assertNotEqual(env["HOME"], str(Path.home()))
         self.assertFalse(Path(env["HOME"]).exists())
 
-    def test_readonly_profile_denies_write(self):
-        out = self.run_cursor(self.cursor_job(writable=False))
+    def test_readonly_role_goes_to_acp_without_shell_or_write(self):
+        runner = CursorRunner(self.cursor)
+        self.addCleanup(runner.close)
+        out = runner.run(self.cursor_job(writable=False))
         self.assertEqual(out.status, STATUS_OK)
-        deny = self.log_cursor_config()["permissions"]["deny"]
+        self.assertEqual(self.calls("cursor-agent"), 0)
+        deny = json.loads(self.log_text("cursor-acp", "config.json"))["permissions"]["deny"]
         self.assertIn("Write(**)", deny)
-        self.assertNotIn("Shell(*)", deny)
+        self.assertIn("Shell(*)", deny)
 
     def test_invalid_json_is_retried_once_with_resume(self):
         responses = ["JSON을 못 냈다", fenced(result_json())]

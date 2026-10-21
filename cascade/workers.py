@@ -13,6 +13,7 @@ from cascade.runners import (
     STATUS_LIMIT,
     STATUS_SKIPPED,
     STATUS_TIMEOUT,
+    UNRECORDED,
     Outcome,
     codex_available,
     codex_model,
@@ -110,4 +111,6 @@ def usage_totals(outcomes: list[Outcome]) -> dict[str, dict[str, int]]:
         total = totals.setdefault(outcome.runner, dict.fromkeys(_USAGE_KEYS, 0))
         for name, key in _USAGE_KEYS.items():
             total[name] += outcome.usage.get(key, 0)
+        if outcome.usage.get(UNRECORDED):
+            total[UNRECORDED] = total.get(UNRECORDED, 0) + outcome.usage[UNRECORDED]
     return totals

@@ -823,6 +823,18 @@ def _cli_runners(jobs: list[CliJob]) -> dict[str, object]:
     return runners
 
 
+def _run_cli_jobs(jobs: list[CliJob], exhausted: dict[str, dict]) -> list:
+    """실행기를 만들어 돌리고, 상주 서버(Cursor ACP)를 둔 실행기는 끝나면 닫는다."""
+    runners = _cli_runners(jobs)
+    try:
+        return run_all(jobs, runners, exhausted=exhausted)
+    finally:
+        for runner in runners.values():
+            close = getattr(runner, "close", None)
+            if close is not None:
+                close()
+
+
 def _pin_worktrees(path: Path, worktrees: list[Path]) -> None:
     """작업 워크트리를 회차의 첫 입력 상태로 맞춘다. 처음 보는 워크트리는 지금 상태를 적어 두고, 적어 둔 워크트리는 그 상태로 되돌린다."""
     saved = s.read_json(path) if path.is_file() else {}
@@ -856,7 +868,7 @@ def _rerun_with_fallbacks(entries: list[dict], first: list, cells: dict[str, dic
             for i, t in targets.items()]
     if not jobs:
         return {}, {}
-    return targets, {o.id: o for o in run_all(jobs, _cli_runners(jobs), exhausted=exhausted)}
+    return targets, {o.id: o for o in _run_cli_jobs(jobs, exhausted)}
 
 
 def cmd_workers(args) -> int:
@@ -882,7 +894,7 @@ def cmd_workers(args) -> int:
     profile = assignment.ledger_profile(ledger)
     cells = assignment.mode_workers(profile["roles"], ledger.mode)
     exhausted = s.exhausted_runners(rnd)
-    first = run_all(jobs, _cli_runners(jobs), exhausted=exhausted)
+    first = _run_cli_jobs(jobs, exhausted)
     reruns, second = _rerun_with_fallbacks(entries, first, cells, set(profile["consented"]), exhausted)
     outcomes = [second.get(o.id, o) for o in first]
     out = rd / f"{args.stage}-cli.json"

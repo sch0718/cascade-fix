@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from cascade.cursor_acp import SESSIONS_PER_SERVER, AcpError, AcpTimeout, CursorAcpPool
 from cascade.jobs import SCHEMAS, valid_output
 from cascade.patches import NO_HOOKS, _git_checked
 
@@ -28,6 +29,7 @@ STATUS_COMMAND_TIMEOUT = 30
 KILL_GRACE = 5
 CODEX_WARMUP_AGE = timedelta(days=7)
 DETAIL_TAIL = 500
+UNRECORDED = "unrecorded"
 
 _CODEX_APP_PATHS = (
     "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
@@ -501,10 +503,22 @@ def _cursor_usage(envelope: dict | None) -> dict:
     return {name: raw[key] for key, name in _CURSOR_USAGE_KEYS.items() if isinstance(raw.get(key), int)}
 
 
+def _acp_env(root: Path) -> dict:
+    return {**os.environ, **_tool_roots_env(), **cache_env(root), "HOME": str(cursor_home(root, "review"))}
+
+
 class CursorRunner:
-    def __init__(self, exe: str, timeout: int = JOB_TIMEOUT):
+    """쓰기 역할은 호출마다 `cursor-agent -p`(OS 샌드박스)로, 읽기 역할은 ACP 상주 서버 풀로 보낸다."""
+
+    def __init__(self, exe: str, timeout: int = JOB_TIMEOUT, max_servers: int = MAX_PARALLEL,
+                 sessions_per_server: int = SESSIONS_PER_SERVER):
         self.exe = exe
         self.timeout = timeout
+        self.max_servers = max_servers
+        self.sessions_per_server = sessions_per_server
+        self._acp: CursorAcpPool | None = None
+        self._acp_lock = threading.Lock()
+        self._closed = False
 
     def run(self, job: CliJob) -> Outcome:
         try:
@@ -512,12 +526,42 @@ class CursorRunner:
         except Exception as e:
             return _unexpected(job, e)
 
+    def close(self) -> None:
+        with self._acp_lock:
+            self._closed = True
+            pool, self._acp = self._acp, None
+        if pool is not None:
+            pool.close()
+
+    def _pool(self) -> CursorAcpPool:
+        with self._acp_lock:
+            if self._closed:
+                raise AcpError("Cursor 실행기를 닫았다")
+            if self._acp is None:
+                self._acp = CursorAcpPool(self.exe, _acp_env, self.max_servers, self.timeout, self.sessions_per_server)
+            return self._acp
+
+    def _run_acp(self, job: CliJob, prompt: str, schema: str) -> Outcome:
+        usage = {UNRECORDED: 1}
+        try:
+            output = self._pool().ask(job.worktree, job.model, prompt, _RETRY_PROMPT.format(schema=schema),
+                                      lambda text: _check_output(job, extract_json_block(text)))
+        except AcpTimeout as e:
+            return Outcome(job.id, job.runner, STATUS_TIMEOUT, None, usage, _tail(str(e)))
+        except AcpError as e:
+            return Outcome(job.id, job.runner, classify_failure(str(e)), None, usage, _tail(str(e)))
+        if output is None:
+            return Outcome(job.id, job.runner, STATUS_INVALID, None, usage, "재요청 뒤에도 스키마를 따르지 않는 결과")
+        return Outcome(job.id, job.runner, STATUS_OK, output, usage, "")
+
     def _run_job(self, job: CliJob) -> Outcome:
         schema = json.dumps(SCHEMAS[job.kind], ensure_ascii=False)
         prompt = job.prompt_path.read_text(encoding="utf-8") + _OUTPUT_INSTRUCTION.format(schema=schema)
+        if not job.writable:
+            return self._run_acp(job, prompt, schema)
         tmp = Path(tempfile.mkdtemp(prefix="cascade-cache-"))
         try:
-            home = cursor_home(tmp, "worker" if job.writable else "readonly")
+            home = cursor_home(tmp, "worker")
             env = {**os.environ, **_tool_roots_env(), **cache_env(tmp), "HOME": str(home)}
             return self._run(job, prompt, schema, env)
         finally:
