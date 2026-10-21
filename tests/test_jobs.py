@@ -131,8 +131,9 @@ class Stage1CodeTest(unittest.TestCase):
                 self.assertIn("취향·가독성·범위(이 변경에서 할 일인지)", p)
                 self.assertIn("`reason`에 확인한 의도 근거", p)
                 self.assertIn("「설계 결정 기준」에 하나라도 걸리면 true", p)
+                self.assertNotIn("판정하기 전에 지적이 고치라는 내용이 이미 정해져 있는지 확인한다.", p)
         for j in jobs.build_stage1_jobs([F2], CFG, wts_for(F2), "doc")["jobs"]:
-            self.assertNotIn("## 설계 결정 기준", j["prompt"])
+            self.assertNotIn("`git log -p -- <파일>`", j["prompt"])
 
     def test_template_placeholders_all_filled(self):
         built = [
@@ -265,6 +266,25 @@ class Stage1DocTest(unittest.TestCase):
             self.assertIn("추측하지 않는다. 재현한 것만 사실로 판정한다.", p)
         for j in args["jobs"]:
             self.assertEqual(j["kind"], "worker")
+
+    def test_doc_prompts_have_design_decision_criteria_for_judges_and_writer(self):
+        built = [jobs.build_stage1_jobs([F2], CFG, wts_for(F2), "doc"), jobs.build_stage1_jobs([F2], CFG, wts_for(F2), "doc", BOTH_WORKERS)]
+        for args in built:
+            self.assertEqual({j["id"] for j in args["jobs"]}, {"r1-02:a", "r1-02:b", "r1-02:writer"})
+            for j in args["jobs"]:
+                p = j["prompt"]
+                self.assertIn("## 설계 결정 기준", p, j["id"])
+                self.assertIn("판정하기 전에 지적이 고치라는 내용이 이미 정해져 있는지 확인한다.", p)
+                self.assertIn("`git log -p -- <문서>`", p)
+                self.assertIn("다음이면 설계 결정이 아니다. `needs_design_decision`을 false로 한다.", p)
+                self.assertIn("앞선 문서나 결정 기록으로 정해진다.", p)
+                self.assertIn("요구나 의도가 문서에서 불분명하다.", p)
+                self.assertIn("지적이 문서가 이미 정한 결정(목표·범위·선택)을 뒤집자고 한다.", p)
+                self.assertIn("true 조건에 하나도 해당하지 않으면 false다.", p)
+                self.assertIn("`reason`에 확인한 근거", p)
+                self.assertIn("「설계 결정 기준」에서 true에 해당하면 true", p)
+        writer = by_id(built[0])["r1-02:writer"]["prompt"]
+        self.assertIn("아래 「설계 결정 기준」에서 설계 결정이 아니면", writer)
 
     def test_doc_mode_builds_checker_with_writer_patch(self):
         args = jobs.build_checker_jobs([F2], wts_for(F2), {"r1-02": PATCH_A})
