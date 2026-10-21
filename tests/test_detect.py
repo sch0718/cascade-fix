@@ -349,6 +349,14 @@ class DetectProfileTest(unittest.TestCase):
         steps = result["recommendation"]["steps"]
         self.assertTrue(steps[0].endswith("review --kind code --uncommitted --profile local"), steps[0])
 
+    def test_dry_run_hint_follows_the_original_source_not_the_external_first_review(self):
+        hint = "--dry-run"
+        external = self.call("local")
+        self.assertEqual(external["recommendation"]["source"], "codex-code")
+        self.assertFalse(any(hint in n for n in external["notes"]), external["notes"])
+        claude = self.call("split")
+        self.assertFalse(any(hint in n for n in claude["notes"]), claude["notes"])
+
     def test_unavailable_first_review_cli_falls_back_and_is_noted(self):
         result = self.call("local", available={"codex": False, "cursor": False})
         rec = result["recommendation"]

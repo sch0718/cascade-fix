@@ -349,6 +349,7 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
                                               available or {}, cursor_model=cursor_model, name=profile.name)
         return _usable_first_review(decided, replaced, first_key, run_review, cursor_ok) if first_review else (decided, replaced)
 
+    original_source = rec["source"]
     roles, substituted = decide_roles(rec["source"] or "")
     if first_review and roles[first_key]["runner"] != RUNNER_CLAUDE:
         rec["source"] = f"{roles[first_key]['runner']}-{mode}"
@@ -384,7 +385,7 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
     sensitive = [p for p in changed_all if is_sensitive_path(p, patterns)]
     if sensitive:
         notes.append("보안·인증·삭제 경로가 바뀌었다. 이 경로를 고친 지적은 채택하지 않고 판단 불가로 보낸다: " + ", ".join(sensitive[:5]))
-    if uncommitted and rec["source"] in ("pr-comment", "codex-code", "codex-doc", *CURSOR_SOURCES):
+    if uncommitted and original_source in ("pr-comment", "codex-code", "codex-doc", *CURSOR_SOURCES):
         notes.append("커밋하지 않은 변경이 있다. 채택 패치가 작업 트리에 섞이지 않게 하려면 --dry-run 을 쓴다")
 
     steps = rec["steps"]

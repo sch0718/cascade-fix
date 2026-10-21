@@ -353,7 +353,7 @@ def _adj_verify_cmds(cfg: RepoConfig | None, item: "AdjInput") -> str:
     return _code_verify_cmds(cfg, item.worktree, item.finding.location)
 
 
-def build_adjudicator_jobs(items: list[AdjInput]) -> dict:
+def build_adjudicator_jobs(items: list[AdjInput], cell: dict | None = None) -> dict:
     jobs = []
     for item in items:
         f = item.finding
@@ -373,7 +373,8 @@ def build_adjudicator_jobs(items: list[AdjInput]) -> dict:
             "verify_b": _format_verify(item.verify_b),
             "rules": RULES,
         }
-        jobs.append(_job(f.id, "adjudicator", _render("adjudicator.md", values)))
+        job = _job(f.id, "adjudicator", _render("adjudicator.md", values))
+        jobs.append(job | {"model": cell["model"], "effort": cell["effort"]} if cell else job)
     return {"jobs": jobs}
 
 

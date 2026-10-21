@@ -622,7 +622,7 @@ def _first_review_line(first_review: dict) -> str:
 
 
 def _runtime_lines(ledger: Ledger, profile: dict) -> list[str]:
-    lines = [f"- {_substitution_line(r, r['to']['runner'])} (회차 {r.get('round', '-')})"
+    lines = [f"- {_substitution_line(r, r['to'])} (회차 {r.get('round', '-')})"
              for r in profile.get("runtime_substitutions", []) if r["role"].startswith(f"{ledger.mode}.")]
     for no, stage, event in _worker_events(ledger):
         total = sum((event.get("counts") or {}).values())

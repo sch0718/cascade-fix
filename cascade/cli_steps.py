@@ -653,12 +653,12 @@ FAILURE_REASONS = {FAILURE_LIMIT: "이용 한도", FAILURE_ERROR: "실행 오류
 
 
 def review_cell(ledger: Ledger, role: str) -> dict:
-    """role 칸의 지금 값. 실행 중 대체가 있으면 가장 나중 것의 `to` 칸이고, 없으면 init·jobs가 확정한 칸이다."""
+    """role 칸의 지금 값. 실행 중 대체가 있으면 가장 나중 것의 `cell`이고, 없으면 init·jobs가 확정한 칸이다."""
     profile = ledger_profile(ledger)
     key = f"{ledger.mode}.{role}"
     for record in reversed(profile.get("runtime_substitutions", [])):
         if record["role"] == key:
-            return record["to"]
+            return record["cell"]
     return profile["roles"][key]
 
 
@@ -688,7 +688,7 @@ def review_event_extra(ledger: Ledger, role: str) -> dict:
     extra = {"runner": cell["runner"], "model": cell["model"]}
     found = [r for r in ledger_profile(ledger).get("runtime_substitutions", []) if r["role"] == f"{ledger.mode}.{role}"]
     if found:
-        extra["fallback"] = {"from": found[-1]["from"], "to": found[-1]["to"]["runner"], "reason": found[-1]["reason"]}
+        extra["fallback"] = {"from": found[-1]["from"], "to": found[-1]["to"], "reason": found[-1]["reason"]}
     return extra
 
 
@@ -702,7 +702,8 @@ def substitute_review(ledger: Ledger, role: str, reason: str, round_no: int | No
     new = fallback_target(old, record["consented"], {old["runner"]}, "reviewer")
     rnd = ledger.current_round()
     record.setdefault("runtime_substitutions", []).append(
-        {"role": key, "from": old["runner"], "to": new, "reason": reason, "round": round_no if round_no is not None else rnd.no if rnd else 0})
+        {"role": key, "from": old["runner"], "to": new["runner"], "cell": new, "reason": reason,
+         "round": round_no if round_no is not None else rnd.no if rnd else 0})
     ledger.profile = record
     return new
 

@@ -119,31 +119,43 @@ def _usable(runner: str, available: dict[str, bool]) -> bool:
     return runner in (RUNNER_CLAUDE, RUNNER_AUTO) or available.get(runner, False)
 
 
-def substitute_unavailable(roles: dict, available: dict[str, bool], reason: str) -> tuple[dict, list[dict]]:
+def _unusable_reason(key: str, runner: str, available: dict[str, bool], reason: str,
+                     scripts: dict[str, bool] | None) -> str | None:
+    if not _usable(runner, available):
+        return reason
+    if scripts is not None and _role(key) in ("opinion", "recheck") and runner in EXTERNAL_RUNNERS \
+            and not scripts.get(runner, False):
+        return NO_SCRIPT_REASON
+    return None
+
+
+def substitute_unavailable(roles: dict, available: dict[str, bool], reason: str,
+                           scripts: dict[str, bool] | None = None) -> tuple[dict, list[dict]]:
     claude_only = profiles.builtin("claude-only")["roles"]
     out, records = copy.deepcopy(roles), []
     for key, cell in list(out.items()):
         runner, fallback = cell["runner"], cell["fallback"]
-        if not _usable(runner, available):
-            if _usable(fallback["runner"], available):
+        if why := _unusable_reason(key, runner, available, reason, scripts):
+            if _unusable_reason(key, fallback["runner"], available, reason, scripts) is None:
                 new = {**fallback, "fallback": dict(claude_only[key]["fallback"])}
             else:
                 new = copy.deepcopy(claude_only[key])
-            records.append({"role": key, "from": runner, "to": new["runner"], "reason": reason})
+            records.append({"role": key, "from": runner, "to": new["runner"], "reason": why})
             out[key] = new
-        elif not _usable(fallback["runner"], available):
-            records.append({"role": key + FALLBACK_SUFFIX, "from": fallback["runner"], "to": RUNNER_CLAUDE, "reason": reason})
+        elif why := _unusable_reason(key, fallback["runner"], available, reason, scripts):
+            records.append({"role": key + FALLBACK_SUFFIX, "from": fallback["runner"], "to": RUNNER_CLAUDE, "reason": why})
             cell["fallback"] = dict(claude_only[key]["fallback"])
     return out, records
 
 
 def decide(roles: dict, pinned: Iterable[str], source: str, run_review: Path,
            cursor_ok: bool | Callable[[], bool], available: dict[str, bool],
-           *, cursor_model: str = DEFAULT_CURSOR_MODEL, name: str = "auto 해석") -> tuple[dict, list[dict]]:
+           *, cursor_model: str = DEFAULT_CURSOR_MODEL, name: str = "auto 해석",
+           scripts: dict[str, bool] | None = None) -> tuple[dict, list[dict]]:
     kept = set(pinned) | {key for key, cell in roles.items() if cell["runner"] == RUNNER_AUTO}
     resolved = resolve_auto(roles, source, run_review, cursor_ok, cursor_model=cursor_model, name=name)
     replaced, records = substitute_unavailable({k: c for k, c in resolved.items() if k not in kept},
-                                               available, UNAVAILABLE_REASON)
+                                               available, UNAVAILABLE_REASON, scripts)
     return {**resolved, **replaced}, records
 
 
@@ -232,6 +244,10 @@ def _is_claude_default(workers: dict[str, dict], mode: str) -> bool:
     defaults = profiles.builtin("claude-only")["roles"]
     return all([spec[k] for k in _VALUE_KEYS] == [defaults[_MODE_WORKER_KEYS[mode][role]][k] for k in _VALUE_KEYS]
                for role, spec in workers.items())
+
+
+def adjudicator_cell(ledger) -> dict:
+    return ledger_profile(ledger)["roles"][f"{ledger.mode}.adjudicator"]
 
 
 def job_workers(ledger) -> dict[str, dict] | None:

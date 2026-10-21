@@ -296,7 +296,8 @@ def _resolve_profile(args, root: Path, available: dict[str, bool]) -> profiles.R
 def _decide_roles(args, resolved: profiles.Resolved, source: str, available: dict[str, bool]) -> tuple[dict, list[dict]]:
     try:
         return assignment.decide(resolved.roles, resolved.pinned, source, s.RUN_REVIEW, _cursor_reviewer_ok(available),
-                                 available, cursor_model=args.cursor_model or DEFAULT_CURSOR_MODEL, name=resolved.name)
+                                 available, cursor_model=args.cursor_model or DEFAULT_CURSOR_MODEL, name=resolved.name,
+                                 scripts={RUNNER_CODEX: s.RUN_REVIEW.is_file(), RUNNER_CURSOR: s.CURSOR_REVIEW.is_file()})
     except profiles.ProfileError as e:
         raise s.CliError(str(profiles.explain_overrides(e, resolved.overrides)), ExitCodes.PARSE_ERROR) from None
 
@@ -446,7 +447,7 @@ def _print_assignment(resolved: profiles.Resolved, roles: dict, substituted: lis
     if resolved.overrides:
         print(assignment.overrides_line(resolved.overrides))
     for record in substituted:
-        if record["role"].startswith(f"{mode}."):
+        if record["role"].startswith(f"{mode}.") and not record["role"].startswith(f"{mode}.review"):
             print(f"대체: {record['role']} {record['from']} → {record['to']} — {record['reason']}")
     pending = {key: cell for key, cell in roles.items() if key != f"{mode}.review"}
     print(assignment.roles_line(pending, mode, first_review))
@@ -526,7 +527,10 @@ def _review_profile(args, root: Path, flag: str | None) -> profiles.Resolved:
 
 
 def _first_review_cell(resolved: profiles.Resolved, mode: str) -> dict:
-    roles = assignment.resolve_auto(resolved.roles, f"claude-{mode}", s.RUN_REVIEW, False, name=resolved.name)
+    try:
+        roles = assignment.resolve_auto(resolved.roles, f"claude-{mode}", s.RUN_REVIEW, False, name=resolved.name)
+    except profiles.ProfileError as e:
+        raise s.CliError(str(e), ExitCodes.PARSE_ERROR) from None
     return roles[f"{mode}.review"]
 
 
@@ -952,7 +956,8 @@ def cmd_judge(args) -> int:
             wt = snap.worktrees[name] if name in snap.worktrees else s.new_worktree(snap, name, s.base_of(ledger, rnd), cfg)
             adj_items.append(s.adj_input(ledger, by_id[d.finding_id], merged, verify, wt, cfg, d.reasons))
     if adj_items:
-        s.write_json(rd / "adj-args.json", write_job_args(build_adjudicator_jobs(adj_items), rd / "prompts"))
+        adj_jobs = build_adjudicator_jobs(adj_items, assignment.adjudicator_cell(ledger))
+        s.write_json(rd / "adj-args.json", write_job_args(adj_jobs, rd / "prompts"))
     held = {f["id"] for f in rnd.hold_findings}
     rnd.decisions = [d for d in rnd.decisions if d["finding_id"] in held] + [d.to_dict() for d in decisions]
     s.write_json(rd / "decisions.json", rnd.decisions)
@@ -991,7 +996,8 @@ def cmd_adjudicate(args) -> int:
     snap = s.snapshot_of(ledger)
     rd = s.round_dir(run_dir, rnd.no)
     results = read_results(s.read_json(args.results))
-    for warning in s.model_warnings(results):
+    expected = assignment.adjudicator_cell(ledger)["model"]
+    for warning in s.model_warnings(results, {key: expected for key, r in results.items() if r.role == "adjudicator"}):
         print(warning)
     merged = s.read_json(rd / "results.json")
     verify = s.read_json(rd / "verify.json")

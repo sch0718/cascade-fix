@@ -47,6 +47,16 @@ class SubstituteUnavailableTest(unittest.TestCase):
         self.assertEqual(out["code.a"]["fallback"], CLAUDE_ONLY["code.a"]["fallback"])
         self.assertIn({"role": "code.a(대체)", "from": "cursor", "to": "claude", "reason": "미설치"}, subs)
 
+    def test_missing_review_script_substitutes_opinion_and_recheck_only(self):
+        roles = profiles.builtin("local")["roles"]
+        out, subs = assignment.substitute_unavailable(roles, {"codex": True, "cursor": True}, "미설치",
+                                                      scripts={"codex": False, "cursor": True})
+        for key in ("code.opinion", "code.recheck", "doc.opinion", "doc.recheck"):
+            self.assertEqual(out[key], CLAUDE_ONLY[key], key)
+            self.assertIn({"role": key, "from": "codex", "to": "claude", "reason": assignment.NO_SCRIPT_REASON}, subs)
+        self.assertEqual((out["code.a"], out["code.review"]), (roles["code.a"], roles["code.review"]))
+        self.assertEqual(len(subs), 4)
+
     def test_everything_available_changes_nothing(self):
         roles = profiles.builtin("local")["roles"]
         out, subs = assignment.substitute_unavailable(roles, {"codex": True, "cursor": True}, "미설치")
@@ -261,6 +271,18 @@ class PinnedCellsTest(unittest.TestCase):
         local, subs = self.decide(self.resolve(flag="local", reviewer="codex"), {"codex": False, "cursor": False})
         self.assertEqual(local["code.a"], CLAUDE_ONLY["code.a"])
         self.assertIn("code.a", [r["role"] for r in subs])
+
+
+    def test_missing_script_leaves_pinned_review_cells(self):
+        scripts = {"codex": False, "cursor": False}
+        both = {"codex": True, "cursor": True}
+        pinned = self.resolve(flag="local", reviewer="codex")
+        roles, subs = assignment.decide(pinned.roles, pinned.pinned, "codex-code", self.none, False, both, scripts=scripts)
+        self.assertEqual((roles["code.opinion"]["runner"], subs), ("codex", []))
+        free = self.resolve(flag="local")
+        roles, subs = assignment.decide(free.roles, free.pinned, "codex-code", self.none, False, both, scripts=scripts)
+        self.assertEqual(roles["code.opinion"], CLAUDE_ONLY["code.opinion"])
+        self.assertEqual({r["reason"] for r in subs}, {assignment.NO_SCRIPT_REASON})
 
 
 class RolesLineTest(unittest.TestCase):

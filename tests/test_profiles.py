@@ -209,6 +209,21 @@ adopt_on_both_pass = false
             with self.subTest(text=text), self.assertRaisesRegex(profiles.ProfileError, r"profiles\.(a|local)"):
                 profiles.load_profiles(write_toml(self.tmp, text))
 
+    def test_auto_cells_must_hold_values_claude_can_use(self):
+        for text in ('[profiles.a]\n"code.review" = { runner = "auto", model = "gpt-5" }\n',
+                     '[profiles.a]\n"code.opinion" = { model = "composer-2.5" }\n',
+                     '[profiles.a]\n"doc.recheck" = { runner = "auto", effort = "turbo" }\n'):
+            with self.subTest(text=text), self.assertRaisesRegex(profiles.ProfileError, r"profiles\.a"):
+                profiles.load_profiles(write_toml(self.tmp, text))
+        found, _ = profiles.load_profiles(write_toml(
+            self.tmp, '[profiles.a]\n"code.review" = { runner = "auto", model = "claude-sonnet-5-5", effort = "low" }\n'))
+        self.assertEqual(found["a"]["roles"]["code.review"]["model"], "claude-sonnet-5-5")
+
+    def test_explicit_cursor_fallback_model_is_kept(self):
+        found, _ = profiles.load_profiles(write_toml(
+            self.tmp, '[profiles.a]\n"code.a" = { runner = "codex", fallback = { runner = "cursor", model = "composer-9" } }\n'))
+        self.assertEqual(found["a"]["roles"]["code.a"]["fallback"], {"runner": "cursor", "model": "composer-9", "effort": ""})
+
     def test_toml_syntax_error_is_profile_error(self):
         with self.assertRaises(profiles.ProfileError):
             profiles.load_profiles(write_toml(self.tmp, "[profiles.a\n"))
@@ -293,6 +308,15 @@ class SelectionTest(unittest.TestCase):
         self.assertEqual(out["roles"]["code.a"]["model"], "")
         self.assertIn("code.b ← --cursor-model cursor-x", notes)
         self.assertNotIn("code.a ← --cursor-model cursor-x", notes)
+
+    def test_cursor_model_overrides_cursor_fallbacks_too(self):
+        profile = profiles.builtin("local")
+        profile["roles"]["code.a"]["fallback"] = {"runner": "cursor", "model": "composer-2.5", "effort": ""}
+        out, notes = profiles.apply_overrides(profile, profiles.LegacyOptions(cursor_model="cursor-x"), {}, "")
+        self.assertEqual(out["roles"]["code.a"]["fallback"], {"runner": "cursor", "model": "cursor-x", "effort": ""})
+        self.assertEqual(out["roles"]["code.a"]["model"], "")
+        self.assertIn("code.a ← --cursor-model cursor-x", notes)
+        self.assertEqual(out["roles"]["code.b"], profile["roles"]["code.b"])
 
     def test_reviewer_overrides_reset_and_order(self):
         co = profiles.builtin("claude-only")

@@ -149,6 +149,8 @@ def _check_values(name: str, key: str, cell: dict, *, fallback: bool) -> None:
         raise _fail(name, where, f"effort {effort!r}는 받지 않는다. 받는 값: {', '.join(EFFORTS)}")
     if runner == RUNNER_CLAUDE and not model.startswith("claude-"):
         raise _fail(name, where, f"claude runner의 model은 claude-로 시작해야 한다: {model!r}")
+    if runner == RUNNER_AUTO and model and not model.startswith("claude-"):
+        raise _fail(name, where, f"auto runner는 claude로 풀릴 수 있어 model은 비우거나 claude-로 시작해야 한다: {model!r}")
     if runner == RUNNER_CURSOR:
         if effort:
             raise _fail(name, where, f"cursor runner는 effort를 쓰지 않는다: {effort!r}")
@@ -350,8 +352,11 @@ def apply_overrides(profile: dict, opts: LegacyOptions, available: dict[str, boo
     if opts.cursor_model is not None:
         via = option("cursor_model", "--cursor-model", opts.cursor_model)
         for key in ROLE_KEYS:
-            if roles[key]["runner"] == RUNNER_CURSOR:
-                put(key, {**roles[key], "model": opts.cursor_model}, via)
+            cell = copy.deepcopy(roles[key])
+            for target in (cell, cell["fallback"]):
+                if target["runner"] == RUNNER_CURSOR:
+                    target["model"] = opts.cursor_model
+            put(key, cell, via)
     for field, flag, value in (("model", "--review-model", opts.review_model), ("effort", "--review-effort", opts.review_effort)):
         if value is None:
             continue

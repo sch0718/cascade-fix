@@ -201,7 +201,9 @@ class CliProfilesTest(unittest.TestCase):
 class LocalProfileTest(ExternalWorkersBase):
     def setUp(self):
         super().setUp()
-        self.env.update({**NO_LEGACY_ENV, "CASCADE_RUN_REVIEW": str(self.tmp / "none.sh"),
+        rr = self.tmp / "run-review.sh"
+        rr.write_text("#!/bin/sh\n", encoding="utf-8")
+        self.env.update({**NO_LEGACY_ENV, "CASCADE_RUN_REVIEW": str(rr),
                          "CASCADE_CURSOR_REVIEW": str(self.tmp / "none-cursor.sh")})
         self.result = FIXTURES / "codex-code-e2e.final"
 
@@ -451,6 +453,7 @@ REVIEW_PROFILES = """
 "code.opinion" = { runner = "codex" }
 
 [profiles.codex-recheck]
+"code.opinion" = { runner = "claude" }
 "code.recheck" = { runner = "codex" }
 
 [profiles.cursor-opinion]
@@ -478,6 +481,8 @@ class ReviewRolesBase(ExternalWorkersBase):
         self.use_fakes()
         self.rr = self.tmp / "run-review.sh"
         self.cr = self.tmp / "cursor-run-review.sh"
+        for script in (self.rr, self.cr):
+            script.write_text("#!/bin/sh\n", encoding="utf-8")
         self.env.update({**NO_LEGACY_ENV, "CASCADE_RUN_REVIEW": str(self.rr), "CASCADE_CURSOR_REVIEW": str(self.cr)})
         self.rd = None
 
@@ -532,7 +537,7 @@ class ReviewRolesBase(ExternalWorkersBase):
         return cli_steps.review_cell(self.ledger(), role)
 
     def substituted(self):
-        return [{"role": r["role"], "from": r["from"], "to": r["to"]["runner"], "reason": r["reason"]}
+        return [{"role": r["role"], "from": r["from"], "to": r["to"], "reason": r["reason"]}
                 for r in self.ledger().profile.get("runtime_substitutions", [])]
 
     def external_opinion(self, fid, text):
@@ -1293,7 +1298,8 @@ class ReviewHelpersTest(unittest.TestCase):
         new = cli_steps.substitute_review(ledger, "opinion", "이용 한도", 2)
         self.assertEqual((new["runner"], new["model"], new["effort"]), ("claude", FABLE, "high"))
         self.assertEqual(ledger.profile["runtime_substitutions"],
-                         [{"role": "code.opinion", "from": "codex", "to": new, "reason": "이용 한도", "round": 2}])
+                         [{"role": "code.opinion", "from": "codex", "to": "claude", "cell": new, "reason": "이용 한도",
+                           "round": 2}])
         self.assertEqual(ledger.profile["roles"]["code.opinion"]["runner"], "codex")
         self.assertEqual(ledger.profile["substituted"], [])
         self.assertEqual(cli_steps.review_cell(ledger, "opinion"), new)
@@ -1312,7 +1318,7 @@ class ReviewHelpersTest(unittest.TestCase):
         self.assertEqual(ledger.profile["roles"]["code.opinion"]["runner"], "codex")
         self.assertEqual(ledger.profile["roles"]["code.recheck"]["runner"], "codex")
         self.assertEqual(cli_steps.review_cell(ledger, "recheck")["runner"], "claude")
-        self.assertEqual([(r["role"], r["from"], r["to"]["runner"], r["reason"]) for r in ledger.profile["runtime_substitutions"]],
+        self.assertEqual([(r["role"], r["from"], r["to"], r["reason"]) for r in ledger.profile["runtime_substitutions"]],
                          [("code.recheck", "codex", "claude", "실행 오류")])
         self.assertEqual(ledger.profile["substituted"], [])
         self.assertEqual(ledger.reviewer, "codex")
@@ -1345,6 +1351,156 @@ class ReviewHelpersTest(unittest.TestCase):
         same = {"runner": "codex", "model": "", "effort": ""}
         ledger = self.ledger(profile=self.profile(fallback=same))
         self.assertEqual(cli_steps.substitute_review(ledger, "opinion", "x")["runner"], "claude")
+
+
+ADJUDICATOR_PROFILES = """
+[profiles.sonnet-adj]
+base = "claude-only"
+"code.adjudicator" = { model = "claude-sonnet-5-5", effort = "low" }
+"""
+
+
+class AdjudicatorCellTest(ExternalWorkersBase):
+    def setUp(self):
+        super().setUp()
+        toml = Path(self.env["CASCADE_REPOS_TOML"])
+        toml.write_text(toml.read_text(encoding="utf-8") + ADJUDICATOR_PROFILES, encoding="utf-8")
+        self.env.update({**NO_LEGACY_ENV, "CASCADE_RUN_REVIEW": str(self.tmp / "none.sh"),
+                         "CASCADE_CURSOR_REVIEW": str(self.tmp / "none-cursor.sh")})
+
+    def to_judge(self, *init_extra):
+        p = self.init(*init_extra)
+        self.rd = self.run_dir / "round-1"
+        self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1")
+        for name in ("r1-01-a", "r1-01-b"):
+            wt = self.wt(name)
+            (wt / "calc.py").write_text(fix(CALC, "return a - b", "return a + b"), encoding="utf-8")
+            commit_worktree(wt, name)
+        stage1 = self.rd / "stage1.json"
+        shutil.copyfile(FIXTURES / "workflow-stage1.json", stage1)
+        self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1))
+        return p
+
+    def adj_jobs(self):
+        return json.loads((self.rd / "adj-args.json").read_text(encoding="utf-8"))["jobs"]
+
+    def adjudicate(self, model_id):
+        data = json.loads((FIXTURES / "workflow-adj.json").read_text(encoding="utf-8"))
+        data["results"][0]["output"]["model_id"] = model_id
+        adj = self.rd / "adj.json"
+        adj.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        return self.cli("adjudicate", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(adj))
+
+    def test_adjudicator_cell_model_and_effort_drive_the_job(self):
+        p = self.to_judge("--profile", "sonnet-adj")
+        self.assertIn("판가름=Claude(Sonnet 5.5 low)", p.stdout)
+        self.assertEqual([(j["id"], j["model"], j["effort"]) for j in self.adj_jobs()],
+                         [("r1-02:adjudicator", SONNET, "low")])
+        p = self.adjudicate(SONNET)
+        self.assertNotIn("r1-02:adjudicator 모델 ID", p.stdout)
+
+    def test_adjudicate_model_warning_expects_the_cell_model(self):
+        self.to_judge("--profile", "sonnet-adj")
+        p = self.adjudicate("claude-opus-5-5")
+        self.assertIn("r1-02:adjudicator 모델 ID가 claude-opus-5-5 이다(기대값 claude-sonnet-5-5)", p.stdout)
+
+    def test_default_profile_adjudicator_job_is_unchanged(self):
+        self.to_judge()
+        [job] = self.adj_jobs()
+        self.assertEqual(sorted(job), ["effort", "id", "kind", "label", "model", "promptPath"])
+        self.assertEqual((job["id"], job["model"], job["effort"], job["kind"]),
+                         ("r1-02:adjudicator", "claude-opus-5-5", "high", "adjudicator"))
+        p = self.adjudicate("claude-opus-5-5")
+        self.assertNotIn("모델 ID", p.stdout)
+
+
+BAD_AUTO_PROFILE = """
+[profiles.bad-auto]
+"code.review" = { runner = "auto", model = "gpt-5" }
+"""
+
+
+class FirstReviewProfileErrorTest(ExternalWorkersBase):
+    def test_cf_review_with_bad_auto_cell_exits_5_without_traceback(self):
+        toml = Path(self.env["CASCADE_REPOS_TOML"])
+        toml.write_text(toml.read_text(encoding="utf-8") + BAD_AUTO_PROFILE, encoding="utf-8")
+        self.env.update(NO_LEGACY_ENV)
+        (self.repo / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+        p = self.cli("review", "--kind", "code", "--uncommitted", "--profile", "bad-auto", ok=False)
+        self.assertEqual(p.returncode, 5, p.stdout + p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertIn("code.review", p.stdout)
+
+    def test_first_review_cell_wraps_profile_error_as_exit_5(self):
+        from cascade import cli
+        roles = profiles.builtin("default")["roles"]
+        roles["code.review"] = {**roles["code.review"], "model": "gpt-5"}
+        resolved = profiles.Resolved("bad-auto", "--profile", True, False, roles, [], [])
+        with self.assertRaises(cli_steps.CliError) as ctx:
+            cli._first_review_cell(resolved, "code")
+        self.assertEqual(ctx.exception.code, 5)
+        self.assertIn("code.review", ctx.exception.message)
+
+
+class InitReviewScriptTest(ExternalWorkersBase):
+    def setUp(self):
+        super().setUp()
+        self.use_fakes()
+        self.env.update({**NO_LEGACY_ENV, "CASCADE_RUN_REVIEW": str(self.tmp / "none.sh"),
+                         "CASCADE_CURSOR_REVIEW": str(self.tmp / "none-cursor.sh")})
+
+    def test_local_without_rr_script_substitutes_opinion_and_recheck(self):
+        p = self.init("--profile", "local")
+        profile = self.ledger().profile
+        for key in ("code.opinion", "code.recheck", "doc.opinion", "doc.recheck"):
+            self.assertEqual(profile["roles"][key]["runner"], "claude", key)
+            self.assertIn({"role": key, "from": "codex", "to": "claude", "reason": "검토 스크립트 없음"},
+                          profile["substituted"])
+        self.assertEqual(profile["roles"]["code.a"]["runner"], "codex")
+        self.assertEqual(self.ledger().reviewer, "claude")
+        self.assertIn("대체: code.opinion codex → claude — 검토 스크립트 없음", p.stdout)
+        self.assertIn("대체: code.recheck codex → claude — 검토 스크립트 없음", p.stdout)
+        self.assertIn("의견=Claude(Fable 5.1 high), 재검토=Claude(Fable 5.1 high)", p.stdout)
+        self.assertIn("전송 동의: A → OpenAI", p.stdout)
+        self.assertNotIn("스킬이 없다", p.stdout)
+
+    def test_cursor_fallback_without_cr_script_is_skipped(self):
+        toml = Path(self.env["CASCADE_REPOS_TOML"])
+        toml.write_text(toml.read_text(encoding="utf-8") + (
+            '\n[profiles.codex-then-cursor]\n'
+            '"code.opinion" = { runner = "codex", fallback = { runner = "cursor", model = "composer-9" } }\n'),
+            encoding="utf-8")
+        rr = self.tmp / "run-review.sh"
+        rr.write_text("#!/bin/sh\n", encoding="utf-8")
+        self.env["CASCADE_RUN_REVIEW"] = str(rr)
+        self.init("--profile", "codex-then-cursor")
+        profile = self.ledger().profile
+        self.assertEqual(profile["roles"]["code.opinion"]["runner"], "codex")
+        self.assertEqual(profile["roles"]["code.opinion"]["fallback"]["runner"], "claude")
+        self.assertIn({"role": "code.opinion(대체)", "from": "cursor", "to": "claude", "reason": "검토 스크립트 없음"},
+                      profile["substituted"])
+        self.env["CASCADE_RUN_REVIEW"] = str(self.tmp / "none.sh")
+        self.init("--profile", "codex-then-cursor")
+        self.assertEqual(self.ledger().profile["roles"]["code.opinion"]["runner"], "claude")
+
+    def test_init_does_not_print_substitution_of_the_finished_first_review(self):
+        self.env.pop("CASCADE_CODEX")
+        p = self.init("--profile", "local")
+        self.assertIn("code.review", [r["role"] for r in self.ledger().profile["substituted"]])
+        self.assertNotIn("대체: code.review", p.stdout)
+        self.assertIn("대체: code.a codex → claude", p.stdout)
+
+    def test_reviewer_option_keeps_the_missing_script_warning(self):
+        p = self.init("--reviewer", "codex")
+        ledger = self.ledger()
+        self.assertEqual(ledger.reviewer, "codex")
+        self.assertEqual(ledger.profile["roles"]["code.opinion"]["runner"], "codex")
+        self.assertEqual(ledger.profile["substituted"], [])
+        self.assertIn("경고: codex-review 스킬이 없다", p.stdout)
+        self.env["CASCADE_REVIEWER"] = "codex"
+        p = self.init()
+        self.assertEqual(self.ledger().reviewer, "codex")
+        self.assertIn("경고: codex-review 스킬이 없다", p.stdout)
 
 
 if __name__ == "__main__":

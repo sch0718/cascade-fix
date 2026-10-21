@@ -541,8 +541,10 @@ class RoleSectionTest(unittest.TestCase):
         record = profile_record("local", substituted=[
             {"role": "code.a", "from": "codex", "to": "claude", "reason": "미설치 또는 로그인 필요"}],
             runtime_substitutions=[
-                {"role": "code.opinion", "from": "codex", "to": claude["code.opinion"], "reason": "이용 한도", "round": 1},
-                {"role": "doc.recheck", "from": "cursor", "to": claude["doc.recheck"], "reason": "실행 오류", "round": 1}])
+                {"role": "code.opinion", "from": "codex", "to": "claude", "cell": claude["code.opinion"],
+                 "reason": "이용 한도", "round": 1},
+                {"role": "doc.recheck", "from": "cursor", "to": "claude", "cell": claude["doc.recheck"],
+                 "reason": "실행 오류", "round": 1}])
         text = section(self.render(profile_ledger(record)), "## 역할 배정")
         runtime = section(text, "### 실행 중 대체")
         self.assertIn("code.opinion codex → claude — 이용 한도 (회차 1)", runtime)
