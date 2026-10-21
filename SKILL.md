@@ -193,7 +193,7 @@ Claude·Cursor·`codex-doc` 결과는 형식이 같아 형식으로는 가릴 �
 3. **judge** — `CF judge --run-dir <run_dir> --round N [--results <run_dir>/round-N/stage1.json]`. `--results`는 Claude 작업이 있을 때만 준다. `judge`가 `stage1.json`, `stage1-cli.json`, `stage1-fallback.json`을 합친다. 실패한 CLI 결과는 합치지 않고 대체 실행 결과를 쓴다. 모델 ID 경고의 기대값은 원장의 배정값이다(`codex:<모델>`, `cursor:<모델>`).
 4. **문서 모드의 점검자** — `judge` 1차가 `checker-args.json`(Claude)·`checker-cli-args.json`(CLI)을 만들면 같은 방식으로 한다. `CF workers … --stage checker`와 Workflow를 동시에 띄우고, 대체 실행 Workflow를 돌려 `checker-fallback.json`에 저장한 뒤 `CF judge … [--results …/stage1.json] [--checker-results …/checker.json]`으로 다시 부른다. `--checker-results`도 Claude 점검자 작업이 있을 때만 준다.
 
-- `jobs --force`는 그 회차의 CLI 결과와 대체 실행 결과(`stage1-cli.json`·`stage1-fallback*.json`, 점검자 쪽 포함)를 무효로 한다. 다시 하면 `workers`부터 한다. `workers`도 이미 한 단계는 다시 하지 않는다(`--force`).
+- `jobs --force`는 그 회차의 CLI 결과와 대체 실행 결과(`stage1-cli.json`·`stage1-fallback*.json`, 점검자 쪽 포함)를 무효로 하고, 작업 워크트리를 회차의 첫 입력 상태로 되돌리며, 이전 판정·의견·판가름 상태를 지운다. `apply`까지 한 회차는 다시 열지 않는다. 다시 하면 `workers`부터 한다. `workers`도 이미 한 단계는 다시 하지 않는다(`--force`).
 - CF workers는 한 번에 하나만 돌린다. 다른 회차나 실행의 `workers`와 나란히 띄우지 않는다. 같은 Codex 로그인을 쓰는 프로세스가 겹쳐 토큰을 갱신하면 로그인이 풀릴 수 있다.
 - 작업 하나의 시간 제한은 900초고 CLI별 동시 실행은 최대 4개다.
 

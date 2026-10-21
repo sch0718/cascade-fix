@@ -156,6 +156,32 @@ class WorkersCommandTest(WorkersTestBase):
         self.args("jobs", "--force")
         self.workers()
 
+    def test_jobs_force_after_judge_discards_old_judgement(self):
+        self.start()
+        self.workers()
+        self.args("judge")
+        (self.rd() / "adj-args.json").write_text('{"jobs": []}', encoding="utf-8")
+        (self.rd() / "opinion-r1-01.md").write_text("의견 요청", encoding="utf-8")
+        self.args("jobs", "--force")
+        self.assertEqual([e["step"] for e in self.ledger().rounds[0].events], ["init", "jobs"])
+        self.assertFalse((self.rd() / "adj-args.json").exists())
+        self.assertFalse((self.rd() / "opinion-r1-01.md").exists())
+        status = self.cli("status", "--run-dir", str(self.run_dir)).stdout
+        self.assertNotIn(" apply ", status)
+        self.workers()
+        self.args("judge")
+
+    def test_jobs_force_after_apply_is_refused(self):
+        self.start()
+        self.workers()
+        self.args("judge")
+        ledger = self.ledger()
+        ledger.rounds[0].events.append({"step": "apply", "at": "x"})
+        ledger.save(self.run_dir / "ledger.json")
+        p = self.args("jobs", "--force", ok=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("apply", p.stdout)
+
     def test_workers_command_is_refused_twice_without_force(self):
         self.start()
         self.workers()
@@ -163,6 +189,31 @@ class WorkersCommandTest(WorkersTestBase):
         self.assertNotEqual(p.returncode, 0)
         self.assertIn("--force", p.stdout)
         self.args("workers", "--stage", "stage1", "--force")
+
+    def test_workers_force_reruns_on_input_tree(self):
+        self.start()
+        self.workers()
+        wts = [Path(p) for name, p in self.ledger().snapshot["worktrees"].items() if name.startswith("r1-01-")]
+        self.assertTrue(wts)
+        self.assertTrue(any((wt / "calc.py").read_text(encoding="utf-8") != CALC for wt in wts))
+        self.env["FAKE_MUTATE_WT"] = "{}"
+        self.args("workers", "--stage", "stage1", "--force")
+        for wt in wts:
+            self.assertEqual((wt / "calc.py").read_text(encoding="utf-8"), CALC, wt)
+
+    def test_jobs_force_restores_worktrees_before_reopening(self):
+        self.start()
+        self.workers()
+        wts = [Path(p) for name, p in self.ledger().snapshot["worktrees"].items() if name.startswith("r1-01-")]
+        self.assertTrue(any((wt / "calc.py").read_text(encoding="utf-8") != CALC for wt in wts))
+        self.args("jobs", "--force")
+        for wt in wts:
+            self.assertEqual((wt / "calc.py").read_text(encoding="utf-8"), CALC, wt)
+        self.env["FAKE_MUTATE_WT"] = "{}"
+        self.workers()
+        self.args("workers", "--stage", "stage1", "--force")
+        for wt in wts:
+            self.assertEqual((wt / "calc.py").read_text(encoding="utf-8"), CALC, wt)
 
     def test_workers_without_cli_jobs_is_error(self):
         self.init("--reviewer", "claude")

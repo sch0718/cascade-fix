@@ -89,7 +89,11 @@ from cascade.runners import (
     CursorRunner,
     find_codex,
     find_cursor_agent,
+    head_of,
+    restore_head,
+    restore_tree,
     run_all,
+    tree_of,
 )
 from cascade.sandbox_check import ensure as ensure_sandbox
 from cascade.snapshot import (
@@ -128,6 +132,7 @@ REASON_FINAL_BASELINE_FAILED = "전체 테스트 실패(기준선도 실패)"
 REASON_OUT_OF_SCOPE = "재검토 범위 밖"
 REASON_SEVERITY_DEFERRED = "등급 선택(--severity)으로 이번 실행에서 뺌"
 RAW_PREVIEW_LINES = 5
+WORKTREE_INPUTS = "worktree-inputs.json"
 FINAL_TAIL_CHARS = 2000
 
 
@@ -408,11 +413,34 @@ def cmd_review(args) -> int:
     return 0
 
 
+_JUDGE_OUTPUTS = ("decisions.json", "results.json", "verify.json", "adj-args.json", "adj.json", s.OPINION_ARGS,
+                  s.OPINION_RESULTS, s.STAGE_ARGS[s.STAGE_CHECKER], f"{s.STAGE_CHECKER}-cli-args.json",
+                  s.STAGE_OUTPUTS[s.STAGE_CHECKER])
+
+
+def _reopen_round(ledger, rnd, rd: Path) -> None:
+    """jobs 를 다시 하면 그 뒤 단계(작업자·판정·의견·판가름)가 남긴 상태를 지워 이전 판정이 이어지지 않게 한다."""
+    if s.step_done(rnd, "apply"):
+        raise s.CliError(f"회차 {rnd.no}는 이미 apply 했다. 적용한 회차는 jobs 로 다시 열지 않는다")
+    first = next(i for i, e in enumerate(rnd.events) if e.get("step") == "jobs")
+    rnd.events = rnd.events[:first]
+    held = {f["id"] for f in rnd.hold_findings}
+    rnd.decisions = [d for d in rnd.decisions if d["finding_id"] in held]
+    for f in rnd.findings:
+        ledger.opinions.pop(f["id"], None)
+    for name in _JUDGE_OUTPUTS:
+        (rd / name).unlink(missing_ok=True)
+    for path in rd.glob("opinion-*"):
+        path.unlink()
+
+
 def cmd_jobs(args) -> int:
     run_dir = Path(args.run_dir)
     ledger = s.load_ledger(run_dir)
     rnd = s.get_round(ledger, args.round)
     s.guard(rnd, "jobs", args.force)
+    if s.step_done(rnd, "jobs"):
+        _reopen_round(ledger, rnd, s.round_dir(run_dir, rnd.no))
     cfg = s.cfg_for(ledger.source, Path(ledger.root))
     snap = s.snapshot_of(ledger)
     base = s.base_of(ledger, rnd)
@@ -426,6 +454,7 @@ def cmd_jobs(args) -> int:
             name = s.wt_name(f.id, role)
             wts[f.id][role] = snap.worktrees[name] if name in snap.worktrees else s.new_worktree(snap, name, base, cfg)
     rd = s.round_dir(run_dir, rnd.no)
+    _pin_worktrees(rd / WORKTREE_INPUTS, [wt for roles_wt in wts.values() for wt in roles_wt.values()])
     failed: list[str] = []
     if ledger.mode == "code" and cfg.tests:
         located = list(dict.fromkeys(p for f in findings if (p := location_file(f.location))))
@@ -490,6 +519,23 @@ def _cli_runners(jobs: list[CliJob]) -> dict[str, object]:
     return runners
 
 
+def _pin_worktrees(path: Path, worktrees: list[Path]) -> None:
+    """작업 워크트리를 회차의 첫 입력 상태로 맞춘다. 처음 보는 워크트리는 지금 상태를 적어 두고, 적어 둔 워크트리는 그 상태로 되돌린다."""
+    saved = s.read_json(path) if path.is_file() else {}
+    for wt in worktrees:
+        key = str(Path(wt).resolve())
+        if key not in saved:
+            saved[key] = [tree_of(wt), head_of(wt)]
+            continue
+        tree, head = saved[key]
+        try:
+            restore_head(wt, head)
+            restore_tree(wt, tree)
+        except Exception as e:
+            raise s.CliError(f"워크트리를 회차의 첫 입력 상태로 되돌리지 못했다({wt}): {e}") from None
+    s.write_json(path, saved)
+
+
 def cmd_workers(args) -> int:
     run_dir = Path(args.run_dir)
     ledger = s.load_ledger(run_dir)
@@ -509,6 +555,7 @@ def cmd_workers(args) -> int:
         raise s.CliError(f"CLI 작업이 없다: {cli_args.name} 가 없다(jobs 단계가 CLI 작업을 만든 회차에서만 쓴다)")
     entries = s.read_json(cli_args)["jobs"]
     jobs = [_cli_job(e) for e in entries]
+    _pin_worktrees(rd / WORKTREE_INPUTS, [job.worktree for job in jobs if job.writable])
     exhausted = s.exhausted_runners(rnd)
     outcomes = run_all(jobs, _cli_runners(jobs), exhausted=exhausted)
     out = rd / f"{args.stage}-cli.json"
