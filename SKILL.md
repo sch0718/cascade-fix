@@ -107,6 +107,7 @@ PYTHONPATH="${CLAUDE_SKILL_DIR}" python3 -m cascade.cli
    - 문서: `CF review --kind doc --doc <문서> [--doc <문서>…] [--focus <관점>] [--profile <이름>] [--consent …] [--workers claude|external] [--cursor-model M]`
    - 출력의 `review_dir=<경로>` 아래에 `review-args.json`이 생긴다. 검토자는 읽기만 하고, 결과는 `Critical`/`Warning`/`Suggestion` 형식(`위치:`/`근거:`/`제안:`)이다. 모델·effort는 칸 값이고 `--review-model`·`--review-effort`는 이 칸만 덮는다.
 2. **Workflow(첫 검토)** — 절차 3과 같은 방식으로 `RJ`를 `review-args.json`으로 돌려 반환값(완료 알림의 output 파일의 `.result`)을 `<review_dir>/review.json`에 저장한다.
+   - 이어서 **init보다 먼저** `CF usage --review-dir <review_dir> --workflow <Workflow 실행 id>`를 돌린다(`<review_dir>/claude-usage.json`이 생긴다). `init`이 이 파일을 읽어 원장 `profile.first_review.usage`에 넣으므로, init 뒤에 `CF usage --review-dir`를 돌리면 보고서에 반영되지 않는다. 기록 폴더를 읽지 못하면 `Claude 토큰 미측정: <이유>`가 나오고 그대로 init으로 넘어가도 된다.
 3. **init** — `CF init --source claude-code --input <review_dir>/review.json`(문서면 `--source claude-doc … --doc <문서>`). `review`가 출력한 명령을 그대로 쓴다. 프로필을 명시했으면 그 줄에 `--profile <이름>`이, 받은 `--consent`가 붙어 있다. 프로필을 고르지 않았으면 `--review-model`·`--review-effort`를 그대로 넘긴다. 결과가 비었으면(호출 실패) 종료 코드 5로 멈춘다 — Workflow를 다시 돌린다.
    - `review`에 준 `--workers`·`--cursor-model`(프로필을 명시하지 않았으면 없을 때 `CASCADE_WORKERS`)은 이 init 줄에 그대로 붙는다. `detect`가 안내하는 `review` 줄에도 붙는다. 외부 작업자를 쓰려면 프로필(`--profile`)을 쓰거나 `--workers external`을 준다(`CASCADE_WORKERS=external`은 폐기 예정이고 프로필을 명시하면 무시된다).
 
@@ -117,7 +118,7 @@ PYTHONPATH="${CLAUDE_SKILL_DIR}" python3 -m cascade.cli
 1. **review** — 위와 같은 `CF review …`. 이 칸에 `--review-model`·`--review-effort`를 주면 종료 코드 5로 거절한다(두 옵션은 claude 칸에만 쓴다). 출력의 `검토자:` 줄이 실제 runner다. 쓸 수 없는 runner(미설치·검토 스크립트 없음)나 동의 밖 수신처면 `대체: <칸> codex → … — <사유>`와 함께 fallback으로 바뀐 명령이 나온다.
 2. **RR·CR** — 출력된 명령을 그대로 돌린다. codex 코드 모드는 `cd <저장소 루트> && RR …` 형태다. 이 모드는 `--focus`를 받지 못해 명령에서 빼고 경고한다. 한 번에 하나씩 돌린다(「규칙」).
 3. **실패하면** — 결과(`review.out.final`)가 없으면 로그(`review.out`) 끝을 본다.
-   - 한도(이용 한도·`CR` 종료 코드 75)·시간 초과·실행 오류: 멈추지 않고 `CF review --review-dir <처음 review_dir> --fallback-from <실패한 runner> --reason <사유>`를 돌린다(동의 범위와 작업자 옵션은 처음 `CF review`에 준 `--consent`·`--workers`·`--cursor-model`이 `review-meta.json`에 남아 이어지므로 다시 주지 않는다). `--fallback-from`은 마지막으로 시도한 runner(`codex`·`cursor`)와 같아야 한다. 사유 기본값은 「실행 오류」다. 같은 폴더에 fallback 칸의 작업이 만들어지고 새 「다음:」이 나온다. 그 칸의 fallback도 외부 CLI면 또 실패할 수 있고, 그러면 같은 명령으로 이어 간다(예: codex → cursor → claude). 동의 밖이거나 이미 실패한 runner로는 가지 않는다. 마지막은 Claude(`claude-only` 값)다.
+   - 한도(이용 한도·`CR` 종료 코드 75)·시간 초과·실행 오류: 멈추지 않고 `CF review --review-dir <처음 review_dir> --fallback-from <실패한 runner> --reason <사유>`를 돌린다(동의 범위와 작업자 옵션은 처음 `CF review`에 준 `--consent`·`--workers`·`--cursor-model`이 `review-meta.json`에 남아 이어지므로 다시 주지 않는다). `--fallback-from`은 마지막으로 시도한 runner(`codex`·`cursor`)와 같아야 한다. 사유 기본값은 「실행 오류」다. 같은 폴더에 fallback 칸의 작업이 만들어지고 새 「다음:」이 나온다(fallback이 Claude면 위 「Claude 단독 첫 검토」 2의 Workflow와 `CF usage --review-dir`, 그 뒤 init이다). 그 칸의 fallback도 외부 CLI면 또 실패할 수 있고, 그러면 같은 명령으로 이어 간다(예: codex → cursor → claude). 동의 밖이거나 이미 실패한 runner로는 가지 않는다. 마지막은 Claude(`claude-only` 값)다.
    - 로그인 만료(401·refresh token, `CR` 종료 코드 77): 대체하지 않고 멈춘다. 사용자에게 `codex login`(Cursor는 `cursor-agent login`)을 하라고 알리고 로그인 뒤 그 `RR`·`CR`부터 다시 돌린다.
 4. **init** — `CF init --source codex-code|cursor-code|… --input <review_dir>/review.out.final`. `review`의 「다음:」 줄을 그대로 쓴다. init은 같은 폴더의 `review-meta.json`을 읽어 첫 검토 이력(요청한 runner·실제 runner·시도 사슬)을 원장 `profile.first_review`에 넣고 보고서 「역할 배정」의 「첫 검토 이력」에 보인다. 이미 끝난 첫 검토라 첫 검토 칸은 init의 동의 줄에서 빠지고, `review-meta.json`이 있으면 역할 줄에 `첫 검토(완료)=<runner 사슬>`(예: `Codex → Claude`)이 이력으로 보인다.
 
@@ -188,6 +189,8 @@ Claude·Cursor·`codex-doc` 결과는 형식이 같아 형식으로는 가릴 �
 2. **jobs** — `CF jobs --run-dir <run_dir> --round N` → `round-N/stage1-args.json`. 기준선(수정 전 base 워크트리)에서 build·typecheck·lint 명령을 한 번 돌려 이미 실패하는 명령을 `round-N/baseline.json`에 적는다(판정에서 제외). `tests` 명령은 기준선에서 실패해도 제외하지 않는다(지적이 곧 실패하는 테스트면 수정이 통과시켜야 한다).
    - `pr-comment`이면 코멘트에서 뽑은 재현 명령을 `round-N/repro-cmds.json`에 쓰고 출력한다. 이 명령은 사용자 셸에서 돈다. 사용자에게 명령 목록을 보이고 승인받은 뒤 `judge`에 `--allow-repro <run_dir>/round-N/repro-cmds.json`으로 넘긴다. 승인이 없으면 재현 검증을 건너뛴다(경고만 낸다).
 3. **Workflow(1단계)** — (`CF jobs`가 `stage1-cli-args.json`을 만들었으면, 곧 작업자 칸에 외부 runner가 있으면 아래 「외부 작업자 칸」의 동시 실행을 따른다.) `RJ`(`scripts/run-jobs.js`, 「다음:」 줄에 절대 경로가 나온다)를 Read로 읽어 그 내용을 Workflow 도구의 `script` 입력으로 통째로 넘긴다(`RJ` 경로를 `scriptPath`로 주면 작업 디렉터리 밖이라 거부된다). 첫 실행 결과에 나오는 `Script file:` 경로(Workflow가 저장해 둔 사본)는 `scriptPath`로 받으므로, 이 세션의 둘째 Workflow부터는 그 경로를 `scriptPath`로 넘긴다. `args`는 `stage1-args.json`의 내용(JSON 객체)이다. 작업마다 `{id, label, model, effort, kind, promptPath}`만 있고 프롬프트 본문은 `round-N/prompts/`의 파일에 있다. 프롬프트를 읽어 옮겨 적지 않는다. 반환값 `{results: [...]}`는 완료 알림의 `<output-file>` JSON에서 `.result`를 꺼내 그대로 `round-N/stage1.json`에 저장한다(예: `python3 -c 'import json,sys; json.dump(json.load(open(sys.argv[1]))["result"], open(sys.argv[2], "w"), ensure_ascii=False)' <output-file> <저장 경로>`). 알림 본문의 `<result>`는 `<`·`>`가 `&lt;`·`&gt;`로 바뀌어 보이므로 옮겨 적지 않는다.
+   - **Workflow를 돌린 뒤마다 `CF usage`를 한다**(1단계·점검자·판가름·의견·재검토·대체 실행 Workflow 모두). 결과를 저장한 다음 `CF usage --run-dir <run_dir> --round N --workflow <Workflow 실행 id>`를 돌린다. 「다음:」의 Workflow 줄 끝에 이 명령이 적혀 있다. 실행 id는 Workflow 완료 알림에 나오는 id(`wf_…`)이고, 그 Workflow의 기록 폴더 경로를 줘도 된다. `CF`가 `~/.claude/projects/<프로젝트>/<세션>/subagents/workflows/<실행 id>/`의 기록을 읽어 작업별 토큰과 추정 비용을 `round-N/claude-usage.json`에 쓰고, 보고서 「역할별 사용량」이 이 파일을 읽는다. 그래서 `report` 전에 끝낸다. 같은 Workflow를 두 번 넣어도 그 Workflow 몫만 바뀌어 두 번 더해지지 않는다. 이름표가 작업과 일치하지 않는 에이전트는 어느 칸에도 넣지 않고 경고한다.
+   - 기록 폴더를 읽지 못하면(문서화되지 않은 내부 형식이다) 실패하지 않는다. 종료 코드 0과 함께 `Claude 토큰 미측정: <이유>`를 출력한다. 이때는 멈추지 않고 다음 단계로 넘어간다. 보고서는 그 칸을 「미측정」으로 적고 0으로 세지 않는다. 사용자에게는 한 줄만 알린다.
 4. **judge** — `CF judge --run-dir <run_dir> --round N --results <run_dir>/round-N/stage1.json [--allow-repro <승인한 목록>]`
    - 종료 코드 6: jobs 뒤 사용자 저장소(작업 트리·HEAD·현재 브랜치·stash)가 바뀌었거나 작업자 워크트리가 브랜치에 붙었다. 작업자가 워크트리 밖을 건드렸을 수 있다. 출력된 `git diff --stat`을 사용자에게 보이고 멈춘다. `adjudicate`도 같은 검사를 한다.
    - 브랜치 목록만 바뀌었으면(다른 세션의 fetch·삭제 등) 경고와 바뀐 브랜치를 출력하고 계속한다.
@@ -261,7 +264,7 @@ Claude·Cursor·`codex-doc` 결과는 형식이 같아 형식으로는 가릴 �
 - 대체 실행 사유: 한도 초과, 로그인 필요, 시간 초과, 실행 오류, 무효 결과(Cursor는 같은 세션에 JSON만 다시 달라고 한 번 요청한 뒤에도 무효), 건너뜀.
 - 한도나 로그인 실패가 한 번 나오면 그 CLI는 그 회차 동안(같은 회차의 `workers --stage checker`·`workers --force`와 외부 fallback 실행 포함) 다시 부르지 않고 남은 작업은 그 칸의 fallback으로 대체 실행된다. fallback이 그 CLI이거나 동의 밖 수신처·쓸 수 없는 CLI일 때만 `claude-only` 값의 Claude로 돈다. 소진 상태는 회차에 남는다. `jobs --force`로 회차를 다시 열면 다시 부른다. 로그인이 풀렸으면 보고서가 `codex login` 또는 `cursor-agent login`을 안내한다. 사용자에게 알리고 로그인 뒤 이어서 돌린다.
 - 읽기 역할(점검자 등)이 워크트리를 바꿨으면 실행기가 되돌리고 그 결과를 무효로 버려 대체 실행으로 보낸다(바뀐 내용을 보고 낸 승인이라 믿지 않는다). 대체 실행 전에도 워크트리를 실행 전 상태로 되돌린다.
-- 보고서의 「역할 배정」 절에 배정 표, 배정 때 바꾼 칸, 실행 중 대체(회차·단계별 CLI 작업 수와 대체 실행 건수, 외부 CLI로 다시 돌린 작업)가 남고, 「역할별 사용량」 표에 칸별 호출 수·대체 실행(사유별)·CLI별 입력·출력·캐시 읽기 토큰과 「기록 없음(건)」이 남는다. ACP 응답에는 토큰 사용량이 없어서 Cursor 읽기 역할 작업은 토큰 대신 기록 없음 건수로 센다. 대체 실행이 있으면 사용자에게 건수를 알린다(Claude 비용이 그만큼 돌아온다).
+- 보고서의 「역할 배정」 절에 배정 표, 배정 때 바꾼 칸, 실행 중 대체(회차·단계별 CLI 작업 수와 대체 실행 건수, 외부 CLI로 다시 돌린 작업)가 남고, 「역할별 사용량」 표에 칸별 호출 수·대체 실행(사유별)·Claude 토큰과 추정 비용·CLI 토큰이 남는다. ACP 응답에는 토큰 사용량이 없어서 Cursor 읽기 역할 작업은 토큰 대신 「기록 없음」 건수로 센다(0으로 세지 않는다). 대체 실행이 있으면 사용자에게 건수를 알린다(Claude 비용이 그만큼 돌아온다).
 
 ### 2026-10-18 실측
 
@@ -306,13 +309,14 @@ Claude·Cursor·`codex-doc` 결과는 형식이 같아 형식으로는 가릴 �
 - `judge`가 모델 ID 경고를 내면(작업자 B가 `claude-haiku-5-5`가 아님 등) 결과를 쓰지 말고 사용자에게 알린다. `init`·`opinion`·`recheck`가 Claude 검토자 모델 ID 경고를 내도 같다.
 - 동의하지 않은 수신처로는 보내지 않는다. 외부 CLI로 대체 실행할 때도 `profile.consented` 밖 runner는 쓰지 않는다(`claude-only` 값). 첫 검토 fallback도 같다.
 - 보고서에 대체 실행이 있으면(「역할 배정」·「역할별 사용량」 절) 사유별 건수를 사용자에게 알린다. 한도·오류로 검토 칸이 Claude로 바뀐 것도 알린다. Cursor 한도 문구(usage limit)나 로그인 풀림이 나오면 남은 작업이 Claude로 돌았다는 것과 로그인 명령(`cursor-agent login`·`codex login`)을 함께 알린다.
+- `CF usage`는 측정일 뿐이라 실패해도(`Claude 토큰 미측정`) 실행을 멈추지 않는다. 종료 코드 5는 `--run-dir`와 `--review-dir`을 둘 다 줬거나 `--run-dir`에 `--round`가 없는 등 호출이 잘못된 경우다.
 - 메모리 저장 도구(`memory_save` 등)가 있으면 보고를 마친 뒤 저장한다(실행 ID, 회차 수, 네 칸 건수, 남은 사람 결정).
 
 ## 결과 보고 형식
 
 `report` 출력을 기준으로 사용자에게 다음을 보고한다.
 
-1. 회차별 표(지적·합의·판가름 회부·판가름 채택·검토자 검토·사람 건수), 검토자(의견 칸의 runner), dry-run 여부. 「역할 배정」 절(프로필 이름·출처, 칸별 runner·모델·effort·fallback, 덮은 칸, 배정 때 바꾼 칸, 첫 검토 이력, 실행 중 대체)과 「역할별 사용량」 절(칸별 호출 수·대체 실행 건수·CLI별 토큰). 의견은 실제로 맡은 runner별로 보인다.
+1. 회차별 표(지적·합의·판가름 회부·판가름 채택·검토자 검토·사람 건수), 검토자(의견 칸의 runner), dry-run 여부. 「역할 배정」 절(프로필 이름·출처, 칸별 runner·모델·effort·fallback, 덮은 칸, 배정 때 바꾼 칸, 첫 검토 이력, 실행 중 대체)과 「역할별 사용량」 절(칸별 호출 수·대체 실행 건수·Claude 토큰·Claude 비용(추정)·CLI 토큰, 합계 줄, 「단가 기준:」 줄). 의견은 실제로 맡은 runner별로 보인다. 비용은 `CF usage`가 기록 때 저장한 추정값의 합이고 그때의 공개 단가 기준이다. 「미측정」은 Claude 작업이 있는데 `CF usage` 기록이 없는 칸이고, 「기록 없음」은 Cursor ACP처럼 토큰을 남기지 않는 CLI 작업이다. 「다시 연 회차의 이전 Claude 비용:」 줄이 있으면 `jobs --force`로 다시 연 회차의 이전 비용이 합계와 따로 있다는 뜻이다.
 2. 사람이 볼 목록 네 칸 — **반박**(동의 / 그래도 고친다), **설계 결정**(판정자 근거, 문서 모드면 작성자 선택지 — 고를 선택지 / 직접 정함 / 보류, 또는 작성자 수정안과 패치 경로 — 작성자 안 채택 / 직접 정함 / 보류), **판단 불가**(Opus·검토자 의견, 패치 경로), **보류 후보**(지금 반영 / 구현 때 테스트로 / 보류). 칸마다 사람이 고를 것을 묻는다.
 3. 「간섭 의심」 절이 있으면(기준선도 실패한 경우 포함) 작업 트리에 패치가 남아 있다는 사실과 되돌릴지 사람이 정해야 한다는 것.
 4. **준비됨** — 커밋 메시지 초안(`prepared/commit-message.txt`), PR이면 답글 초안(`prepared/replies.json`)과 resolve 대상(`prepared/resolve.json`). 누르는 것은 사람이다.

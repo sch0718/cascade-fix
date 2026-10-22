@@ -1345,5 +1345,12 @@ class ReplayExternalTest(WorkersTestBase):
         self.assertFalse((Path(meta["pending_run_dir"]) / "round-1" / "stage1-cli.json").exists())
 
 
+class EvalScriptsTest(unittest.TestCase):
+    def test_eval_scripts_still_import_stdlib(self):
+        for script in ("replay.py", "score.py", "select_profiles.py", "adopt_recalc.py", "first_review.py", "regress.py"):
+            proc = subprocess.run([sys.executable, str(ROOT / "eval" / script), "--help"], capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, f"{script}: {proc.stderr}")
+
+
 if __name__ == "__main__":
     unittest.main()

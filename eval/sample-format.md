@@ -32,6 +32,19 @@
 
 `finding.id`는 표본 안에서 겹쳐도 된다. 채점은 항목 `id`로 찾고 항목 안에서 `finding.id`의 마지막 판정을 본다.
 
+## 실행 단위 표본(`run`)
+
+문서 하나를 한 번 실행하면 지적 여러 개가 한 원장에 들어간다. 줄에 `run`을 적으면 `score.py`가 `replay.py`의 `<id>/run/` 대신 그 실행 폴더를 직접 읽는다. 판정은 지적마다 보고, 호출 수·사용량·비용은 같은 `run`을 한 번만 센다(지적별 폴더에 같은 실행을 연결하면 지적 수만큼 겹쳐 잡힌다).
+
+```json
+{"id": "plan-a-01", "run": "plan-a-2026-10-22", "finding": {"id": "r1-01"}, "truth": {"verdict": "사실", "accepted_patch": null}}
+```
+
+- `run`: `score.py --runs` 폴더 아래의 이름. 그 폴더에 `ledger.json`과 `round-*`가 있어야 한다(실행 폴더 `.cascade-fix/<실행 id>/`를 `cleanup` 전에 통째로 복사한 것). 구성별 폴더(`--runs`·`--baseline-runs`)에서 같은 `run` 이름으로 찾는다.
+- 채점에 쓰는 키는 `id`·`run`·`finding.id`·`truth.verdict`다. `repo`·`commit`·`source`·`doc`은 `replay.py`가 읽는 키라 이 줄에는 필요 없다. `baseline_opus_calls`를 빼면 지적 1건당 1로 센다.
+- `<runs>/<run>/ledger.json`이 없으면 그 지적은 「실행 기록 없는 항목」으로 세고 「맞히지 못함」이다.
+- 실행이 끝나지 않았으면(회차마다 판정과 `apply` 이벤트가 있어야 끝난 것이다. `--round N`이면 N회차까지만 본다) 그 실행의 지적이 모두 「미완료 항목」이고 「맞히지 못함」이다. 다른 실행은 영향이 없다.
+
 ## 30건 모으는 방법
 
 목표는 30건 이상이고 「사실」과 「아님」이 섞여야 한다. 「아님」은 일부러 넣는다. 일치율이 「사실」만 모은 표본에서는 과대하게 나온다.
@@ -83,21 +96,36 @@
 4. 채점.
 
    ```
-   python3 eval/score.py --runs <결과 폴더> --sample eval/sample.jsonl [--out score.md]
+   python3 eval/score.py --runs <결과 폴더> --sample eval/sample.jsonl [--round N] [--pre-final] [--cost-scope all|round1-core] [--out score.md] [--json score.json]
    ```
 
-   마크다운 표 하나와 끝의 성공 기준 줄이 나온다. 표의 값은 설계 14절의 것이다.
+   마크다운 표 하나와 정답별 표, 끝의 성공 기준 줄이 나온다. 표의 값은 설계 14절의 것이다.
 
    | 값 | 계산 |
    | --- | --- |
+   | 정확도 | 판정이 `truth.verdict`와 같은 항목 ÷ **표본 전체 수**. 오류·미완료·누락 항목과 판정 없음은 「맞히지 못함」으로 센다(분모에서 빼지 않는다) |
+   | 완료율 | 채점된 항목 ÷ 표본 전체 수. 오류·미완료·누락 항목이 빠진다 |
    | 판정 일치율 | 예측 판정이 `truth.verdict`와 같은 항목 ÷ 판정이 나온 항목. 합의-사실·판가름(패치 채택)은 사실, 합의-아님·판가름(아님)은 아님, 이유에 「재현 불가」가 있으면 재현 불가. 판단불가·설계결정·보류후보는 판정 없음이라 분모에서 뺀다 |
    | 채택 경로 분포 | 합의(합의-사실·합의-아님, 규칙 채택 제외) / 규칙 채택(합의-사실 중 이유에 「둘 다 검증 통과」가 있는 것. `--adopt-on-both-pass`를 끈 실행에서는 0) / 판가름 / Codex 검토(판단불가·설계결정·보류후보 중 Codex 의견이 원장에 붙은 것) / 사람(나머지) |
    | 패치 다르지만 둘 다 통과 | 판정 이유에 「패치가 다름」이나 「둘 다 검증 통과」가 있는 항목 ÷ 채점한 항목 |
    | Opus 호출 수 | 회차별 `results.json`의 `<id>:adjudicator` 개수 |
    | 기준 Opus 호출 수 | `baseline_opus_calls`의 합. 비율은 호출 수 ÷ 기준 |
-   | 회귀 건수 | `apply.json`의 `final_ok`가 `false`인 항목 |
+   | 회귀 건수 | 회귀가 난 **실행** 수. `apply.json`의 전체 검사 이력(`final_history`) 중 한 번이라도 `final_ok`가 `false`이고 기준선도 실패한 것이 아니었던 실행이다(이력이 없는 옛 기록은 지금 필드로 같은 조건). 한 실행의 여러 회차가 회귀해도 1이다. 같은 판정 함수(`is_regression`)를 `regress.py`도 쓴다 |
    | 문서 점검자 정확도 | 문서 항목에서 점검자가 「아니오」라 한 것 중 판가름이 「사실」이라 한 비율. 없으면 `-` |
+   | 아님→사실 채택 | 정답이 「아님」인데 예측이 「사실」인 항목 수 |
+   | 사람 목록 | 판정이 판단불가·설계결정·보류후보인 항목 수 |
+   | Claude 비용(추정) | 실행마다 `CF usage`가 저장한 작업별 비용(`claude-usage.json`, 첫 검토는 원장 `profile.first_review.usage`)의 합. 단가로 다시 계산하지 않는다. 비용을 구할 수 없는 실행(기록이 없거나 비용이 없는 작업이 있는 것)이 하나라도 섞이면 합계는 「미측정(<실행 id>)」이고 0으로 세지 않는다 |
    | 오류 항목 수 | `replay.py`가 `meta.json`에 오류를 적은 항목. 채점에서 뺀다 |
+
+   옵션과 출력은 다음과 같다.
+
+   - `--round N`: N회차까지의 판정·호출·사용량·비용만 센다. 소급 재생 비교는 1회차만 보므로 `--round 1`을 준다.
+   - `--pre-final`: 회차별 `decisions-pre-final.json`(`apply`가 전체 검사 전에 저장한 판정)으로 판정한다. 없는 회차는 원장 판정을 쓴다. 실제 실행만 거치는 전체 검사가 판정을 바꾼 몫을 빼고 dry-run과 비교할 때 쓴다.
+   - `--cost-scope all|round1-core`(기본 `all`): `round1-core`는 1회차 작업자·점검자·판가름(`a`·`b`·`judge_a`·`judge_b`·`writer`·`checker`·`adjudicator`)과 그 대체 실행만 센다. 의견·재검토·첫 검토는 뺀다. `adopt_recalc.py`가 만든 폴더(`counterfactual.json`)는 `round1-core`로만 비용을 낸다(`all`이면 비용이 「미측정(반사실은 round1-core만)」).
+   - `--json <파일>`: 지표를 JSON으로 쓴다. `--baseline-runs`를 줬으면 `selection`(선정 판정)도 들어간다. `select_profiles.py`의 입력이다.
+   - 비용 줄과 표: 표 아래에 「칸별 Claude 사용량」 표(칸·호출·대체 실행·Claude 토큰(입력/출력/캐시 읽기)·Claude 비용(추정). 토큰을 남기지 않는 Cursor ACP 칸은 「기록 없음」, `CF usage` 기록이 빠진 칸은 「미측정」)와 「단가 기준:」 줄(저장된 기준 날짜와 출처)이 붙는다.
+   - 정답별 표: 정답(`사실`·`아님`·`재현 불가`)마다 맞음·판정 있음·전체·사람 목록·아님→사실 채택.
+   - `--baseline-runs`를 주면 끝에 「선정 조건」 줄이 붙는다. 형식은 `선정 조건: 통과|미달(<미달 조건>) — 정확도 …(…) · 「아님」 오채택 …(…) · 완주 …(…) · 대체 실행 …(…) · 회귀 … · Claude 비용 …`이다. 조건은 정확도(기준선보다 5%p 넘게 낮지 않다), 「아님」 오채택(기준선 이하), 완주(오류·미완료·누락이 표본의 5% 이하), 대체 실행(CLI 작업의 10% 이하), 회귀(0건)다. 회귀를 못 재면 `회귀 미측정`이고 조건에서 뺀다. 비용을 구할 수 없으면 `Claude 비용 미측정`이다.
 
    회귀는 전향(실제 적용) 실행에서만 측정된다. 소급 재생은 항상 dry-run이라 전체 테스트를 돌리지 않으므로 `apply.json`에 `final_ok`가 없고, 이때 표는 「측정 불가」, 판정 줄은 「회귀 미측정」으로 적는다. `--collect`는 끝나지 않은 항목(위 조건)을 수집하지 않고 `meta.json`에 `incomplete`를 적으며, 채점은 그런 항목을 오류 항목처럼 빼고 「미완료 항목 수」로 따로 센다. 항목에 오류가 하나라도 있으면 `replay.py`는 종료 코드 1을 돌려준다.
 
@@ -116,6 +144,56 @@
    python3 eval/score.py --runs <external 결과> --baseline-runs <claude 결과> --sample eval/sample.jsonl [--out compare.md]
    ```
 
-   표는 「Claude 작업자 | 외부 작업자」 두 열이고 끝에 「비교 판정」 한 줄이 붙는다. 통과 기준은 일치율 차이 5%p 이하, Opus 호출 수가 Claude 작업자 실행 이하, 대체 실행이 CLI 작업의 10% 이하, 회귀 0건이다. 못 미치는 항목은 `미달(일치율, Opus 호출, 대체 실행, 회귀)`처럼 적는다. 외부 실행에 CLI 작업이 없으면 대체 실행을 잴 수 없으므로 `미달(대체 실행 미측정)`이다. 소급 재생은 회귀를 못 재므로 「회귀 미측정」이라 적고 판정에서는 뺀다. 이때 단일 실행의 성공 기준 줄(95%·40%)은 나오지 않는다. 절차 전체는 `docs/2026-10-18-workers-measurement-plan.md`에 있다.
+   표는 「Claude 작업자 | 외부 작업자」 두 열이고 끝에 「선정 조건」(위)과 「비교 판정」 두 줄이 붙는다. 통과 기준은 일치율 차이 5%p 이하, Opus 호출 수가 Claude 작업자 실행 이하, 대체 실행이 CLI 작업의 10% 이하, 회귀 0건이다. 못 미치는 항목은 `미달(일치율, Opus 호출, 대체 실행, 회귀)`처럼 적는다. 외부 실행에 CLI 작업이 없으면 대체 실행을 잴 수 없으므로 `미달(대체 실행 미측정)`이다. 소급 재생은 회귀를 못 재므로 「회귀 미측정」이라 적고 판정에서는 뺀다. 이때 단일 실행의 성공 기준 줄(95%·40%)은 나오지 않는다. 절차 전체는 `docs/2026-10-18-workers-measurement-plan.md`에 있다.
 
    성공 기준은 판정 일치 95% 이상, Opus 호출 40% 이하, 회귀 0건이다. 하나라도 못 미치면 값과 원인을 보고하고 구조를 되돌릴지 사용자가 정한다.
+
+5. 후보 고르기. 구성(프로필)마다 같은 표본을 여러 번 돌려 `score.py --json`으로 실행마다 지표를 저장해 둔다. 기준선 구성의 결과를 `--baseline-runs`로 주고 채점한 JSON이면 실행마다의 `selection`도 들어 있다.
+
+   ```
+   python3 eval/select_profiles.py --candidate <이름>=<JSON>[,<JSON>…] [--candidate …] --baseline <기준선 이름> [--json 선정.json]
+   ```
+
+   - `--candidate`는 후보 이름과 그 후보의 실행별 `score.py --json` 파일을 쉼표로 이어 준다. 여러 번 줄 수 있고 `--baseline`은 그중 하나여야 한다.
+   - 출력은 `기준선:` 줄, 후보별 평균 `[최소~최대]` 표(정확도·「아님」 오채택·완주·대체 실행·회귀 실행·Opus 호출·Claude 비용·사람 목록·판정 흔들림), 후보마다의 「거름 사유」, 끝의 `선정:` 줄이다.
+   - 조건은 `score.py`의 「선정 조건」과 같고 평균으로 본다. 실행 중 한 번이라도 정확도 조건을 못 넘으면 후보 이름에 「(불안정)」이 붙는다. Claude 비용이 한 실행이라도 미측정이면 그 후보는 「비용 미측정으로 제외」되어 0원으로 이기지 않는다.
+   - 조건을 통과한 후보 중 Claude 비용 평균이 가장 적은 것을 고른다. 비용 차이가 10% 이내인 후보끼리는 사람 목록 평균이 적은 쪽이다. 고를 후보가 없으면 `선정: 없음`이다.
+   - 점수 JSON을 읽지 못하면 종료 코드 1이다.
+
+6. 첫 검토 세 결과 합치기·채점. 같은 입력을 Claude·Codex·Cursor가 각각 첫 검토한 결과를 묶음으로 합친다. 묶음 정답은 합친 목록으로 실제 실행한 결과와 사람의 반영·철회로 정한다.
+
+   - **검토자마다 결과를 자기 폴더에 둔다.** `merge`는 `--claude`·`--codex`·`--cursor`가 가리키는 결과 파일 **옆의** `review-meta.json`을 그 검토자의 첫 검토 이력으로 붙이고(`merged.json`의 `reviewers.<runner>.meta`), Claude는 같은 폴더의 `claude-usage.json`을, Cursor는 결과 파일 이름에서 `.final`을 뺀 원본 로그(`review.out.final`이면 `review.out`)에서 토큰을 읽는다. 결과를 한 폴더에 모으면 그 폴더의 `review-meta.json` 하나가 모두의 이력으로 붙는다. 보통 `CF review`가 만든 각자의 `review_dir`을 그대로 쓴다. Claude 첫 검토는 Workflow 뒤에 `CF usage --review-dir <review_dir> --workflow <Workflow 실행 id>`를 돌려 `claude-usage.json`을 만들어 둔다.
+   - 묶음 후보를 만든다. 코드 모드는 `--doc` 없이, 문서 모드는 검토한 문서를 `--doc`으로 준다. 결과는 하나 이상 주면 된다.
+
+     ```
+     python3 eval/first_review.py merge [--claude <review.json>] [--codex <.final>] [--cursor <.final>] [--doc <문서>…] --out <폴더>
+     ```
+
+     `<폴더>/merged.json`(지적과 묶음 후보)과 `<폴더>/review.md`(확정 방법과 묶음 표)가 생긴다. 위치가 같거나 같은 파일 5줄 안이면 묶음 후보로 제안할 뿐 자동으로 확정하지 않는다.
+   - 사람이 `merged.json`의 `groups`를 고친다(같은 지적이면 `members`를 한 묶음으로 옮기고, 다르면 나눈다. 모든 지적은 한 묶음에만 둔다). 다 고쳤으면 `"confirmed"`를 `true`로 바꾸고 확정한다.
+
+     ```
+     python3 eval/first_review.py merge --confirm <폴더>/merged.json --out <폴더>
+     ```
+
+     `findings-input.json`(묶음마다 가장 높은 등급의 지적)과 `found-by.json`(묶음을 찾은 검토자)이 생기고, 이어 돌릴 `cascade.cli init --source claude-code|claude-doc --findings-json …` 명령이 출력된다. `--confirm`은 `--claude`·`--codex`·`--cursor`·`--doc`과 함께 쓰지 않는다.
+   - **합친 입력의 실제 실행 보고서에는 첫 검토 이력이 없다**(`--findings-json`으로 시작하므로). 첫 검토 비용은 아래 `score`로 본다.
+   - 채점. 정답 파일(jsonl)은 줄마다 `{"group": "g01", "truth": "사실|아님|재현 불가"}`이고 모든 묶음에 줄이 있어야 한다.
+
+     ```
+     python3 eval/first_review.py score --merged <확정한 merged.json> --truth <정답.jsonl> [--usage-claude <claude-usage.json>] [--usage-cli <Cursor 원본 로그>…] [--json 결과.json]
+     ```
+
+     검토자별 지적 수·정밀도·재현율, 등급별 정밀도·재현율, 첫 검토 비용(입력·출력·캐시 읽기·캐시 쓰기 토큰과 저장된 비용의 합, 다시 계산하지 않는다)이 나온다. Codex는 토큰을 남기지 않아 「기록 없음」, Claude는 사용량 파일이 없으면 「기록 없음」, 사용량 행이 없으면 「미측정(형식 확인 필요: …)」, 비용이 없는 작업이 있으면 비용 칸이 「미측정: 비용이 없는 작업이 있다」이다. `--usage-*`를 주지 않으면 `merged.json`에 담긴 값을 쓴다. 확정하지 않았거나 묶음·정답이 어긋나면 종료 코드 1과 이유 한 줄이다.
+
+7. 회귀(전향 측정). 실제 실행(dry-run 아님)의 실행 폴더를 프로필별로 모아 회귀를 센다.
+
+   ```
+   python3 eval/regress.py --runs <.cascade-fix/<실행 id>>… [--reverts <되돌림.jsonl>] [--stop-runs N] [--stop-patches N] [--json 결과.json]
+   ```
+
+   - 프로필은 원장의 `profile.name`이고 없으면 `legacy`다. dry-run 실행은 「dry-run 제외」로 따로 세고 회귀에 넣지 않는다.
+   - 회귀 = 전체 검사 회귀가 있었던 실행(`score.py`의 `is_regression`과 같은 판정) ∪ 되돌림이 있었던 실행(합집합의 크기)이다. 기준선도 실패한 전체 검사는 회귀가 아니다.
+   - 되돌림 파일은 채택 패치를 되돌리거나 다시 고친 것을 줄마다 `{"run": "<실행 폴더 이름>", "finding": "<지적 id>", "reason": "<사유>"}`로 적는다. `run`이 `--runs`에 없으면 경고하고 「프로필 불명」으로 센다.
+   - `--runs`는 시간 순서로 준다. 프로필마다 실행 `--stop-runs`건(기본 10) 또는 채택 패치 `--stop-patches`건(기본 50) 중 먼저 닿는 쪽을 「종료 조건 진행」 줄이 알린다.
+   - 출력은 프로필 · 실행 · dry-run 제외 · 채택 패치 · 간섭 회귀 실행 · 회귀 회차 · 기준선도 실패 · 되돌림 · 회귀 표다. 읽지 못한 실행 폴더나 형식이 틀린 되돌림 줄이 있으면 `오류:`를 stderr에 내고 종료 코드 1이다.
