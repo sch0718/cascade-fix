@@ -727,13 +727,21 @@ class RoleUsageTest(unittest.TestCase):
 SONNET = "claude-sonnet-5-5"
 
 
+def price_table_source():
+    from cascade import usage as price_table
+    return price_table.PRICE_SOURCE
+
+
 def usage_row(job_id, cell, input=4, output=80, cache_read=2000, cost=0.0123, model=SONNET):
     return {"job_id": job_id, "label": f"{job_id} label", "cell": cell, "model": model, "input": input, "output": output,
             "cache_read": cache_read, "cache_write": 0, "cost": cost}
 
 
-def usage_file(*rows, prices_as_of="2026-10-06"):
-    return {"prices_as_of": prices_as_of, "workflows": {"wf_1": list(rows)}, "unmatched": {"wf_1": []}}
+def usage_file(*rows, prices_as_of="2026-10-06", price_source=None):
+    data = {"prices_as_of": prices_as_of, "workflows": {"wf_1": list(rows)}, "unmatched": {"wf_1": []}}
+    if price_source is not None:
+        data["price_source"] = price_source
+    return data
 
 
 class ClaudeUsageColumnsTest(unittest.TestCase):
@@ -898,6 +906,86 @@ class ClaudeUsageColumnsTest(unittest.TestCase):
             text = self.render(ledger, run_dir)
         self.assertIn("| Claude 의견 | 1 | 0 | 4/80/2000 | $0.0500 | - |", text)
         self.assertIn("| Claude 재검토 | 0 | 0 | - | - | - |", text)
+
+    def mixed_opinion_ledger(self, run_dir, with_usage):
+        events = [{"step": "opinion:F1", "at": "t", "runner": "codex", "model": ""},
+                  {"step": "opinion:F2", "at": "t", "runner": "claude", "model": SONNET,
+                   "fallback": {"from": "codex", "to": "claude", "reason": "이용 한도"}}]
+        ledger = profile_ledger(profile_record("local"), events=events, opinions={"F1": "a", "F2": "b"})
+        write_json(run_dir / "round-1" / "opinion-args.json", {"jobs": [job("F2:opinion")]})
+        if with_usage:
+            write_json(run_dir / "round-1" / "claude-usage.json",
+                       usage_file(usage_row("F2:opinion", "code.opinion", cost=0.05)))
+        return ledger
+
+    def test_codex_opinion_row_does_not_show_the_claude_cell_usage_or_double_the_total(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            text = self.render(self.mixed_opinion_ledger(run_dir, True), run_dir)
+        self.assertIn("| Codex 의견 | 1 | 0 | - | - | - |", text)
+        self.assertIn("| Claude 의견 | 1 | 1(이용 한도) | 4/80/2000 | $0.0500 | - |", text)
+        self.assertIn("합계: Claude 토큰 입력 4 · 출력 80 · 캐시 읽기 2000, 추정 비용 $0.0500", text)
+        self.assertNotIn("$0.1000", text)
+
+    def test_codex_opinion_row_does_not_double_the_unmeasured_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            text = self.render(self.mixed_opinion_ledger(run_dir, False), run_dir)
+        self.assertIn("| Codex 의견 | 1 | 0 | - | - | - |", text)
+        self.assertIn("| Claude 의견 | 1 | 1(이용 한도) | 미측정 | 미측정 | - |", text)
+        self.assertIn("합계: Claude 토큰·비용 미측정(미측정 1건)", text)
+
+    def test_codex_recheck_row_does_not_show_the_claude_cell_usage_or_double_the_total(self):
+        events = [{"step": "recheck", "at": "t", "runner": "codex", "model": ""}]
+        ledger = profile_ledger(profile_record("local"), events=events, recheck=True)
+        ledger.rounds.append(RoundRecord(no=2, findings=[], decisions=[], adopted=[], recheck_opened=True,
+                                         events=[{"step": "recheck", "at": "t", "runner": "claude", "model": SONNET}]))
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            write_json(run_dir / "round-2" / "recheck-args.json", {"jobs": [job("round-2:recheck")]})
+            write_json(run_dir / "round-2" / "claude-usage.json",
+                       usage_file(usage_row("round-2:recheck", "code.recheck", cost=0.07)))
+            text = self.render(ledger, run_dir)
+        self.assertIn("| Codex 재검토 | 1 | 0 | - | - | - |", text)
+        self.assertIn("| Claude 재검토 | 1 | 0 | 4/80/2000 | $0.0700 | - |", text)
+        self.assertIn("추정 비용 $0.0700", text)
+        self.assertNotIn("$0.1400", text)
+
+    def test_tiny_cost_prints_as_less_than_a_unit_not_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            ledger = self.code_ledger(run_dir, usage_file(usage_row("F1:a", "code.a", cost=0.00002),
+                                                          usage_row("F1:b", "code.b", cost=0.0)))
+            text = self.render(ledger, run_dir)
+        self.assertIn("| code.a | 1 | 0 | 4/80/2000 | <$0.0001 | - |", text)
+        self.assertIn("| code.b | 1 | 0 | 4/80/2000 | $0.0000 | - |", text)
+        self.assertIn("추정 비용 <$0.0001", text)
+
+    def test_price_basis_uses_the_stored_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            ledger = self.code_ledger(run_dir, usage_file(usage_row("F1:a", "code.a"), prices_as_of="2026-09-01",
+                                                          price_source="옛 단가 출처"))
+            text = self.render(ledger, run_dir)
+        self.assertIn("단가 기준: 2026-09-01 옛 단가 출처", text)
+        self.assertNotIn(price_table_source(), text)
+
+    def test_superseded_usage_is_listed_apart_and_not_in_the_total(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            ledger = self.code_ledger(run_dir, usage_file(usage_row("F1:a", "code.a", cost=0.5)))
+            write_json(run_dir / "round-1" / "claude-usage.superseded-1.json", usage_file(usage_row("F1:a", "code.a", cost=0.2)))
+            write_json(run_dir / "round-1" / "claude-usage.superseded-2.json", usage_file(usage_row("F1:a", "code.a", cost=0.3)))
+            text = self.render(ledger, run_dir)
+        self.assertIn("다시 연 회차의 이전 Claude 비용: $0.5000(별도, 합계에 넣지 않음)", text)
+        self.assertIn("| code.a | 1 | 0 | 4/80/2000 | $0.5000 | - |", text)
+        self.assertIn("추정 비용 $0.5000", text)
+
+    def test_no_superseded_line_without_superseded_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            text = self.render(self.code_ledger(run_dir, usage_file(usage_row("F1:a", "code.a"))), run_dir)
+        self.assertNotIn("다시 연 회차", text)
 
     def test_claude_opinion_without_usage_is_unmeasured(self):
         events = [{"step": "opinion:F1", "at": "t", "runner": "claude", "model": SONNET}]

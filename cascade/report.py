@@ -46,6 +46,7 @@ REPLY_PENDING = "검토 중입니다."
 UNTIMED_STEPS = ("report", "usage")
 UNMEASURED = "미측정"
 NOT_RECORDED = "기록 없음"
+SUPERSEDED_GLOB = "claude-usage.superseded-*.json"
 TABLE_FOOTNOTE = (
     "합의-아님은 합의 칸에 한 번 세고 사람이 볼 목록의 반박 칸에도 오른다. "
     "판가름 회부는 판가름에 들어간 지적 전부이고, 판가름 채택은 그 가운데 패치를 채택한 지적이다. "
@@ -608,7 +609,10 @@ def _review_rows(runners: list[str], events: list[dict | None], fallback: str, w
             _add_reason(reasons, runner, str(event["fallback"].get("reason", "")))
     rows = []
     for r, n in counts.items():
-        tokens, cost = claude.columns(claude.rows.get(cell, []), claude.jobs.get(cell, set()), r == RUNNER_CLAUDE)
+        if r == RUNNER_CLAUDE:
+            tokens, cost = claude.columns(claude.rows.get(cell, []), claude.jobs.get(cell, set()), True)
+        else:
+            tokens, cost = "-", "-"
         rows.append(f"| {reviewer_label(r)} {what} | {n} | {_reason_text(reasons.get(r, {}))} | {tokens} | {cost} | - |")
     return rows or [f"| {reviewer_label(fallback)} {what} | 0 | 0 | - | - | - |"]
 
@@ -627,6 +631,10 @@ def _stored_number(value) -> int | float | None:
     return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 
+def _money(amount: float) -> str:
+    return "<$0.0001" if 0 < amount < 0.0001 else f"${amount:.4f}"
+
+
 def _read_usage_rows(data) -> list[dict]:
     workflows = data.get("workflows") if isinstance(data, dict) else None
     rows = [row for share in (workflows.values() if isinstance(workflows, dict) else []) if isinstance(share, list)
@@ -641,7 +649,8 @@ class _ClaudeUsage:
         self.known = run_dir is not None
         self.rows: dict[str, list[dict]] = {}
         self.jobs: dict[str, set[str]] = {}
-        self.as_of: list[str] = []
+        self.basis: list[tuple[str, str]] = []
+        self.superseded: list[float] | None = None
         self.first_review_rows: list[dict] = []
         self.shown: list[dict] = []
         self.unmeasured = 0
@@ -650,6 +659,8 @@ class _ClaudeUsage:
             rd = Path(run_dir) / f"round-{rnd.no}"
             data = _read_json(rd / USAGE_FILE)
             self._note_date(data)
+            for old in sorted(rd.glob(SUPERSEDED_GLOB)):
+                self.superseded = [*(self.superseded or []), *self._costs(_read_usage_rows(_read_json(old)))]
             for row in _read_usage_rows(data):
                 if isinstance(row.get("cell"), str):
                     self.rows.setdefault(row["cell"], []).append(row)
@@ -665,10 +676,17 @@ class _ClaudeUsage:
         self._note_date(data)
         self.first_review_rows = _read_usage_rows(data)
 
+    @staticmethod
+    def _costs(rows: list[dict]) -> list[float]:
+        return [c for c in (_stored_number(row.get("cost")) for row in rows) if c is not None]
+
     def _note_date(self, data) -> None:
         stored = data.get("prices_as_of") if isinstance(data, dict) else None
-        if isinstance(stored, str) and stored not in self.as_of:
-            self.as_of.append(stored)
+        if isinstance(stored, str):
+            source = data.get("price_source")
+            entry = (stored, source if isinstance(source, str) else price_table.PRICE_SOURCE)
+            if entry not in self.basis:
+                self.basis.append(entry)
 
     def columns(self, rows: list[dict], jobs: set[str], work: bool) -> tuple[str, str]:
         """(토큰, 비용) 칸 글자. 이 칸에 Claude 작업이 있는데(work나 jobs) 기록이 없으면 미측정, 작업이 없으면 -."""
@@ -684,7 +702,7 @@ class _ClaudeUsage:
         self.unmeasured += missing + no_price
         tokens = "/".join(str(sum(_stored_number(row.get(k)) or 0 for row in rows)) for k in ("input", "output", "cache_read"))
         known = [c for c in costs if c is not None]
-        cost = f"${sum(known):.4f}" if known else UNMEASURED
+        cost = _money(sum(known)) if known else UNMEASURED
         return (f"{tokens} 외 {UNMEASURED} {missing}건" if missing else tokens,
                 f"{cost} 외 {UNMEASURED} {missing + no_price}건" if known and missing + no_price else cost)
 
@@ -694,16 +712,23 @@ class _ClaudeUsage:
                 total = f"Claude 토큰·비용 {UNMEASURED}({UNMEASURED} {self.unmeasured}건)"
             else:
                 total = "Claude 작업 없음" if self.known else "알 수 없다(run-dir 없음)"
-            return [f"합계: {total}", "", self._basis()]
+            return [f"합계: {total}", "", self._basis(), *self._superseded_lines()]
         sums = [sum(_stored_number(row.get(k)) or 0 for row in self.shown) for k in ("input", "output", "cache_read")]
-        known = [c for c in (_stored_number(row.get("cost")) for row in self.shown) if c is not None]
-        cost = f"${sum(known):.4f}" if known else UNMEASURED
+        known = self._costs(self.shown)
+        cost = _money(sum(known)) if known else UNMEASURED
         note = f" ({UNMEASURED} {self.unmeasured}건은 합계에서 빠졌다)" if self.unmeasured else ""
         return [f"합계: Claude 토큰 입력 {sums[0]} · 출력 {sums[1]} · 캐시 읽기 {sums[2]}, 추정 비용 {cost}{note}", "",
-                self._basis()]
+                self._basis(), *self._superseded_lines()]
 
     def _basis(self) -> str:
-        return f"단가 기준: {', '.join(self.as_of) or price_table.PRICES_AS_OF} {price_table.PRICE_SOURCE}"
+        entries = self.basis or [(price_table.PRICES_AS_OF, price_table.PRICE_SOURCE)]
+        return "단가 기준: " + "; ".join(f"{as_of} {source}" for as_of, source in entries)
+
+    def _superseded_lines(self) -> list[str]:
+        if self.superseded is None:
+            return []
+        cost = _money(sum(self.superseded)) if self.superseded else UNMEASURED
+        return ["", f"다시 연 회차의 이전 Claude 비용: {cost}(별도, 합계에 넣지 않음)"]
 
 
 def _calls_section(ledger: Ledger, run_dir: Path | None) -> list[str]:

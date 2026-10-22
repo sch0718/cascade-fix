@@ -1,4 +1,5 @@
 import argparse
+import itertools
 import json
 import os
 import re
@@ -759,6 +760,9 @@ def _reopen_round(ledger, rnd, rd: Path) -> None:
         ledger.opinions.pop(f["id"], None)
     for name in _JUDGE_OUTPUTS:
         (rd / name).unlink(missing_ok=True)
+    if (rd / s.USAGE_FILE).is_file():
+        k = next(n for n in itertools.count(1) if not (rd / f"claude-usage.superseded-{n}.json").exists())
+        (rd / s.USAGE_FILE).rename(rd / f"claude-usage.superseded-{k}.json")
     for path in rd.glob("opinion-*"):
         path.unlink()
 
@@ -1392,8 +1396,12 @@ def cmd_apply(args) -> int:
     if not ledger.dry_run:
         _remove_round_worktrees(ledger, rnd)
         base_wt = s.snapshot_of(ledger).worktrees.get(s.base_name(rnd))
-        if not (rd / PRE_FINAL_DECISIONS).exists():
+        if not (rd / PRE_FINAL_DECISIONS).exists() and data.get("final_ok") is not False:
             s.write_json(rd / PRE_FINAL_DECISIONS, rnd.decisions)
+        if "final_history" not in data and "final_ok" in data:
+            data["final_history"] = [{"final_ok": data["final_ok"], "baseline_failed": bool(data.get("baseline_failed")),
+                                      "interference": bool(data.get("interference")), "applied": data.get("applied", []),
+                                      "at": None}]
         final = _final_suite(root, base_wt, cfg, ledger.mode, changed) if applied else {"final_ok": None, "final_tail": ""}
         data.update(final)
         data["final_history"] = [*data.get("final_history", []), {
@@ -1637,8 +1645,8 @@ def _usage_record(workflow: str, labels: dict[str, str], cell_of, out: Path) -> 
         data = {}
     workflows = data["workflows"] if isinstance(data.get("workflows"), dict) else {}
     skipped = data["unmatched"] if isinstance(data.get("unmatched"), dict) else {}
-    s.write_json(out, {"prices_as_of": workflow_usage.PRICES_AS_OF, "workflows": {**workflows, name: rows},
-                       "unmatched": {**skipped, name: unmatched}})
+    s.write_json(out, {"prices_as_of": workflow_usage.PRICES_AS_OF, "price_source": workflow_usage.PRICE_SOURCE,
+                       "workflows": {**workflows, name: rows}, "unmatched": {**skipped, name: unmatched}})
     if unmatched:
         print(f"경고: 이름표가 작업과 일치하지 않는 에이전트는 어느 칸에도 넣지 않았다: {', '.join(unmatched)}")
     return {"workflow": name, "jobs": len(rows), "unmatched": len(unmatched), "error": None}

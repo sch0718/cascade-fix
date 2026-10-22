@@ -57,6 +57,7 @@ class UsageRecordTest(UsageCliBase):
         data = self.recorded()
         rows = {r["job_id"]: r for r in data["workflows"][wf.name]}
         self.assertEqual(data["prices_as_of"], usage.PRICES_AS_OF)
+        self.assertEqual(data["price_source"], usage.PRICE_SOURCE)
         self.assertEqual(rows["r1-01:a"]["cell"], "code.a")
         self.assertEqual(rows["r1-01:a"]["model"], SONNET)
         self.assertEqual(rows["r1-01:b"]["cell"], "code.b")
@@ -157,6 +158,34 @@ class UsageRecordTest(UsageCliBase):
         cost = usage.cost(SONNET, 3, 20, 500, 40)
         self.assertIn(f"| code.a | 2 | 0 | 3/20/500 외 미측정 1건 | ${cost:.4f} 외 미측정 1건 |", after)
         self.assertIn("단가 기준: " + usage.PRICES_AS_OF, after)
+
+    def jobs_force(self):
+        self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1", "--force")
+
+    def test_reopening_the_round_moves_the_record_aside(self):
+        self.usage(self.workflow())
+        first = self.recorded()
+        self.jobs_force()
+        self.assertFalse((self.rd / "claude-usage.json").exists())
+        self.assertEqual(json.loads((self.rd / "claude-usage.superseded-1.json").read_text(encoding="utf-8")), first)
+        self.usage(self.workflow("wf_2"))
+        self.jobs_force()
+        self.assertFalse((self.rd / "claude-usage.json").exists())
+        self.assertTrue((self.rd / "claude-usage.superseded-1.json").is_file())
+        self.assertEqual(sorted(json.loads((self.rd / "claude-usage.superseded-2.json").read_text(encoding="utf-8"))["workflows"]),
+                         ["wf_2"])
+
+    def test_reopening_without_a_record_leaves_no_superseded_file(self):
+        self.jobs_force()
+        self.assertEqual(list(self.rd.glob("claude-usage*")), [])
+
+    def test_report_shows_superseded_cost_apart_from_the_current_total(self):
+        self.usage(self.workflow())
+        self.jobs_force()
+        text = self.cli("report", "--run-dir", str(self.run_dir)).stdout
+        cost = usage.cost(SONNET, 3, 20, 500, 40) + usage.cost(HAIKU, 3, 20, 500, 40)
+        self.assertIn(f"다시 연 회차의 이전 Claude 비용: ${cost:.4f}(별도, 합계에 넣지 않음)", text)
+        self.assertIn("합계: Claude 토큰·비용 미측정", text)
 
     def test_opinion_and_recheck_jobs_map_to_cells(self):
         (self.rd / "opinion-args.json").write_text(json.dumps(

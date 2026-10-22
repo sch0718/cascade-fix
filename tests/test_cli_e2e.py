@@ -1364,6 +1364,40 @@ class FinalSuiteRecordTest(CliTestBase):
         self.assertIsNone(apply["final_ok"])
         self.assertIs(apply["interference"], True)
 
+    def drop_history(self):
+        path = self.run_dir / "round-1" / "apply.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        del data["final_history"]
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+    def test_old_apply_json_without_history_is_seeded_before_a_forced_rerun(self):
+        self.failing_full_suite()
+        self.run_to_apply()
+        self.drop_history()
+        self.apply_force()
+        hist = self.read("apply.json")["final_history"]
+        self.assertEqual([h["final_ok"] for h in hist], [False, None])
+        self.assertEqual((hist[0]["interference"], hist[0]["baseline_failed"], hist[0]["applied"]),
+                         (True, False, ["r1-01", "r1-02"]))
+
+    def test_rerun_after_a_final_failure_does_not_write_pre_final_from_changed_decisions(self):
+        self.failing_full_suite()
+        self.run_to_apply()
+        self.drop_history()
+        (self.run_dir / "round-1" / "decisions-pre-final.json").unlink()
+        self.apply_force()
+        self.assertFalse((self.run_dir / "round-1" / "decisions-pre-final.json").exists())
+
+    def test_old_passing_apply_json_is_seeded_and_still_gets_pre_final(self):
+        self.run_to_apply()
+        self.drop_history()
+        (self.run_dir / "round-1" / "decisions-pre-final.json").unlink()
+        self.apply_force()
+        hist = self.read("apply.json")["final_history"]
+        self.assertEqual([h["final_ok"] for h in hist], [True, True])
+        self.assertEqual(hist[0]["applied"], ["r1-01", "r1-02"])
+        self.assertEqual(self.read("decisions-pre-final.json")[0]["outcome"], "합의-사실")
+
     def test_final_history_records_baseline_failure(self):
         toml = write_repos_toml(self.tmp, {str(self.repo): {
             "tests": ["python3 -m unittest {files}"], "full_tests": ["python3 -c 'import sys; sys.exit(3)'"]}})
