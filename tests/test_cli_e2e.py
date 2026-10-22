@@ -517,6 +517,20 @@ class CliEndToEndTest(CliTestBase):
         self.assertEqual((d["r1-01"]["outcome"], d["r1-01"]["patch_from"]), ("판단불가", None))
         self.assertEqual(d["r1-01"]["reasons"][-1], "UTF-8 아닌 패치")
 
+    def test_utf8_replacement_character_in_the_file_is_not_lossy(self):
+        self.init()
+        self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1")
+        for name in ("r1-01-a", "r1-01-b"):
+            wt = self.wt(name)
+            (wt / "calc.py").write_text(fix(CALC, "return a - b", "return a + b"), encoding="utf-8")
+            (wt / "notes.txt").write_text("대체 문자 \ufffd\n", encoding="utf-8")
+        stage1 = self.run_dir / "round-1" / "stage1.json"
+        shutil.copyfile(FIXTURES / "workflow-stage1.json", stage1)
+        self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1))
+        d = {x["finding_id"]: x for x in self.ledger().rounds[0].decisions}
+        self.assertEqual(d["r1-01"]["outcome"], "합의-사실")
+        self.assertNotIn("UTF-8 아닌 패치", d["r1-01"]["reasons"])
+
     def test_missing_full_tests_falls_back_to_tests_with_warning(self):
         toml = write_repos_toml(self.tmp, {str(self.repo): {"tests": ["python3 -m unittest {files}"]}})
         self.env["CASCADE_REPOS_TOML"] = str(toml)

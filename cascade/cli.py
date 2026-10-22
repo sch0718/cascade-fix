@@ -950,7 +950,7 @@ def _judge_code(ledger, rnd, f, results, snap, cfg, baseline, repro):
     sensitive = s.is_sensitive(changed_files(pa) + changed_files(pb), cfg)
     d = decide(a, b, va, vb, pa, pb, sensitive, ledger.adopt_on_both_pass)
     d = s.without_empty_patch(d, {"a": pa, "b": pb}, adjudicated=False)
-    d = s.without_lossy_patch(d, {"a": pa, "b": pb})
+    d = s.without_lossy_patch(d, lambda role: s.worktree(snap, f.id, role), base)
     workers = {"a": a, "b": b}
     return d, workers, {"a": [r.to_dict() for r in ra], "b": [r.to_dict() for r in rb]}
 
@@ -1036,7 +1036,7 @@ def cmd_judge(args) -> int:
             checker = s.worker_from(merged, f.id, "checker") if f"{f.id}:checker" in merged else None
             d = decide_doc(a, b, checker, doc_problems[f.id])
             d = s.without_empty_patch(d, {"writer": writer_patches[f.id]}, adjudicated=False)
-            d = s.without_lossy_patch(d, {"writer": writer_patches[f.id]})
+            d = s.without_lossy_patch(d, lambda role: s.worktree(snap, f.id, role), s.base_of(ledger, rnd))
             decisions.append(s.without_outside_docs(d, {"writer": writer_patches[f.id]}, ledger.docs))
 
     by_id = {f.id: f for f in s.prompt_findings(ledger, findings)}
@@ -1110,7 +1110,8 @@ def cmd_adjudicate(args) -> int:
             d.reasons.append(REASON_SENSITIVE)
         patches = {role: s.worker_from(merged, f.id, role).patch for role in ("a", "b", "writer")}
         patches["adjudicator"] = adj.patch
-        new = s.without_lossy_patch(s.without_empty_patch(after_adjudication(d, adj, vadj), patches, adjudicated=True), patches)
+        new = s.without_lossy_patch(s.without_empty_patch(after_adjudication(d, adj, vadj), patches, adjudicated=True),
+                                    lambda role: s.worktree(snap, f.id, role), s.base_of(ledger, rnd))
         if ledger.mode == "doc":
             new = s.without_outside_docs(new, patches, ledger.docs)
         if adj.patch.strip():

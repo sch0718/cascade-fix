@@ -37,10 +37,6 @@ def _decode(data: bytes) -> str:
     return data.decode("utf-8", errors="replace")
 
 
-def is_lossy(diff: str) -> bool:
-    return "\ufffd" in diff
-
-
 def _git_checked(cwd: Path, *args: str) -> str:
     p = _git(cwd, *args)
     if p.returncode != 0:
@@ -86,8 +82,27 @@ def extract(wt: Path, snap_commit: str, cfg: RepoConfig | None = None) -> str:
     if cfg is not None:
         run_format(wt, cfg, files)
     _git_checked(wt, *NO_HOOKS, "add", "-A")
-    return _git_checked(wt, "--literal-pathspecs", "-c", "core.quotepath=false", "diff", "--cached", *DIFF_FLAGS,
-                        snap_commit, "--", *files)
+    return _decode(_staged_diff(wt, snap_commit, files))
+
+
+def _staged_diff(wt: Path, snap_commit: str, files: list[str]) -> bytes:
+    args = ("--literal-pathspecs", "-c", "core.quotepath=false", "diff", "--cached", *DIFF_FLAGS, snap_commit, "--", *files)
+    p = _git(wt, *args)
+    if p.returncode != 0:
+        raise RuntimeError(f"git 명령 실패 (git {' '.join(args)}): {_decode(p.stderr).strip()}")
+    return p.stdout
+
+
+def is_lossy(wt: Path, snap_commit: str) -> bool:
+    """extract가 뽑은 패치가 UTF-8로 읽히지 않아 바꿔 읽은 바이트가 있는지. 파일에 원래 있던 U+FFFD는 손실이 아니다."""
+    files = touched_files(Path(wt), snap_commit)
+    if not files:
+        return False
+    try:
+        _staged_diff(Path(wt), snap_commit, files).decode("utf-8")
+    except UnicodeDecodeError:
+        return True
+    return False
 
 
 def normalize(diff: str) -> str:

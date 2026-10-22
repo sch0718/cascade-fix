@@ -5,6 +5,7 @@ import re
 import shlex
 import subprocess
 import tomllib
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -624,8 +625,8 @@ def without_empty_patch(d: Decision, patches: dict[str, str], adjudicated: bool)
     return Decision(d.finding_id, OUTCOME_ADJUDICATE, None, [*d.reasons, REASON_NO_PATCH])
 
 
-def without_lossy_patch(d: Decision, patches: dict[str, str]) -> Decision:
-    if not is_adopted(d.to_dict()) or not is_lossy(patches.get(d.patch_from, "")):
+def without_lossy_patch(d: Decision, worktree_of: Callable[[str], Path], base: str) -> Decision:
+    if not is_adopted(d.to_dict()) or not is_lossy(worktree_of(d.patch_from), base):
         return d
     return Decision(d.finding_id, OUTCOME_UNDECIDABLE, None, [*d.reasons, REASON_NON_UTF8])
 
