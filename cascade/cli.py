@@ -325,9 +325,13 @@ def _decide_roles(args, resolved: profiles.Resolved, source: str, available: dic
     try:
         return assignment.decide(resolved.roles, resolved.pinned, source, s.RUN_REVIEW, _cursor_reviewer_ok(available),
                                  available, cursor_model=args.cursor_model or DEFAULT_CURSOR_MODEL, name=resolved.name,
-                                 scripts={RUNNER_CODEX: s.RUN_REVIEW.is_file(), RUNNER_CURSOR: s.CURSOR_REVIEW.is_file()})
+                                 scripts=_review_scripts())
     except profiles.ProfileError as e:
         raise s.CliError(str(profiles.explain_overrides(e, resolved.overrides)), ExitCodes.PARSE_ERROR) from None
+
+
+def _review_scripts() -> dict[str, bool]:
+    return {RUNNER_CODEX: s.RUN_REVIEW.is_file(), RUNNER_CURSOR: s.CURSOR_REVIEW.is_file()}
 
 
 def _consent_option(raw: str | None) -> set[str] | None:
@@ -509,7 +513,8 @@ def cmd_detect(args) -> int:
     available: dict[str, bool] = {}
     resolved = _resolve_profile(args, root, available)
     env = {} if resolved.explicit else os.environ
-    reviewer_choice = args.reviewer or env.get("CASCADE_REVIEWER") or REVIEWER_AUTO
+    reviewer = args.reviewer or env.get("CASCADE_REVIEWER")
+    reviewer_choice = reviewer or REVIEWER_AUTO
     workers_choice = args.workers or env.get("CASCADE_WORKERS") or WORKERS_CLAUDE
     cursor_model = args.cursor_model or DEFAULT_CURSOR_MODEL
     try:
@@ -519,7 +524,9 @@ def cmd_detect(args) -> int:
                         docs=[Path(d).resolve() for d in args.doc or []], cwd=Path.cwd(),
                         workers_choice=workers_choice, cursor_model=cursor_model,
                         profile=resolved, available=available, profile_flag=args.profile,
-                        codex_model=codex_model(Path.home() / ".codex"))
+                        codex_model=codex_model(Path.home() / ".codex"), scripts=_review_scripts(),
+                        reviewer_flag=f" --reviewer {reviewer}" if reviewer else "",
+                        workers_flag=_next_workers_flags(args, resolved.explicit))
     except profiles.ProfileError as e:
         raise s.CliError(str(profiles.explain_overrides(e, resolved.overrides)), ExitCodes.PARSE_ERROR) from None
     print(json.dumps(result, ensure_ascii=False, indent=2) if args.json else render_detect(result))
@@ -552,8 +559,8 @@ def _review_prompt(scope: dict) -> str:
 def _review_profile(args, root: Path, flag: str | None) -> profiles.Resolved:
     env = {name: value for name, value in os.environ.items() if name not in REVIEW_IGNORED_ENVS}
     try:
-        return profiles.resolve(root, s.repos_toml(), flag=flag, cli=profiles.LegacyOptions(), env=env,
-                                available={}, codex_model="")
+        return profiles.resolve(root, s.repos_toml(), flag=flag, cli=profiles.LegacyOptions(cursor_model=args.cursor_model),
+                                env=env, available={}, codex_model="")
     except ConfigError as e:
         raise s.CliError(str(e), ExitCodes.PARSE_ERROR) from None
 
@@ -659,13 +666,11 @@ def _emit_first_review(args, review_dir: Path, meta: dict, new_attempts: list[di
           f"{meta.get('workers_flags', '')}{consent}{root_flag}")
 
 
-def _review_workers_flags(args, explicit: bool) -> str:
-    """CF review에 준 작업자 선택을 init 줄로 넘긴다. 환경 변수는 init과 같은 규칙으로 읽는다(프로필을 명시하면 읽지 않는다)."""
-    env = {} if explicit else os.environ
-    choice = args.workers or env.get("CASCADE_WORKERS")
-    if choice not in WORKERS_CHOICES:
-        return ""
-    return workers_flags(choice, args.cursor_model or DEFAULT_CURSOR_MODEL, env)
+def _next_workers_flags(args, explicit: bool) -> str:
+    """detect·review에 준 작업자 옵션을 다음 명령으로 넘긴다. 준 값은 기본값과 같아도 넘기고,
+    CASCADE_WORKERS는 init과 같은 규칙으로 읽어(프로필을 명시하면 읽지 않는다) external일 때만 넘긴다."""
+    env_value = None if explicit else os.environ.get("CASCADE_WORKERS")
+    return workers_flags(args.workers or (env_value if env_value == WORKERS_EXTERNAL else None), args.cursor_model)
 
 
 def _load_review_meta(review_dir: Path) -> dict:
@@ -714,7 +719,7 @@ def cmd_review(args) -> int:
     requested = _apply_review_options(args, resolved.name, key, _first_review_cell(resolved, args.kind))
     cell, consented, attempts = _consent_first_review(requested, key, args.kind, consent)
     actual = _first_review_target(cell, set(consented), attempts, {})
-    workers = _review_workers_flags(args, resolved.explicit)
+    workers = _next_workers_flags(args, resolved.explicit)
     ensure_excluded(root)
     meta = {"role": key, "requested": {**_runner_values(requested), "fallback": _runner_values(cell["fallback"])},
             "actual": _runner_values(actual), "fallback_reason": attempts[-1]["reason"] if attempts else None,

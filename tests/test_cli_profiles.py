@@ -391,6 +391,48 @@ class DetectFirstReviewCliTest(ExternalWorkersBase):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertNotIn("--workers", p.stdout)
 
+    def test_given_options_reach_the_next_init_line_even_when_they_are_defaults(self):
+        toml = Path(self.env["CASCADE_REPOS_TOML"])
+        toml.write_text(toml.read_text(encoding="utf-8")
+                        + '\n[profiles.cursor-a]\n"code.a" = { runner = "cursor", model = "composer-9" }\n'
+                        + '"code.opinion" = { runner = "codex" }\n', encoding="utf-8")
+        code, r = self.detect("--profile", "cursor-a", "--workers", "claude", "--cursor-model", "composer-2.5",
+                              "--reviewer", "auto", "--input", str(FIXTURES / "codex-code-e2e.final"))
+        self.assertEqual(code, 0, r)
+        step = r["recommendation"]["steps"][0]
+        self.assertIn("--reviewer auto --workers claude --cursor-model composer-2.5", step)
+        words = shlex.split(step)
+        p = run_cli(words[words.index("init"):], self.repo, env=self.env)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("A=Claude", p.stdout)
+
+    def test_missing_review_script_substitutes_opinion_like_init(self):
+        self.env["CASCADE_RUN_REVIEW"] = str(self.tmp / "no-such-run-review.sh")
+        code, r = self.detect("--profile", "local", "--input", str(FIXTURES / "codex-code-e2e.final"))
+        self.assertEqual(code, 0, r)
+        roles = r["profile"]["roles"]
+        self.assertEqual((roles["code.opinion"]["runner"], roles["code.recheck"]["runner"]), ("claude", "claude"))
+        words = shlex.split(r["recommendation"]["steps"][0])
+        p = run_cli(words[words.index("init"):], self.repo, env=self.env)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("의견=Claude", p.stdout)
+
+    def test_cursor_model_alone_reaches_the_next_init_line(self):
+        toml = Path(self.env["CASCADE_REPOS_TOML"])
+        toml.write_text(toml.read_text(encoding="utf-8")
+                        + '\n[profiles.cursor-a]\n"code.a" = { runner = "cursor", model = "composer-9" }\n', encoding="utf-8")
+        code, r = self.detect("--profile", "cursor-a", "--cursor-model", "composer-test",
+                              "--input", str(FIXTURES / "codex-code-e2e.final"))
+        self.assertEqual(code, 0, r)
+        self.assertEqual(r["profile"]["roles"]["code.a"]["model"], "composer-test")
+        step = r["recommendation"]["steps"][0]
+        self.assertIn("--cursor-model composer-test", step)
+        self.assertNotIn("--workers", step)
+        words = shlex.split(step)
+        p = run_cli(words[words.index("init"):], self.repo, env=self.env)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("A=Cursor(composer-test)", p.stdout)
+
     def test_detect_init_step_runs(self):
         code, r = self.detect("--profile", "local", "--input", str(FIXTURES / "codex-code-e2e.final"))
         words = shlex.split(r["recommendation"]["steps"][0])
@@ -888,6 +930,15 @@ class FirstReviewTest(ExternalWorkersBase):
         self.assertIn("--source cursor-code", p.stdout)
         self.assertIn("검토자: Cursor", p.stdout)
 
+    def test_cursor_model_overrides_the_cursor_first_review_and_its_fallback(self):
+        p = self.review("--profile", "cursor-first", "--cursor-model", "composer-2.5", "--uncommitted", scope=())
+        self.assertIn("--model composer-2.5", self.next_lines(p)[0])
+        self.assertIn("--cursor-model composer-2.5", self.init_line(p))
+        first = self.review_dir(self.review("--profile", "codex-then-cursor-first", "--cursor-model", "composer-2.5"))
+        p = run_cli(["review", "--review-dir", str(first), "--fallback-from", "codex"], self.repo, env=self.env)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("--model composer-2.5", self.next_lines(p)[0])
+
     def test_review_model_rejected_for_external_cell(self):
         for option in (["--review-model", "claude-sonnet-5-5"], ["--review-effort", "low"]):
             with self.subTest(option=option):
@@ -1003,6 +1054,10 @@ class FirstReviewTest(ExternalWorkersBase):
         p = run_cli(["review", "--review-dir", str(first), "--fallback-from", "codex"], self.repo, env=self.env)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertIn("--profile local --workers external --cursor-model composer-test", self.init_line(p))
+
+    def test_review_keeps_a_given_default_workers_choice(self):
+        p = self.review("--profile", "local", "--workers", "claude")
+        self.assertIn("--profile local --workers claude", self.init_line(p))
 
     def test_fallback_from_reuses_the_original_scope_not_the_cwd(self):
         first = self.review_dir(self.review("--profile", "local", "--commit", "HEAD", scope=()))

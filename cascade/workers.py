@@ -1,4 +1,3 @@
-import os
 import shlex
 from pathlib import Path
 
@@ -63,16 +62,10 @@ def assign_available(choice: str, cursor_model: str) -> dict[str, dict]:
     return assign(choice, available, codex_model(Path.home() / ".codex"), cursor_model)
 
 
-def workers_flags(choice: str, cursor_model: str, env: dict | None = None) -> str:
-    """후속 명령에 붙일 작업자 옵션. CASCADE_WORKERS가 다른 값이면 claude도 적어 환경 변수가 선택을 뒤집지 않게 한다.
-    env는 다음 명령이 읽을 환경 변수다(기본 os.environ, 프로필을 명시해 환경 변수를 읽지 않으면 {})."""
-    env = os.environ if env is None else env
-    if choice == WORKERS_CLAUDE and (env.get("CASCADE_WORKERS") or WORKERS_CLAUDE) == WORKERS_CLAUDE:
-        return ""
-    flags = f" --workers {choice}"
-    if choice == WORKERS_EXTERNAL and cursor_model != DEFAULT_CURSOR_MODEL:
-        flags += f" --cursor-model {shlex.quote(cursor_model)}"
-    return flags
+def workers_flags(workers: str | None, cursor_model: str | None) -> str:
+    """후속 명령에 붙일 작업자 옵션. 받은 값은 기본값과 같아도 넘긴다(프로필 칸을 덮는 옵션이라 빠지면 프로필 값으로 돌아간다)."""
+    flags = f" --workers {workers}" if workers else ""
+    return flags + (f" --cursor-model {shlex.quote(cursor_model)}" if cursor_model else "")
 
 
 def expected_model_id(spec: dict) -> str:

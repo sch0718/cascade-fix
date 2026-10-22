@@ -28,7 +28,6 @@ from cascade.workers import (
     WORKERS_EXTERNAL,
     describe,
     has_external,
-    workers_flags,
 )
 
 DOC_SUFFIXES = (".md", ".markdown", ".txt", ".rst")
@@ -293,7 +292,8 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
            root_flag: str = "", docs: list[Path] | None = None, cwd: Path | None = None,
            cursor_ok: bool | Callable[[], bool] = False, workers_choice: str = WORKERS_CLAUDE,
            cursor_model: str = DEFAULT_CURSOR_MODEL, available: dict[str, bool] | None = None,
-           profile_flag: str | None = None, codex_model: str = "") -> dict:
+           profile_flag: str | None = None, codex_model: str = "", scripts: dict[str, bool] | None = None,
+           reviewer_flag: str = "", workers_flag: str = "") -> dict:
     root = Path(root)
     branch = current_branch(root)
     base = default_base(root)
@@ -368,7 +368,7 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
 
     def decide_roles(source: str) -> tuple[dict, list[dict]]:
         decided, replaced = assignment.decide(profile.roles, profile.pinned, source, run_review, cursor_ok,
-                                              available or {}, cursor_model=cursor_model, name=profile.name)
+                                              available or {}, cursor_model=cursor_model, name=profile.name, scripts=scripts)
         return _usable_first_review(decided, replaced, first_key, run_review, cursor_ok) if first_review else (decided, replaced)
 
     original_source = rec["source"]
@@ -411,9 +411,8 @@ def detect(root: Path, *, repos_toml: Path, run_review: Path, cli: str, gh: list
         notes.append("커밋하지 않은 변경이 있다. 채택 패치가 작업 트리에 섞이지 않게 하려면 --dry-run 을 쓴다")
 
     steps = rec["steps"]
-    workers_flag = workers_flags(workers_choice, cursor_model, {} if profile.explicit else None)
     profile_arg = f" --profile {q(profile_flag or profile.name)}" if profile.explicit or profile_flag else ""
-    flags = ("" if reviewer_choice == REVIEWER_AUTO else f" --reviewer {reviewer_choice}") + workers_flag + profile_arg + root_flag
+    flags = reviewer_flag + workers_flag + profile_arg + root_flag
     if not blockers and rec["source"]:
         if first_review:
             rec["first_review"] = 1
