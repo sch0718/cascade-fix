@@ -138,7 +138,26 @@ class DecideTest(unittest.TestCase):
         bare["selection"] = None
         result = select_profiles.decide({"claude-only": [bare]}, "claude-only")
         self.assertEqual(result["selected"], "claude-only")
-        self.assertFalse(result["candidates"]["claude-only"]["unstable"])
+
+    def test_runs_without_selection_have_unmeasured_stability_not_stable(self):
+        bare = run()
+        bare["selection"] = None
+        result = select_profiles.decide({"claude-only": [bare, run()], "other": [run(), run()]}, "claude-only")
+        summary = result["candidates"]["claude-only"]
+        self.assertIsNone(summary["unstable"])
+        self.assertIn("정확도 안정성 미측정", summary["reasons"])
+        text = select_profiles.render(result)
+        self.assertIn("| claude-only (안정성 미측정) |", text)
+        self.assertIn("정확도 안정성 미측정", text)
+        self.assertNotIn("| other (", text)
+        self.assertIs(result["candidates"]["other"]["unstable"], False)
+        self.assertEqual(json.loads(json.dumps(result))["candidates"]["claude-only"]["unstable"], None)
+
+    def test_one_failing_run_is_unstable_even_if_another_run_has_no_selection(self):
+        bare = run()
+        bare["selection"] = None
+        result = select_profiles.decide({"claude-only": [bare, run(acc_ok=False, accuracy=0.5)]}, "claude-only")
+        self.assertIs(result["candidates"]["claude-only"]["unstable"], True)
 
     def test_cost_mean_and_range_in_table(self):
         text = select_profiles.render(select_profiles.decide(candidates(), "claude-only"))

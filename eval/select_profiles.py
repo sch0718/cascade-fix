@@ -100,6 +100,13 @@ def unstable_runs(runs: list[dict]) -> int:
     return sum(run_check(run, "accuracy").get("ok") is False for run in runs)
 
 
+def is_unstable(runs: list[dict], unstable: int) -> bool | None:
+    """한 번이라도 조건 미달이면 불안정. 모든 실행의 정확도 조건이 기록돼 있지 않으면 안정하다고 말하지 않고 None(미측정)."""
+    if unstable:
+        return True
+    return False if all(run_check(run, "accuracy").get("ok") is not None for run in runs) else None
+
+
 def cost_mean(runs: list[dict]) -> float | None:
     costs = [run.get("claude_cost") for run in runs]
     return None if not costs or any(cost is None for cost in costs) else sum(costs) / len(costs)
@@ -111,14 +118,17 @@ def summarize(runs: list[dict], base_metrics: dict | None) -> dict:
     checks = {"accuracy": accuracy_check(metrics, base), "false_fact": false_fact_check(metrics, base),
               "completion": completion_check(metrics), "fallback": fallback_check(metrics), "regression": regression_check(runs)}
     unstable = unstable_runs(runs)
+    unstable_state = is_unstable(runs, unstable)
     cost = cost_mean(runs)
     reasons = [reason for key, check in checks.items() if (reason := check_reason(key, check))]
     if unstable:
         reasons.append(f"정확도 {UNSTABLE}(실행 {len(runs)}회 중 {unstable}회 조건 미달)")
+    elif unstable_state is None:
+        reasons.append(f"정확도 안정성 {UNMEASURED}")
     if cost is None:
         reasons.append(COST_EXCLUDED)
     return {"runs": len(runs), "metrics": metrics, "flip_rate": flip_rate([run.get("predicted") or {} for run in runs]),
-            "checks": checks, "passed": all(check["ok"] is not False for check in checks.values()), "unstable": bool(unstable),
+            "checks": checks, "passed": all(check["ok"] is not False for check in checks.values()), "unstable": unstable_state,
             "unstable_runs": unstable, "cost_mean": cost, "reasons": reasons}
 
 
@@ -154,7 +164,8 @@ def number(value: float) -> str:
 def row(name: str, summary: dict) -> tuple[str, ...]:
     m = summary["metrics"]
     regressions = summary["checks"]["regression"]
-    return (name + (f" ({UNSTABLE})" if summary["unstable"] else ""),
+    stability = {True: f" ({UNSTABLE})", None: f" (안정성 {UNMEASURED})"}.get(summary["unstable"], "")
+    return (name + stability,
             spread(m["accuracy"], ratio_text), spread(m["false_fact"], number), spread(m["completion"], ratio_text),
             NOT_APPLICABLE if m["fallback_ratio"] is None else spread(m["fallback_ratio"], ratio_text),
             UNMEASURED if regressions["ok"] is None else f"{regressions['value']}/{regressions['runs']}",
