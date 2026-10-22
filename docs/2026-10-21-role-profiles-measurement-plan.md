@@ -133,7 +133,7 @@ CASCADE_REPOS_TOML=<결과>/profiles.toml python3 eval/replay.py --sample <결�
   - 켠 결과가 끈 결과와 다른 항목 수가, 켬에서 빠진 판가름 호출 수와 같다.
   - 뺀 Opus 토큰이 그 항목들의 작업별 판가름 토큰 합과 같다.
   - `python3 eval/adopt_recalc.py --runs <결과>/<구성> --out <결과>/<구성>/adopt-recalc`로 돌린다. `--out`에 항목별 끔·켬 결정(`decisions.jsonl`), 위 세 검증의 대조 결과(`check.json`, 하나라도 어긋나면 종료 코드 1), 켬 값으로 바꾼 채점용 폴더, `counterfactual.json`이 들어간다. 스크립트는 `cascade`의 `decide()`를 그대로 불러 쓴다. 켠 폴더는 `score.py --cost-scope round1-core`로만 비용을 낸다.
-- 구성별 채점과 고르기. 구성마다 `python3 eval/score.py --runs <결과>/<구성> --baseline-runs <결과>/m-claude-only --sample <결과>/sample.jsonl --round 1 --cost-scope round1-core --json <결과>/<구성>/score.json`을 낸다(켬 값은 `--runs`에 그 구성의 `adopt-recalc` 폴더를 주고 기준선도 같은 쪽을 줘서 끔은 끔끼리, 켬은 켬끼리 짝을 맞춘다). 2단계의 반복까지 모이면 `python3 eval/select_profiles.py --candidate <구성>=<점수 JSON>[,…] … --baseline m-claude-only`가 2절 규칙대로 평균·최소·최대와 거름 사유, 선정을 낸다. 사용법은 `eval/sample-format.md`에 있다.
+- 구성별 채점과 고르기. 구성마다 `python3 eval/score.py --runs <결과>/<구성> --baseline-runs <결과>/m-claude-only --sample <결과>/sample.jsonl --round 1 --cost-scope round1-core --json <결과>/<구성>/score.json`을 낸다(켬 값은 `--runs`에 그 구성의 `adopt-recalc` 폴더를 주고 기준선도 같은 쪽을 줘서 끔은 끔끼리, 켬은 켬끼리 짝을 맞춘다. 그래서 기준선 `m-claude-only`에도 `adopt_recalc.py`를 돌려 둔다). 2단계의 반복까지 모이면 `python3 eval/select_profiles.py --candidate <구성>=<점수 JSON>[,…] … --baseline m-claude-only`가 2절 규칙대로 평균·최소·최대와 거름 사유, 선정을 낸다. `--baseline`은 `--candidate`로 준 이름 중 하나여야 하고, 끔 값과 켬 값은 따로 한 번씩 부른다. 사용법은 `eval/sample-format.md`에 있다.
 - 빠진 것: Claude 대안(Haiku+Haiku, effort 조정)은 이번 단계에서 뺐다(사용자 결정). 그래서 이 계획으로는 `claude-only`를 채택 규칙 효과 말고는 바꿀 근거가 생기지 않는다. 넣을지는 2단계 뒤에 다시 정한다.
 
 | 구성 | Claude 토큰(추정) | 외부 | 시간(추정) |

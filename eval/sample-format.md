@@ -69,7 +69,7 @@
    python3 eval/replay.py --sample eval/sample.jsonl --out <결과 폴더> [--limit N] [--repos-toml F]
    ```
 
-   모델을 실제로 부르는 단계는 스킬의 Workflow가 한다. 위 명령은 `jobs`까지 만들고 멈추며 `meta.json`에 `pending_run_dir`을 적는다. 항목마다 Workflow로 `stage1.json`(필요하면 `adj.json`)을 돌리고 `judge` → `adjudicate` → `apply` → `report`를 이어간 뒤 다음으로 모은다.
+   모델을 실제로 부르는 단계는 스킬의 Workflow가 한다. 위 명령은 `jobs`까지 만들고 멈추며 `meta.json`에 `pending_run_dir`을 적는다. 항목마다 Workflow로 `stage1.json`(필요하면 `adj.json`)을 돌리고 `judge` → `adjudicate` → `apply` → `report`를 이어간 뒤 다음으로 모은다. Workflow를 돌린 뒤마다 `CF usage --run-dir <pending_run_dir> --round N --workflow <Workflow 실행 id>`를 돌린다. `score.py`의 Claude 비용과 `select_profiles.py`의 선정이 이 기록에 기대므로, 빠뜨리면 그 실행의 비용이 「미측정」이 되고 후보가 「비용 미측정으로 제외」된다.
 
    ```
    python3 eval/replay.py --sample eval/sample.jsonl --out <결과 폴더> --collect
@@ -184,7 +184,7 @@
      python3 eval/first_review.py score --merged <확정한 merged.json> --truth <정답.jsonl> [--usage-claude <claude-usage.json>] [--usage-cli <Cursor 원본 로그>…] [--json 결과.json]
      ```
 
-     검토자별 지적 수·정밀도·재현율, 등급별 정밀도·재현율, 첫 검토 비용(입력·출력·캐시 읽기·캐시 쓰기 토큰과 저장된 비용의 합, 다시 계산하지 않는다)이 나온다. Codex는 토큰을 남기지 않아 「기록 없음」, Claude는 사용량 파일이 없으면 「기록 없음」, 사용량 행이 없으면 「미측정(형식 확인 필요: …)」, 비용이 없는 작업이 있으면 비용 칸이 「미측정: 비용이 없는 작업이 있다」이다. `--usage-*`를 주지 않으면 `merged.json`에 담긴 값을 쓴다. 확정하지 않았거나 묶음·정답이 어긋나면 종료 코드 1과 이유 한 줄이다.
+     검토자별 지적 수·정밀도·재현율, 등급별 정밀도·재현율, 첫 검토 비용(입력·출력·캐시 읽기·캐시 쓰기 토큰과 저장된 비용의 합, 다시 계산하지 않는다)이 나온다. Codex는 토큰을 남기지 않아 「기록 없음」, Cursor는 로그에 usage가 없으면 「기록 없음」이고 `--usage-cli` 로그 중 일부에만 있으면 「부분 기록(일부 로그에 usage 없음)」, Claude는 사용량 파일이 없으면 「기록 없음」, 사용량 행이 없으면 「미측정(형식 확인 필요: …)」, 비용이 없는 작업이 있으면 비용 칸이 「미측정: 비용이 없는 작업이 있다」이다. `--usage-*`를 주지 않으면 `merged.json`에 담긴 값을 쓴다. 확정하지 않았거나 묶음·정답이 어긋나면 종료 코드 1과 이유 한 줄이다.
 
 7. 회귀(전향 측정). 실제 실행(dry-run 아님)의 실행 폴더를 프로필별로 모아 회귀를 센다.
 
