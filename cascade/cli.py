@@ -939,7 +939,9 @@ def cmd_workers(args) -> int:
            **({"exhausted": exhausted} if exhausted else {}))
     s.save_ledger(run_dir, ledger)
     n, reasons = fallback_counts(counts)
-    print(f"CLI 작업 {len(outcomes)}건: 성공 {counts.get(STATUS_OK, 0)}, 대체 실행 {n}" + (f"({reasons})" if n else ""))
+    rerun_ok = sum(1 for o in second.values() if o.status == STATUS_OK)
+    print(f"CLI 작업 {len(outcomes)}건: 성공 {counts.get(STATUS_OK, 0)}, 대체 실행 {n}" + (f"({reasons})" if n else "")
+          + (f" → 외부 재실행 성공 {rerun_ok}, Claude 대체 {len(unresolved)}" if n else ""))
     if reruns:
         print(f"외부 CLI로 다시 돌린 작업 {len(reruns)}건: " + ", ".join(f"{i}→{spec['runner']}" for i, spec in reruns.items()))
     print(f"결과: {out}")
