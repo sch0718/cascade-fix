@@ -22,8 +22,13 @@ ADJUDICATOR = "adjudicator"
 MODE_CODE = "code"
 
 
+ITEM_ERRORS = (OSError, ValueError, KeyError, TypeError, StopIteration, AttributeError)
+
+
 class RecalcError(Exception):
-    pass
+    def __init__(self, reason: str, check: str = "read"):
+        super().__init__(reason)
+        self.check = check
 
 
 def write_json(path: Path, data) -> None:
@@ -67,9 +72,12 @@ def adjudicator_id(fid: str) -> str:
 
 def repo_config(base: Path, ledger: dict) -> RepoConfig:
     try:
-        return load_repo_config(Path(ledger["root"]), base / "repos.toml") or RepoConfig()
+        cfg = load_repo_config(Path(ledger["root"]), base / "repos.toml")
     except (ConfigError, tomllib.TOMLDecodeError) as e:
         raise RecalcError(f"repos.toml을 읽지 못했다: {e}") from None
+    if cfg is None or not cfg.tests:
+        raise RecalcError(f"repos.toml에 {ledger['root']} 의 검증 명령(tests)이 없다. judge는 이 설정 없이 돌 수 없다", "config")
+    return cfg
 
 
 def worker(results: dict, fid: str, role: str) -> WorkerResult:
@@ -106,6 +114,8 @@ def without_lossy(d: Decision, lossy, fid: str) -> tuple[Decision, bool]:
 
 
 def recompute(base: Path, ledger: dict) -> list[dict]:
+    if ledger.get("adopt_on_both_pass"):
+        raise RecalcError("원장의 adopt_on_both_pass가 이미 참이다. 채택 규칙을 끄고 돌린 결과 폴더를 준다", "adopt")
     rd = base / "run" / ROUND_DIR
     rnd = first_round(ledger)
     try:
@@ -239,22 +249,34 @@ def copy_runs(runs: Path, out: Path) -> None:
     shutil.copytree(runs, out, ignore=ignore, dirs_exist_ok=True)
 
 
+def recalc_item(base: Path, out_base: Path) -> str | tuple[list[dict], list[dict], dict]:
+    """건너뛴 항목은 사유 문자열, 아니면 (지적별 행, 어긋난 것, 측정값)."""
+    reason = skip_reason(base)
+    if reason:
+        return reason
+    rows = recompute(base, read_json(base / "ledger.json"))
+    flipped = [row for row in rows if row["flipped"]]
+    if flipped:
+        flip_item(out_base, flipped)
+    found, measured = check_item(base, out_base, rows)
+    return rows, found, measured
+
+
 def recalc(runs: Path, out: Path) -> tuple[list[dict], dict]:
     rows, mismatches, skipped = [], [], []
     removed_jobs, tokens = 0, dict.fromkeys(TOKEN_KEYS, 0)
     for base in sorted(p for p in runs.iterdir() if (p / "meta.json").is_file()):
-        reason = skip_reason(base)
-        if reason:
-            skipped.append({"item": base.name, "reason": reason})
-            continue
         try:
-            item_rows = recompute(base, read_json(base / "ledger.json"))
-            flipped = [row for row in item_rows if row["flipped"]]
-            if flipped:
-                flip_item(out / base.name, flipped)
-            found, measured = check_item(base, out / base.name, item_rows)
+            result = recalc_item(base, out / base.name)
+            if isinstance(result, str):
+                skipped.append({"item": base.name, "reason": result})
+                continue
+            item_rows, found, measured = result
         except RecalcError as e:
-            item_rows, found, measured = [], [mismatch(base.name, "read", str(e))], {"removed_jobs": 0, "tokens": tokens}
+            item_rows, found, measured = [], [mismatch(base.name, e.check, str(e))], {"removed_jobs": 0, "tokens": tokens}
+        except ITEM_ERRORS as e:
+            reason = f"{type(e).__name__}: {e}"
+            item_rows, found, measured = [], [mismatch(base.name, "read", f"결과를 읽지 못했다({reason})")], {"removed_jobs": 0, "tokens": tokens}
         rows += item_rows
         mismatches += found
         removed_jobs += measured["removed_jobs"]

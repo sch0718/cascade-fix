@@ -140,6 +140,80 @@ class AdoptRecalcTest(unittest.TestCase):
         rows = [json.loads(line) for line in (self.out / "decisions.jsonl").read_text(encoding="utf-8").splitlines()]
         self.assertEqual({row["item"]: row["flipped"] for row in rows}, {"x": True, "same": False})
 
+    def write_repos_toml(self, *lines):
+        (self.runs / "x" / "repos.toml").write_text(
+            '[repos."/nonexistent/wt"]\n' + "\n".join(lines) + "\n", encoding="utf-8")
+
+    def on_row(self):
+        return json.loads((self.out / "decisions.jsonl").read_text(encoding="utf-8").splitlines()[0])
+
+    def test_recalc_applies_security_path_like_judge(self):
+        self.write_repos_toml('tests = ["python3 -m unittest {files}"]', 'sensitive_paths = ["calc.py"]')
+        code, _ = self.recalc()
+        self.assertEqual(code, 0)
+        row = self.on_row()
+        self.assertEqual(row["on"]["outcome"], "판단불가")
+        self.assertIn("보안 경로", row["on"]["reasons"])
+        self.assertIsNone(row["on"]["patch_from"])
+        self.assertTrue(read(self.out / "check.json")["ok"])
+
+    def test_recalc_excludes_baseline_failed_commands_like_judge(self):
+        verify = read(self.round_dir() / "verify.json")
+        failed = {"cmd": "npm run lint", "ok": False, "tail": "lint 실패"}
+        verify["r1-01"]["b"].append({**failed, "cmd": "[기준선 실패·판정 제외] " + failed["cmd"]})
+        write(self.round_dir() / "verify.json", verify)
+        self.assertEqual(self.recalc()[0], 0)
+        self.assertEqual(self.on_row()["on"]["outcome"], "합의-사실")
+
+        shutil.rmtree(self.out)
+        verify["r1-01"]["b"][-1] = failed
+        write(self.round_dir() / "verify.json", verify)
+        self.assertEqual(self.recalc()[0], 0)
+        row = self.on_row()
+        self.assertEqual((row["on"]["outcome"], row["flipped"]), ("판가름", False))
+        self.assertIn("한쪽만 검증 통과", row["on"]["reasons"])
+
+    def test_recalc_requires_repo_config_with_tests(self):
+        (self.runs / "x" / "repos.toml").unlink()
+        self.assertEqual(self.recalc()[0], 1)
+        self.assertEqual(read(self.out / "check.json")["mismatches"][0]["check"], "config")
+        shutil.rmtree(self.out)
+        self.write_repos_toml('format = []')
+        self.assertEqual(self.recalc()[0], 1)
+        self.assertIn("tests", read(self.out / "check.json")["mismatches"][0]["reason"])
+
+    def test_recalc_counts_unreadable_items_as_errors_and_continues(self):
+        shutil.copytree(self.runs / "x", self.runs / "ok")
+        (self.runs / "x" / "ledger.json").write_text("{깨짐", encoding="utf-8")
+        shutil.copytree(self.runs / "ok", self.runs / "nokey")
+        results = read(self.runs / "nokey" / "run" / "round-1" / "results.json")
+        del results["r1-01:b"]
+        write(self.runs / "nokey" / "run" / "round-1" / "results.json", results)
+        shutil.copytree(self.runs / "ok", self.runs / "noroot")
+        ledger = read(self.runs / "noroot" / "ledger.json")
+        del ledger["root"]
+        write(self.runs / "noroot" / "ledger.json", ledger)
+        code, text = self.recalc()
+        self.assertEqual(code, 1)
+        self.assertNotIn("Traceback", text)
+        check = read(self.out / "check.json")
+        self.assertEqual({m["item"] for m in check["mismatches"]}, {"x", "nokey", "noroot"})
+        self.assertTrue(all(m["check"] == "read" for m in check["mismatches"]))
+        self.assertEqual(check["flipped"], 1)
+        self.assertEqual(read(self.out / "ok" / "ledger.json")["rounds"][0]["decisions"][0]["patch_from"], "a")
+
+    def test_recalc_refuses_a_ledger_that_already_adopts_on_both_pass(self):
+        for name in ("ledger.json", "run/ledger.json"):
+            ledger = read(self.runs / "x" / name)
+            ledger["adopt_on_both_pass"] = True
+            write(self.runs / "x" / name, ledger)
+        code, text = self.recalc()
+        self.assertEqual(code, 1)
+        mismatch = read(self.out / "check.json")["mismatches"][0]
+        self.assertEqual(mismatch["check"], "adopt")
+        self.assertIn("이미 참", mismatch["reason"])
+        self.assertIn("이미 참", text)
+
     def test_recalc_can_write_inside_the_runs_folder(self):
         self.out = self.runs / "adopt-recalc"
         code, _ = self.recalc()
