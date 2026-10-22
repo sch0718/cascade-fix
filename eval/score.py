@@ -5,15 +5,23 @@ from pathlib import Path
 
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SKILL_ROOT))
+from cascade.assignment import job_cell_key  # noqa: E402
 from cascade.cli import PRE_FINAL_DECISIONS  # noqa: E402
+from cascade.cli_steps import OPINION_ARGS, RECHECK_ARGS, USAGE_FILE  # noqa: E402
 from cascade.consensus import REASON_BOTH_PASS  # noqa: E402
+from cascade.report import JOB_FILES  # noqa: E402
+from cascade.report import _money as money  # noqa: E402
+from cascade.review import CLAUDE_SOURCES, REVIEWER_CLAUDE  # noqa: E402
 from cascade.runners import STATUS_INVALID  # noqa: E402
+from cascade.usage import PRICE_SOURCE, PRICES_AS_OF  # noqa: E402
 from cascade.workers import FALLBACK_LABELS  # noqa: E402
 
 TARGET_AGREEMENT = 0.95
 TARGET_OPUS = 0.40
 MAX_AGREEMENT_GAP = 0.05
 MAX_FALLBACK = 0.10
+MAX_ACCURACY_DROP = 0.05
+MAX_UNFINISHED = 0.05
 VERDICT_FACT = "사실"
 VERDICT_NO = "아님"
 VERDICT_UNREPRODUCIBLE = "재현 불가"
@@ -32,6 +40,18 @@ CLAUDE_JOB_FILES = ("stage1-args.json", "stage1-fallback-args.json", "checker-ar
 USAGE_KEYS = ("input", "output", "cache_read")
 TRUTH_KEYS = (VERDICT_FACT, VERDICT_NO, VERDICT_UNREPRODUCIBLE)
 STEP_APPLY = "apply"
+COST_ALL, COST_CORE = "all", "round1-core"
+COST_SCOPES = (COST_ALL, COST_CORE)
+CORE_ROLES = ("a", "b", "judge_a", "judge_b", "writer", "checker", "adjudicator")
+TOKEN_KEYS = ("input", "output", "cache_read", "cache_write")
+COUNTERFACTUAL_FILE = "counterfactual.json"
+REASON_COUNTERFACTUAL = "반사실은 round1-core만"
+REASON_NO_RUN = "채점된 실행 없음"
+TAG_FIRST_REVIEW = "첫 검토"
+UNMEASURED_COST = "미측정"
+NO_RECORD = "기록 없음"
+SELECTION_LABELS = {"accuracy": "정확도", "false_fact": "「아님」 오채택", "completion": "완주", "fallback": "대체 실행",
+                    "regression": "회귀"}
 
 
 def read_json(path: Path):
@@ -214,17 +234,189 @@ def locate(runs: Path, item_id: str, item: dict, round_no: int | None, pre_final
     return item_id, run and {**run, "complete": True}
 
 
+def read_optional(path: Path):
+    try:
+        return read_json(path)
+    except (OSError, ValueError):
+        return None
+
+
+def stored_number(value) -> int | float | None:
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def usage_rows(data, cell: str | None = None) -> list[dict]:
+    workflows = data.get("workflows") if isinstance(data, dict) else None
+    rows = [row for share in (workflows.values() if isinstance(workflows, dict) else []) if isinstance(share, list)
+            for row in share if isinstance(row, dict)]
+    return [{**row, "cell": cell or row["cell"]} for row in rows if cell or isinstance(row.get("cell"), str)]
+
+
+def in_scope(cell: str, scope: str) -> bool:
+    return scope == COST_ALL or cell.partition(".")[2] in CORE_ROLES
+
+
+def cost_round(round_no: int | None, scope: str) -> int | None:
+    if scope == COST_ALL:
+        return round_no
+    return 1 if round_no is None else min(round_no, 1)
+
+
+def round_dirs(run_dir: Path, round_no: int | None) -> list[Path]:
+    suffixes = {path: path.name.removeprefix("round-") for path in sorted(run_dir.glob("round-*"))}
+    return [path for path, suffix in suffixes.items() if suffix.isdigit() and within_round(int(suffix), round_no)]
+
+
+def job_ids(round_dir: Path, names: tuple[str, ...]) -> set[str]:
+    ids: set[str] = set()
+    for name in names:
+        data = read_optional(round_dir / name)
+        jobs = data.get("jobs") if isinstance(data, dict) else None
+        ids.update(j["id"] for j in jobs or [] if isinstance(j, dict) and isinstance(j.get("id"), str))
+    return ids
+
+
+def scoped_cells(ids, mode: str, scope: str) -> list[str]:
+    cells = (job_cell_key(mode, job_id.rsplit(":", 1)[-1]) for job_id in ids)
+    return [cell for cell in cells if cell and in_scope(cell, scope)]
+
+
+def new_cell() -> dict:
+    return {"calls": 0, "fallback": 0, "tokens": None, "cost": None}
+
+
+def fallback_job_ids(ledger: dict, numbers: set[int]) -> list[str]:
+    ids: list[str] = []
+    for rnd in ledger.get("rounds", []):
+        last = {e["step"]: e for e in rnd.get("events", []) if str(e.get("step", "")).startswith("workers-")}
+        if rnd.get("no") in numbers:
+            ids += [job_id for event in last.values() for job_id in event.get("fallback") or []]
+    return ids
+
+
+def first_review_of(ledger: dict) -> dict:
+    review = (ledger.get("profile") or {}).get("first_review")
+    return review if isinstance(review, dict) else {}
+
+
+def first_review_is_claude(ledger: dict, review: dict) -> bool:
+    runner = (review.get("actual") or {}).get("runner")
+    return runner == REVIEWER_CLAUDE or (not runner and ledger.get("source") in CLAUDE_SOURCES)
+
+
+def add_cell_calls(cells: dict[str, dict], ledger: dict, rounds: list[Path], scope: str) -> None:
+    mode = ledger.get("mode")
+    names = (*JOB_FILES, *((OPINION_ARGS, RECHECK_ARGS) if scope == COST_ALL else ()))
+    numbers = {int(path.name.removeprefix("round-")) for path in rounds}
+    for round_dir in rounds:
+        results = read_optional(round_dir / "results.json")
+        ids = job_ids(round_dir, names) | set(results if isinstance(results, dict) else ())
+        for cell in scoped_cells(ids, mode, scope):
+            cells.setdefault(cell, new_cell())["calls"] += 1
+    for cell in scoped_cells(fallback_job_ids(ledger, numbers), mode, scope):
+        cells.setdefault(cell, new_cell())["fallback"] += 1
+    if scope == COST_ALL and first_review_of(ledger):
+        cells.setdefault(f"{mode}.review", new_cell())["calls"] += 1
+
+
+def add_cell_usage(cells: dict[str, dict], unmeasured: set[str], rows: list[dict]) -> None:
+    for row in rows:
+        cell = cells.setdefault(row["cell"], new_cell())
+        cell["tokens"] = cell["tokens"] or dict.fromkeys(TOKEN_KEYS, 0)
+        for key in TOKEN_KEYS:
+            cell["tokens"][key] += stored_number(row.get(key)) or 0
+        cost = stored_number(row.get("cost"))
+        if cost is None:
+            unmeasured.add(row["cell"])
+        else:
+            cell["cost"] = (cell["cost"] or 0.0) + cost
+
+
+def collect_usage(ledger: dict, rounds: list[Path], scope: str) -> tuple[list[dict], list[str], list[str]]:
+    """(쓸 행, 단가 기준 날짜, 미측정 표지). 표지는 ""(이 실행의 작업)나 첫 검토다."""
+    mode = ledger.get("mode")
+    names = (*CLAUDE_JOB_FILES, *((OPINION_ARGS, RECHECK_ARGS) if scope == COST_ALL else ()))
+    rows: list[dict] = []
+    dates: list[str] = []
+    tags: list[str] = []
+    for round_dir in rounds:
+        data = read_optional(round_dir / USAGE_FILE)
+        found = [row for row in usage_rows(data) if in_scope(row["cell"], scope)]
+        if found and isinstance(data.get("prices_as_of"), str):
+            dates.append(data["prices_as_of"])
+        rows += found
+        wanted = {job_id for job_id in job_ids(round_dir, names) if scoped_cells([job_id], mode, scope)}
+        if wanted - {row.get("job_id") for row in found}:
+            tags.append("")
+    review = first_review_of(ledger)
+    if scope == COST_ALL and review:
+        found = usage_rows(review.get("usage"), f"{mode}.review")
+        if found and isinstance((review.get("usage") or {}).get("prices_as_of"), str):
+            dates.append(review["usage"]["prices_as_of"])
+        rows += found
+        if not found and first_review_is_claude(ledger, review):
+            tags.append(TAG_FIRST_REVIEW)
+    if any(stored_number(row.get("cost")) is None for row in rows):
+        tags.append("")
+    return rows, dates, list(dict.fromkeys(tags))
+
+
+def counterfactual_scope(runs: Path) -> str | None:
+    path = runs / COUNTERFACTUAL_FILE
+    if not path.is_file():
+        return None
+    data = read_optional(path)
+    declared = data.get("cost_scope") if isinstance(data, dict) else None
+    return declared if declared in COST_SCOPES else COST_CORE
+
+
+def add_run_cost(m: dict, acc: dict, run_key: str, run: dict, round_no: int | None, scope: str) -> None:
+    ledger = run["ledger"]
+    rounds = round_dirs(Path(run["run_dir"]), cost_round(round_no, scope))
+    add_cell_calls(m["cells"], ledger, rounds, scope)
+    if acc["refused"]:
+        return
+    rows, dates, tags = collect_usage(ledger, rounds, scope)
+    acc["counted"] += 1
+    acc["dates"] += dates
+    acc["missing"] += [f"{run_key}: {tag}" if tag else run_key for tag in tags]
+    acc["total"] += sum(c for c in (stored_number(row.get("cost")) for row in rows) if c is not None)
+    add_cell_usage(m["cells"], acc["unmeasured"], rows)
+
+
+def finish_cost(m: dict, acc: dict) -> None:
+    for cell in acc["unmeasured"]:
+        m["cells"][cell]["cost"] = None
+    if acc["refused"]:
+        m["cost_missing"] = [REASON_COUNTERFACTUAL]
+    else:
+        m["cost_missing"] = acc["missing"] or ([] if acc["counted"] else [REASON_NO_RUN])
+    m["claude_cost"] = None if m["cost_missing"] else acc["total"]
+    dates = sorted(set(acc["dates"]))
+    m["prices_as_of"] = dates[0] if len(dates) == 1 else dates or PRICES_AS_OF
+    m["price_source"] = PRICE_SOURCE
+
+
+def fallback_ratio(m: dict) -> float | None:
+    return sum(m["fallback"].values()) / m["cli_jobs"] if m["cli_jobs"] else None
+
+
 def new_truth_row(truth: str) -> dict:
     return {"total": 0, "correct": 0, "judged": 0, "to_human": 0, "false_fact": 0 if truth == VERDICT_NO else None}
 
 
-def compute(runs, sample: dict[str, dict], *, round_no: int | None = None, pre_final: bool = False) -> dict:
+def compute(runs, sample: dict[str, dict], *, round_no: int | None = None, pre_final: bool = False,
+            cost_scope: str = COST_ALL) -> dict:
+    if cost_scope not in COST_SCOPES:
+        raise ValueError(f"알 수 없는 비용 범위: {cost_scope}")
     runs = Path(runs)
     m = {"items": 0, "errors": 0, "incomplete": 0, "missing": 0, "regression_measured": False, "agree": 0, "judged": 0, "opus_calls": 0, "baseline_calls": 0,
          "patch_differs": 0, "regressions": 0, "paths": dict.fromkeys(PATH_KEYS, 0), "predicted": {},
          "claude_calls": dict.fromkeys(CLAUDE_FAMILIES, 0), "fallback": {}, "cli_jobs": 0, "invalid": 0, "usage": {},
-         "total": len(sample), "correct": 0, "false_fact": 0, "to_human": 0,
+         "total": len(sample), "correct": 0, "false_fact": 0, "to_human": 0, "cells": {}, "cost_scope": cost_scope,
          "by_truth": {truth: new_truth_row(truth) for truth in TRUTH_KEYS}}
+    refused = cost_scope == COST_ALL and counterfactual_scope(runs) not in (None, COST_ALL)
+    acc = {"refused": refused, "counted": 0, "total": 0.0, "missing": [], "dates": [], "unmeasured": set()}
     checker_fixed = checker_false = 0
     counted: set[str] = set()
     for item_id, item in sample.items():
@@ -272,12 +464,15 @@ def compute(runs, sample: dict[str, dict], *, round_no: int | None = None, pre_f
             fixed, false_ids = add_run_metrics(m, run, round_no)
             checker_fixed += fixed
             checker_false += false_ids
+            add_run_cost(m, acc, run_key, run, round_no, cost_scope)
     m["opus_ratio"] = m["opus_calls"] / m["baseline_calls"] if m["baseline_calls"] else None
     m["agreement"] = m["agree"] / m["judged"] if m["judged"] else None
     m["accuracy"] = m["correct"] / m["total"] if m["total"] else None
     m["scored"] = m["total"] - m["errors"] - m["incomplete"] - m["missing"]
     m["completion"] = m["scored"] / m["total"] if m["total"] else None
     m["checker"] = (checker_fixed, checker_false)
+    m["fallback_ratio"] = fallback_ratio(m)
+    finish_cost(m, acc)
     return m
 
 
@@ -303,6 +498,31 @@ def verdict_line(m: dict) -> str:
     return (f"성공 기준: 판정 일치 {ratio_text(m['agreement'])} (목표 95%) {passed(agree_ok)}"
             f" · Opus 호출 {ratio_text(m['opus_ratio'])} (목표 40% 이하) {passed(opus_ok)}"
             f" · {regression_text(m)} (목표 0)" + ("" if not m["regression_measured"] else f" {passed(m['regressions'] == 0)}"))
+
+
+def cost_text(m: dict) -> str:
+    if m["claude_cost"] is None:
+        return f"{UNMEASURED_COST}({', '.join(m['cost_missing'])})"
+    return money(m["claude_cost"])
+
+
+def price_basis_line(m: dict) -> str:
+    as_of = m["prices_as_of"] if isinstance(m["prices_as_of"], str) else ", ".join(m["prices_as_of"])
+    return f"단가 기준: {as_of} {m['price_source']}"
+
+
+def cell_rows(m: dict) -> list[tuple[str, ...]]:
+    rows = []
+    for key, cell in m["cells"].items():
+        tokens = cell["tokens"]
+        tokens_text = NO_RECORD if tokens is None else "/".join(str(tokens[k]) for k in TOKEN_KEYS[:3])
+        cost = NO_RECORD if tokens is None else UNMEASURED_COST if cell["cost"] is None else money(cell["cost"])
+        rows.append((key, str(cell["calls"]), str(cell["fallback"]), tokens_text, cost))
+    return rows
+
+
+def has_cell_usage(m: dict) -> bool:
+    return bool(m["cli_jobs"]) or any(cell["tokens"] for cell in m["cells"].values())
 
 
 def claude_calls_text(m: dict) -> str:
@@ -356,6 +576,7 @@ def render(m: dict) -> str:
         ("기준 Opus 호출 수", str(m["baseline_calls"])),
         ("Opus 호출 비율", ratio_text(m["opus_ratio"])),
         ("회귀 건수", str(m["regressions"]) if m["regression_measured"] else UNMEASURED),
+        ("Claude 비용(추정)", f"{cost_text(m)} — 범위 {m['cost_scope']}"),
         ("문서 점검자 정확도", pct(*m["checker"])),
         *(workers_rows(m) if m["cli_jobs"] else []),
         ("채점한 항목 수", str(m["items"])),
@@ -364,7 +585,66 @@ def render(m: dict) -> str:
         ("실행 기록 없는 항목 수", str(m["missing"])),
     ]
     truth = table(("정답", "맞음", "판정 있음", "전체", "사람 목록", "아님→사실 채택"), truth_rows(m))
-    return "\n".join([*table(("값", "결과"), rows), "", "정답별", "", *truth, "", verdict_line(m), ""])
+    cells = table(("칸", "호출", "대체 실행", "Claude 토큰(입력/출력/캐시 읽기)", "Claude 비용(추정)"), cell_rows(m))
+    return "\n".join([*table(("값", "결과"), rows), "", "정답별", "", *truth, "", *(["칸별 Claude 사용량", "", *cells, ""] if has_cell_usage(m) else []),
+                      price_basis_line(m), "", verdict_line(m), ""])
+
+
+def unfinished(m: dict) -> int:
+    return m["errors"] + m["incomplete"] + m["missing"]
+
+
+def accuracy_check(m: dict, base: dict) -> dict:
+    cand, ref = m["accuracy"], base["accuracy"]
+    ok = cand is not None and ref is not None and round(ref - cand, 6) <= MAX_ACCURACY_DROP
+    return {"ok": ok, "value": cand, "baseline": ref, "limit": MAX_ACCURACY_DROP}
+
+
+def completion_check(m: dict) -> dict:
+    ratio = unfinished(m) / m["total"] if m["total"] else None
+    return {"ok": ratio is not None and round(ratio, 6) <= MAX_UNFINISHED, "value": ratio, "count": unfinished(m),
+            "total": m["total"], "limit": MAX_UNFINISHED}
+
+
+def fallback_check(m: dict) -> dict:
+    ratio = fallback_ratio(m)
+    return {"ok": ratio is None or round(ratio, 6) <= MAX_FALLBACK, "value": ratio, "limit": MAX_FALLBACK}
+
+
+def regression_check(m: dict) -> dict:
+    if not m["regression_measured"]:
+        return {"ok": None, "value": None, "limit": 0}
+    return {"ok": m["regressions"] == 0, "value": m["regressions"], "limit": 0}
+
+
+def selection(m: dict, base: dict) -> dict:
+    checks = {"accuracy": accuracy_check(m, base),
+              "false_fact": {"ok": m["false_fact"] <= base["false_fact"], "value": m["false_fact"], "baseline": base["false_fact"]},
+              "completion": completion_check(m), "fallback": fallback_check(m), "regression": regression_check(m)}
+    return {"passed": all(check["ok"] is not False for check in checks.values()), "checks": checks,
+            "claude_cost": m["claude_cost"], "cost_missing": m["cost_missing"]}
+
+
+SELECTION_DETAILS = {
+    "accuracy": lambda c: f"{ratio_text(c['value'])}, 기준선 {ratio_text(c['baseline'])}에서 {c['limit'] * 100:.0f}%p 이내",
+    "false_fact": lambda c: f"{c['value']}건, 기준선 {c['baseline']}건 이하",
+    "completion": lambda c: f"오류·미완료·누락 {c['count']}/{c['total']}, {c['limit'] * 100:.0f}% 이하",
+    "fallback": lambda c: "외부 작업 없음" if c["value"] is None else f"{ratio_text(c['value'])}, {c['limit'] * 100:.0f}% 이하",
+    "regression": lambda c: f"{c['value']}건",
+}
+
+
+def selection_part(key: str, check: dict) -> str:
+    if check["ok"] is None:
+        return f"{SELECTION_LABELS[key]} 미측정"
+    return f"{SELECTION_LABELS[key]} {passed(check['ok'])}({SELECTION_DETAILS[key](check)})"
+
+
+def selection_line(sel: dict) -> str:
+    failed = [SELECTION_LABELS[key] for key, check in sel["checks"].items() if check["ok"] is False]
+    cost = money(sel["claude_cost"]) if sel["claude_cost"] is not None else UNMEASURED_COST
+    parts = [selection_part(key, check) for key, check in sel["checks"].items()]
+    return f"선정 조건: {'통과' if not failed else '미달(' + ', '.join(failed) + ')'} — {' · '.join(parts)} · Claude 비용 {cost}"
 
 
 def compare_causes(m: dict, base: dict) -> list[str]:
@@ -409,12 +689,14 @@ def render_compare(m: dict, base: dict) -> str:
         ("무효 결과", pct(base["invalid"], base["cli_jobs"]), pct(m["invalid"], m["cli_jobs"])),
         *((f"CLI 사용량({runner})", usage_text(base["usage"].get(runner)), usage_text(m["usage"].get(runner))) for runner in runners),
         ("회귀 건수", *(str(x["regressions"]) if x["regression_measured"] else UNMEASURED for x in (base, m))),
+        ("Claude 비용(추정)", cost_text(base), cost_text(m)),
         ("채점한 항목 수", str(base["items"]), str(m["items"])),
     ]
     truth = [(name, truth_cell(base["by_truth"][name]), truth_cell(m["by_truth"][name])) for name in m["by_truth"]
              if name in base["by_truth"]]
     return "\n".join([*table(("값", "Claude 작업자", "외부 작업자"), rows), "", "정답별 (맞음/판정 있음/전체)", "",
-                      *table(("정답", "Claude 작업자", "외부 작업자"), truth), "", compare_verdict_line(m, base), ""])
+                      *table(("정답", "Claude 작업자", "외부 작업자"), truth), "", price_basis_line(m), "",
+                      selection_line(selection(m, base)), compare_verdict_line(m, base), ""])
 
 
 def main(argv=None) -> int:
@@ -424,15 +706,22 @@ def main(argv=None) -> int:
     parser.add_argument("--baseline-runs", help="Claude 작업자로 돌린 결과 폴더. 주면 --runs(외부 작업자)와 나란히 비교한다")
     parser.add_argument("--round", type=int, dest="round_no", help="이 회차까지만 채점한다")
     parser.add_argument("--pre-final", action="store_true", help="전체 검사 전 판정(decisions-pre-final.json)으로 채점한다")
+    parser.add_argument("--cost-scope", choices=COST_SCOPES, default=COST_ALL, dest="cost_scope",
+                        help="Claude 비용 범위. round1-core는 1회차 작업자·점검자·판가름과 그 대체 실행만 센다")
     parser.add_argument("--out")
+    parser.add_argument("--json", help="지표(와 기준선이 있으면 선정 판정)를 JSON으로 쓴다")
     args = parser.parse_args(argv)
     sample = load_sample(args.sample)
-    options = {"round_no": args.round_no, "pre_final": args.pre_final}
+    options = {"round_no": args.round_no, "pre_final": args.pre_final, "cost_scope": args.cost_scope}
     m = compute(args.runs, sample, **options)
-    text = render_compare(m, compute(args.baseline_runs, sample, **options)) if args.baseline_runs else render(m)
+    base = compute(args.baseline_runs, sample, **options) if args.baseline_runs else None
+    text = render_compare(m, base) if base else render(m)
     print(text)
     if args.out:
         Path(args.out).write_text(text, encoding="utf-8")
+    if args.json:
+        Path(args.json).write_text(json.dumps({**m, "selection": selection(m, base) if base else None}, ensure_ascii=False,
+                                              indent=2) + "\n", encoding="utf-8")
     return 0
 
 
