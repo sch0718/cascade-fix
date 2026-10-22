@@ -472,3 +472,18 @@ class SandboxSubstitutionTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FirstReviewRunnerTest(unittest.TestCase):
+    def test_empty_first_review_is_not_applicable_whatever_the_source(self):
+        for source in ("claude-code", "claude-doc", "codex-code", "local"):
+            self.assertIsNone(assignment.first_review_runner({}, source))
+            self.assertIsNone(assignment.first_review_runner(None, source))
+
+    def test_actual_runner_wins_over_source(self):
+        self.assertEqual(assignment.first_review_runner({"actual": {"runner": "codex"}}, "claude-code"), "codex")
+        self.assertEqual(assignment.first_review_runner({"actual": {"runner": "claude"}}, "codex-code"), "claude")
+
+    def test_claude_source_stands_in_when_the_record_has_no_runner(self):
+        self.assertEqual(assignment.first_review_runner({"role": "code.review"}, "claude-code"), "claude")
+        self.assertIsNone(assignment.first_review_runner({"role": "code.review"}, "codex-code"))

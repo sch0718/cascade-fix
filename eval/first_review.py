@@ -7,6 +7,7 @@ from pathlib import Path
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SKILL_ROOT))
 from cascade.cli import FIRST_REVIEW_KEYS  # noqa: E402
+from cascade.cli_steps import USAGE_FILE  # noqa: E402
 from cascade.findings import _LOCATION, SEVERITIES, ParseError, parse_codex_code, parse_codex_doc  # noqa: E402
 from cascade.review import (REVIEW_JOB, REVIEW_META, REVIEWER_CLAUDE, REVIEWER_CODEX, REVIEWER_CURSOR,  # noqa: E402
                             label, load_text)
@@ -17,7 +18,6 @@ RUNNERS = (REVIEWER_CLAUDE, REVIEWER_CODEX, REVIEWER_CURSOR)
 TRUTH_VALUES = (VERDICT_FACT, VERDICT_NO, VERDICT_UNREPRODUCIBLE)
 MODE_DOC, MODE_CODE = "doc", "code"
 NEAR_LINES = 5
-USAGE_FILE = "claude-usage.json"
 MERGED_FILE, REVIEW_FILE = "merged.json", "review.md"
 FINDINGS_INPUT_FILE, FOUND_BY_FILE = "findings-input.json", "found-by.json"
 FINAL_SUFFIX = ".final"

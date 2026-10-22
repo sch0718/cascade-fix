@@ -16,7 +16,6 @@ from cascade.consensus import (
 )
 from cascade.jobs import RUNNER_CLAUDE
 from cascade.profiles import ROLE_KEYS
-from cascade.review import CLAUDE_SOURCES
 from cascade.review import label as reviewer_label
 from cascade.rounds import Ledger
 from cascade.runners import STATUS_AUTH, STATUS_OK
@@ -589,10 +588,7 @@ def _token_text(tokens: dict[str, int] | None) -> str:
 
 
 def _first_review_runner(ledger: Ledger) -> str | None:
-    actual = (assignment.ledger_profile(ledger).get("first_review") or {}).get("actual") or {}
-    if actual.get("runner"):
-        return actual["runner"]
-    return "claude" if ledger.source in CLAUDE_SOURCES else None
+    return assignment.first_review_runner(assignment.ledger_profile(ledger).get("first_review"), ledger.source)
 
 
 def _first_review_attempts(ledger: Ledger) -> list[dict]:

@@ -53,13 +53,13 @@ def worker(verdict, role, checker_ok=None):
 
 
 def make_run(runs, item_id, decisions, results=None, mode="code", opinions=None, apply=None, error=None,
-             events=None, files=None, profile=None):
+             events=None, files=None, profile=None, source=None):
     base = Path(runs) / item_id
     base.mkdir(parents=True, exist_ok=True)
     write_json(base / "meta.json", {"error": error} if error else {"truth": {}, "baseline_opus_calls": 1})
     if error:
         return
-    write_json(base / "ledger.json", {"mode": mode, "source": "codex-doc" if mode == "doc" else "codex-code",
+    write_json(base / "ledger.json", {"mode": mode, "source": source or ("codex-doc" if mode == "doc" else "codex-code"),
                                       "opinions": opinions or {}, "profile": profile or {},
                                       "rounds": [{"no": 1, "decisions": decisions, "events": events or []}]})
     rnd = base / "run" / "round-1"
@@ -391,6 +391,30 @@ class ScoreAccuracyTest(unittest.TestCase):
         self.assertEqual(score.compute(self.runs, sample)["predicted"]["x"], "판정 없음")
         self.assertEqual(score.compute(self.runs, sample, pre_final=True)["predicted"]["x"], "사실")
 
+    def test_broken_pre_final_file_counts_the_run_as_an_error_and_names_it(self):
+        make_cf_run(self.runs, "r", [{"no": 1, "decisions": [decision("합의-사실", "a")], "pre_final": [decision("합의-사실", "a")]}])
+        make_cf_run(self.runs, "ok", [{"no": 1, "decisions": [decision("합의-사실", "a")]}])
+        (self.runs / "r" / "round-1" / "decisions-pre-final.json").write_text("{깨짐", encoding="utf-8")
+        sample = sample_of(sample_line("x", run="r"), sample_line("y", run="ok"))
+        m = score.compute(self.runs, sample, pre_final=True)
+        self.assertEqual((m["errors"], m["items"], m["scored"], m["correct"]), (1, 1, 1, 1))
+        self.assertEqual(m["accuracy"], 1 / 2)
+        self.assertEqual(len(m["read_errors"]), 1)
+        self.assertIn("r", m["read_errors"][0])
+        self.assertIn("decisions-pre-final.json", m["read_errors"][0])
+        self.assertEqual(score.compute(self.runs, sample)["errors"], 0)
+
+    def test_pre_final_file_that_is_not_a_list_counts_the_run_as_an_error(self):
+        make_cf_run(self.runs, "r", [{"no": 1, "decisions": [decision("합의-사실", "a")], "pre_final": {"a": 1}}])
+        m = score.compute(self.runs, sample_of(sample_line("x", run="r")), pre_final=True)
+        self.assertEqual((m["errors"], m["items"]), (1, 0))
+
+    def test_broken_ledger_counts_the_run_as_an_error(self):
+        make_run(self.runs, "x", [decision("합의-사실", "a")])
+        (self.runs / "x" / "ledger.json").write_text("{깨짐", encoding="utf-8")
+        m = score.compute(self.runs, sample_of(sample_line("x")))
+        self.assertEqual((m["errors"], m["items"], m["correct"]), (1, 0, 0))
+
     def test_pre_final_leaves_rounds_without_file_unchanged(self):
         make_cf_run(self.runs, "r", [
             {"no": 1, "decisions": [decision("합의-아님")], "pre_final": [decision("합의-사실", "a")]},
@@ -585,6 +609,20 @@ class ScoreCostTest(unittest.TestCase):
         self.assertAlmostEqual(m["claude_cost"], 0.5)
         self.assertEqual(m["cost_missing"], [])
 
+    def test_claude_source_without_first_review_record_is_not_missing(self):
+        self.add(usage_data(usage_row("r1-01:a", "code.a")), profile={"first_review": {}}, source="claude-code")
+        m = self.compute()
+        self.assertAlmostEqual(m["claude_cost"], 0.5)
+        self.assertEqual(m["cost_missing"], [])
+        self.assertNotIn("code.review", m["cells"])
+
+    def test_first_review_record_without_runner_is_claude_for_a_claude_source(self):
+        self.add(usage_data(usage_row("r1-01:a", "code.a")), profile={"first_review": {"role": "code.review"}},
+                 source="claude-code")
+        m = self.compute()
+        self.assertIsNone(m["claude_cost"])
+        self.assertEqual(m["cost_missing"], ["x: 첫 검토"])
+
     def test_external_first_review_is_not_missing(self):
         self.add(usage_data(usage_row("r1-01:a", "code.a")), profile={"first_review": {"actual": {"runner": "cursor"}}})
         self.assertAlmostEqual(self.compute()["claude_cost"], 0.5)
@@ -620,6 +658,16 @@ class ScoreCostTest(unittest.TestCase):
         self.assertEqual(m["cells"]["code.a"], {"calls": 2, "fallback": 0, "tokens": None, "cost": None})
         self.assertEqual(m["cells_unmeasured"], ["code.a"])
         self.assertIn("| code.a | 2 | 0 | 미측정 | 미측정 |", score.render(m))
+
+    def test_gap_cell_seen_only_in_fallback_args_does_not_crash(self):
+        make_run(self.runs, COUNTED_ITEM, [decision("합의-사실", "a")],
+                 files={"stage1-fallback-args.json": jobs_file(("r1-01:a", SONNET))})
+        m = self.compute()
+        self.assertIsNone(m["claude_cost"])
+        self.assertEqual(m["cells_unmeasured"], ["code.a"])
+        self.assertIsNone(m["cells"]["code.a"]["tokens"])
+        self.assertIsNone(m["cells"]["code.a"]["cost"])
+        self.assertIn("code.a", score.render(m))
 
     def test_fully_recorded_cell_beside_a_gap_keeps_its_values(self):
         self.add(usage_data(usage_row("r1-01:a", "code.a", 0.5)), jobs=("r1-01:a", "r1-01:b"))
@@ -878,6 +926,25 @@ class ScoreJsonTest(unittest.TestCase):
     def test_cost_scope_option(self):
         self.run_main("--cost-scope", "round1-core")
         self.assertEqual(json.loads(self.out.read_text(encoding="utf-8"))["cost_scope"], "round1-core")
+
+    def test_json_write_failure_is_a_korean_message_and_exit_one(self):
+        self.out = self.runs / "missing-dir" / "out.json"
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            code = score.main(["--runs", str(self.runs), "--sample", str(self.sample), "--json", str(self.out)])
+        self.assertEqual(code, 1)
+        self.assertIn("쓰지 못했다", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+
+    def test_main_prints_unreadable_runs_to_stderr_and_still_exits_zero(self):
+        (self.runs / "x" / "ledger.json").write_text("{깨짐", encoding="utf-8")
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            code = score.main(["--runs", str(self.runs), "--sample", str(self.sample), "--json", str(self.out)])
+        self.assertEqual(code, 0)
+        self.assertIn("x", err.getvalue())
+        self.assertIn("읽지 못했다", err.getvalue())
+        self.assertEqual(json.loads(self.out.read_text(encoding="utf-8"))["errors"], 1)
 
     def test_unknown_cost_scope_is_rejected_by_the_parser(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):

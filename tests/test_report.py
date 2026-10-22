@@ -424,8 +424,9 @@ class RenderTest(unittest.TestCase):
         self.assertNotIn("B 근거", rebuttal)
 
     def test_claude_first_review_counted_in_calls(self):
-        ledger = make_ledger([finding("F1")], [decision("F1", OUTCOME_AGREED_FACT, "a")], source="claude-code")
-        ledger.reviewer = "claude"
+        first = {"role": "code.review", "requested": {"runner": "claude", "model": "", "effort": ""},
+                 "actual": {"runner": "claude", "model": SONNET, "effort": "high"}, "fallback_reason": None, "attempts": []}
+        ledger = profile_ledger(profile_record("claude-only", first_review=first), source="claude-code")
         calls = section(report.render(ledger, False), "## 역할별 사용량")
         self.assertIn("| Claude 첫 검토 | 1 |", calls)
         self.assertIn("| Claude 의견 | 0 |", calls)
@@ -888,6 +889,21 @@ class ClaudeUsageColumnsTest(unittest.TestCase):
                  "actual": {"runner": "claude", "model": SONNET, "effort": "high"}, "fallback_reason": None, "attempts": []}
         text = self.render(profile_ledger(profile_record("claude-only", first_review=first), source="claude-code"), None)
         self.assertIn("| Claude 첫 검토 | 1 | 0 | 미측정 | 미측정 | - |", text)
+
+    def test_first_review_record_without_runner_is_claude_for_a_claude_source_and_unmeasured_without_usage(self):
+        first = {"role": "code.review", "requested": {"runner": "claude", "model": "", "effort": ""}, "attempts": []}
+        text = self.render(profile_ledger(profile_record("claude-only", first_review=first), source="claude-code"), None)
+        self.assertIn("| Claude 첫 검토 | 1 | 0 | 미측정 | 미측정 | - |", text)
+
+    def test_no_first_review_record_has_no_first_review_row_even_for_a_claude_source(self):
+        usage = usage_file(usage_row("F1:a", "code.a", input=3, output=20, cache_read=500, cost=0.4))
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            write_json(run_dir / "round-1" / "claude-usage.json", usage)
+            write_json(run_dir / "round-1" / "stage1-args.json", {"jobs": [job("F1:a")]})
+            text = self.render(profile_ledger(profile_record("claude-only", first_review={}), source="claude-code"), run_dir)
+        self.assertNotIn("첫 검토", text)
+        self.assertNotIn("합계에서 빠졌다", text)
 
     def test_external_first_review_has_no_claude_columns(self):
         first = {"role": "code.review", "requested": {"runner": "codex", "model": "", "effort": ""},

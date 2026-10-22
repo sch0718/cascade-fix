@@ -5,13 +5,14 @@ from pathlib import Path
 
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SKILL_ROOT))
-from cascade.assignment import job_cell_key  # noqa: E402
+from cascade.assignment import first_review_runner, job_cell_key  # noqa: E402
 from cascade.cli import PRE_FINAL_DECISIONS  # noqa: E402
+from cascade.cli_steps import CLAUDE_JOB_FILES as ALL_CLAUDE_JOB_FILES  # noqa: E402
 from cascade.cli_steps import OPINION_ARGS, RECHECK_ARGS, USAGE_FILE  # noqa: E402
 from cascade.consensus import REASON_BOTH_PASS  # noqa: E402
+from cascade.jobs import RUNNER_CLAUDE  # noqa: E402
 from cascade.report import JOB_FILES  # noqa: E402
 from cascade.report import _money as money  # noqa: E402
-from cascade.review import CLAUDE_SOURCES, REVIEWER_CLAUDE  # noqa: E402
 from cascade.runners import STATUS_INVALID  # noqa: E402
 from cascade.usage import PRICE_SOURCE, PRICES_AS_OF  # noqa: E402
 from cascade.workers import FALLBACK_LABELS  # noqa: E402
@@ -35,8 +36,7 @@ REASON_ADJUDICATED_NO = "판가름: 아님"
 UNMEASURED = "측정 불가(dry-run은 전체 테스트를 돌리지 않음)"
 PATH_KEYS = ("합의", "규칙 채택", "판가름", "Codex 검토", "사람")
 CLAUDE_FAMILIES = ("sonnet", "haiku", "opus")
-CLAUDE_JOB_FILES = ("stage1-args.json", "stage1-fallback-args.json", "checker-args.json", "checker-fallback-args.json",
-                    "adj-args.json")
+CLAUDE_JOB_FILES = tuple(name for name in ALL_CLAUDE_JOB_FILES if name not in (OPINION_ARGS, RECHECK_ARGS))
 USAGE_KEYS = ("input", "output", "cache_read")
 TRUTH_KEYS = (VERDICT_FACT, VERDICT_NO, VERDICT_UNREPRODUCIBLE)
 STEP_APPLY = "apply"
@@ -186,18 +186,31 @@ def limit_rounds(ledger: dict, round_no: int | None) -> dict:
     return {**ledger, "rounds": [rnd for rnd in ledger.get("rounds", []) if within_round(rnd.get("no"), round_no)]}
 
 
+def read_record(path: Path):
+    try:
+        return read_json(path)
+    except (OSError, ValueError) as e:
+        raise ValueError(f"{path.parent.name}/{path.name}을 읽지 못했다 ({e})") from None
+
+
 def use_pre_final(ledger: dict, run_dir: Path) -> dict:
     rounds = []
     for rnd in ledger["rounds"]:
         saved = run_dir / f"round-{rnd.get('no')}" / PRE_FINAL_DECISIONS
-        rounds.append({**rnd, "decisions": read_json(saved)} if saved.is_file() else rnd)
+        decisions = read_record(saved) if saved.is_file() else None
+        if saved.is_file() and not isinstance(decisions, list):
+            raise ValueError(f"{saved.parent.name}/{saved.name}이 판정 목록이 아니다")
+        rounds.append({**rnd, "decisions": decisions} if saved.is_file() else rnd)
     return {**ledger, "rounds": rounds}
 
 
 def load_run(base: Path, run_dir: Path, round_no: int | None, pre_final: bool) -> dict | None:
     if not (base / "ledger.json").is_file():
         return None
-    limited = limit_rounds(read_json(base / "ledger.json"), round_no)
+    ledger = read_record(base / "ledger.json")
+    if not isinstance(ledger, dict):
+        raise ValueError(f"{base.name}/ledger.json이 원장 객체가 아니다")
+    limited = limit_rounds(ledger, round_no)
     return {"ledger": use_pre_final(limited, run_dir) if pre_final else limited, "run_dir": run_dir,
             "complete": is_complete(limited)}
 
@@ -218,20 +231,32 @@ def add_run_metrics(m: dict, run: dict, round_no: int | None) -> tuple[int, int]
     return checker_stats(ledger, run_dir, round_no)
 
 
-def locate(runs: Path, item_id: str, item: dict, round_no: int | None, pre_final: bool) -> tuple[str, dict | str | None]:
+def locate(runs: Path, item_id: str, item: dict, round_no: int | None,
+           pre_final: bool) -> tuple[str, dict | str | None, str | None]:
+    """(실행 키, 실행·"errors"·"incomplete"·None, 읽기 실패 사유). 기록을 읽지 못한 실행은 오류 항목으로 센다."""
+    run_key = item.get("run") or item_id
+    try:
+        return run_key, find_run(runs, item_id, item, round_no, pre_final), None
+    except (OSError, ValueError) as e:
+        return run_key, "errors", f"{run_key}: {e}"
+
+
+def find_run(runs: Path, item_id: str, item: dict, round_no: int | None, pre_final: bool) -> dict | str | None:
     if item.get("run"):
         base = runs / item["run"]
-        return item["run"], load_run(base, base, round_no, pre_final)
+        return load_run(base, base, round_no, pre_final)
     base = runs / item_id
     if not (base / "meta.json").is_file():
-        return item_id, None
-    meta = read_json(base / "meta.json")
+        return None
+    meta = read_record(base / "meta.json")
+    if not isinstance(meta, dict):
+        raise ValueError(f"{item_id}/meta.json이 객체가 아니다")
     if "error" in meta:
-        return item_id, "errors"
+        return "errors"
     if meta.get("incomplete"):
-        return item_id, "incomplete"
+        return "incomplete"
     run = load_run(base, base / "run", round_no, pre_final)
-    return item_id, run and {**run, "complete": True}
+    return run and {**run, "complete": True}
 
 
 def read_optional(path: Path):
@@ -303,8 +328,7 @@ def first_review_of(ledger: dict) -> dict:
 
 
 def first_review_is_claude(ledger: dict, review: dict) -> bool:
-    runner = (review.get("actual") or {}).get("runner")
-    return runner == REVIEWER_CLAUDE or (not runner and ledger.get("source") in CLAUDE_SOURCES)
+    return first_review_runner(review, ledger.get("source")) == RUNNER_CLAUDE
 
 
 def add_cell_calls(cells: dict[str, dict], ledger: dict, rounds: list[Path], scope: str) -> None:
@@ -394,9 +418,9 @@ def add_run_cost(m: dict, acc: dict, run_key: str, run: dict, round_no: int | No
 
 def finish_cost(m: dict, acc: dict) -> None:
     for cell in acc["unmeasured"] | acc["gaps"]:
-        m["cells"][cell]["cost"] = None
+        m["cells"].setdefault(cell, new_cell())["cost"] = None
     for cell in acc["gaps"]:
-        m["cells"][cell]["tokens"] = None
+        m["cells"].setdefault(cell, new_cell())["tokens"] = None
     m["cells_unmeasured"] = sorted(acc["gaps"])
     if acc["refused"]:
         m["cost_missing"] = [REASON_COUNTERFACTUAL]
@@ -424,7 +448,7 @@ def compute(runs, sample: dict[str, dict], *, round_no: int | None = None, pre_f
     m = {"items": 0, "errors": 0, "incomplete": 0, "missing": 0, "regression_measured": False, "agree": 0, "judged": 0, "opus_calls": 0, "baseline_calls": 0,
          "patch_differs": 0, "regressions": 0, "paths": dict.fromkeys(PATH_KEYS, 0), "predicted": {},
          "claude_calls": dict.fromkeys(CLAUDE_FAMILIES, 0), "fallback": {}, "cli_jobs": 0, "invalid": 0, "usage": {},
-         "total": len(sample), "correct": 0, "false_fact": 0, "to_human": 0, "cells": {}, "cost_scope": cost_scope,
+         "total": len(sample), "correct": 0, "false_fact": 0, "to_human": 0, "cells": {}, "cost_scope": cost_scope, "read_errors": [],
          "by_truth": {truth: new_truth_row(truth) for truth in TRUTH_KEYS}}
     refused = cost_scope == COST_ALL and counterfactual_scope(runs) not in (None, COST_ALL)
     acc = {"refused": refused, "counted": 0, "total": 0.0, "missing": [], "dates": [], "unmeasured": set(), "gaps": set()}
@@ -434,7 +458,9 @@ def compute(runs, sample: dict[str, dict], *, round_no: int | None = None, pre_f
         truth = item["truth"]["verdict"]
         row = m["by_truth"].setdefault(truth, new_truth_row(truth))
         row["total"] += 1
-        run_key, run = locate(runs, item_id, item, round_no, pre_final)
+        run_key, run, read_error = locate(runs, item_id, item, round_no, pre_final)
+        if read_error and read_error not in m["read_errors"]:
+            m["read_errors"].append(read_error)
         if run is None:
             m["missing"] += 1
             continue
@@ -711,6 +737,15 @@ def render_compare(m: dict, base: dict) -> str:
                       selection_line(selection(m, base)), compare_verdict_line(m, base), ""])
 
 
+def write_output(path: str, text: str) -> bool:
+    try:
+        Path(path).write_text(text, encoding="utf-8")
+    except OSError as e:
+        print(f"결과를 쓰지 못했다: {path} ({e})", file=sys.stderr)
+        return False
+    return True
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="소급 재생 결과 채점")
     parser.add_argument("--runs", required=True)
@@ -729,12 +764,16 @@ def main(argv=None) -> int:
     base = compute(args.baseline_runs, sample, **options) if args.baseline_runs else None
     text = render_compare(m, base) if base else render(m)
     print(text)
+    for result in (m, base):
+        for line in (result or {}).get("read_errors", []):
+            print(f"읽지 못해 오류 항목으로 셌다: {line}", file=sys.stderr)
+    failed = False
     if args.out:
-        Path(args.out).write_text(text, encoding="utf-8")
+        failed |= not write_output(args.out, text)
     if args.json:
-        Path(args.json).write_text(json.dumps({**m, "selection": selection(m, base) if base else None}, ensure_ascii=False,
-                                              indent=2) + "\n", encoding="utf-8")
-    return 0
+        failed |= not write_output(args.json, json.dumps({**m, "selection": selection(m, base) if base else None},
+                                                         ensure_ascii=False, indent=2) + "\n")
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

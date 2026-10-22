@@ -5,7 +5,7 @@ from pathlib import Path
 from cascade import profiles
 from cascade.jobs import ROLES, RUNNER_CLAUDE
 from cascade.profiles import ROLE_KEYS, RUNNER_AUTO
-from cascade.review import REVIEWER_AUTO, resolve
+from cascade.review import CLAUDE_SOURCES, REVIEWER_AUTO, resolve
 from cascade.runners import RUNNER_CODEX, RUNNER_CURSOR
 from cascade.workers import DEFAULT_CURSOR_MODEL, RECIPIENTS, WORKERS_EXTERNAL
 
@@ -83,6 +83,16 @@ def first_review_chain(first_review: dict) -> str:
     chain = "".join(f" → {_RUNNER_LABELS.get(runners[i + 1], runners[i + 1])}({attempts[i].get('reason', '')})"
                     for i in range(len(attempts)))
     return _RUNNER_LABELS.get(runners[0], runners[0]) + chain
+
+
+def first_review_runner(first_review: dict | None, source: str | None) -> str | None:
+    """첫 검토를 한 runner. 첫 검토 기록이 비어 있으면(--findings-json, review-meta 없는 --input) 해당 없음이라 None."""
+    if not first_review:
+        return None
+    runner = (first_review.get("actual") or {}).get("runner")
+    if runner:
+        return runner
+    return RUNNER_CLAUDE if source in CLAUDE_SOURCES else None
 
 
 def roles_line(roles: dict, mode: str, first_review: dict | None = None) -> str:
