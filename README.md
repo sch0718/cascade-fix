@@ -208,7 +208,7 @@ Codex 검토 결과(review.final) 반영해줘
 | `fallback` | 대체 실행 대상 `{ runner, model, effort }` 하나. 생략하면 내장 `claude-only`의 같은 칸 값입니다. `auto`는 받지 않습니다 |
 
 - `auto`는 init이 정합니다(`--reviewer auto` 규칙). Claude 리뷰로 시작했으면 Claude, 아니면 `codex-review`가 있으면 Codex, 아니면 로그인된 `cursor-review`면 Cursor, 모두 아니면 Claude입니다. 첫 검토 칸의 `auto`는 Claude입니다.
-- codex 검토 칸(`review`·`opinion`·`recheck`)은 `model`·`effort`를 비워야 합니다. `run-review.sh`에 그 옵션이 없기 때문입니다. cursor 검토 칸은 `CR --model`로 모델을 넘깁니다.
+- codex 검토 칸(`review`·`opinion`·`recheck`)은 `model`·`effort`를 비워야 합니다. `run-review.sh`에 그 옵션이 없기 때문입니다. cursor 검토 칸은 `CR --model`로 모델을 넘깁니다. 반대로 codex 작업자 칸은 `effort`를, cursor 작업자 칸은 `model`을 비울 수 없습니다(실행하면 늘 실패해 fallback으로 넘어가므로 종료 코드 5로 막습니다).
 - 판가름 칸은 `claude`만 받습니다.
 - 프로필 단위 값으로 `adopt_on_both_pass`(참/거짓)가 있습니다. 명령줄에 `--adopt-on-both-pass`를 주면 참이 됩니다.
 - 칸의 `runner`만 바꾸면 모델·effort는 새 runner에 맞게 다시 정합니다. claude는 `claude-only`의 같은 칸 값, codex는 모델을 비우고 effort는 작업자 칸이면 `low`·검토 칸이면 비움, cursor는 `--cursor-model`(기본 `composer-2.5`)과 effort 비움입니다. 같은 칸에 `model`·`effort`를 함께 주면 그 값이 먼저입니다.

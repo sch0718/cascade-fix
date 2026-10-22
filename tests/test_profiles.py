@@ -128,11 +128,20 @@ class ProfilesTest(unittest.TestCase):
             "bad effort": mutated("code.a", effort="turbo"),
             "claude empty model": mutated("code.a", model=""),
             "gpt on cursor": mutated("code.b", runner="cursor", model="gpt-6.1-sol", effort=""),
+            "codex worker empty effort": mutated("code.a", runner="codex", model="", effort=""),
+            "codex worker fallback empty effort": mutated_fallback("code.b", runner="codex", model="", effort=""),
+            "cursor worker empty model": mutated("doc.checker", runner="cursor", model="", effort=""),
+            "cursor worker fallback empty model": mutated_fallback("code.a", runner="cursor", model="", effort=""),
             "adopt not bool": {**profiles.builtin("default"), "adopt_on_both_pass": "yes"},
         }
         for label, p in cases.items():
             with self.subTest(label), self.assertRaisesRegex(profiles.ProfileError, r"profiles\.x"):
                 profiles.validate("x", p)
+
+    def test_cursor_review_role_may_leave_model_empty(self):
+        p = profiles.builtin("default")
+        p["roles"]["code.opinion"] = {**p["roles"]["code.opinion"], "runner": "cursor", "model": "", "effort": ""}
+        profiles.validate("x", p)
 
     def test_validate_message_names_profile_and_key(self):
         p = profiles.builtin("default")

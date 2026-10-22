@@ -156,8 +156,12 @@ def _check_values(name: str, key: str, cell: dict, *, fallback: bool) -> None:
             raise _fail(name, where, f"cursor runner는 effort를 쓰지 않는다: {effort!r}")
         if model.startswith(_FOREIGN_MODEL_PREFIXES):
             raise _fail(name, where, f"cursor runner에는 Claude·GPT 계열 모델을 쓸 수 없다: {model!r}")
+        if not model and _role(key) not in _REVIEW_ROLES:
+            raise _fail(name, where, "cursor 작업자 칸은 model을 비울 수 없다(빈 모델로는 작업자를 띄우지 못한다)")
     if runner == RUNNER_CODEX and _role(key) in _REVIEW_ROLES and (model or effort):
         raise _fail(name, where, "codex 검토 역할은 model·effort를 비워야 한다")
+    if runner == RUNNER_CODEX and _role(key) not in _REVIEW_ROLES and not effort:
+        raise _fail(name, where, f"codex 작업자 칸은 effort를 비울 수 없다. 받는 값: {', '.join(EFFORTS)}")
 
 
 def _check_shape(name: str, key: str, cell, keys: tuple[str, ...], *, partial: bool = False) -> None:
