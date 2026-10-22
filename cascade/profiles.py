@@ -30,6 +30,7 @@ _ROLES_SOURCE = {
 }
 _WORKER_KEYS = ("code.a", "code.b", "doc.judge_a", "doc.judge_b", "doc.writer", "doc.checker")
 _FOREIGN_MODEL_PREFIXES = ("claude-", "gpt-")
+_ACP_READ_ROLES = ("judge_a", "judge_b", "checker")
 
 
 class ProfileError(ConfigError):
@@ -156,6 +157,8 @@ def _check_values(name: str, key: str, cell: dict, *, fallback: bool) -> None:
             raise _fail(name, where, f"cursor runner는 effort를 쓰지 않는다: {effort!r}")
         if model.startswith(_FOREIGN_MODEL_PREFIXES):
             raise _fail(name, where, f"cursor runner에는 Claude·GPT 계열 모델을 쓸 수 없다: {model!r}")
+        if model.lower().startswith("auto") and _role(key) in _ACP_READ_ROLES:
+            raise _fail(name, where, f"cursor 읽기 역할 칸은 Auto 모델을 쓸 수 없다(ACP 실행기가 거절한다): {model!r}")
         if not model and _role(key) not in _REVIEW_ROLES:
             raise _fail(name, where, "cursor 작업자 칸은 model을 비울 수 없다(빈 모델로는 작업자를 띄우지 못한다)")
     if runner == RUNNER_CODEX and _role(key) in _REVIEW_ROLES and (model or effort):

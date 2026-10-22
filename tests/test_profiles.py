@@ -127,6 +127,7 @@ class ProfilesTest(unittest.TestCase):
             "fallback codex review with effort": mutated_fallback("code.recheck", runner="codex", model="", effort="high"),
             "bad effort": mutated("code.a", effort="turbo"),
             "claude empty model": mutated("code.a", model=""),
+            "auto on cursor read role": mutated("doc.judge_a", runner="cursor", model="auto", effort=""),
             "gpt on cursor": mutated("code.b", runner="cursor", model="gpt-6.1-sol", effort=""),
             "codex worker empty effort": mutated("code.a", runner="codex", model="", effort=""),
             "codex worker fallback empty effort": mutated_fallback("code.b", runner="codex", model="", effort=""),
