@@ -448,6 +448,14 @@ class MainTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("2번째 줄의 묶음 g01", err)
 
+    def test_non_string_truth_group_is_an_error(self):
+        merged = self.write("m.json", json.dumps(confirmed_of(first_review.merge(None, CODEX_TEXT, None, mode="doc")), ensure_ascii=False))
+        truth = self.write("t.jsonl", '{"group": ["g01"], "truth": "사실"}\n')
+        code, _, err = self.call(["score", "--merged", merged, "--truth", truth])
+        self.assertEqual(code, 1)
+        self.assertNotIn("Traceback", err)
+        self.assertIn("1번째 줄을 읽지 못했다", err)
+
     def test_broken_merged_file_exits_one_without_traceback(self):
         merged = self.write("m.json", json.dumps(["목록"]))
         code, _, err = self.call(["score", "--merged", merged, "--truth", self.write("t.jsonl", '{"group": "g01", "truth": "사실"}\n')])

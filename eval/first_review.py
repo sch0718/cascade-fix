@@ -273,6 +273,8 @@ def load_truth(path: Path) -> dict[str, str]:
         try:
             item = json.loads(line)
             gid, value = item["group"], item["truth"]
+            if not isinstance(gid, str):
+                raise TypeError(gid)
         except (ValueError, KeyError, TypeError):
             errors.append(f"{number}번째 줄을 읽지 못했다: {line}")
             continue
