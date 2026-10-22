@@ -1680,7 +1680,8 @@ def cmd_usage(args) -> int:
     out = rd / s.USAGE_FILE
     result = _usage_record(args.workflow, labels, cell_of, out)
     if args.run_dir:
-        s.mark(rnd, "usage", **result)
+        ledger = s.load_ledger(run_dir)
+        s.mark(s.get_round(ledger, args.round), "usage", **result)
         s.save_ledger(run_dir, ledger)
     if result["error"]:
         print(f"Claude 토큰 미측정: {result['error']}")

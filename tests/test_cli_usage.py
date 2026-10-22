@@ -1,13 +1,16 @@
+import contextlib
+import io
 import json
 import shutil
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from cascade import assignment, cli_steps, usage  # noqa: E402
+from cascade import assignment, cli, cli_steps, usage  # noqa: E402
 from helpers import run_cli  # noqa: E402
 from test_cli_e2e import CliTestBase  # noqa: E402
 
@@ -196,6 +199,24 @@ class UsageRecordTest(UsageCliBase):
         self.usage(wf)
         rows = {r["job_id"]: r["cell"] for r in self.recorded()["workflows"][wf.name]}
         self.assertEqual(rows, {"r1-01:opinion": "code.opinion", "round-1:recheck": "code.recheck"})
+
+    def test_usage_keeps_a_ledger_event_saved_while_it_reads_the_workflow(self):
+        wf = self.workflow()
+        real = cli._usage_record
+
+        def workers_save_in_between(*args, **kwargs):
+            ledger = cli_steps.load_ledger(self.run_dir)
+            cli_steps.mark(cli_steps.get_round(ledger, 1), "workers-stage1", counts={"ok": 1})
+            cli_steps.save_ledger(self.run_dir, ledger)
+            return real(*args, **kwargs)
+
+        with mock.patch.object(cli, "_usage_record", workers_save_in_between), \
+                contextlib.redirect_stdout(io.StringIO()):
+            cli.main(["usage", "--run-dir", str(self.run_dir), "--round", "1", "--workflow", str(wf)])
+        steps = [e["step"] for e in json.loads((self.run_dir / "ledger.json").read_text(encoding="utf-8"))
+                 ["rounds"][0]["events"]]
+        self.assertIn("workers-stage1", steps)
+        self.assertIn("usage", steps)
 
     def test_run_dir_needs_round(self):
         p = self.cli("usage", "--run-dir", str(self.run_dir), "--workflow", str(self.workflow()), ok=False)
