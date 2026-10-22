@@ -13,6 +13,7 @@ from pathlib import Path
 from cascade import assignment
 from cascade import cli_steps as s
 from cascade import profiles
+from cascade import usage as workflow_usage
 from cascade.config import ConfigError, ExitCodes
 from cascade.consensus import (
     OUTCOME_ADJUDICATE,
@@ -345,6 +346,13 @@ def _consent_option(raw: str | None) -> set[str] | None:
     return set(names)
 
 
+def _read_optional_json(path: Path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
 def _first_review_meta(args, mode: str) -> dict:
     if args.findings_json or not args.input or args.source == "pr-comment":
         return {}
@@ -359,6 +367,8 @@ def _first_review_meta(args, mode: str) -> dict:
     if not isinstance(meta, dict) or meta.get("role") != f"{mode}.review":
         return {}
     first_review = {key: meta[key] for key in FIRST_REVIEW_KEYS if key in meta}
+    if isinstance(measured := _read_optional_json(path.parent / s.USAGE_FILE), dict):
+        first_review["usage"] = measured
     if isinstance(first_review.get("requested"), dict):
         first_review["requested"] = {key: first_review["requested"][key] for key in ("runner", "model", "effort")
                                      if key in first_review["requested"]}
@@ -1583,6 +1593,84 @@ def cmd_cleanup(args) -> int:
     return 0
 
 
+CLAUDE_JOB_FILES = ("stage1-args.json", "stage1-fallback-args.json", "checker-args.json",
+                    "checker-fallback-args.json", "adj-args.json", s.OPINION_ARGS, s.RECHECK_ARGS)
+
+
+def _label_job_ids(files: list[Path]) -> dict[str, str]:
+    labels: dict[str, str] = {}
+    for path in files:
+        data = _read_optional_json(path)
+        for job in data.get("jobs", []) if isinstance(data, dict) else []:
+            if isinstance(job, dict) and isinstance(job.get("id"), str) and isinstance(job.get("label"), str):
+                labels.setdefault(job["label"], job["id"])
+    return labels
+
+
+def _usage_record(workflow: str, labels: dict[str, str], cell_of, out: Path) -> dict:
+    """Workflow 기록 폴더를 읽어 out(claude-usage.json)의 그 Workflow 몫을 덮어쓴다. 읽지 못하면 error만 돌려준다."""
+    try:
+        agents = workflow_usage.read_workflow(workflow_usage.find_workflow_dir(workflow))
+    except workflow_usage.UsageFormatError as e:
+        return {"workflow": Path(workflow).name, "jobs": 0, "unmatched": 0, "error": str(e)}
+    name = Path(workflow).name
+    rows, unmatched = [], []
+    for agent in agents:
+        job_id = labels.get(agent.label)
+        if job_id is None:
+            unmatched.append(agent.label)
+            continue
+        rows.append({"job_id": job_id, "label": agent.label, "cell": cell_of(job_id), "model": agent.model,
+                     "input": agent.input, "output": agent.output, "cache_read": agent.cache_read,
+                     "cache_write": agent.cache_write, "cost": agent.cost})
+    data = _read_optional_json(out)
+    data = data if isinstance(data, dict) else {}
+    workflows = data["workflows"] if isinstance(data.get("workflows"), dict) else {}
+    skipped = data["unmatched"] if isinstance(data.get("unmatched"), dict) else {}
+    s.write_json(out, {"prices_as_of": workflow_usage.PRICES_AS_OF, "workflows": {**workflows, name: rows},
+                       "unmatched": {**skipped, name: unmatched}})
+    if unmatched:
+        print(f"경고: 이름표가 작업과 일치하지 않는 에이전트는 어느 칸에도 넣지 않았다: {', '.join(unmatched)}")
+    return {"workflow": name, "jobs": len(rows), "unmatched": len(unmatched), "error": None}
+
+
+def cmd_usage(args) -> int:
+    if bool(args.run_dir) == bool(args.review_dir):
+        raise s.CliError("--run-dir(과 --round)와 --review-dir 중 하나만 준다", ExitCodes.PARSE_ERROR)
+    if args.run_dir:
+        if args.round is None:
+            raise s.CliError("--run-dir은 --round와 함께 쓴다", ExitCodes.PARSE_ERROR)
+        run_dir = Path(args.run_dir)
+        ledger = s.load_ledger(run_dir)
+        rnd = s.get_round(ledger, args.round)
+        rd = s.round_dir(run_dir, rnd.no)
+        labels = _label_job_ids([rd / name for name in CLAUDE_JOB_FILES])
+        mode = ledger.mode
+
+        def cell_of(job_id: str) -> str | None:
+            return assignment.job_cell_key(mode, job_id.rsplit(":", 1)[-1])
+    else:
+        rd = Path(args.review_dir)
+        if not rd.is_dir():
+            raise s.CliError(f"첫 검토 폴더가 아니다: {rd}", ExitCodes.PARSE_ERROR)
+        meta = _read_optional_json(rd / REVIEW_META)
+        role = meta.get("role") if isinstance(meta, dict) else None
+        labels = _label_job_ids([rd / "review-args.json"])
+
+        def cell_of(job_id: str) -> str | None:
+            return role
+    out = rd / s.USAGE_FILE
+    result = _usage_record(args.workflow, labels, cell_of, out)
+    if args.run_dir:
+        s.mark(rnd, "usage", **result)
+        s.save_ledger(run_dir, ledger)
+    if result["error"]:
+        print(f"Claude 토큰 미측정: {result['error']}")
+    else:
+        print(f"Claude 토큰: Workflow {result['workflow']} 작업 {result['jobs']}건 기록, 일치하지 않음 {result['unmatched']}건 → {out}")
+    return 0
+
+
 def cmd_status(args) -> int:
     run_dir = Path(args.run_dir)
     ledger = s.load_ledger(run_dir)
@@ -1664,6 +1752,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fallback-from", help="실패한 첫 검토 runner(codex·cursor). 마지막으로 시도한 runner와 같아야 한다")
     p.add_argument("--reason", help=f"--fallback-from의 사유(기본 {REVIEW_DEFAULT_REASON})")
     add("jobs", cmd_jobs, round_no=True)
+    p = add("usage", cmd_usage, run_dir=False, force=False)
+    p.add_argument("--run-dir")
+    p.add_argument("--round", type=int)
+    p.add_argument("--review-dir", help="CF review가 만든 첫 검토 폴더(review_dir=로 찍힌 곳)")
+    p.add_argument("--workflow", required=True, help="Workflow 실행 id 또는 그 기록 폴더 경로")
     p = add("workers", cmd_workers, round_no=True)
     p.add_argument("--stage", choices=(s.STAGE1, s.STAGE_CHECKER), required=True)
     p = add("judge", cmd_judge, round_no=True)

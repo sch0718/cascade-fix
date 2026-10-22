@@ -5,9 +5,10 @@ from pathlib import Path
 PRICES_AS_OF = "2026-10-06"
 PRICE_SOURCE = (
     "claude-api 스킬 자료(shared/prompt-caching.md, shared/model-migration.md) 2026-10-06 기준, $/MTok: "
-    "캐시 읽기는 모델별 표기값(Haiku 5.5는 입력 단가의 0.1배), 캐시 쓰기는 5분 TTL 기준 입력 단가의 1.25배"
+    "캐시 읽기는 모델별 표기값(Haiku 5.5는 입력 단가의 0.1배), 캐시 쓰기는 5분 TTL 입력 단가의 1.25배·1시간 TTL 입력 단가의 2배"
 )
 LONG_PROMPT_TOKENS = 100_000
+CACHE_WRITE_1H_MULTIPLIER = 2.0
 
 PRICES: dict[str, dict[str, float]] = {
     "claude-fable-5-1": {"input": 10.0, "output": 50.0, "cache_read": 0.25, "cache_write": 12.5},
@@ -38,11 +39,13 @@ class AgentUsage:
     cost: float | None
 
 
-def cost(model: str, input: int, output: int, cache_read: int, cache_write: int) -> float | None:
+def cost(model: str, input: int, output: int, cache_read: int, cache_write: int,
+         cache_write_1h: int = 0) -> float | None:
+    """cache_write는 5분 TTL 쓰기, cache_write_1h는 1시간 TTL 쓰기 토큰 수다."""
     prices = PRICES.get(model)
     if prices is None:
         return None
-    if model in LONG_PROMPT_PRICES and input + cache_read + cache_write > LONG_PROMPT_TOKENS:
+    if model in LONG_PROMPT_PRICES and input + cache_read + cache_write + cache_write_1h > LONG_PROMPT_TOKENS:
         prices = LONG_PROMPT_PRICES[model]
     total = 0.0
     for key, tokens in (("input", input), ("output", output), ("cache_read", cache_read), ("cache_write", cache_write)):
@@ -51,7 +54,7 @@ def cost(model: str, input: int, output: int, cache_read: int, cache_write: int)
         if key not in prices:
             return None
         total += tokens * prices[key] / 1_000_000
-    return total
+    return total + cache_write_1h * prices["input"] * CACHE_WRITE_1H_MULTIPLIER / 1_000_000
 
 
 def find_workflow_dir(ref: str, projects_root: Path = _DEFAULT_PROJECTS_ROOT) -> Path:
@@ -110,6 +113,14 @@ def _agent_model(workflow_dir: Path, agent_id: str) -> str:
     return model
 
 
+def _one_hour_writes(raw: dict) -> int:
+    breakdown = raw.get("cache_creation")
+    tokens = breakdown.get("ephemeral_1h_input_tokens") if isinstance(breakdown, dict) else None
+    if not isinstance(tokens, int) or isinstance(tokens, bool):
+        return 0
+    return max(0, min(tokens, raw["cache_creation_input_tokens"]))
+
+
 def _last_usage_per_message(workflow_dir: Path, agent_id: str) -> list[dict[str, int]]:
     name = f"agent-{agent_id}.jsonl"
     last: dict[str, dict[str, int]] = {}
@@ -124,7 +135,7 @@ def _last_usage_per_message(workflow_dir: Path, agent_id: str) -> list[dict[str,
         for key in _USAGE_KEYS:
             if not isinstance(raw.get(key), int):
                 raise UsageFormatError(f"{name}의 usage에 {key}가 없다")
-        last[message_id] = {key: raw[key] for key in _USAGE_KEYS}
+        last[message_id] = {**{key: raw[key] for key in _USAGE_KEYS}, "cache_write_1h": _one_hour_writes(raw)}
     if not last:
         raise UsageFormatError(f"{name}에 토큰 사용량 줄이 없다")
     return list(last.values())
@@ -138,7 +149,7 @@ def read_workflow(dir: Path) -> list[AgentUsage]:
         messages = _last_usage_per_message(workflow_dir, agent_id)
         costs = [
             cost(model, m["input_tokens"], m["output_tokens"], m["cache_read_input_tokens"],
-                 m["cache_creation_input_tokens"])
+                 m["cache_creation_input_tokens"] - m["cache_write_1h"], m["cache_write_1h"])
             for m in messages
         ]
         result.append(AgentUsage(

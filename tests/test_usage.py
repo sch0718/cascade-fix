@@ -105,6 +105,23 @@ class UsageTest(unittest.TestCase):
         self.assertAlmostEqual(low, 1 * 0.10 / 1e6 + 99_000 * 0.01 / 1e6)
         self.assertAlmostEqual(high, 1 * 0.50 / 1e6 + 100_000 * 0.05 / 1e6)
 
+    def test_one_hour_cache_write_costs_double_the_input_price(self):
+        self.assertAlmostEqual(usage.cost("claude-sonnet-5-5", 0, 0, 0, 0, cache_write_1h=1_000_000), 4.0)
+        self.assertAlmostEqual(usage.cost("claude-sonnet-5-5", 0, 0, 0, 1_000_000), 2.5)
+
+    def test_cache_creation_breakdown_prices_each_ttl(self):
+        row = {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0,
+               "cache_creation_input_tokens": 300_000,
+               "cache_creation": {"ephemeral_5m_input_tokens": 100_000, "ephemeral_1h_input_tokens": 200_000}}
+        got = usage.read_workflow(self.make_run(row))[0]
+        self.assertEqual(got.cache_write, 300_000)
+        self.assertAlmostEqual(got.cost, 100_000 * 2.5 / 1e6 + 200_000 * 4.0 / 1e6)
+
+    def test_cache_creation_without_breakdown_is_all_five_minute(self):
+        row = {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0,
+               "cache_creation_input_tokens": 300_000}
+        self.assertAlmostEqual(usage.read_workflow(self.make_run(row))[0].cost, 300_000 * 2.5 / 1e6)
+
     def test_unconfirmed_price_key_gives_none(self):
         saved = usage.PRICES["claude-sonnet-5-5"].pop("cache_write")
         self.addCleanup(usage.PRICES["claude-sonnet-5-5"].__setitem__, "cache_write", saved)

@@ -89,6 +89,7 @@ OPINION_ARGS = "opinion-args.json"
 OPINION_RESULTS = "opinion.json"
 RECHECK_ARGS = "recheck-args.json"
 RECHECK_RESULTS = "recheck.json"
+USAGE_FILE = "claude-usage.json"
 STAGE1, STAGE_CHECKER = "stage1", "checker"
 STAGE_ARGS = {STAGE1: "stage1-args.json", STAGE_CHECKER: "checker-args.json"}
 STAGE_OUTPUTS = {STAGE1: "stage1.json", STAGE_CHECKER: "checker.json"}
@@ -758,7 +759,11 @@ def pending_opinions(ledger: Ledger, rd: Path) -> list[str]:
 
 
 def workflow_step(args: Path, out: Path) -> str:
-    return f"Workflow 실행: script={RUN_JOBS} 내용, args={args} 내용 → 결과를 {out} 에 저장"
+    folder = Path(args).parent
+    round_dir_name = re.fullmatch(r"round-(\d+)", folder.name)
+    where = f"--run-dir {_q(folder.parent)} --round {round_dir_name.group(1)}" if round_dir_name else f"--review-dir {_q(folder)}"
+    return (f"Workflow 실행: script={RUN_JOBS} 내용, args={args} 내용 → 결과를 {out} 에 저장"
+            f" → 끝나면 CF usage {where} --workflow <Workflow 실행 id>")
 
 
 def parse_remote(url: str) -> tuple[str, str]:

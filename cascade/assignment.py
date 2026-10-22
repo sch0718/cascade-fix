@@ -24,6 +24,7 @@ _MODE_WORKER_KEYS = {
     "code": {"a": "code.a", "b": "code.b"},
     "doc": {"a": "doc.judge_a", "b": "doc.judge_b", "writer": "doc.writer", "checker": "doc.checker"},
 }
+_MODE_SHARED_ROLES = ("adjudicator", "opinion", "recheck")
 _WORKER_ROLES = ("a", "b", "judge_a", "judge_b", "writer", "checker")
 _REVIEW_ROLES = ("review", "opinion", "recheck")
 _OVERRIDE_SEPARATOR = " ← "
@@ -34,7 +35,7 @@ def _role(key: str) -> str:
 
 
 def job_cell_key(mode: str, role: str) -> str | None:
-    return f"{mode}.{role}" if role == "adjudicator" else _MODE_WORKER_KEYS.get(mode, {}).get(role)
+    return f"{mode}.{role}" if role in _MODE_SHARED_ROLES else _MODE_WORKER_KEYS.get(mode, {}).get(role)
 
 
 def _cell_label(key: str) -> str:
