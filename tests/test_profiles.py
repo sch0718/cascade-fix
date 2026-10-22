@@ -1,8 +1,10 @@
 import copy
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -451,6 +453,16 @@ class SelectionTest(unittest.TestCase):
         self.assertFalse(r.adopt_on_both_pass)
         r = self.resolve(toml, env={"CASCADE_PROFILE": "mine"})
         self.assertEqual((r.name, r.source), ("mine", "CASCADE_PROFILE"))
+
+    def test_repo_profile_key_may_be_a_symlink_or_home_path(self):
+        link = Path(self.tmp) / "link"
+        link.symlink_to(self.root)
+        toml = (f'default_profile = "local"\n[profiles.mine]\nbase = "claude-only"\n'
+                f'[repos."{link}"]\ntests = ["x"]\nprofile = "mine"\n')
+        self.assertEqual(self.resolve(toml).name, "mine")
+        with mock.patch.dict(os.environ, {"HOME": str(self.tmp)}):
+            toml = toml.replace(f'[repos."{link}"]', '[repos."~/link"]')
+            self.assertEqual(self.resolve(toml).name, "mine")
 
     def test_resolve_unknown_names_are_profile_errors(self):
         with self.assertRaisesRegex(profiles.ProfileError, "nope"):

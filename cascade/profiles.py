@@ -5,7 +5,7 @@ from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
 from pathlib import Path
 
-from cascade.config import ConfigError
+from cascade.config import ConfigError, repo_entry
 from cascade.jobs import ROLES, RUNNER_CLAUDE
 from cascade.review import EFFORTS
 from cascade.runners import RUNNER_CODEX, RUNNER_CURSOR
@@ -393,7 +393,7 @@ def resolve(root: Path, repos_toml: Path, *, flag: str | None, cli: LegacyOption
             available: dict[str, bool], codex_model: str) -> Resolved:
     found, data = load_profiles(repos_toml)
     repos = data.get("repos", {})
-    entry = repos.get(str(Path(root).resolve())) if isinstance(repos, dict) else None
+    entry = repo_entry(repos, root) if isinstance(repos, dict) else None
     repo_profile = _config_text(entry.get("profile"), "저장소 항목의 profile") if isinstance(entry, dict) else None
     default_profile = _config_text(data.get("default_profile"), "default_profile")
     name, source, explicit = select(flag=flag, env=env, repo_profile=repo_profile,

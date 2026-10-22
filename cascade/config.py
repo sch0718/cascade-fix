@@ -35,14 +35,19 @@ class RepoConfig:
     sensitive_paths: list[str] = field(default_factory=lambda: list(DEFAULT_SENSITIVE_PATHS))
 
 
+def repo_entry(repos: dict, root: Path):
+    """repos.toml의 [repos] 표에서 root 항목을 찾는다. 키는 ~·심볼릭 링크 경로로 적어도 된다."""
+    root = Path(root).resolve()
+    return next((v for k, v in repos.items() if Path(k).expanduser().resolve() == root), None)
+
+
 def load_repo_config(root: Path, config_path: Path) -> RepoConfig | None:
     config_path = Path(config_path)
     if not config_path.is_file():
         return None
     with config_path.open("rb") as f:
         data = tomllib.load(f)
-    root = Path(root).resolve()
-    entry = next((v for k, v in data.get("repos", {}).items() if Path(k).expanduser().resolve() == root), None)
+    entry = repo_entry(data.get("repos", {}), root)
     if entry is None:
         return None
     known = {f.name for f in fields(RepoConfig)}
