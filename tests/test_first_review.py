@@ -175,8 +175,13 @@ class CursorUsageTest(unittest.TestCase):
         self.assertEqual(first_review.cursor_usage(CURSOR_LOG)["input"], 1234)
 
     def test_whole_file_json(self):
-        path = self.log(json.dumps({"type": "result", "usage": {"inputTokens": 7, "outputTokens": 1}}, indent=2))
-        self.assertEqual(first_review.cursor_usage(path), {"input": 7, "output": 1, "cache_read": 0, "cache_write": 0})
+        usage = {"inputTokens": 7, "outputTokens": 1, "cacheReadTokens": 0, "cacheWriteTokens": 3}
+        path = self.log(json.dumps({"type": "result", "usage": usage}, indent=2))
+        self.assertEqual(first_review.cursor_usage(path), {"input": 7, "output": 1, "cache_read": 0, "cache_write": 3})
+
+    def test_missing_usage_key_is_none_not_zero(self):
+        self.assertIsNone(first_review.cursor_usage(self.log(json.dumps({"type": "result", "usage": {"inputTokens": 7, "outputTokens": 1}}))))
+        self.assertIsNone(first_review.cursor_usage(self.log(json.dumps({"type": "result", "usage": {}}))))
 
     def test_no_envelope_is_none_not_zero(self):
         self.assertIsNone(first_review.cursor_usage(self.log("오류만 있는 로그\n")))
@@ -284,10 +289,32 @@ class ScoreTest(unittest.TestCase):
         s = first_review.score(merged, {"g01": "사실", "g02": "아님", "g03": "사실"})
         self.assertEqual(sorted(s), ["codex", "cursor"])
 
-    def test_unjudged_groups_are_counted_apart(self):
-        s = first_review.score(self.merged, {"g03": "사실"})
-        self.assertEqual(s["codex"]["precision"], (1, 1))
-        self.assertEqual(s["codex"]["unjudged"], 1)
+    def test_missing_truth_line_is_an_error_listing_group_ids(self):
+        with self.assertRaises(first_review.FirstReviewError) as ctx:
+            first_review.score(self.merged, {"g03": "사실"})
+        self.assertIn("g01, g02, g04, g05", str(ctx.exception))
+        self.assertNotIn("g03", str(ctx.exception))
+        with self.assertRaises(first_review.FirstReviewError) as ctx:
+            first_review.score(self.merged, {})
+        self.assertIn("g01, g02, g03, g04, g05", str(ctx.exception))
+
+    def test_precision_denominator_is_the_reviewers_finding_count(self):
+        truth = {**TRUTH, "g04": "사실"}
+        s = first_review.score(self.merged, truth)
+        self.assertEqual(s["codex"]["findings"], 2)
+        self.assertEqual(s["codex"]["precision"], (2, 2))
+        self.assertEqual(s["cursor"]["precision"], (1, 2))
+        self.assertEqual(s["cursor"]["recall"], (1, 3))
+
+    def test_structurally_broken_merged_is_a_korean_error(self):
+        broken = (["그냥 목록"], {**self.merged, "groups": "문자열"}, {**self.merged, "findings": [1]},
+                  {**self.merged, "groups": [{"id": "g01", "members": ["codex r1-01"]}]}, {**self.merged, "groups": ["g01"]},
+                  {**self.merged, "findings": [{"runner": "gemini", "id": "x", "severity": "Warning", "location": "a:1", "body": "b"}]})
+        for merged in broken:
+            with self.subTest(merged=str(merged)[:40]):
+                with self.assertRaises(first_review.FirstReviewError) as ctx:
+                    first_review.score(merged, TRUTH)
+                self.assertIn("merged.json", str(ctx.exception))
 
     def test_unknown_group_or_truth_is_rejected(self):
         for truth in ({"g99": "사실"}, {"g01": "맞음"}):
@@ -408,9 +435,41 @@ class MainTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("2번째 줄", err)
 
+    def test_empty_truth_file_fails_listing_missing_groups(self):
+        merged = self.write("m.json", json.dumps(confirmed_of(first_review.merge(None, CODEX_TEXT, None, mode="doc")), ensure_ascii=False))
+        code, _, err = self.call(["score", "--merged", merged, "--truth", self.write("t.jsonl", "")])
+        self.assertEqual(code, 1)
+        self.assertIn("g01, g02", err)
+
+    def test_duplicate_truth_group_is_an_error(self):
+        merged = self.write("m.json", json.dumps(confirmed_of(first_review.merge(None, CODEX_TEXT, None, mode="doc")), ensure_ascii=False))
+        truth = self.write("t.jsonl", '{"group": "g01", "truth": "사실"}\n{"group": "g01", "truth": "아님"}\n{"group": "g02", "truth": "사실"}\n')
+        code, _, err = self.call(["score", "--merged", merged, "--truth", truth])
+        self.assertEqual(code, 1)
+        self.assertIn("2번째 줄의 묶음 g01", err)
+
+    def test_broken_merged_file_exits_one_without_traceback(self):
+        merged = self.write("m.json", json.dumps(["목록"]))
+        code, _, err = self.call(["score", "--merged", merged, "--truth", self.write("t.jsonl", '{"group": "g01", "truth": "사실"}\n')])
+        self.assertEqual(code, 1)
+        self.assertNotIn("Traceback", err)
+        self.assertIn("merged.json", err)
+
+    def test_partial_cursor_logs_are_not_summed(self):
+        merged = self.write("m.json", json.dumps(confirmed_of(first_review.merge(None, None, CURSOR_TEXT, mode="doc")), ensure_ascii=False))
+        truth = self.write("t.jsonl", '{"group": "g01", "truth": "사실"}\n{"group": "g02", "truth": "사실"}\n')
+        empty = self.write("empty.log", "usage 없음\n")
+        code, stdout, err = self.call(["score", "--merged", merged, "--truth", truth, "--usage-cli", CURSOR_LOG, empty])
+        self.assertEqual(code, 0)
+        self.assertIn("부분 기록", stdout)
+        self.assertNotIn("1234", stdout)
+        self.assertIn(str(empty), err)
+        code, stdout, _ = self.call(["score", "--merged", merged, "--truth", truth, "--usage-cli", empty])
+        self.assertIn("기록 없음", stdout)
+
     def test_score_reads_usage_files(self):
         merged = self.write("m.json", json.dumps(confirmed_of(first_review.merge(CLAUDE_TEXT, None, CURSOR_TEXT, mode="doc")), ensure_ascii=False))
-        truth = self.write("t.jsonl", json.dumps({"group": "g01", "truth": "사실"}) + "\n")
+        truth = self.write("t.jsonl", "".join(json.dumps({"group": f"g0{n}", "truth": "사실"}) + "\n" for n in range(1, 5)))
         usage = self.write("u.json", json.dumps(usage_data(1.5)))
         code, stdout, _ = self.call(["score", "--merged", merged, "--truth", truth, "--usage-claude", usage, "--usage-cli", CURSOR_LOG])
         self.assertEqual(code, 0)

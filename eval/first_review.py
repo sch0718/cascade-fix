@@ -24,6 +24,8 @@ FINAL_SUFFIX = ".final"
 CURSOR_TOKEN_KEYS = {"input": "inputTokens", "output": "outputTokens", "cache_read": "cacheReadTokens",
                      "cache_write": "cacheWriteTokens"}
 INIT_SOURCES = {MODE_DOC: "claude-doc", MODE_CODE: "claude-code"}
+FINDING_KEYS = ("runner", "id", "severity", "location", "body")
+PARTIAL_RECORD = "부분 기록(일부 로그에 usage 없음)"
 UNMEASURED_FORMAT = "미측정(형식 확인 필요: {reason})"
 
 
@@ -151,7 +153,7 @@ def cursor_usage(path: Path) -> dict | None:
     usage = envelope.get("usage") if envelope else None
     if not isinstance(usage, dict):
         return None
-    tokens = {key: usage.get(source, 0) for key, source in CURSOR_TOKEN_KEYS.items()}
+    tokens = {key: usage.get(source) for key, source in CURSOR_TOKEN_KEYS.items()}
     return tokens if all(stored_number(value) is not None for value in tokens.values()) else None
 
 
@@ -178,24 +180,41 @@ def merge_files(claude: Path | None, codex: Path | None, cursor: Path | None, mo
     return merged
 
 
+def malformed(reason: str) -> FirstReviewError:
+    return FirstReviewError(f"merged.json 형식이 맞지 않는다: {reason}")
+
+
 def index_findings(merged: dict) -> dict[tuple[str, str], dict]:
-    return {(f["runner"], f["id"]): f for f in merged["findings"]}
+    findings = merged.get("findings")
+    if not isinstance(findings, list):
+        raise malformed("findings가 목록이 아니다")
+    for index, finding in enumerate(findings, 1):
+        if not isinstance(finding, dict) or any(not isinstance(finding.get(key), str) for key in FINDING_KEYS) \
+                or finding["runner"] not in RUNNERS:
+            raise malformed(f"findings {index}번째 지적에 {', '.join(FINDING_KEYS)}가 문자열로 없거나 runner가 {'|'.join(RUNNERS)}가 아니다")
+    return {(f["runner"], f["id"]): f for f in findings}
 
 
 def check_groups(merged: dict) -> list[dict]:
     """확정된 묶음 목록. 확정 표시가 없거나 묶음이 지적과 맞지 않으면 오류다."""
+    if not isinstance(merged, dict):
+        raise malformed("최상위가 객체가 아니다")
     if merged.get("confirmed") is not True:
         raise FirstReviewError('확정되지 않았다: 묶음을 확인·수정한 뒤 merged.json의 "confirmed"를 true로 바꾼다')
     findings, groups = index_findings(merged), merged.get("groups")
     if not isinstance(groups, list):
-        raise FirstReviewError("merged.json의 groups가 목록이 아니다")
+        raise malformed("groups가 목록이 아니다")
     ids, assigned = [], {}
     for index, group in enumerate(groups, 1):
+        if not isinstance(group, dict):
+            raise malformed(f"groups {index}번째가 객체가 아니다")
         gid, members = group.get("id"), group.get("members")
         if not isinstance(gid, str) or not gid:
             raise FirstReviewError(f"id 없음: {index}번째 묶음에 id를 적는다")
         if not members:
             raise FirstReviewError(f"빈 묶음: {gid}")
+        if not isinstance(members, list) or any(not isinstance(m, dict) for m in members):
+            raise malformed(f"{gid}의 members가 객체 목록이 아니다")
         ids.append(gid)
         for member in members:
             key = (member.get("runner"), member.get("id"))
@@ -234,7 +253,7 @@ def confirm(merged: dict, out: Path) -> list[dict]:
         members = member_findings(group, findings)
         rep = representative(members)
         inputs.append({"id": group["id"], "severity": rep["severity"], "location": rep["location"], "body": rep["body"],
-                       "evidence": rep["evidence"]})
+                       "evidence": rep.get("evidence", "")})
         found_by[group["id"]] = [{"runner": f["runner"], "id": f["id"]} for f in members]
     out = Path(out)
     write_json(out / FINDINGS_INPUT_FILE, inputs)
@@ -253,9 +272,13 @@ def load_truth(path: Path) -> dict[str, str]:
             continue
         try:
             item = json.loads(line)
-            truth[item["group"]] = item["truth"]
+            gid, value = item["group"], item["truth"]
         except (ValueError, KeyError, TypeError):
             errors.append(f"{number}번째 줄을 읽지 못했다: {line}")
+            continue
+        if gid in truth:
+            errors.append(f"{number}번째 줄의 묶음 {gid}가 앞 줄과 겹친다")
+        truth[gid] = value
     if errors:
         raise FirstReviewError("정답 파일 오류: " + "; ".join(errors))
     return truth
@@ -269,15 +292,13 @@ def check_truth(truth: dict[str, str], groups: list[dict]) -> None:
         raise FirstReviewError(f"정답은 {'|'.join(TRUTH_VALUES)} 중 하나다: {', '.join(bad)}")
     if unknown:
         raise FirstReviewError(f"정답에 없는 묶음 id가 있다: {', '.join(unknown)}")
-
-
-def ratio(hits: int, total: int) -> tuple[int, int]:
-    return hits, total
+    missing = [group["id"] for group in groups if group["id"] not in truth]
+    if missing:
+        raise FirstReviewError(f"정답 줄이 없는 묶음이 있다: {', '.join(missing)}")
 
 
 def reviewer_score(runner: str, groups: list[dict], findings: dict, truth: dict[str, str]) -> dict:
     mine = [(g, f) for g in groups for f in member_findings(g, findings) if f["runner"] == runner]
-    judged = [(g, f) for g, f in mine if g["id"] in truth]
     facts = [g for g in groups if truth.get(g["id"]) == VERDICT_FACT]
     found = [g for g in facts if runner in found_by_of(member_findings(g, findings))]
     severity_of = {g["id"]: group_severity(member_findings(g, findings)) for g in groups}
@@ -285,12 +306,11 @@ def reviewer_score(runner: str, groups: list[dict], findings: dict, truth: dict[
     for severity in SEVERITIES:
         all_facts = [g for g in facts if severity_of[g["id"]] == severity]
         by_severity[severity] = {
-            "precision": ratio(sum(truth[g["id"]] == VERDICT_FACT for g, f in judged if f["severity"] == severity),
-                               sum(f["severity"] == severity for g, f in judged)),
-            "recall": ratio(sum(g in found for g in all_facts), len(all_facts))}
-    return {"findings": len(mine), "unjudged": len(mine) - len(judged),
-            "precision": ratio(sum(truth[g["id"]] == VERDICT_FACT for g, f in judged), len(judged)),
-            "recall": ratio(len(found), len(facts)), "by_severity": by_severity}
+            "precision": (sum(truth[g["id"]] == VERDICT_FACT for g, f in mine if f["severity"] == severity),
+                          sum(f["severity"] == severity for g, f in mine)),
+            "recall": (sum(g in found for g in all_facts), len(all_facts))}
+    return {"findings": len(mine), "precision": (sum(truth[g["id"]] == VERDICT_FACT for g, f in mine), len(mine)),
+            "recall": (len(found), len(facts)), "by_severity": by_severity}
 
 
 def sum_tokens(rows: list[dict]) -> dict:
@@ -310,13 +330,20 @@ def claude_cost(usage) -> dict:
 
 
 def token_cost(tokens: dict | None) -> dict:
+    if tokens == {}:
+        return {"tokens": None, "cost": None, "note": PARTIAL_RECORD}
     return {"tokens": tokens, "cost": None, "note": None if tokens else NO_RECORD}
 
 
+def reviewer_record(merged: dict, runner: str) -> dict:
+    reviewers = merged.get("reviewers")
+    record = reviewers.get(runner) if isinstance(reviewers, dict) else None
+    return record if isinstance(record, dict) else {}
+
+
 def reviewer_costs(merged: dict, usage_claude, usage_cli) -> dict:
-    reviewers = merged.get("reviewers") or {}
-    claude = usage_claude if usage_claude is not None else (reviewers.get(REVIEWER_CLAUDE) or {}).get("usage")
-    cursor = usage_cli if usage_cli is not None else (reviewers.get(REVIEWER_CURSOR) or {}).get("usage")
+    claude = usage_claude if usage_claude is not None else reviewer_record(merged, REVIEWER_CLAUDE).get("usage")
+    cursor = usage_cli if usage_cli is not None else reviewer_record(merged, REVIEWER_CURSOR).get("usage")
     return {REVIEWER_CLAUDE: claude_cost(claude), REVIEWER_CODEX: token_cost(None), REVIEWER_CURSOR: token_cost(cursor)}
 
 
@@ -325,7 +352,7 @@ def score(merged: dict, truth: dict[str, str], usage_claude: dict | None = None,
     check_truth(truth, groups)
     findings = index_findings(merged)
     costs = reviewer_costs(merged, usage_claude, usage_cli)
-    given = [runner for runner in RUNNERS if (merged.get("reviewers") or {}).get(runner, {}).get("given", True)]
+    given = [runner for runner in RUNNERS if reviewer_record(merged, runner).get("given", True)]
     return {runner: {**reviewer_score(runner, groups, findings, truth), "cost": costs[runner]} for runner in given}
 
 
@@ -347,8 +374,8 @@ def table(header: tuple[str, ...], rows: list[tuple[str, ...]]) -> list[str]:
 
 def render(result: dict) -> str:
     lines = ["## 검토자별 정밀도·재현율", "",
-             *table(("검토자", "지적 수", "정밀도", "재현율", "판정 없음"),
-                    [(label(r), str(v["findings"]), pct(v["precision"]), pct(v["recall"]), str(v["unjudged"])) for r, v in result.items()]),
+             *table(("검토자", "지적 수", "정밀도", "재현율"),
+                    [(label(r), str(v["findings"]), pct(v["precision"]), pct(v["recall"])) for r, v in result.items()]),
              "", "## 등급별(정밀도는 검토자가 붙인 등급, 재현율은 묶음의 가장 높은 등급)", "",
              *table(("검토자", "등급", "정밀도", "재현율"),
                     [(label(r), severity, pct(s["precision"]), pct(s["recall"])) for r, v in result.items()
@@ -423,8 +450,15 @@ def run_score(args) -> int:
 
 
 def sum_cli_logs(paths: list[str]) -> dict | None:
-    found = [tokens for path in paths if (tokens := cursor_usage(Path(path)))]
-    return {key: sum(tokens[key] for tokens in found) for key in CURSOR_TOKEN_KEYS} if found else None
+    """로그마다 usage가 있어야 합계를 낸다. 일부만 있으면 부분 합계를 전체처럼 보이지 않도록 {}(부분 기록)를 돌려준다."""
+    found = [cursor_usage(Path(path)) for path in paths]
+    if not any(found):
+        return None
+    if not all(found):
+        missing = [path for path, tokens in zip(paths, found) if not tokens]
+        print(f"경고: usage가 없는 로그가 있어 Cursor 토큰 합계를 내지 않는다: {', '.join(missing)}", file=sys.stderr)
+        return {}
+    return {key: sum(tokens[key] for tokens in found) for key in CURSOR_TOKEN_KEYS}
 
 
 def build_parser() -> argparse.ArgumentParser:
