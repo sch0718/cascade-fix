@@ -46,6 +46,8 @@ def git(cwd, *args, check=True) -> str:
 def toml_value(value) -> str:
     if isinstance(value, list):
         return "[" + ", ".join(toml_value(v) for v in value) + "]"
+    if isinstance(value, dict):
+        return "{" + ", ".join(f"{json.dumps(k, ensure_ascii=False)} = {toml_value(v)}" for k, v in value.items()) + "}"
     return json.dumps(value, ensure_ascii=False)
 
 
@@ -53,13 +55,17 @@ def write_worktree_toml(src: Path, repo: Path, wt: Path, dest: Path) -> None:
     data = tomllib.loads(src.read_text(encoding="utf-8")) if src.is_file() else {}
     root = repo.resolve()
     entry = next((v for k, v in data.get("repos", {}).items() if Path(k).expanduser().resolve() == root), None)
-    lines = ["[repos]"]
+    lines = [f"default_profile = {toml_value(data['default_profile'])}"] if "default_profile" in data else []
+    lines.append("[repos]")
     if entry is not None:
         key = json.dumps(str(wt))
         tables = {k: v for k, v in entry.items() if isinstance(v, dict)}
         lines += [f"[repos.{key}]", *(f"{k} = {toml_value(v)}" for k, v in entry.items() if k not in tables)]
         for name, table in tables.items():
             lines += [f"[repos.{key}.{name}]", *(f"{k} = {toml_value(v)}" for k, v in table.items())]
+    for name, table in data.get("profiles", {}).items():
+        lines += [f"[profiles.{json.dumps(name, ensure_ascii=False)}]",
+                  *(f"{json.dumps(k, ensure_ascii=False)} = {toml_value(v)}" for k, v in table.items())]
     dest.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 

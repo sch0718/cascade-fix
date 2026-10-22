@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -488,6 +489,25 @@ class ReplayTest(unittest.TestCase):
         dest = self.tmp / "wt.toml"
         replay.write_worktree_toml(toml, self.repo, self.tmp / "wt", dest)
         self.assertIn('tests = ["make test"]', dest.read_text(encoding="utf-8"))
+
+    def test_worktree_toml_keeps_profile_definitions_the_repo_selects(self):
+        src = self.tmp / "src.toml"
+        src.write_text(f'[profiles.mine]\nbase = "claude-only"\nadopt_on_both_pass = false\n'
+                       f'"code.a" = {{ runner = "codex", model = "", effort = "low", '
+                       f'fallback = {{ runner = "claude", model = "claude-sonnet-5-5", effort = "low" }} }}\n'
+                       f'[repos."{self.repo}"]\ntests = ["make test"]\nprofile = "mine"\n', encoding="utf-8")
+        dest, wt = self.tmp / "wt.toml", self.tmp / "wt"
+        replay.write_worktree_toml(src, self.repo, wt, dest)
+        written = tomllib.loads(dest.read_text(encoding="utf-8"))
+        self.assertEqual(written["profiles"], tomllib.loads(src.read_text(encoding="utf-8"))["profiles"])
+        self.assertEqual(written["repos"][str(wt)]["profile"], "mine")
+
+    def test_worktree_toml_keeps_default_profile(self):
+        src = self.tmp / "src.toml"
+        src.write_text(f'default_profile = "claude-only"\n[repos."{self.repo}"]\ntests = ["make test"]\n', encoding="utf-8")
+        dest = self.tmp / "wt.toml"
+        replay.write_worktree_toml(src, self.repo, self.tmp / "wt", dest)
+        self.assertEqual(tomllib.loads(dest.read_text(encoding="utf-8"))["default_profile"], "claude-only")
 
     def test_replay_rejects_reused_worktree_at_other_commit(self):
         (self.repo / "calc.py").write_text(CALC + "\n", encoding="utf-8")
