@@ -10,8 +10,10 @@ NOT_APPLICABLE = "해당 없음"
 UNMEASURED = "미측정"
 COST_EXCLUDED = "비용 미측정으로 제외"
 UNSTABLE = "불안정"
-METRICS = ("accuracy", "false_fact", "completion", "fallback_ratio", "regressions", "claude_cost", "to_human")
-TABLE_HEADER = ("후보", "정확도", "「아님」 오채택", "완주", "대체 실행", "회귀 실행", "Claude 비용", "사람 목록", "판정 흔들림")
+METRICS = ("accuracy", "false_fact", "completion", "fallback_ratio", "regressions", "claude_cost", "to_human", "opus_calls")
+NUMBER_KEYS = METRICS + ("regressions",)
+TABLE_HEADER = ("후보", "정확도", "「아님」 오채택", "완주", "대체 실행", "회귀 실행", "Opus 호출", "Claude 비용", "사람 목록",
+                "판정 흔들림")
 
 
 def stats(values: list) -> dict | None:
@@ -120,13 +122,18 @@ def summarize(runs: list[dict], base_metrics: dict | None) -> dict:
             "unstable_runs": unstable, "cost_mean": cost, "reasons": reasons}
 
 
+def to_human_rank(summary: dict) -> float:
+    mean = mean_of(summary["metrics"], "to_human")
+    return float("inf") if mean is None else mean
+
+
 def pick(summaries: dict[str, dict], eligible: list[str]) -> str | None:
     priced = [name for name in eligible if summaries[name]["cost_mean"] is not None]
     if not priced:
         return None
     lowest = min(summaries[name]["cost_mean"] for name in priced)
-    near = [name for name in priced if summaries[name]["cost_mean"] <= lowest * (1 + COST_TIE)]
-    return min(near, key=lambda name: (mean_of(summaries[name]["metrics"], "to_human") or 0, summaries[name]["cost_mean"], name))
+    near = [name for name in priced if round(summaries[name]["cost_mean"] - lowest * (1 + COST_TIE), 6) <= 0]
+    return min(near, key=lambda name: (to_human_rank(summaries[name]), summaries[name]["cost_mean"], name))
 
 
 def decide(cands: dict[str, list[dict]], baseline: str) -> dict:
@@ -137,7 +144,7 @@ def decide(cands: dict[str, list[dict]], baseline: str) -> dict:
 
 
 def spread(stat: dict | None, fmt) -> str:
-    return "-" if stat is None else f"{fmt(stat['mean'])} [{fmt(stat['min'])}~{fmt(stat['max'])}]"
+    return UNMEASURED if stat is None else f"{fmt(stat['mean'])} [{fmt(stat['min'])}~{fmt(stat['max'])}]"
 
 
 def number(value: float) -> str:
@@ -151,7 +158,7 @@ def row(name: str, summary: dict) -> tuple[str, ...]:
             spread(m["accuracy"], ratio_text), spread(m["false_fact"], number), spread(m["completion"], ratio_text),
             NOT_APPLICABLE if m["fallback_ratio"] is None else spread(m["fallback_ratio"], ratio_text),
             UNMEASURED if regressions["ok"] is None else f"{regressions['value']}/{regressions['runs']}",
-            spread(m["claude_cost"], money) if summary["cost_mean"] is not None else COST_EXCLUDED,
+            spread(m["opus_calls"], number), spread(m["claude_cost"], money) if summary["cost_mean"] is not None else COST_EXCLUDED,
             spread(m["to_human"], number), ratio_text(summary["flip_rate"]))
 
 
@@ -169,8 +176,9 @@ def selection_line(result: dict) -> str:
     if selected is None:
         return "선정: 없음 — 조건을 넘고 비용이 측정된 후보가 없다"
     summary = result["candidates"][selected]
-    return (f"선정: {selected} — Claude 비용 평균 {money(summary['cost_mean'])}, 사람 목록 평균 "
-            f"{number(mean_of(summary['metrics'], 'to_human') or 0)}")
+    to_human = mean_of(summary["metrics"], "to_human")
+    human_text = UNMEASURED if to_human is None else f"평균 {number(to_human)}"
+    return f"선정: {selected} — Claude 비용 평균 {money(summary['cost_mean'])}, 사람 목록 {human_text}"
 
 
 def render(result: dict) -> str:
@@ -187,6 +195,24 @@ class InputError(Exception):
     pass
 
 
+def is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def invalid_key(data: dict) -> str | None:
+    wrong = [key for key in NUMBER_KEYS if data.get(key) is not None and not is_number(data[key])]
+    if data.get("predicted") is not None and not isinstance(data["predicted"], dict):
+        wrong.append("predicted")
+    selection = data.get("selection")
+    checks = selection.get("checks") if isinstance(selection, dict) else None
+    if selection is not None and not isinstance(selection, dict):
+        wrong.append("selection")
+    elif isinstance(selection, dict) and checks is not None and not (
+            isinstance(checks, dict) and all(isinstance(check, dict) for check in checks.values())):
+        wrong.append("selection.checks")
+    return wrong[0] if wrong else None
+
+
 def load_run(name: str, path: str) -> dict:
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -194,6 +220,8 @@ def load_run(name: str, path: str) -> dict:
         raise InputError(f"후보 {name}의 점수 JSON을 읽지 못했다: {path} ({exc})") from exc
     if not isinstance(data, dict):
         raise InputError(f"후보 {name}의 점수 JSON이 객체가 아니다: {path}")
+    if (wrong := invalid_key(data)) is not None:
+        raise InputError(f"후보 {name}의 점수 JSON에서 {wrong} 값의 형식이 맞지 않는다: {path}")
     return data
 
 
@@ -225,7 +253,11 @@ def main(argv=None) -> int:
     result = decide(cands, args.baseline)
     print(render(result))
     if args.json:
-        Path(args.json).write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        try:
+            Path(args.json).write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        except OSError as exc:
+            print(f"--json 파일을 쓰지 못했다: {args.json} ({exc})", file=sys.stderr)
+            return 1
     return 0
 
 

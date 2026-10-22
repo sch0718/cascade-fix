@@ -111,6 +111,28 @@ class DecideTest(unittest.TestCase):
         self.assertIsNone(result["selected"])
         self.assertIn("선정: 없음", select_profiles.render(result))
 
+    def test_unmeasured_to_human_never_wins_tie_break(self):
+        cands = {"claude-only": [run(claude_cost=9.0)], "a-none": [run(claude_cost=5.0, to_human=None)],
+                 "b-some": [run(claude_cost=5.4, to_human=7)]}
+        result = select_profiles.decide(cands, "claude-only")
+        self.assertEqual(result["selected"], "b-some")
+        only = select_profiles.decide({"claude-only": [run(claude_cost=9.0, to_human=None)]}, "claude-only")
+        self.assertIn("사람 목록 미측정", select_profiles.render(only))
+
+    def test_cost_tie_uses_rounding_tolerance(self):
+        cands = {"claude-only": [run(claude_cost=9.0)], "a": [run(claude_cost=0.3, to_human=5)],
+                 "b": [run(claude_cost=0.1 * 3 * 1.1 + 1e-12, to_human=1)]}
+        self.assertEqual(select_profiles.decide(cands, "claude-only")["selected"], "b")
+
+    def test_opus_calls_in_table_and_missing_is_unmeasured(self):
+        cands = candidates(**{"mix-codex-haiku": [run(claude_cost=5.0, opus_calls=4), run(claude_cost=5.0, opus_calls=8)]})
+        result = select_profiles.decide(cands, "claude-only")
+        self.assertEqual(result["candidates"]["mix-codex-haiku"]["metrics"]["opus_calls"], {"mean": 6.0, "min": 4, "max": 8})
+        text = select_profiles.render(result)
+        self.assertIn("6 [4~8]", text)
+        self.assertIn("| claude-only | ", text)
+        self.assertIsNone(result["candidates"]["claude-only"]["metrics"]["opus_calls"])
+
     def test_runs_without_selection_are_tolerated(self):
         bare = run()
         bare["selection"] = None
@@ -186,6 +208,24 @@ class CliTest(unittest.TestCase):
         bad.write_text("{not json", encoding="utf-8")
         code, _, err = self.call(["--candidate", f"a={bad}", "--baseline", "a"])
         self.assertEqual(code, 1)
+        self.assertNotIn("Traceback", err)
+
+    def test_wrong_value_type_is_a_korean_error(self):
+        path = self.write("wrong.json", run(predicted=["a", "b"]))
+        code, _, err = self.call(["--candidate", f"a={path}", "--baseline", "a"])
+        self.assertEqual(code, 1)
+        self.assertIn("predicted", err)
+        self.assertNotIn("Traceback", err)
+        path = self.write("wrong2.json", run(accuracy="0.9"))
+        code, _, err = self.call(["--candidate", f"a={path}", "--baseline", "a"])
+        self.assertEqual(code, 1)
+        self.assertIn("accuracy", err)
+
+    def test_unwritable_json_output_is_a_korean_error(self):
+        path = self.write("a.json", run())
+        code, _, err = self.call(["--candidate", f"a={path}", "--baseline", "a", "--json", str(self.tmp / "no-dir" / "out.json")])
+        self.assertEqual(code, 1)
+        self.assertIn("out.json", err)
         self.assertNotIn("Traceback", err)
 
     def test_malformed_candidate_argument(self):
