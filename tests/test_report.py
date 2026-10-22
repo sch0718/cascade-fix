@@ -799,6 +799,16 @@ class ClaudeUsageColumnsTest(unittest.TestCase):
         self.assertIn("| code.a | 2 | 0 | 4/80/2000 외 미측정 1건 | $0.0123 외 미측정 1건 | - |", text)
         self.assertIn("(미측정 1건은 합계에서 빠졌다)", text)
 
+    def test_same_job_id_in_a_resumed_round_without_usage_is_unmeasured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            ledger = self.code_ledger(run_dir, usage_file(usage_row("F1:a", "code.a")), jobs=("F1:a",))
+            ledger.rounds.append(RoundRecord(no=2, findings=[], decisions=[], adopted=[], recheck_opened=False))
+            write_json(run_dir / "round-2" / "stage1-args.json", {"jobs": [job("F1:a")]})
+            text = self.render(ledger, run_dir)
+        self.assertIn("4/80/2000 외 미측정 1건", text)
+        self.assertIn("(미측정 1건은 합계에서 빠졌다)", text)
+
     def test_row_without_a_price_keeps_tokens_and_marks_cost_unmeasured(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)

@@ -644,7 +644,7 @@ class _ClaudeUsage:
     def __init__(self, ledger: Ledger, run_dir: Path | None):
         self.known = run_dir is not None
         self.rows: dict[str, list[dict]] = {}
-        self.jobs: dict[str, set[str]] = {}
+        self.jobs: dict[str, set[tuple[int, str]]] = {}
         self.basis: list[tuple[str, str]] = []
         self.superseded: list[float] | None = None
         self.first_review_rows: list[dict] = []
@@ -659,13 +659,13 @@ class _ClaudeUsage:
                 self.superseded = [*(self.superseded or []), *self._costs(_read_usage_rows(_read_json(old)))]
             for row in _read_usage_rows(data):
                 if isinstance(row.get("cell"), str):
-                    self.rows.setdefault(row["cell"], []).append(row)
+                    self.rows.setdefault(row["cell"], []).append({**row, "round": rnd.no})
             for name in CLAUDE_JOB_FILES:
                 listed = _read_json(rd / name)
                 for entry in listed.get("jobs", []) if isinstance(listed, dict) and isinstance(listed.get("jobs"), list) else []:
                     cell = _cell_of(ledger, entry["id"]) if isinstance(entry, dict) and isinstance(entry.get("id"), str) else None
                     if cell:
-                        self.jobs.setdefault(cell, set()).add(entry["id"])
+                        self.jobs.setdefault(cell, set()).add((rnd.no, entry["id"]))
 
     def _collect_first_review(self, ledger: Ledger) -> None:
         data = (assignment.ledger_profile(ledger).get("first_review") or {}).get("usage")
@@ -684,11 +684,11 @@ class _ClaudeUsage:
             if entry not in self.basis:
                 self.basis.append(entry)
 
-    def columns(self, rows: list[dict], jobs: set[str], work: bool) -> tuple[str, str]:
+    def columns(self, rows: list[dict], jobs: set[tuple[int, str]], work: bool) -> tuple[str, str]:
         """(토큰, 비용) 칸 글자. 이 칸에 Claude 작업이 있는데(work나 jobs) 기록이 없으면 미측정, 작업이 없으면 -."""
         if not rows and not (work or jobs):
             return "-", "-"
-        missing = len(jobs - {row.get("job_id") for row in rows})
+        missing = len(jobs - {(row.get("round"), row.get("job_id")) for row in rows})
         if not rows:
             self.unmeasured += max(missing, 1)
             return UNMEASURED, UNMEASURED
