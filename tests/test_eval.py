@@ -67,8 +67,37 @@ def make_run(runs, item_id, decisions, results=None, mode="code", opinions=None,
         write_json(rnd / "apply.json", apply)
 
 
-def decision(outcome, patch_from=None, reasons=None):
-    return {"finding_id": "r1-01", "outcome": outcome, "patch_from": patch_from, "reasons": reasons or []}
+def decision(outcome, patch_from=None, reasons=None, fid="r1-01"):
+    return {"finding_id": fid, "outcome": outcome, "patch_from": patch_from, "reasons": reasons or []}
+
+
+APPLY_DONE = [{"step": "apply"}]
+
+
+def make_cf_run(runs, name, rounds, mode="code"):
+    base = Path(runs) / name
+    write_json(base / "ledger.json", {"mode": mode, "source": "codex-code", "opinions": {}, "rounds": [
+        {"no": r["no"], "decisions": r.get("decisions", []), "events": r.get("events", APPLY_DONE)} for r in rounds]})
+    for r in rounds:
+        rd = base / f"round-{r['no']}"
+        write_json(rd / "results.json", r.get("results", {}))
+        if "apply" in r:
+            write_json(rd / "apply.json", r["apply"])
+        if "pre_final" in r:
+            write_json(rd / "decisions-pre-final.json", r["pre_final"])
+        for fname, data in r.get("files", {}).items():
+            write_json(rd / fname, data)
+
+
+def sample_line(item_id, truth="사실", run=None, fid="r1-01"):
+    line = {"id": item_id, "finding": {"id": fid}, "truth": {"verdict": truth}, "baseline_opus_calls": 1}
+    if run:
+        line["run"] = run
+    return line
+
+
+def sample_of(*lines):
+    return {line["id"]: line for line in lines}
 
 
 def claude_job(job_id, model):
@@ -244,6 +273,185 @@ class ScoreTest(unittest.TestCase):
         self.assertIn("| 무효 결과 | 1/4 (25.0%) |", text)
         self.assertIn("| Claude 호출 | Sonnet 0 · Haiku 0 · Opus 1 |", text)
         self.assertIn("| CLI 사용량(codex) | 입력 1 · 출력 2 · 캐시 읽기 3 |", text)
+
+
+class ScoreAccuracyTest(unittest.TestCase):
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.runs = Path(self._td.name)
+
+    def mixed_runs(self):
+        make_run(self.runs, "m1", [decision("합의-사실", "a")])
+        make_run(self.runs, "m2", [decision("합의-사실", "a")])
+        make_run(self.runs, "m3", [decision("합의-사실", "a")])
+        make_run(self.runs, "m4", [decision("설계결정")])
+        make_run(self.runs, "m5", [decision("판단불가", None, ["판가름 재현 불가"])])
+        return sample_of(sample_line("m1"), sample_line("m2"), sample_line("m3", "아님"), sample_line("m4", "아님"),
+                         sample_line("m5", "재현 불가"))
+
+    def test_fixed_denominator_counts_errors_wrong(self):
+        lines = [sample_line(f"e{i}") for i in range(36)] + [sample_line("ok")]
+        for i in range(36):
+            make_run(self.runs, f"e{i}", [], error="boom")
+        make_run(self.runs, "ok", [decision("합의-사실", "a")])
+        m = score.compute(self.runs, sample_of(*lines))
+        self.assertAlmostEqual(m["accuracy"], 1 / 37)
+        self.assertAlmostEqual(m["completion"], 1 / 37)
+        self.assertEqual(m["agreement"], 1.0)
+        self.assertEqual((m["total"], m["correct"]), (37, 1))
+
+    def test_accuracy_none_without_sample(self):
+        m = score.compute(self.runs, {})
+        self.assertEqual((m["accuracy"], m["completion"]), (None, None))
+
+    def test_run_unit_sample_counts_calls_once(self):
+        results = {"r1-01:adjudicator": worker("사실", "adjudicator"), "r1-02:adjudicator": worker("사실", "adjudicator")}
+        make_cf_run(self.runs, "doc1", [{"no": 1, "decisions": [decision("합의-사실", "a"), decision("합의-사실", "a", fid="r1-02")],
+                                         "results": results, "apply": {"final_ok": False},
+                                         "files": {"adj-args.json": jobs_file(("r1-01:adjudicator", "claude-opus-5-5"))}}])
+        sample = sample_of(sample_line("a", run="doc1"), sample_line("b", run="doc1", fid="r1-02"))
+        m = score.compute(self.runs, sample)
+        self.assertEqual((m["opus_calls"], m["baseline_calls"], m["items"]), (2, 2, 2))
+        self.assertEqual(m["claude_calls"]["opus"], 1)
+        self.assertEqual(m["regressions"], 1)
+        self.assertEqual(m["predicted"], {"a": "사실", "b": "사실"})
+
+    def test_run_resolved_under_each_runs_dir(self):
+        cfg_a, cfg_b = self.runs / "a", self.runs / "b"
+        make_cf_run(cfg_a, "r", [{"no": 1, "decisions": [decision("합의-사실", "a")]}])
+        make_cf_run(cfg_b, "r", [{"no": 1, "decisions": [decision("합의-아님")]}])
+        sample = sample_of(sample_line("x", run="r"))
+        a, b = score.compute(cfg_a, sample), score.compute(cfg_b, sample)
+        self.assertNotEqual(a["predicted"], b["predicted"])
+
+    def test_run_without_ledger_is_missing(self):
+        m = score.compute(self.runs, sample_of(sample_line("x", run="nope")))
+        self.assertEqual((m["missing"], m["items"], m["accuracy"], m["completion"]), (1, 0, 0.0, 0.0))
+
+    def test_round_limits_decision_and_completion(self):
+        make_cf_run(self.runs, "r", [
+            {"no": 1, "decisions": [decision("합의-사실", "a")], "apply": {"final_ok": True}},
+            {"no": 2, "decisions": [], "events": [], "apply": {"final_ok": False}}])
+        sample = sample_of(sample_line("x", run="r"))
+        full = score.compute(self.runs, sample)
+        self.assertEqual((full["incomplete"], full["items"]), (1, 0))
+        m = score.compute(self.runs, sample, round_no=1)
+        self.assertEqual((m["incomplete"], m["regressions"]), (0, 0))
+        self.assertEqual(m["predicted"]["x"], "사실")
+
+    def test_run_ended_before_round_n_is_not_incomplete(self):
+        make_cf_run(self.runs, "r", [{"no": 1, "decisions": [decision("합의-사실", "a")]}])
+        m = score.compute(self.runs, sample_of(sample_line("x", run="r")), round_no=3)
+        self.assertEqual((m["incomplete"], m["items"]), (0, 1))
+
+    def test_round_limits_role_counts(self):
+        adjudicator = {"r1-01:adjudicator": worker("사실", "adjudicator")}
+        make_cf_run(self.runs, "r", [
+            {"no": 1, "decisions": [decision("합의-사실", "a")], "results": adjudicator},
+            {"no": 2, "decisions": [decision("합의-사실", "a")], "results": adjudicator}])
+        sample = sample_of(sample_line("x", run="r"))
+        self.assertEqual(score.compute(self.runs, sample)["opus_calls"], 2)
+        self.assertEqual(score.compute(self.runs, sample, round_no=1)["opus_calls"], 1)
+
+    def test_round_limits_legacy_item(self):
+        base = self.runs / "s1"
+        make_run(self.runs, "s1", [decision("합의-사실", "a")], apply={"final_ok": True})
+        write_json(base / "run" / "round-2" / "apply.json", {"final_ok": False})
+        write_json(base / "ledger.json", {"mode": "code", "opinions": {}, "rounds": [
+            {"no": 1, "decisions": [decision("합의-사실", "a")], "events": []},
+            {"no": 2, "decisions": [decision("합의-아님")], "events": []}]})
+        sample = sample_of(sample_line("s1"))
+        self.assertEqual(score.compute(self.runs, sample)["predicted"]["s1"], "아님")
+        m = score.compute(self.runs, sample, round_no=1)
+        self.assertEqual((m["predicted"]["s1"], m["regressions"]), ("사실", 0))
+
+    def test_apply_patched_only_is_incomplete(self):
+        make_cf_run(self.runs, "r", [{"no": 1, "decisions": [decision("합의-사실", "a")], "events": [{"step": "apply-patched"}]}])
+        m = score.compute(self.runs, sample_of(sample_line("x", run="r")), round_no=1)
+        self.assertEqual((m["incomplete"], m["accuracy"]), (1, 0.0))
+
+    def test_incomplete_run_counts_all_its_findings_wrong(self):
+        two = [decision("합의-사실", "a"), decision("합의-사실", "a", fid="r1-02")]
+        make_cf_run(self.runs, "A", [{"no": 1, "decisions": two}])
+        make_cf_run(self.runs, "B", [{"no": 1, "decisions": two, "events": [{"step": "apply-patched"}]}])
+        sample = sample_of(sample_line("a1", run="A"), sample_line("a2", run="A", fid="r1-02"),
+                           sample_line("b1", run="B"), sample_line("b2", run="B", fid="r1-02"))
+        m = score.compute(self.runs, sample)
+        self.assertEqual((m["incomplete"], m["accuracy"]), (2, 2 / 4))
+        self.assertEqual(m["completion"], 2 / 4)
+
+    def test_pre_final_uses_decisions_before_final_suite(self):
+        make_cf_run(self.runs, "r", [{"no": 1, "decisions": [decision("판단불가", None, ["전체 검사 실패"])],
+                                      "pre_final": [decision("합의-사실", "a")], "apply": {"final_ok": False}}])
+        sample = sample_of(sample_line("x", run="r"))
+        self.assertEqual(score.compute(self.runs, sample)["predicted"]["x"], "판정 없음")
+        self.assertEqual(score.compute(self.runs, sample, pre_final=True)["predicted"]["x"], "사실")
+
+    def test_pre_final_leaves_rounds_without_file_unchanged(self):
+        make_cf_run(self.runs, "r", [
+            {"no": 1, "decisions": [decision("합의-아님")], "pre_final": [decision("합의-사실", "a")]},
+            {"no": 2, "decisions": [decision("합의-사실", "a")]}])
+        m = score.compute(self.runs, sample_of(sample_line("x", run="r")), pre_final=True)
+        self.assertEqual(m["predicted"]["x"], "사실")
+        m = score.compute(self.runs, sample_of(sample_line("x", run="r")), round_no=1, pre_final=True)
+        self.assertEqual(m["predicted"]["x"], "사실")
+
+    def test_baseline_failure_is_not_regression(self):
+        self.assertFalse(score.is_regression({"final_ok": False, "baseline_failed": True}))
+        self.assertTrue(score.is_regression({"final_ok": False, "baseline_failed": False}))
+        self.assertTrue(score.is_regression({"final_ok": False}))
+        self.assertFalse(score.is_regression({"final_ok": None}))
+        make_cf_run(self.runs, "r", [{"no": 1, "decisions": [decision("합의-사실", "a")],
+                                      "apply": {"final_ok": False, "baseline_failed": True}}])
+        make_cf_run(self.runs, "q", [{"no": 1, "decisions": [decision("합의-사실", "a")],
+                                      "apply": {"final_ok": False, "baseline_failed": False}}])
+        self.assertEqual(score.compute(self.runs, sample_of(sample_line("x", run="r")))["regressions"], 0)
+        self.assertEqual(score.compute(self.runs, sample_of(sample_line("x", run="q")))["regressions"], 1)
+
+    def test_regression_uses_final_history(self):
+        past = {"final_ok": False, "baseline_failed": False}
+        redo = {"final_ok": None, "baseline_failed": False}
+        self.assertTrue(score.is_regression({"final_ok": None, "final_history": [past, redo]}))
+        self.assertFalse(score.is_regression({"final_ok": None, "final_history": [redo, {"final_ok": True}]}))
+        self.assertFalse(score.is_regression({"final_ok": False, "baseline_failed": False,
+                                              "final_history": [{"final_ok": False, "baseline_failed": True}]}))
+
+    def test_regressions_count_runs_not_rounds_and_legacy_items(self):
+        bad = {"final_ok": False, "baseline_failed": False}
+        make_cf_run(self.runs, "r", [{"no": 1, "decisions": [decision("합의-사실", "a")], "apply": bad},
+                                     {"no": 2, "decisions": [decision("합의-사실", "a")], "apply": bad}])
+        m = score.compute(self.runs, sample_of(sample_line("x", run="r"), sample_line("y", run="r")))
+        self.assertEqual(m["regressions"], 1)
+
+    def test_by_truth_table(self):
+        m = score.compute(self.runs, self.mixed_runs())
+        self.assertEqual(m["by_truth"]["아님"], {"total": 2, "correct": 0, "judged": 1, "to_human": 1, "false_fact": 1})
+        self.assertEqual(m["by_truth"]["사실"]["total"], 2)
+        self.assertEqual(m["by_truth"]["재현 불가"], {"total": 1, "correct": 1, "judged": 1, "to_human": 1, "false_fact": None})
+        self.assertIn("| 아님 | 0 | 1 | 2 | 1 | 1 |", score.render(m))
+
+    def test_false_fact_and_to_human(self):
+        m = score.compute(self.runs, self.mixed_runs())
+        self.assertEqual((m["false_fact"], m["to_human"]), (1, 2))
+
+    def test_render_compare_has_by_truth_table(self):
+        m = score.compute(self.runs, self.mixed_runs())
+        text = score.render_compare(m, m)
+        self.assertIn("| 아님 |", text)
+        self.assertIn("정답별", text)
+
+    def test_cli_passes_round_and_pre_final(self):
+        make_cf_run(self.runs, "r", [
+            {"no": 1, "decisions": [decision("판단불가", None, ["x"])], "pre_final": [decision("합의-사실", "a")]},
+            {"no": 2, "decisions": [], "events": []}])
+        sample = self.runs / "sample.jsonl"
+        sample.write_text(json.dumps(sample_line("x", run="r"), ensure_ascii=False) + "\n", encoding="utf-8")
+        p = subprocess.run([sys.executable, str(ROOT / "eval" / "score.py"), "--runs", str(self.runs), "--sample", str(sample),
+                            "--round", "1", "--pre-final"], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("| 미완료 항목 수 | 0 |", p.stdout)
+        self.assertIn("| 정확도 | 1/1 (100.0%)", p.stdout)
 
 
 class CompareTest(unittest.TestCase):

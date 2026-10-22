@@ -5,6 +5,7 @@ from pathlib import Path
 
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SKILL_ROOT))
+from cascade.cli import PRE_FINAL_DECISIONS  # noqa: E402
 from cascade.consensus import REASON_BOTH_PASS  # noqa: E402
 from cascade.runners import STATUS_INVALID  # noqa: E402
 from cascade.workers import FALLBACK_LABELS  # noqa: E402
@@ -29,6 +30,8 @@ CLAUDE_FAMILIES = ("sonnet", "haiku", "opus")
 CLAUDE_JOB_FILES = ("stage1-args.json", "stage1-fallback-args.json", "checker-args.json", "checker-fallback-args.json",
                     "adj-args.json")
 USAGE_KEYS = ("input", "output", "cache_read")
+TRUTH_KEYS = (VERDICT_FACT, VERDICT_NO, VERDICT_UNREPRODUCIBLE)
+STEP_APPLY = "apply"
 
 
 def read_json(path: Path):
@@ -78,23 +81,29 @@ def path_of(decision: dict | None, opinions: dict, finding_id: str) -> str | Non
     return None
 
 
-def round_files(run_dir: Path, name: str):
+def within_round(no: int | None, round_no: int | None) -> bool:
+    return round_no is None or (no is not None and no <= round_no)
+
+
+def round_files(run_dir: Path, name: str, round_no: int | None = None):
     for path in sorted(run_dir.glob(f"round-*/{name}")):
-        yield read_json(path)
+        suffix = path.parent.name.removeprefix("round-")
+        if within_round(int(suffix) if suffix.isdigit() else None, round_no):
+            yield read_json(path)
 
 
-def count_roles(run_dir: Path, role: str) -> list[dict]:
+def count_roles(run_dir: Path, role: str, round_no: int | None = None) -> list[dict]:
     out = []
-    for merged in round_files(run_dir, "results.json"):
+    for merged in round_files(run_dir, "results.json", round_no):
         out += [w for key, w in merged.items() if key.endswith(f":{role}")]
     return out
 
 
-def checker_stats(ledger: dict, run_dir: Path) -> tuple[int, int]:
+def checker_stats(ledger: dict, run_dir: Path, round_no: int | None = None) -> tuple[int, int]:
     if ledger.get("mode") != "doc":
         return 0, 0
     false_ids, fixed = 0, 0
-    for merged in round_files(run_dir, "results.json"):
+    for merged in round_files(run_dir, "results.json", round_no):
         for key, w in merged.items():
             if key.endswith(":checker") and w.get("checker_ok") is False:
                 false_ids += 1
@@ -104,10 +113,10 @@ def checker_stats(ledger: dict, run_dir: Path) -> tuple[int, int]:
     return fixed, false_ids
 
 
-def claude_calls(run_dir: Path) -> dict[str, int]:
+def claude_calls(run_dir: Path, round_no: int | None = None) -> dict[str, int]:
     calls = dict.fromkeys(CLAUDE_FAMILIES, 0)
     for name in CLAUDE_JOB_FILES:
-        for data in round_files(run_dir, name):
+        for data in round_files(run_dir, name, round_no):
             for job in data.get("jobs", []):
                 for family in CLAUDE_FAMILIES:
                     calls[family] += str(job.get("model", "")).startswith(f"claude-{family}-")
@@ -139,28 +148,96 @@ def workers_stats(ledger: dict) -> tuple[int, dict[str, int], int, dict[str, dic
     return sum(counts.values()), fallback, counts.get(STATUS_INVALID, 0), usage
 
 
-def compute(runs, sample: dict[str, dict]) -> dict:
+def is_regression(apply: dict) -> bool:
+    return any(h.get("final_ok") is False and not h.get("baseline_failed") for h in apply.get("final_history") or [apply])
+
+
+def is_complete(ledger: dict) -> bool:
+    rounds = ledger.get("rounds", [])
+    return bool(rounds) and all(rnd.get("decisions") and any(e.get("step") == STEP_APPLY for e in rnd.get("events", []))
+                                for rnd in rounds)
+
+
+def limit_rounds(ledger: dict, round_no: int | None) -> dict:
+    return {**ledger, "rounds": [rnd for rnd in ledger.get("rounds", []) if within_round(rnd.get("no"), round_no)]}
+
+
+def use_pre_final(ledger: dict, run_dir: Path) -> dict:
+    rounds = []
+    for rnd in ledger["rounds"]:
+        saved = run_dir / f"round-{rnd.get('no')}" / PRE_FINAL_DECISIONS
+        rounds.append({**rnd, "decisions": read_json(saved)} if saved.is_file() else rnd)
+    return {**ledger, "rounds": rounds}
+
+
+def load_run(base: Path, run_dir: Path, round_no: int | None, pre_final: bool) -> dict | None:
+    if not (base / "ledger.json").is_file():
+        return None
+    limited = limit_rounds(read_json(base / "ledger.json"), round_no)
+    return {"ledger": use_pre_final(limited, run_dir) if pre_final else limited, "run_dir": run_dir,
+            "complete": is_complete(limited)}
+
+
+def add_run_metrics(m: dict, run: dict, round_no: int | None) -> tuple[int, int]:
+    ledger, run_dir = run["ledger"], run["run_dir"]
+    m["opus_calls"] += len(count_roles(run_dir, "adjudicator", round_no))
+    add_counts(m["claude_calls"], claude_calls(run_dir, round_no))
+    cli_jobs, fallback, invalid, usage = workers_stats(ledger)
+    m["cli_jobs"] += cli_jobs
+    m["invalid"] += invalid
+    add_counts(m["fallback"], fallback)
+    for runner, tokens in usage.items():
+        add_counts(m["usage"].setdefault(runner, dict.fromkeys(USAGE_KEYS, 0)), tokens)
+    applies = list(round_files(run_dir, "apply.json", round_no))
+    m["regression_measured"] |= any(a.get("final_ok") is not None for a in applies)
+    m["regressions"] += any(is_regression(a) for a in applies)
+    return checker_stats(ledger, run_dir, round_no)
+
+
+def locate(runs: Path, item_id: str, item: dict, round_no: int | None, pre_final: bool) -> tuple[str, dict | str | None]:
+    if item.get("run"):
+        base = runs / item["run"]
+        return item["run"], load_run(base, base, round_no, pre_final)
+    base = runs / item_id
+    if not (base / "meta.json").is_file():
+        return item_id, None
+    meta = read_json(base / "meta.json")
+    if "error" in meta:
+        return item_id, "errors"
+    if meta.get("incomplete"):
+        return item_id, "incomplete"
+    run = load_run(base, base / "run", round_no, pre_final)
+    return item_id, run and {**run, "complete": True}
+
+
+def new_truth_row(truth: str) -> dict:
+    return {"total": 0, "correct": 0, "judged": 0, "to_human": 0, "false_fact": 0 if truth == VERDICT_NO else None}
+
+
+def compute(runs, sample: dict[str, dict], *, round_no: int | None = None, pre_final: bool = False) -> dict:
     runs = Path(runs)
     m = {"items": 0, "errors": 0, "incomplete": 0, "missing": 0, "regression_measured": False, "agree": 0, "judged": 0, "opus_calls": 0, "baseline_calls": 0,
          "patch_differs": 0, "regressions": 0, "paths": dict.fromkeys(PATH_KEYS, 0), "predicted": {},
-         "claude_calls": dict.fromkeys(CLAUDE_FAMILIES, 0), "fallback": {}, "cli_jobs": 0, "invalid": 0, "usage": {}}
+         "claude_calls": dict.fromkeys(CLAUDE_FAMILIES, 0), "fallback": {}, "cli_jobs": 0, "invalid": 0, "usage": {},
+         "total": len(sample), "correct": 0, "false_fact": 0, "to_human": 0,
+         "by_truth": {truth: new_truth_row(truth) for truth in TRUTH_KEYS}}
     checker_fixed = checker_false = 0
+    counted: set[str] = set()
     for item_id, item in sample.items():
-        base = runs / item_id
-        if not (base / "meta.json").is_file():
+        truth = item["truth"]["verdict"]
+        row = m["by_truth"].setdefault(truth, new_truth_row(truth))
+        row["total"] += 1
+        run_key, run = locate(runs, item_id, item, round_no, pre_final)
+        if run is None:
             m["missing"] += 1
             continue
-        meta = read_json(base / "meta.json")
-        if "error" in meta:
-            m["errors"] += 1
+        if isinstance(run, str):
+            m[run] += 1
             continue
-        if meta.get("incomplete"):
+        if not run["complete"]:
             m["incomplete"] += 1
             continue
-        if not (base / "ledger.json").is_file():
-            m["missing"] += 1
-            continue
-        ledger, run_dir = read_json(base / "ledger.json"), base / "run"
+        ledger = run["ledger"]
         fid = item["finding"]["id"]
         decision = final_decision(ledger, fid)
         verdict = predict(decision)
@@ -168,30 +245,34 @@ def compute(runs, sample: dict[str, dict]) -> dict:
         m["predicted"][item_id] = verdict
         if verdict != VERDICT_NONE:
             m["judged"] += 1
-            m["agree"] += verdict == item["truth"]["verdict"]
+            row["judged"] += 1
+            m["agree"] += verdict == truth
+        if verdict == truth:
+            m["correct"] += 1
+            row["correct"] += 1
+        if verdict == VERDICT_FACT and truth == VERDICT_NO:
+            m["false_fact"] += 1
+            row["false_fact"] += 1
+        if decision and decision.get("outcome") in OUTCOMES_TO_HUMAN:
+            m["to_human"] += 1
+            row["to_human"] += 1
         path = path_of(decision, ledger.get("opinions", {}), fid)
         if path:
             m["paths"][path] += 1
         if any(key in r for rnd in ledger.get("rounds", []) for d in rnd.get("decisions", [])
                if d.get("finding_id") == fid for r in d.get("reasons", []) for key in BOTH_PASS_REASONS):
             m["patch_differs"] += 1
-        m["opus_calls"] += len(count_roles(run_dir, "adjudicator"))
         m["baseline_calls"] += item.get("baseline_opus_calls", 1)
-        add_counts(m["claude_calls"], claude_calls(run_dir))
-        cli_jobs, fallback, invalid, usage = workers_stats(ledger)
-        m["cli_jobs"] += cli_jobs
-        m["invalid"] += invalid
-        add_counts(m["fallback"], fallback)
-        for runner, tokens in usage.items():
-            add_counts(m["usage"].setdefault(runner, dict.fromkeys(USAGE_KEYS, 0)), tokens)
-        applies = list(round_files(run_dir, "apply.json"))
-        m["regression_measured"] |= any(a.get("final_ok") is not None for a in applies)
-        m["regressions"] += any(a.get("final_ok") is False for a in applies)
-        fixed, false_ids = checker_stats(ledger, run_dir)
-        checker_fixed += fixed
-        checker_false += false_ids
+        if run_key not in counted:
+            counted.add(run_key)
+            fixed, false_ids = add_run_metrics(m, run, round_no)
+            checker_fixed += fixed
+            checker_false += false_ids
     m["opus_ratio"] = m["opus_calls"] / m["baseline_calls"] if m["baseline_calls"] else None
     m["agreement"] = m["agree"] / m["judged"] if m["judged"] else None
+    m["accuracy"] = m["correct"] / m["total"] if m["total"] else None
+    unscored = m["errors"] + m["incomplete"] + m["missing"]
+    m["completion"] = (m["total"] - unscored) / m["total"] if m["total"] else None
     m["checker"] = (checker_fixed, checker_false)
     return m
 
@@ -243,6 +324,16 @@ def workers_rows(m: dict) -> list[tuple[str, str]]:
             *((f"CLI 사용량({runner})", usage_text(tokens)) for runner, tokens in m["usage"].items())]
 
 
+def truth_rows(m: dict) -> list[tuple[str, ...]]:
+    return [(truth, str(r["correct"]), str(r["judged"]), str(r["total"]), str(r["to_human"]),
+             "-" if r["false_fact"] is None else str(r["false_fact"])) for truth, r in m["by_truth"].items()]
+
+
+def truth_cell(row: dict) -> str:
+    cell = f"{row['correct']}/{row['judged']}/{row['total']} · 사람 목록 {row['to_human']}"
+    return cell if row["false_fact"] is None else f"{cell} · 아님→사실 채택 {row['false_fact']}"
+
+
 def table(header: tuple[str, ...], rows: list[tuple[str, ...]]) -> list[str]:
     return [f"| {' | '.join(header)} |", f"| {' | '.join(['---'] * len(header))} |", *(f"| {' | '.join(row)} |" for row in rows)]
 
@@ -250,7 +341,11 @@ def table(header: tuple[str, ...], rows: list[tuple[str, ...]]) -> list[str]:
 def render(m: dict) -> str:
     paths = ", ".join(f"{k} {v}" for k, v in m["paths"].items())
     rows = [
+        ("정확도", f"{pct(m['correct'], m['total'])} — 맞음/표본 전체"),
+        ("완료율", f"{pct(m['total'] - m['errors'] - m['incomplete'] - m['missing'], m['total'])} — 채점됨/표본 전체"),
         ("판정 일치율", f"{pct(m['agree'], m['judged'])} — 일치/판정 있음"),
+        ("아님→사실 채택", str(m["false_fact"])),
+        ("사람 목록", str(m["to_human"])),
         ("채택 경로 분포", paths),
         ("패치 다르지만 둘 다 통과", pct(m["patch_differs"], m["items"])),
         ("Opus 호출 수", str(m["opus_calls"])),
@@ -264,7 +359,8 @@ def render(m: dict) -> str:
         ("미완료 항목 수", str(m["incomplete"])),
         ("실행 기록 없는 항목 수", str(m["missing"])),
     ]
-    return "\n".join([*table(("값", "결과"), rows), "", verdict_line(m), ""])
+    truth = table(("정답", "맞음", "판정 있음", "전체", "사람 목록", "아님→사실 채택"), truth_rows(m))
+    return "\n".join([*table(("값", "결과"), rows), "", "정답별", "", *truth, "", verdict_line(m), ""])
 
 
 def compare_causes(m: dict, base: dict) -> list[str]:
@@ -300,6 +396,7 @@ def compare_verdict_line(m: dict, base: dict) -> str:
 def render_compare(m: dict, base: dict) -> str:
     runners = list(dict.fromkeys([*base["usage"], *m["usage"]]))
     rows = [
+        ("정확도", pct(base["correct"], base["total"]), pct(m["correct"], m["total"])),
         ("판정 일치율", pct(base["agree"], base["judged"]), pct(m["agree"], m["judged"])),
         ("Opus 호출 수", str(base["opus_calls"]), str(m["opus_calls"])),
         ("Opus 호출 비율", ratio_text(base["opus_ratio"]), ratio_text(m["opus_ratio"])),
@@ -310,7 +407,10 @@ def render_compare(m: dict, base: dict) -> str:
         ("회귀 건수", *(str(x["regressions"]) if x["regression_measured"] else UNMEASURED for x in (base, m))),
         ("채점한 항목 수", str(base["items"]), str(m["items"])),
     ]
-    return "\n".join([*table(("값", "Claude 작업자", "외부 작업자"), rows), "", compare_verdict_line(m, base), ""])
+    truth = [(name, truth_cell(base["by_truth"][name]), truth_cell(m["by_truth"][name])) for name in m["by_truth"]
+             if name in base["by_truth"]]
+    return "\n".join([*table(("값", "Claude 작업자", "외부 작업자"), rows), "", "정답별 (맞음/판정 있음/전체)", "",
+                      *table(("정답", "Claude 작업자", "외부 작업자"), truth), "", compare_verdict_line(m, base), ""])
 
 
 def main(argv=None) -> int:
@@ -318,11 +418,14 @@ def main(argv=None) -> int:
     parser.add_argument("--runs", required=True)
     parser.add_argument("--sample", required=True)
     parser.add_argument("--baseline-runs", help="Claude 작업자로 돌린 결과 폴더. 주면 --runs(외부 작업자)와 나란히 비교한다")
+    parser.add_argument("--round", type=int, dest="round_no", help="이 회차까지만 채점한다")
+    parser.add_argument("--pre-final", action="store_true", help="전체 검사 전 판정(decisions-pre-final.json)으로 채점한다")
     parser.add_argument("--out")
     args = parser.parse_args(argv)
     sample = load_sample(args.sample)
-    m = compute(args.runs, sample)
-    text = render_compare(m, compute(args.baseline_runs, sample)) if args.baseline_runs else render(m)
+    options = {"round_no": args.round_no, "pre_final": args.pre_final}
+    m = compute(args.runs, sample, **options)
+    text = render_compare(m, compute(args.baseline_runs, sample, **options)) if args.baseline_runs else render(m)
     print(text)
     if args.out:
         Path(args.out).write_text(text, encoding="utf-8")
