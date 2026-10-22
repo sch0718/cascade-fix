@@ -285,13 +285,16 @@ def new_cell() -> dict:
     return {"calls": 0, "fallback": 0, "tokens": None, "cost": None}
 
 
-def fallback_job_ids(ledger: dict, numbers: set[int]) -> list[str]:
-    ids: list[str] = []
-    for rnd in ledger.get("rounds", []):
-        last = {e["step"]: e for e in rnd.get("events", []) if str(e.get("step", "")).startswith("workers-")}
-        if rnd.get("no") in numbers:
-            ids += [job_id for event in last.values() for job_id in event.get("fallback") or []]
-    return ids
+def fallback_job_ids(ledger: dict) -> list[str]:
+    return [job_id for event in workers_events(ledger) for job_id in event.get("fallback") or []]
+
+
+def claude_job_names(scope: str) -> tuple[str, ...]:
+    return (*CLAUDE_JOB_FILES, *((OPINION_ARGS, RECHECK_ARGS) if scope == COST_ALL else ()))
+
+
+def claude_jobs(round_dir: Path, mode: str, scope: str) -> set[str]:
+    return {job_id for job_id in job_ids(round_dir, claude_job_names(scope)) if scoped_cells([job_id], mode, scope)}
 
 
 def first_review_of(ledger: dict) -> dict:
@@ -307,13 +310,12 @@ def first_review_is_claude(ledger: dict, review: dict) -> bool:
 def add_cell_calls(cells: dict[str, dict], ledger: dict, rounds: list[Path], scope: str) -> None:
     mode = ledger.get("mode")
     names = (*JOB_FILES, *((OPINION_ARGS, RECHECK_ARGS) if scope == COST_ALL else ()))
-    numbers = {int(path.name.removeprefix("round-")) for path in rounds}
     for round_dir in rounds:
         results = read_optional(round_dir / "results.json")
         ids = job_ids(round_dir, names) | set(results if isinstance(results, dict) else ())
         for cell in scoped_cells(ids, mode, scope):
             cells.setdefault(cell, new_cell())["calls"] += 1
-    for cell in scoped_cells(fallback_job_ids(ledger, numbers), mode, scope):
+    for cell in scoped_cells(fallback_job_ids(ledger), mode, scope):
         cells.setdefault(cell, new_cell())["fallback"] += 1
     if scope == COST_ALL and first_review_of(ledger):
         cells.setdefault(f"{mode}.review", new_cell())["calls"] += 1
@@ -332,22 +334,23 @@ def add_cell_usage(cells: dict[str, dict], unmeasured: set[str], rows: list[dict
             cell["cost"] = (cell["cost"] or 0.0) + cost
 
 
-def collect_usage(ledger: dict, rounds: list[Path], scope: str) -> tuple[list[dict], list[str], list[str]]:
-    """(쓸 행, 단가 기준 날짜, 미측정 표지). 표지는 ""(이 실행의 작업)나 첫 검토다."""
+def collect_usage(ledger: dict, rounds: list[Path], scope: str) -> tuple[list[dict], list[str], list[str], set[str]]:
+    """(쓸 행, 단가 기준 날짜, 미측정 표지, 기록이 빠진 작업이 있는 칸). 표지는 ""(이 실행의 작업)나 첫 검토다."""
     mode = ledger.get("mode")
-    names = (*CLAUDE_JOB_FILES, *((OPINION_ARGS, RECHECK_ARGS) if scope == COST_ALL else ()))
     rows: list[dict] = []
     dates: list[str] = []
     tags: list[str] = []
+    gaps: set[str] = set()
     for round_dir in rounds:
         data = read_optional(round_dir / USAGE_FILE)
         found = [row for row in usage_rows(data) if in_scope(row["cell"], scope)]
         if found and isinstance(data.get("prices_as_of"), str):
             dates.append(data["prices_as_of"])
         rows += found
-        wanted = {job_id for job_id in job_ids(round_dir, names) if scoped_cells([job_id], mode, scope)}
-        if wanted - {row.get("job_id") for row in found}:
+        unrecorded = claude_jobs(round_dir, mode, scope) - {row.get("job_id") for row in found}
+        if unrecorded:
             tags.append("")
+            gaps.update(scoped_cells(unrecorded, mode, scope))
     review = first_review_of(ledger)
     if scope == COST_ALL and review:
         found = usage_rows(review.get("usage"), f"{mode}.review")
@@ -356,9 +359,10 @@ def collect_usage(ledger: dict, rounds: list[Path], scope: str) -> tuple[list[di
         rows += found
         if not found and first_review_is_claude(ledger, review):
             tags.append(TAG_FIRST_REVIEW)
+            gaps.add(f"{mode}.review")
     if any(stored_number(row.get("cost")) is None for row in rows):
         tags.append("")
-    return rows, dates, list(dict.fromkeys(tags))
+    return rows, dates, list(dict.fromkeys(tags)), gaps
 
 
 def counterfactual_scope(runs: Path) -> str | None:
@@ -371,12 +375,16 @@ def counterfactual_scope(runs: Path) -> str | None:
 
 
 def add_run_cost(m: dict, acc: dict, run_key: str, run: dict, round_no: int | None, scope: str) -> None:
-    ledger = run["ledger"]
+    ledger = limit_rounds(run["ledger"], cost_round(round_no, scope))
     rounds = round_dirs(Path(run["run_dir"]), cost_round(round_no, scope))
     add_cell_calls(m["cells"], ledger, rounds, scope)
+    mode = ledger.get("mode")
     if acc["refused"]:
+        for round_dir in rounds:
+            acc["gaps"].update(scoped_cells(claude_jobs(round_dir, mode, scope), mode, scope))
         return
-    rows, dates, tags = collect_usage(ledger, rounds, scope)
+    rows, dates, tags, gaps = collect_usage(ledger, rounds, scope)
+    acc["gaps"] |= gaps
     acc["counted"] += 1
     acc["dates"] += dates
     acc["missing"] += [f"{run_key}: {tag}" if tag else run_key for tag in tags]
@@ -385,8 +393,11 @@ def add_run_cost(m: dict, acc: dict, run_key: str, run: dict, round_no: int | No
 
 
 def finish_cost(m: dict, acc: dict) -> None:
-    for cell in acc["unmeasured"]:
+    for cell in acc["unmeasured"] | acc["gaps"]:
         m["cells"][cell]["cost"] = None
+    for cell in acc["gaps"]:
+        m["cells"][cell]["tokens"] = None
+    m["cells_unmeasured"] = sorted(acc["gaps"])
     if acc["refused"]:
         m["cost_missing"] = [REASON_COUNTERFACTUAL]
     else:
@@ -416,7 +427,7 @@ def compute(runs, sample: dict[str, dict], *, round_no: int | None = None, pre_f
          "total": len(sample), "correct": 0, "false_fact": 0, "to_human": 0, "cells": {}, "cost_scope": cost_scope,
          "by_truth": {truth: new_truth_row(truth) for truth in TRUTH_KEYS}}
     refused = cost_scope == COST_ALL and counterfactual_scope(runs) not in (None, COST_ALL)
-    acc = {"refused": refused, "counted": 0, "total": 0.0, "missing": [], "dates": [], "unmeasured": set()}
+    acc = {"refused": refused, "counted": 0, "total": 0.0, "missing": [], "dates": [], "unmeasured": set(), "gaps": set()}
     checker_fixed = checker_false = 0
     counted: set[str] = set()
     for item_id, item in sample.items():
@@ -515,14 +526,15 @@ def cell_rows(m: dict) -> list[tuple[str, ...]]:
     rows = []
     for key, cell in m["cells"].items():
         tokens = cell["tokens"]
-        tokens_text = NO_RECORD if tokens is None else "/".join(str(tokens[k]) for k in TOKEN_KEYS[:3])
-        cost = NO_RECORD if tokens is None else UNMEASURED_COST if cell["cost"] is None else money(cell["cost"])
+        absent = UNMEASURED_COST if key in m["cells_unmeasured"] else NO_RECORD
+        tokens_text = absent if tokens is None else "/".join(str(tokens[k]) for k in TOKEN_KEYS[:3])
+        cost = absent if tokens is None else UNMEASURED_COST if cell["cost"] is None else money(cell["cost"])
         rows.append((key, str(cell["calls"]), str(cell["fallback"]), tokens_text, cost))
     return rows
 
 
 def has_cell_usage(m: dict) -> bool:
-    return bool(m["cli_jobs"]) or any(cell["tokens"] for cell in m["cells"].values())
+    return bool(m["cli_jobs"] or m["cells_unmeasured"]) or any(cell["tokens"] for cell in m["cells"].values())
 
 
 def claude_calls_text(m: dict) -> str:

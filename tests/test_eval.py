@@ -613,6 +613,37 @@ class ScoreCostTest(unittest.TestCase):
         self.assertIsNone(m["claude_cost"])
         self.assertEqual(m["cost_missing"], ["x"])
 
+    def test_partly_recorded_cell_is_unmeasured_not_partial(self):
+        self.add(usage_data(usage_row("r1-01:a", "code.a")), jobs=("r1-01:a", "r1-02:a"))
+        m = self.compute()
+        self.assertEqual(m["cells"]["code.a"], {"calls": 2, "fallback": 0, "tokens": None, "cost": None})
+        self.assertEqual(m["cells_unmeasured"], ["code.a"])
+        self.assertIn("| code.a | 2 | 0 | 미측정 | 미측정 |", score.render(m))
+
+    def test_fully_recorded_cell_beside_a_gap_keeps_its_values(self):
+        self.add(usage_data(usage_row("r1-01:a", "code.a", 0.5)), jobs=("r1-01:a", "r1-01:b"))
+        cells = self.compute()["cells"]
+        self.assertEqual(cells["code.a"]["cost"], 0.5)
+        self.assertIsNone(cells["code.b"]["cost"])
+
+    def test_claude_cell_without_usage_says_unmeasured_and_acp_cell_says_no_record(self):
+        self.add(jobs=("r1-01:b",), results={"r1-01:a": worker("사실", "a")})
+        text = score.render(self.compute())
+        self.assertIn("| code.b | 1 | 0 | 미측정 | 미측정 |", text)
+        self.assertIn("| code.a | 1 | 0 | 기록 없음 | 기록 없음 |", text)
+
+    def test_counterfactual_refusal_marks_claude_cells_unmeasured(self):
+        self.two_round_run()
+        write_json(self.runs / "counterfactual.json", {"cost_scope": "round1-core"})
+        m = self.compute()
+        self.assertIn("code.a", m["cells_unmeasured"])
+        self.assertIsNone(m["cells"]["code.a"]["tokens"])
+
+    def test_fallback_uses_only_the_last_event_per_stage(self):
+        self.add(events=[workers_event("stage1", {"ok": 1, "limit": 1}, fallback=["r1-01:b"]),
+                         workers_event("stage1", {"ok": 2}, fallback=[])])
+        self.assertEqual(self.compute()["cells"].get("code.b", {}).get("fallback", 0), 0)
+
     def test_null_cost_makes_cost_unmeasured(self):
         self.add(usage_data(usage_row("r1-01:a", "code.a", None)))
         m = self.compute()
