@@ -143,7 +143,7 @@ def init_args(item: dict, wt: Path, *, profile: str | None, workers: str | None,
 
 def worker_cells(ledger: dict) -> dict[str, dict]:
     roles, mode = ledger["profile"]["roles"], ledger["mode"]
-    return {f"{mode}.{role}": cell for role, cell in assignment.mode_workers(roles, mode).items()}
+    return {assignment.job_cell_key(mode, role): cell for role, cell in assignment.mode_workers(roles, mode).items()}
 
 
 def is_external(cell: dict) -> bool:

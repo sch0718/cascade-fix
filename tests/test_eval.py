@@ -1265,6 +1265,12 @@ class ReplayTest(unittest.TestCase):
         ledger = json.loads((base / "ledger.json").read_text(encoding="utf-8"))
         self.assertEqual(ledger["profile"]["name"], "claude-only")
 
+    def test_doc_mode_confirmed_roles_use_the_profile_cell_keys(self):
+        keys = ["doc.judge_a", "doc.judge_b", "doc.writer", "doc.checker", "doc.adjudicator"]
+        cell = {"runner": "claude", "model": "claude-haiku-5-5", "effort": "low", "fallback": None}
+        ledger = {"mode": "doc", "profile": {"roles": {key: dict(cell) for key in keys}}}
+        self.assertEqual(sorted(replay.confirmed_roles(ledger)), sorted(keys))
+
     def test_worktree_toml_matches_key_written_through_symlink(self):
         link = self.tmp / "link"
         link.symlink_to(self.tmp)
