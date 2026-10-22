@@ -182,6 +182,15 @@ class AdoptRecalcTest(unittest.TestCase):
         self.assertEqual(self.recalc()[0], 1)
         self.assertIn("tests", read(self.out / "check.json")["mismatches"][0]["reason"])
 
+    def test_failed_item_after_a_flipped_item_adds_no_tokens(self):
+        self.assertEqual(self.recalc()[0], 0)
+        alone = read(self.out / "check.json")["removed_tokens"]
+        shutil.rmtree(self.out)
+        shutil.copytree(self.runs / "x", self.runs / "y")
+        (self.runs / "y" / "ledger.json").write_text("{깨짐", encoding="utf-8")
+        self.assertEqual(self.recalc()[0], 1)
+        self.assertEqual(read(self.out / "check.json")["removed_tokens"], alone)
+
     def test_recalc_counts_unreadable_items_as_errors_and_continues(self):
         shutil.copytree(self.runs / "x", self.runs / "ok")
         (self.runs / "x" / "ledger.json").write_text("{깨짐", encoding="utf-8")

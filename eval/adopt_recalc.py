@@ -282,10 +282,10 @@ def recalc(runs: Path, out: Path) -> tuple[list[dict], dict]:
                 continue
             item_rows, found, measured = result
         except RecalcError as e:
-            item_rows, found, measured = [], [mismatch(base.name, e.check, str(e))], {"removed_jobs": 0, "tokens": tokens}
+            item_rows, found, measured = [], [mismatch(base.name, e.check, str(e))], {"removed_jobs": 0, "tokens": dict.fromkeys(TOKEN_KEYS, 0)}
         except ITEM_ERRORS as e:
             reason = f"{type(e).__name__}: {e}"
-            item_rows, found, measured = [], [mismatch(base.name, "read", f"결과를 읽지 못했다({reason})")], {"removed_jobs": 0, "tokens": tokens}
+            item_rows, found, measured = [], [mismatch(base.name, "read", f"결과를 읽지 못했다({reason})")], {"removed_jobs": 0, "tokens": dict.fromkeys(TOKEN_KEYS, 0)}
         rows += item_rows
         mismatches += found
         removed_jobs += measured["removed_jobs"]
