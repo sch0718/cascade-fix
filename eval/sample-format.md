@@ -62,13 +62,25 @@
    python3 eval/replay.py --sample eval/sample.jsonl --out <결과 폴더> --collect
    ```
 
-   `--collect`는 `cleanup`을 돌리고 `run_dir`을 `<결과 폴더>/<id>/run/`으로 복사하며 `ledger.json`을 `<결과 폴더>/<id>/`에 놓고 워크트리를 지운다.
+   `--collect`는 항목이 끝났는지 먼저 본다(1회차 `apply` 완료 이벤트, 마지막 회차 `apply.json`, 남은 의견 단계 없음, `report.md`와 원장의 `report` 이벤트). 하나라도 빠지면 `meta.json`에 `incomplete`를 적고 워크트리를 지우지 않는다. 끝났으면 `cleanup`을 돌리고 `run_dir`을 `<결과 폴더>/<id>/run/`으로 복사하며 `ledger.json`을 `<결과 폴더>/<id>/`에 놓고 워크트리를 지운다.
 
-   외부 작업자(Codex·Cursor)를 재려면 `--workers external`을 준다. 항목마다 `jobs` 뒤에 `workers --stage stage1`을 스스로 돌려 CLI 작업을 끝내고, 대체 실행이나 Claude 몫으로 남은 stage1 작업이 있을 때만 위처럼 멈춘다. 기본값은 `--workers claude`다. 같은 표본을 `--workers claude`와 `--workers external`로 각각 다른 `--out` 아래에 돌린다.
+   `--profile <이름>`은 init에 넘긴다. `--workers`·`--adopt-on-both-pass`도 명령줄에 줬을 때만 init에 넘긴다(프로필 칸을 덮으므로 프로필을 잴 때는 주지 않는다). init 출력의 `프로필:`·`덮음:`·`대체:`·`역할:`·`전송 동의:` 줄은 `<결과 폴더>/<id>/init.txt`에 남고, jobs 뒤 확정 배정은 `역할 확정:` 한 줄로 찍으며 `meta.json`의 `roles`에 남는다.
 
-2. 모델 없이 배관만 시험하려면 `--fake-results <폴더>`를 준다. 폴더 안에 `<id>/stage1.json`(필요하면 `adj.json`, `checker.json`)을 두면 `judge`·`adjudicate`·`apply`·`report`·`cleanup`까지 한 번에 돌고 항목마다 워크트리를 지운다. `--workers external`은 Codex·Cursor를 실제로 부르므로 `--fake-results`와 함께 쓸 수 없다(함께 주면 오류로 거절한다). 외부 작업자 쪽 배관은 `--fake-results` 없이 가짜 CLI(`CASCADE_CODEX`·`CASCADE_CURSOR_AGENT`)로 시험한다.
+   외부 작업자(Codex·Cursor)를 재려면 `--workers external`을 준다. 항목마다 `jobs` 뒤에 `workers --stage stage1`을 스스로 돌려 CLI 작업을 끝내고, 대체 실행이나 Claude 몫으로 남은 stage1 작업이 있을 때만 위처럼 멈춘다. `--workers`를 주지 않으면 init의 기본(프로필 또는 `claude`)을 따른다. 같은 표본을 `--workers claude`와 `--workers external`로 각각 다른 `--out` 아래에 돌린다.
 
-3. 채점.
+2. 모델 없이 배관만 시험하려면 `--fake-results <폴더>`를 준다. 폴더 안에 `<id>/stage1.json`(필요하면 `adj.json`, `checker.json`)을 두면 `judge`·`adjudicate`·`apply`·`report`·`cleanup`까지 한 번에 돌고 항목마다 워크트리를 지운다. `--workers external`은 Codex·Cursor를 실제로 부르므로 `--fake-results`와 함께 쓸 수 없다(함께 주면 오류로 거절한다). init 뒤 확정 배정(`profile.roles`의 그 모드 작업자·점검자 칸)에 외부 runner나 외부 대체가 있으면 jobs를 부르기 전에 그 항목을 오류로 멈춘다(jobs의 샌드박스 점검이 Cursor 모델을 부를 수 있다). 외부 작업자 쪽 배관은 `--fake-results` 없이 가짜 CLI(`CASCADE_CODEX`·`CASCADE_CURSOR_AGENT`)로 시험한다.
+
+3. 채택 규칙 반사실. 채택 규칙을 끄고 돌린 결과 폴더에서 규칙을 켠 값을 모델 호출 없이 다시 계산한다.
+
+   ```
+   python3 eval/adopt_recalc.py --runs <채택 규칙 끈 결과> --out <결과>/adopt-recalc
+   ```
+
+   항목마다 1회차 작업자 a·b 결과(`results.json`)와 검증(`verify.json`, 기준선 실패 명령 제외)으로 `decide`를 끄고 한 번, 켜고 한 번 돌린다. 보안 경로 → 빈 패치 → 손실 패치(`lossy.json`) 순서는 `judge`와 같다. 켠 결과가 바뀐 항목은 원장 결정을 새 결정으로 바꾸고 `adj-args.json`·`adj.json`·`results.json`의 `:adjudicator`·`claude-usage.json`의 판가름 행·원장의 `adjudicate` 이벤트를 지운다. 의견·재검토는 켠 값을 구할 수 없어 다시 계산하지 않으므로 `--out` 폴더는 `counterfactual.json`(`{"cost_scope": "round1-core"}`)을 두고 `score.py --cost-scope round1-core`로만 비용을 낸다. 오류·미완료 항목과 문서 모드 항목은 그대로 복사하고 `check.json`의 `skipped`에 적는다. `--out`을 `--runs` 안에 둬도 된다.
+
+   `check.json`의 검증은 셋이다. 끈 결과의 판가름 분기가 원장(`adj-args.json` 유무)과 모두 같다 / 켠 결과가 바뀐 항목 수 = 빠진 판가름 수 / 뺀 토큰 = 그 항목들의 판가름 토큰 합. 옛 결과처럼 `lossy.json`이 없는데 켠 결과가 채택으로 바뀌는 항목은 「손실 여부 미확인」으로 실패한다. 하나라도 어긋나면 종료 코드 1과 어긋난 항목 목록을 낸다.
+
+4. 채점.
 
    ```
    python3 eval/score.py --runs <결과 폴더> --sample eval/sample.jsonl [--out score.md]
@@ -87,7 +99,7 @@
    | 문서 점검자 정확도 | 문서 항목에서 점검자가 「아니오」라 한 것 중 판가름이 「사실」이라 한 비율. 없으면 `-` |
    | 오류 항목 수 | `replay.py`가 `meta.json`에 오류를 적은 항목. 채점에서 뺀다 |
 
-   회귀는 전향(실제 적용) 실행에서만 측정된다. 소급 재생은 항상 dry-run이라 전체 테스트를 돌리지 않으므로 `apply.json`에 `final_ok`가 없고, 이때 표는 「측정 불가」, 판정 줄은 「회귀 미측정」으로 적는다. `--collect`는 마지막 회차의 `apply.json`이 없는 항목을 수집하지 않고 `meta.json`에 `incomplete`를 적으며, 채점은 그런 항목을 오류 항목처럼 빼고 「미완료 항목 수」로 따로 센다. 항목에 오류가 하나라도 있으면 `replay.py`는 종료 코드 1을 돌려준다.
+   회귀는 전향(실제 적용) 실행에서만 측정된다. 소급 재생은 항상 dry-run이라 전체 테스트를 돌리지 않으므로 `apply.json`에 `final_ok`가 없고, 이때 표는 「측정 불가」, 판정 줄은 「회귀 미측정」으로 적는다. `--collect`는 끝나지 않은 항목(위 조건)을 수집하지 않고 `meta.json`에 `incomplete`를 적으며, 채점은 그런 항목을 오류 항목처럼 빼고 「미완료 항목 수」로 따로 센다. 항목에 오류가 하나라도 있으면 `replay.py`는 종료 코드 1을 돌려준다.
 
    `--workers external`로 돌린 결과에는 표에 행이 더해진다(CLI 작업이 있을 때만).
 

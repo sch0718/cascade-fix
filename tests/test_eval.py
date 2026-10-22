@@ -2,6 +2,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1091,12 +1092,30 @@ class ReplayTest(unittest.TestCase):
         self.assertTrue((self.out / "item-01").is_dir())
         self.assertFalse((self.out / "item-02").exists())
 
-    def test_replay_without_fake_results_stops_after_jobs_and_collect_finishes(self):
-        sample = self.write_sample([self.item("item-01")])
+    def start_pending(self, item_id="item-01"):
+        sample = self.write_sample([self.item(item_id)])
         self.assertEqual(self.run_replay(sample), 0)
-        base = self.out / "item-01"
+        base = self.out / item_id
         meta = json.loads((base / "meta.json").read_text(encoding="utf-8"))
-        run_dir = Path(meta["pending_run_dir"])
+        return sample, base, Path(meta["pending_run_dir"])
+
+    def run_steps(self, base, run_dir, *commands):
+        env = replay.base_env(base / "repos.toml")
+        for command in commands:
+            extra = {"judge": ["--round", "1", "--results", str(run_dir / "round-1" / "stage1.json")],
+                     "apply": ["--round", "1"], "report": []}[command]
+            replay.cli(base / "wt", env, command, "--run-dir", str(run_dir), *extra)
+
+    def finish_steps(self, base, run_dir, *commands):
+        shutil.copyfile(self.write_fake(base.name) / base.name / "stage1.json", run_dir / "round-1" / "stage1.json")
+        self.run_steps(base, run_dir, *commands)
+
+    def collect(self, item_id="item-01"):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return replay.collect_item(self.item(item_id), self.out, self.toml)
+
+    def test_replay_without_fake_results_stops_after_jobs_and_collect_finishes(self):
+        sample, base, run_dir = self.start_pending()
         self.assertTrue((run_dir / "round-1" / "stage1-args.json").is_file())
         self.assertTrue((base / "wt").is_dir())
 
@@ -1109,7 +1128,7 @@ class ReplayTest(unittest.TestCase):
         m = score.compute(self.out, score.load_sample(sample))
         self.assertEqual((m["incomplete"], m["items"]), (1, 0))
 
-        write_json(run_dir / "round-1" / "apply.json", {"dry_run": True, "applied": []})
+        self.finish_steps(base, run_dir, "judge", "apply", "report")
         self.assertEqual(self.run_replay(sample, "--collect"), 0)
         meta = json.loads((base / "meta.json").read_text(encoding="utf-8"))
         self.assertNotIn("pending_run_dir", meta)
@@ -1117,6 +1136,67 @@ class ReplayTest(unittest.TestCase):
         self.assertTrue((base / "ledger.json").is_file())
         self.assertFalse((base / "wt").exists())
         self.assertEqual(git(self.repo, "worktree", "list", "--porcelain").count("worktree "), 1)
+
+    def test_collect_requires_report(self):
+        _, base, run_dir = self.start_pending()
+        self.finish_steps(base, run_dir, "judge", "apply")
+        self.assertTrue((run_dir / "round-1" / "apply.json").is_file())
+        self.assertFalse(self.collect())
+        self.assertTrue((base / "wt").exists())
+        self.assertIs(json.loads((base / "meta.json").read_text(encoding="utf-8"))["incomplete"], True)
+        self.assertFalse((base / "ledger.json").exists())
+
+    def test_collect_requires_apply_event_and_no_pending_opinion(self):
+        _, base, run_dir = self.start_pending()
+        self.finish_steps(base, run_dir, "judge", "apply", "report")
+        ledger_path = run_dir / "ledger.json"
+        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+        events = ledger["rounds"][0]["events"]
+        ledger["rounds"][0]["events"] = [e for e in events if e["step"] != "apply"]
+        ledger_path.write_text(json.dumps(ledger, ensure_ascii=False), encoding="utf-8")
+        self.assertFalse(self.collect())
+        ledger["rounds"][0]["events"] = events
+        ledger_path.write_text(json.dumps(ledger, ensure_ascii=False), encoding="utf-8")
+        opinion = run_dir / "round-1" / "opinion-r1-01.md"
+        opinion.write_text("의견 프롬프트", encoding="utf-8")
+        self.assertFalse(self.collect())
+        self.assertTrue((base / "wt").exists())
+        opinion.unlink()
+        self.assertTrue(self.collect())
+        self.assertFalse((base / "wt").exists())
+
+    def test_replay_passes_only_explicit_options(self):
+        item, wt = self.item("item-01"), self.tmp / "wt"
+        args = replay.init_args(item, wt, profile="m-claude-only", workers=None, adopt_on_both_pass=False)
+        self.assertEqual(args[args.index("--profile") + 1], "m-claude-only")
+        self.assertNotIn("--workers", args)
+        self.assertNotIn("--adopt-on-both-pass", args)
+        self.assertIn("--dry-run", args)
+        bare = replay.init_args(item, wt, profile=None, workers=None, adopt_on_both_pass=False)
+        self.assertEqual([a for a in bare if a in ("--profile", "--workers", "--adopt-on-both-pass")], [])
+        full = replay.init_args(item, wt, profile="p", workers="external", adopt_on_both_pass=True)
+        self.assertEqual(full[full.index("--workers") + 1], "external")
+        self.assertIn("--adopt-on-both-pass", full)
+
+    def test_replay_records_init_lines_and_confirmed_roles(self):
+        sample = self.write_sample([self.item("item-01")])
+        with contextlib.redirect_stdout(io.StringIO()) as buf:
+            code = replay.main(["--sample", str(sample), "--out", str(self.out), "--repos-toml", str(self.toml),
+                                "--fake-results", str(self.write_fake("item-01")), "--profile", "claude-only"])
+        self.assertEqual(code, 0)
+        base = self.out / "item-01"
+        init_text = (base / "init.txt").read_text(encoding="utf-8")
+        self.assertIn("프로필: claude-only (--profile)", init_text)
+        self.assertIn("역할:", init_text)
+        self.assertNotIn("덮음:", init_text)
+        self.assertNotIn("run_dir=", init_text)
+        self.assertIn("item-01: 프로필: claude-only (--profile)", buf.getvalue())
+        self.assertIn("item-01: 역할 확정: code.a=claude(claude-sonnet-5-5, low), code.b=claude(claude-haiku-5-5, low)", buf.getvalue())
+        meta = json.loads((base / "meta.json").read_text(encoding="utf-8"))
+        self.assertEqual({k: meta["roles"][k]["runner"] for k in meta["roles"]},
+                         {"code.a": "claude", "code.b": "claude", "code.adjudicator": "claude"})
+        ledger = json.loads((base / "ledger.json").read_text(encoding="utf-8"))
+        self.assertEqual(ledger["profile"]["name"], "claude-only")
 
     def test_worktree_toml_matches_key_written_through_symlink(self):
         link = self.tmp / "link"
@@ -1236,6 +1316,16 @@ class ReplayExternalTest(WorkersTestBase):
         self.assertIn("external", err.getvalue())
         self.assertIn("모델을 부르지 않", err.getvalue())
         self.assertFalse((self.out / "item-01").exists())
+
+    def test_fake_results_refuse_external_profile(self):
+        code, text = self.replay("--fake-results", str(self.fake), "--profile", "local")
+        self.assertEqual(code, 1)
+        self.assertIn("오류", text)
+        meta = json.loads((self.out / "item-01" / "meta.json").read_text(encoding="utf-8"))
+        self.assertIn("code.a=codex", meta["error"])
+        self.assertEqual(list((self.tmp / "log").glob("*.args.json")), [])
+        self.assertFalse((self.out / "item-01" / "run" / "round-1" / "stage1-args.json").exists())
+        self.assertFalse((self.out / "item-01" / "wt").exists())
 
     def test_replay_external_without_fake_results_stops_after_workers(self):
         code, text = self.replay("--workers", "external")
