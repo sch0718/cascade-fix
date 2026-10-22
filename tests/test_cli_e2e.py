@@ -1388,6 +1388,18 @@ class FinalSuiteRecordTest(CliTestBase):
         self.apply_force()
         self.assertFalse((self.run_dir / "round-1" / "decisions-pre-final.json").exists())
 
+    def test_second_forced_rerun_of_an_old_failed_record_does_not_write_pre_final(self):
+        self.failing_full_suite()
+        self.run_to_apply()
+        self.drop_history()
+        (self.run_dir / "round-1" / "decisions-pre-final.json").unlink()
+        self.apply_force()
+        apply = self.read("apply.json")
+        self.assertIsNone(apply["final_ok"])
+        self.assertIs(apply["interference"], True)
+        self.apply_force()
+        self.assertFalse((self.run_dir / "round-1" / "decisions-pre-final.json").exists())
+
     def test_old_passing_apply_json_is_seeded_and_still_gets_pre_final(self):
         self.run_to_apply()
         self.drop_history()

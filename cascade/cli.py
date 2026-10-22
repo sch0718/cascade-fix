@@ -1396,7 +1396,7 @@ def cmd_apply(args) -> int:
     if not ledger.dry_run:
         _remove_round_worktrees(ledger, rnd)
         base_wt = s.snapshot_of(ledger).worktrees.get(s.base_name(rnd))
-        if not (rd / PRE_FINAL_DECISIONS).exists() and data.get("final_ok") is not False:
+        if not (rd / PRE_FINAL_DECISIONS).exists() and data.get("final_ok") is not False and not data.get("interference"):
             s.write_json(rd / PRE_FINAL_DECISIONS, rnd.decisions)
         if "final_history" not in data and "final_ok" in data:
             data["final_history"] = [{"final_ok": data["final_ok"], "baseline_failed": bool(data.get("baseline_failed")),
