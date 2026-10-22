@@ -307,6 +307,13 @@ class LocalProfileTest(ExternalWorkersBase):
         status_calls = sorted((self.tmp / "log").glob("cursor-status-*.args.json"))
         self.assertEqual(len(status_calls), 1)
 
+    def test_ignored_env_workers_does_not_probe_external_clis(self):
+        self.use_fakes()
+        self.env["CASCADE_WORKERS"] = "external"
+        for extra in (("--profile", "claude-only"), ("--workers", "claude")):
+            self.init_cli(*extra, "--reviewer", "claude")
+        self.assertEqual(sorted((self.tmp / "log").glob("cursor-status-*.args.json")), [])
+
     def test_detect_local_asks_one_consent_line(self):
         self.use_fakes()
         p = self.cli("detect", "--json", "--no-gh", "--profile", "local", "--input", str(self.result))

@@ -295,18 +295,27 @@ def _cursor_reviewer_ok(available: dict[str, bool]):
 
 
 def _resolve_profile(args, root: Path, available: dict[str, bool]) -> profiles.Resolved:
+    """--workers external이 실제로 쓰일 때만 외부 CLI를 미리 확인한다. CASCADE_WORKERS는 --workers가 없고
+    프로필을 명시하지 않았을 때만 쓰이므로, 그때는 한 번 풀어 본 뒤 확인하고 다시 푼다."""
     env = os.environ
-    if WORKERS_EXTERNAL in (args.workers, env.get("CASCADE_WORKERS")):
-        _probe(available, (RUNNER_CODEX, RUNNER_CURSOR))
     cli = profiles.LegacyOptions(
         workers=args.workers, cursor_model=args.cursor_model, reviewer=args.reviewer,
         review_model=getattr(args, "review_model", None), review_effort=getattr(args, "review_effort", None),
         adopt_on_both_pass=getattr(args, "adopt_on_both_pass", False))
-    try:
-        resolved = profiles.resolve(root, s.repos_toml(), flag=args.profile, cli=cli, env=env, available=available,
+
+    def resolve() -> profiles.Resolved:
+        try:
+            return profiles.resolve(root, s.repos_toml(), flag=args.profile, cli=cli, env=env, available=available,
                                     codex_model=codex_model(Path.home() / ".codex"))
-    except ConfigError as e:
-        raise s.CliError(str(e), ExitCodes.PARSE_ERROR) from None
+        except ConfigError as e:
+            raise s.CliError(str(e), ExitCodes.PARSE_ERROR) from None
+
+    if args.workers == WORKERS_EXTERNAL:
+        _probe(available, (RUNNER_CODEX, RUNNER_CURSOR))
+    resolved = resolve()
+    if args.workers is None and env.get("CASCADE_WORKERS") == WORKERS_EXTERNAL and not resolved.explicit:
+        _probe(available, (RUNNER_CODEX, RUNNER_CURSOR))
+        resolved = resolve()
     _probe(available, assignment.runners_to_check(resolved.roles, resolved.pinned))
     return resolved
 
