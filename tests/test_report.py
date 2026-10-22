@@ -13,6 +13,7 @@ from cascade.consensus import (  # noqa: E402
     OUTCOME_ADJUDICATE,
     OUTCOME_AGREED_FACT,
     OUTCOME_AGREED_NO,
+    OUTCOME_CARRIED,
     OUTCOME_DESIGN,
     OUTCOME_HOLD,
     OUTCOME_UNDECIDABLE,
@@ -851,6 +852,19 @@ class RerunRoundsTest(unittest.TestCase):
         readopted = rerun_ledger(decision("r1-03", OUTCOME_UNDECIDABLE, None, ["둘 다 검증 실패"]),
                                  decision("r1-03", OUTCOME_AGREED_FACT, "a", []))
         self.assertIn("- T3", section(report.render(readopted, False), "### resolve 대상"))
+
+    def test_carried_finding_replaces_its_original_in_the_thread(self):
+        original = finding("r1-02", thread_id="T2", body="겹친 지적")
+        carried = {**finding("r2-01", thread_id="T2", body="겹친 지적"), "carried_from": "r1-02"}
+        r1 = RoundRecord(no=1, findings=[original], decisions=[decision("r1-02", OUTCOME_CARRIED, None, ["겹침"])],
+                         adopted=[], recheck_opened=False)
+        r2 = RoundRecord(no=2, findings=[carried], decisions=[decision("r2-01", OUTCOME_AGREED_FACT, "a", [])],
+                         adopted=["r2-01"], recheck_opened=False, final=True)
+        ledger = Ledger(run_id="run-1", source="pr-comment", mode="code", root="/tmp/x", snapshot={}, dry_run=False,
+                        rounds=[r1, r2])
+        text = report.render(ledger, False)
+        self.assertIn("thread T2:\n반영했습니다. 겹친 지적\n", section(text, "### PR 답글 초안"))
+        self.assertIn("- T2", section(text, "### resolve 대상"))
 
     def test_reviewer_column_counts_only_round_with_opinion_event(self):
         ledger = rerun_ledger(decision("r1-03", OUTCOME_AGREED_FACT, "a", []),

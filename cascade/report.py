@@ -356,11 +356,13 @@ def _final_decisions(ledger: Ledger) -> dict[str, tuple[int, dict]]:
 
 
 def _thread_findings(ledger: Ledger) -> dict[str, list[dict]]:
+    """thread별 지적. 다음 회차로 넘긴 지적은 넘어간 쪽(carried_from으로 이어진 새 id)만 남긴다."""
+    carried = {f["carried_from"] for rnd in ledger.rounds for f in rnd.findings if f.get("carried_from")}
     threads: dict[str, list[dict]] = {}
     for rnd in ledger.rounds:
         for f in rnd.findings:
             thread_id = f.get("thread_id")
-            if not thread_id:
+            if not thread_id or f["id"] in carried:
                 continue
             items = threads.setdefault(thread_id, [])
             if all(item["id"] != f["id"] for item in items):
