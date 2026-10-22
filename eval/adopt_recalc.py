@@ -262,6 +262,15 @@ def recalc_item(base: Path, out_base: Path) -> str | tuple[list[dict], list[dict
     return rows, found, measured
 
 
+def mark_errors(out: Path, mismatches: list[dict]) -> None:
+    """검증에 실패한 항목은 끈 결과(또는 반쯤 바뀐 결과)가 켠 항목으로 채점되지 않게 오류 항목으로 적는다."""
+    for item in dict.fromkeys(m["item"] for m in mismatches):
+        meta_path = out / item / "meta.json"
+        meta = read_optional(meta_path)
+        reasons = "; ".join(f"[{m['check']}] {m['reason']}" for m in mismatches if m["item"] == item)
+        write_json(meta_path, {**(meta if isinstance(meta, dict) else {}), "error": f"채택 규칙 재계산 실패: {reasons}"})
+
+
 def recalc(runs: Path, out: Path) -> tuple[list[dict], dict]:
     rows, mismatches, skipped = [], [], []
     removed_jobs, tokens = 0, dict.fromkeys(TOKEN_KEYS, 0)
@@ -281,6 +290,7 @@ def recalc(runs: Path, out: Path) -> tuple[list[dict], dict]:
         mismatches += found
         removed_jobs += measured["removed_jobs"]
         tokens = {key: tokens[key] + measured["tokens"][key] for key in TOKEN_KEYS}
+    mark_errors(out, mismatches)
     flipped_count = sum(row["flipped"] for row in rows)
     check = {"ok": not mismatches, "cost_scope": COST_CORE, "items": len({row["item"] for row in rows}), "flipped": flipped_count,
              "removed_adjudications": removed_jobs, "removed_tokens": tokens, "mismatches": mismatches, "skipped": skipped}

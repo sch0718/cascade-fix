@@ -202,6 +202,55 @@ class AdoptRecalcTest(unittest.TestCase):
         self.assertEqual(check["flipped"], 1)
         self.assertEqual(read(self.out / "ok" / "ledger.json")["rounds"][0]["decisions"][0]["patch_from"], "a")
 
+    def failing_cases(self):
+        def no_tests():
+            self.write_repos_toml("tests = []")
+
+        def no_lossy():
+            (self.round_dir() / "lossy.json").unlink()
+
+        def no_branch():
+            (self.round_dir() / "adj-args.json").unlink()
+
+        def broken_ledger():
+            (self.runs / "x" / "ledger.json").write_text("{깨짐", encoding="utf-8")
+
+        def already_adopting():
+            for name in ("ledger.json", "run/ledger.json"):
+                ledger = read(self.runs / "x" / name)
+                ledger["adopt_on_both_pass"] = True
+                write(self.runs / "x" / name, ledger)
+
+        return {"tests 없음": no_tests, "손실 미확인": no_lossy, "분기 불일치": no_branch, "원장 깨짐": broken_ledger,
+                "이미 채택": already_adopting}
+
+    def test_failed_item_is_written_as_an_error_item_so_score_does_not_count_it_as_on(self):
+        for name, break_item in self.failing_cases().items():
+            with self.subTest(name):
+                shutil.rmtree(self.tmp / "runs", ignore_errors=True)
+                shutil.rmtree(self.out, ignore_errors=True)
+                shutil.copytree(FIXTURE, self.runs)
+                shutil.copytree(self.runs / "x", self.runs / "ok")
+                break_item()
+                code, _ = self.recalc()
+                self.assertEqual(code, 1)
+                self.assertFalse(read(self.out / "check.json")["ok"])
+                self.assertIn("error", read(self.out / "x" / "meta.json"))
+                self.assertNotIn("error", read(self.out / "ok" / "meta.json"))
+                both = {"x": SAMPLE["x"], "ok": {**SAMPLE["x"], "id": "ok"}}
+                on = score.compute(self.out, both, cost_scope="round1-core")
+                ok_only = score.compute(self.out, {"ok": both["ok"]}, cost_scope="round1-core")
+                self.assertEqual((on["errors"], on["items"], on["correct"], on["total"]), (1, 1, 1, 2))
+                self.assertEqual(on["opus_calls"], ok_only["opus_calls"])
+                self.assertEqual(on["claude_cost"], ok_only["claude_cost"])
+
+    def test_error_reason_names_the_failed_checks_in_korean(self):
+        self.write_repos_toml("tests = []")
+        self.recalc()
+        reason = read(self.out / "x" / "meta.json")["error"]
+        self.assertIn("채택 규칙 재계산 실패", reason)
+        self.assertIn("tests", reason)
+
     def test_recalc_refuses_a_ledger_that_already_adopts_on_both_pass(self):
         for name in ("ledger.json", "run/ledger.json"):
             ledger = read(self.runs / "x" / name)
