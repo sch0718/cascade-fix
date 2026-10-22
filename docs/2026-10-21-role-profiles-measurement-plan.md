@@ -11,8 +11,7 @@
 ## 1. 전제
 
 - 프로필 구현(`--profile`, repos.toml `[profiles.*]`, `eval/replay.py --profile`)이 끝난 뒤에 돌린다. 섞는 조합(A=Codex·B=Haiku 등)은 프로필 없이는 만들 수 없다.
-- 작업별 Claude 토큰 기록(설계 8절 1순위: `scripts/run-jobs.js`가 작업마다 사용량을 결과에 담는다)도 측정 전에 구현한다(사용자 결정). 켬 값을 반사실로 다시 계산하려면 판가름이 빠진 항목의 Opus 토큰을 항목별로 빼야 하기 때문이다. 단계 합계로는 Sonnet·Haiku 몫도 나눌 수 없다.
-  - Workflow가 토큰을 돌려주지 않는다고 확인되면 대안으로 넘어간다. stage1을 모델별 Workflow로 나눠 돌려 모델별 합계를 얻는다. 판가름은 항목마다 Workflow를 따로 띄워 항목별 Opus 합계를 얻는다(Codex 리뷰 4회차 지적 반영). 평균 토큰으로 빼면 4절의 반사실 검증 조건(「뺀 Opus 토큰 = 그 항목들의 판가름 토큰 합」)을 확인할 수 없기 때문이다. 판가름 Workflow가 구성마다 14~31개로 늘어 시간이 조금 더 걸린다. 결과는 3절 `claude-usage.json` 형식으로 항목(`run`)마다 적는다.
+- 작업별 Claude 토큰 기록은 `CF usage`로 한다(사용자 결정). Workflow를 돌릴 때마다 `CF usage --run-dir <실행 폴더> --round N --workflow <Workflow 실행 id>`(첫 검토는 `--review-dir <review_dir>`, `init` 전에)를 돌리면 Workflow 기록 폴더(`~/.claude/projects/<프로젝트>/<세션>/subagents/workflows/wf_*/`)에서 작업별 토큰과 추정 비용을 읽어 `round-N/claude-usage.json`에 쓴다. 켬 값을 반사실로 다시 계산하려면 판가름이 빠진 항목의 Opus 토큰을 항목별로 빼야 하기 때문이다. 단계 합계로는 Sonnet·Haiku 몫도 나눌 수 없다.
 - 다른 세션의 수정이 들어간 뒤에 돌린다. 수정 전 결과와는 기준선이 달라 직접 비교하지 않는다.
   - 빈 검증 통과(아무 테스트도 돌지 않은 검증을 통과로 보지 않음)
   - `eval/score.py` 통계(「둘 다 검증 통과」 사유 채택 집계)
@@ -38,7 +37,7 @@
 ### 고르는 규칙
 
 - 남은 구성 중 **Claude 비용(추정)**이 가장 적은 것을 고른다. Opus 호출 수 기준은 따로 두지 않는다. Claude 비용에 녹아 있기 때문이다.
-- Claude 비용(추정) = Σ(모델별 Claude 토큰 × 그 모델 단가)다. 토큰은 원장의 작업별 사용량(1절)에서 읽고, 대안 경로면 3절의 `claude-usage.json`에서 읽는다. 단가는 측정 시점 Anthropic 공개 가격(입력·출력·캐시 읽기)이다. 구독 이용 한도가 이 값에 비례한다고 가정한다. 이 가정은 결과 문서에 적는다.
+- Claude 비용(추정) = Σ(모델별 Claude 토큰 × 그 모델 단가)다. 토큰은 `CF usage`가 쓴 작업별 사용량(1절)에서 읽는다. 단가는 `CF usage`가 기록할 때의 Anthropic 공개 가격(입력·출력·캐시 읽기·캐시 쓰기)이고, 기준 날짜와 출처가 `claude-usage.json`과 채점 결과의 「단가 기준:」 줄에 남는다. 구독 이용 한도가 이 값에 비례한다고 가정한다. 이 가정은 결과 문서에 적는다.
 - 비용 범위는 1회차의 작업자·점검자·판가름이다(`score.py --cost-scope round1-core`). 의견·재검토는 판가름·채택 결과에 따라 생기므로 반사실 켬 값을 구할 수 없다(Codex 리뷰 지적 반영). 그래서 고르는 데 쓰지 않고, 끔 실행의 값만 따로 적는다.
 - 판정은 `score.py`의 「선정 조건」 줄(설계 8절)로 쌍마다 낸다. 여러 후보·3회 평균을 모아 고르는 것은 결과 문서의 표에서 아래 규칙대로 한다.
 - 비용 차이가 10% 이내인 구성끼리는 사람 목록으로 간 수가 적은 쪽을 고른다(내가 정함).
@@ -58,9 +57,6 @@
 실행마다 결과 폴더(`eval/runs/<날짜>-<단계>/<구성>/`, git 제외)에 남긴다.
 
 - `profiles.toml`(그 실행의 repos.toml 사본)
-- `claude-usage.json`(대안 경로일 때만): Workflow 완료 보고의 서브에이전트 토큰을 메인 세션이 적는다. 작업별 기록(1절)이 되면 원장에서 바로 읽으므로 필요 없다. 다만 첫 검토(`CF review`)처럼 원장 밖에서 도는 Claude 작업은 그 결과 파일의 사용량을 함께 모은다.
-  - 형식(Codex 리뷰 지적 반영): 레코드 목록 `[{"run": "<항목 id 또는 실행 id>", "round": 1, "stage": "stage1|checker|adjudicator|opinion|recheck|review", "model": "claude-…", "input": 0, "output": 0, "cache_read": 0, "cache_write": 0}]`. Workflow 하나가 여러 실행·회차를 함께 돌렸으면 실행·회차마다 레코드를 나눠 적는다(완료 보고가 작업별 토큰을 주는 경우). 작업별로 나눌 수 없으면 그 Workflow를 실행·회차 단위로 나눠 띄운다.
-  - 이렇게 해야 `--round 1`·`--cost-scope round1-core` 집계가 대안 경로에서도 맞는다. 테스트: 2회차 레코드가 섞인 파일에서 1회차 비용만 집계되는지 본다(설계 8절).
 - 걸린 시간(단계별 시작·끝 시각)
 
 ## 4. 단계
@@ -114,7 +110,7 @@ CASCADE_REPOS_TOML=<결과>/profiles.toml python3 eval/replay.py --sample <결�
 ```
 
   - 두 명령은 `jobs`(외부 작업은 `workers`)까지 하고 멈춘다(`eval/replay.py:153-161`, `meta.json`에 `pending_run_dir`). 확인 실행과 본 실행 모두 `eval/sample-format.md` 「돌리는 순서」대로 끝까지 잇는다(Codex 리뷰 지적 반영).
-    1. 항목마다 남은 Claude 작업(`stage1-args.json`, 있으면 `stage1-fallback-args.json`)을 스킬의 Workflow로 돌려 결과를 저장한다.
+    1. 항목마다 남은 Claude 작업(`stage1-args.json`, 있으면 `stage1-fallback-args.json`)을 스킬의 Workflow로 돌려 결과를 저장하고, 끝날 때마다 `CF usage --run-dir <pending_run_dir> --round 1 --workflow <Workflow 실행 id>`를 돌린다(이후 판가름·의견 Workflow도 같다).
     2. 각 명령의 「다음:」 출력을 따라 `judge` → (판가름이 있으면 Workflow로 `adj.json`) `adjudicate` → (판단 불가가 있으면) 의견 → `apply` → `report`로 잇는다. 의견은 건너뛰지 않는다(Codex 리뷰 3회차 지적 반영). 판가름 뒤 의견 단계가 있기 때문이다(`cascade/cli_steps.py:743`). 끔 실행의 의견 비용도 이 단계에서 기록한다(2절).
        - 재검토는 돌리지 않는다. 비교는 1회차만 보기 때문이다(내가 정함). `apply`가 재검토 프롬프트(`round-1/recheck-prompt.md`)를 만들었으면 그 사실만 결과 문서에 센다.
     3. `python3 eval/replay.py --sample … --out <같은 폴더> --collect`로 모은다. `--collect`가 원장과 `run/`을 항목 폴더로 복사하고 워크트리를 지운다.
@@ -136,7 +132,8 @@ CASCADE_REPOS_TOML=<결과>/profiles.toml python3 eval/replay.py --sample <결�
   - 끈 재계산이 저장된 원장 판정의 분기와 모든 항목에서 같다. 판가름이면 `adj-args.json`이 있고, 아니면 없다.
   - 켠 결과가 끈 결과와 다른 항목 수가, 켬에서 빠진 판가름 호출 수와 같다.
   - 뺀 Opus 토큰이 그 항목들의 작업별 판가름 토큰 합과 같다.
-  - 산출물은 `<결과>/<구성>/adopt-recalc/`에 둔다. 재계산 스크립트, 항목별 끔·켬 결정(JSON), 대조 결과, 켬 값으로 바꾼 채점용 폴더가 들어간다. 스크립트는 측정 브랜치의 `decide()`를 그대로 불러 쓴다.
+  - `python3 eval/adopt_recalc.py --runs <결과>/<구성> --out <결과>/<구성>/adopt-recalc`로 돌린다. `--out`에 항목별 끔·켬 결정(`decisions.jsonl`), 위 세 검증의 대조 결과(`check.json`, 하나라도 어긋나면 종료 코드 1), 켬 값으로 바꾼 채점용 폴더, `counterfactual.json`이 들어간다. 스크립트는 `cascade`의 `decide()`를 그대로 불러 쓴다. 켠 폴더는 `score.py --cost-scope round1-core`로만 비용을 낸다.
+- 구성별 채점과 고르기. 구성마다 `python3 eval/score.py --runs <결과>/<구성> --baseline-runs <결과>/m-claude-only --sample <결과>/sample.jsonl --round 1 --cost-scope round1-core --json <결과>/<구성>/score.json`을 낸다(켬 값은 `--runs`에 그 구성의 `adopt-recalc` 폴더를 주고 기준선도 같은 쪽을 줘서 끔은 끔끼리, 켬은 켬끼리 짝을 맞춘다. 그래서 기준선 `m-claude-only`에도 `adopt_recalc.py`를 돌려 둔다). 2단계의 반복까지 모이면 `python3 eval/select_profiles.py --candidate <구성>=<점수 JSON>[,…] … --baseline m-claude-only`가 2절 규칙대로 평균·최소·최대와 거름 사유, 선정을 낸다. `--baseline`은 `--candidate`로 준 이름 중 하나여야 하고, 끔 값과 켬 값은 따로 한 번씩 부른다. 사용법은 `eval/sample-format.md`에 있다.
 - 빠진 것: Claude 대안(Haiku+Haiku, effort 조정)은 이번 단계에서 뺐다(사용자 결정). 그래서 이 계획으로는 `claude-only`를 채택 규칙 효과 말고는 바꿀 근거가 생기지 않는다. 넣을지는 2단계 뒤에 다시 정한다.
 
 | 구성 | Claude 토큰(추정) | 외부 | 시간(추정) |
@@ -164,8 +161,8 @@ CASCADE_REPOS_TOML=<결과>/profiles.toml python3 eval/replay.py --sample <결�
 - **표본 모으기**
   - 대상: 초안 단계의 설계·계획 문서(「설계 합의 완료」 전). 지난 문서 측정은 합의가 끝난 문서라 7건이 모두 「사실」 쪽이었다.
   - 문서를 실제로 검토할 때마다 첫 검토를 셋 다 돌린다: Claude(Fable 5.1 high, `CF review --profile claude-only --root <저장소> --kind doc --doc <문서>`), Codex(`RR --repo <저장소> --doc <문서>`), Cursor(`CR --repo <저장소> --doc <문서> --model composer-2.5`). 세 명령 모두 같은 저장소 루트를 명시한다(Codex 리뷰 5회차 지적 반영). `--repo`가 없으면 `RR`·`CR`은 문서가 있는 폴더의 저장소를 기준으로 삼고(`docs/codex-review-changes/run-review.sh:56`), `CF review`는 현재 디렉터리의 저장소를 본다. 문서가 저장소 밖에 있으면 셋이 서로 다른 코드를 보게 된다. Claude 첫 검토는 프로필을 명시해 Fable로 고정한다(Codex 리뷰 지적 반영). 사용자 기본 프로필이 `local`이면 `CF review`가 Codex 안내로 바뀌기 때문이다(설계 5절).
-  - 세 결과의 지적을 합쳐 중복을 지운다(같은 위치·같은 문제면 하나로 친다). 누가 찾았는지는 지적마다 남긴다. 중복 판정은 메인 세션이 하고, 애매한 것은 사용자에게 보인다.
-  - 합친 목록으로 cascade-fix를 실제로 한 번 돌린다. 이 실행의 결과와 사용자의 반영·철회·선택이 정답이다. 정답을 정하는 방식은 코드 표본과 같다(`eval/sample-format.md`).
+  - 세 결과의 지적을 합쳐 중복을 지운다(같은 위치·같은 문제면 하나로 친다). 누가 찾았는지는 지적마다 남긴다. 중복 판정은 메인 세션이 하고, 애매한 것은 사용자에게 보인다. `python3 eval/first_review.py merge --claude … --codex … --cursor … --doc <문서> --out <폴더>`가 묶음 후보를 만들고, 사람이 `merged.json`을 확정한 뒤 `merge --confirm`이 cascade-fix 입력(`findings-input.json`)과 누가 찾았는지(`found-by.json`)를 쓴다. 검토자마다 결과를 자기 폴더(각자의 `review_dir`)에 둔다. 결과 옆의 `review-meta.json`이 그 검토자의 이력으로 붙기 때문이다.
+  - 합친 목록으로 cascade-fix를 실제로 한 번 돌린다(`init --findings-json`). 이 실행의 결과와 사용자의 반영·철회·선택이 정답이다. 정답을 정하는 방식은 코드 표본과 같다(`eval/sample-format.md`). 합친 입력의 실제 실행 보고서에는 첫 검토 이력이 없고 첫 검토 비용은 `first_review.py score`로 본다.
   - 실제 실행의 구성은 문서마다 `claude-only`와 `doc-mix`를 번갈아 쓴다(사용자 결정). 실제 실행의 결과를 보고 사용자가 고르므로 정답이 그 구성 쪽으로 기울 수 있다. 번갈아 쓰면 그 기울어짐이 두 구성에 고르게 나뉜다. 결과 문서에는 항목마다 어느 구성이 실제 실행이었는지 적고, 구성별로 나눈 표도 함께 보인다.
   - 다른 구성은 같은 입력으로 `--dry-run` 돌려 비교한다.
   - **기준 시점을 하나로 고정한다**(리뷰 지적 반영). 실제 실행이 문서를 고친 뒤 다른 구성을 돌리면 서로 다른 문서를 비교하게 된다. 사본을 따로 만들면 git 밖 문서의 경로(`외부/<파일명>`, `cascade/cli.py:155-170`)와 함께 보이는 파일이 실제 실행과 달라진다(Codex 리뷰 지적 반영). 그래서 두 구성을 모두 **원래 저장소에서 같은 상태로** 돌린다(내가 정함).
@@ -195,7 +192,7 @@ base = "claude-only"
 - **첫 검토 지표**(검토자마다)
   - 정밀도 = 그 검토자 지적 중 정답 「사실」 / 그 검토자 지적 수
   - 재현율 = 그 검토자가 찾은 「사실」 / 합친 목록의 「사실」 전체
-  - 등급별(Critical·Warning·Suggestion)로도 나눈다. 비용(Fable 토큰, Codex·Cursor 토큰)도 함께 적는다.
+  - 등급별(Critical·Warning·Suggestion)로도 나눈다. 비용(Fable 토큰, Codex·Cursor 토큰)도 함께 적는다. 확정한 묶음과 정답 파일로 `python3 eval/first_review.py score --merged <확정한 merged.json> --truth <정답.jsonl>`이 검토자별 정밀도·재현율·비용을 낸다(Claude 첫 검토는 `CF usage --review-dir`로 만든 `claude-usage.json`, Codex는 토큰 기록 없음).
 - **코드 모드 첫 검토**도 같은 방식으로 실제 코드 검토(`--base`·`--uncommitted`) 때 세 검토자를 돌려 모은다. 코드 작업자 비교는 1·2단계가 맡으므로 여기서는 첫 검토 지표만 본다(내가 정함).
   - 명령: Claude(`CF review --profile claude-only --root <저장소> --kind code --base <브랜치>`), Codex(`cd <저장소> && RR --base <브랜치>`), Cursor(`CR --repo <저장소> --base <브랜치> --model composer-2.5`). `--uncommitted`도 같은 꼴이다.
   - Codex만 `cd`로 들어간다. codex-review의 코드 모드는 `--repo`를 무시하고 현재 디렉터리의 저장소를 검토하기 때문이다(문서 모드와 cursor-review는 `--repo`를 따른다). `CF review`가 외부 첫 검토를 안내할 때도 같은 접두를 붙인다.
@@ -209,6 +206,7 @@ base = "claude-only"
   - apply 뒤 전체 테스트가 간섭 의심으로 실패
   - 채택 패치가 버그 때문에 같은 PR 안에서 사람에게 되돌려지거나 다시 고쳐짐
 - 회귀가 하나라도 있으면 원인을 보고하고, 그 후보를 내장값으로 올리지 않는다.
+- `python3 eval/regress.py --runs <실행 폴더>… [--reverts <되돌림.jsonl>]`가 프로필별로 센다. 실행 폴더는 시간 순서로 주고, 되돌려진 패치는 줄마다 `{"run", "finding", "reason"}`으로 적는다. 종료 조건(실행 10회·채택 패치 50건)에 먼저 닿은 쪽이 출력에 나온다.
 - 추가 비용이 없다(실제 작업 비용). 다만 외부 전송 동의는 실행마다 받는다.
 
 ## 5. 산출물

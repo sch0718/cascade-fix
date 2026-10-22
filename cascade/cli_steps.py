@@ -89,6 +89,10 @@ OPINION_ARGS = "opinion-args.json"
 OPINION_RESULTS = "opinion.json"
 RECHECK_ARGS = "recheck-args.json"
 RECHECK_RESULTS = "recheck.json"
+USAGE_FILE = "claude-usage.json"
+CLAUDE_JOB_FILES = ("stage1-args.json", "stage1-fallback-args.json", "checker-args.json", "checker-fallback-args.json",
+                    "adj-args.json", OPINION_ARGS, RECHECK_ARGS)
+NON_PROGRESS_STEPS = ("cleanup", "usage")
 STAGE1, STAGE_CHECKER = "stage1", "checker"
 STAGE_ARGS = {STAGE1: "stage1-args.json", STAGE_CHECKER: "checker-args.json"}
 STAGE_OUTPUTS = {STAGE1: "stage1.json", STAGE_CHECKER: "checker.json"}
@@ -758,7 +762,11 @@ def pending_opinions(ledger: Ledger, rd: Path) -> list[str]:
 
 
 def workflow_step(args: Path, out: Path) -> str:
-    return f"Workflow 실행: script={RUN_JOBS} 내용, args={args} 내용 → 결과를 {out} 에 저장"
+    folder = Path(args).parent
+    round_dir_name = re.fullmatch(r"round-(\d+)", folder.name)
+    where = f"--run-dir {_q(folder.parent)} --round {round_dir_name.group(1)}" if round_dir_name else f"--review-dir {_q(folder)}"
+    return (f"Workflow 실행: script={RUN_JOBS} 내용, args={args} 내용 → 결과를 {out} 에 저장"
+            f" → 끝나면 CF usage {where} --workflow <Workflow 실행 id>")
 
 
 def parse_remote(url: str) -> tuple[str, str]:
@@ -824,7 +832,7 @@ def next_steps(ledger: Ledger, run_dir: Path) -> list[str]:
         return ["회차가 없다"]
     if ledger.status == STATUS_DONE:
         steps = []
-        latest = next((e for e in reversed(rnd.events) if e.get("step") != "cleanup"), {})
+        latest = next((e for e in reversed(rnd.events) if e.get("step") not in NON_PROGRESS_STEPS), {})
         reported = latest.get("step") == "report" and latest.get("round") == rnd.no
         if not reported or not (Path(run_dir) / "report.md").is_file():
             steps.append(_cmd("report", run_dir))

@@ -1,4 +1,5 @@
 import argparse
+import itertools
 import json
 import os
 import re
@@ -13,6 +14,7 @@ from pathlib import Path
 from cascade import assignment
 from cascade import cli_steps as s
 from cascade import profiles
+from cascade import usage as workflow_usage
 from cascade.config import ConfigError, ExitCodes
 from cascade.consensus import (
     OUTCOME_ADJUDICATE,
@@ -345,6 +347,13 @@ def _consent_option(raw: str | None) -> set[str] | None:
     return set(names)
 
 
+def _read_optional_json(path: Path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
 def _first_review_meta(args, mode: str) -> dict:
     if args.findings_json or not args.input or args.source == "pr-comment":
         return {}
@@ -359,6 +368,8 @@ def _first_review_meta(args, mode: str) -> dict:
     if not isinstance(meta, dict) or meta.get("role") != f"{mode}.review":
         return {}
     first_review = {key: meta[key] for key in FIRST_REVIEW_KEYS if key in meta}
+    if isinstance(measured := _read_optional_json(path.parent / s.USAGE_FILE), dict):
+        first_review["usage"] = measured
     if isinstance(first_review.get("requested"), dict):
         first_review["requested"] = {key: first_review["requested"][key] for key in ("runner", "model", "effort")
                                      if key in first_review["requested"]}
@@ -730,7 +741,9 @@ def cmd_review(args) -> int:
     return 0
 
 
-_JUDGE_OUTPUTS = ("decisions.json", "results.json", "verify.json", "adj-args.json", "adj.json", s.OPINION_ARGS,
+LOSSY_FILE = "lossy.json"
+PRE_FINAL_DECISIONS = "decisions-pre-final.json"
+_JUDGE_OUTPUTS = ("decisions.json", "results.json", "verify.json", LOSSY_FILE, "adj-args.json", "adj.json", s.OPINION_ARGS,
                   s.OPINION_RESULTS, s.STAGE_ARGS[s.STAGE_CHECKER], f"{s.STAGE_CHECKER}-cli-args.json",
                   s.STAGE_OUTPUTS[s.STAGE_CHECKER])
 
@@ -747,6 +760,9 @@ def _reopen_round(ledger, rnd, rd: Path) -> None:
         ledger.opinions.pop(f["id"], None)
     for name in _JUDGE_OUTPUTS:
         (rd / name).unlink(missing_ok=True)
+    if (rd / s.USAGE_FILE).is_file():
+        k = next(n for n in itertools.count(1) if not (rd / f"claude-usage.superseded-{n}.json").exists())
+        (rd / s.USAGE_FILE).rename(rd / f"claude-usage.superseded-{k}.json")
     for path in rd.glob("opinion-*"):
         path.unlink()
 
@@ -971,7 +987,8 @@ def _judge_code(ledger, rnd, f, results, snap, cfg, baseline, repro):
     d = s.without_empty_patch(d, {"a": pa, "b": pb}, adjudicated=False)
     d = s.without_lossy_patch(d, lambda role: s.worktree(snap, f.id, role), base)
     workers = {"a": a, "b": b}
-    return d, workers, {"a": [r.to_dict() for r in ra], "b": [r.to_dict() for r in rb]}
+    lossy = {"a": s.is_lossy(wt_a, base), "b": s.is_lossy(wt_b, base)}
+    return d, workers, {"a": [r.to_dict() for r in ra], "b": [r.to_dict() for r in rb]}, lossy
 
 
 def _judge_doc_inputs(ledger, rnd, f, results, snap, cfg):
@@ -1012,6 +1029,7 @@ def cmd_judge(args) -> int:
     pending: list = []
     writer_patches: dict[str, str] = {}
     doc_problems: dict[str, list[str]] = {}
+    lossy: dict[str, dict[str, bool]] = {}
     for f in findings:
         if ledger.mode == "doc":
             workers, problems, snippets = _judge_doc_inputs(ledger, rnd, f, results, snap, cfg)
@@ -1023,7 +1041,7 @@ def cmd_judge(args) -> int:
                 if checker_results is not None and f"{f.id}:checker" in checker_results:
                     workers["checker"] = checker_results[f"{f.id}:checker"]
         else:
-            d, workers, verify[f.id] = _judge_code(ledger, rnd, f, results, snap, cfg, baseline, repro)
+            d, workers, verify[f.id], lossy[f.id] = _judge_code(ledger, rnd, f, results, snap, cfg, baseline, repro)
             decisions.append(d)
         for role, w in workers.items():
             merged[f"{f.id}:{role}"] = w.to_dict()
@@ -1031,6 +1049,8 @@ def cmd_judge(args) -> int:
                 s.patch_path(rd, f.id, role).write_text(w.patch, encoding="utf-8")
     s.write_json(rd / "results.json", merged)
     s.write_json(rd / "verify.json", verify)
+    if ledger.mode == "code":
+        s.write_json(rd / LOSSY_FILE, lossy)
 
     if ledger.mode == "doc":
         if pending and checker_results is None:
@@ -1376,8 +1396,17 @@ def cmd_apply(args) -> int:
     if not ledger.dry_run:
         _remove_round_worktrees(ledger, rnd)
         base_wt = s.snapshot_of(ledger).worktrees.get(s.base_name(rnd))
+        if not (rd / PRE_FINAL_DECISIONS).exists() and data.get("final_ok") is not False and not data.get("interference"):
+            s.write_json(rd / PRE_FINAL_DECISIONS, rnd.decisions)
+        if "final_history" not in data and "final_ok" in data:
+            data["final_history"] = [{"final_ok": data["final_ok"], "baseline_failed": bool(data.get("baseline_failed")),
+                                      "interference": bool(data.get("interference")), "applied": data.get("applied", []),
+                                      "at": None}]
         final = _final_suite(root, base_wt, cfg, ledger.mode, changed) if applied else {"final_ok": None, "final_tail": ""}
         data.update(final)
+        data["final_history"] = [*data.get("final_history", []), {
+            "final_ok": final["final_ok"], "baseline_failed": bool(final.get("baseline_failed")),
+            "interference": final["final_ok"] is False, "applied": applied, "at": s.now()}]
         if final["final_ok"] is False:
             data["interference"] = True
             reason = REASON_FINAL_BASELINE_FAILED if final.get("baseline_failed") else REASON_INTERFERENCE
@@ -1583,6 +1612,84 @@ def cmd_cleanup(args) -> int:
     return 0
 
 
+def _label_job_ids(files: list[Path]) -> dict[str, str]:
+    labels: dict[str, str] = {}
+    for path in files:
+        data = _read_optional_json(path)
+        for job in data.get("jobs", []) if isinstance(data, dict) else []:
+            if isinstance(job, dict) and isinstance(job.get("id"), str) and isinstance(job.get("label"), str):
+                labels.setdefault(job["label"], job["id"])
+    return labels
+
+
+def _usage_record(workflow: str, labels: dict[str, str], cell_of, out: Path) -> dict:
+    """Workflow 기록 폴더를 읽어 out(claude-usage.json)의 그 Workflow 몫을 덮어쓴다. 읽지 못하면 error만 돌려준다."""
+    try:
+        agents = workflow_usage.read_workflow(workflow_usage.find_workflow_dir(workflow))
+    except workflow_usage.UsageFormatError as e:
+        return {"workflow": Path(workflow).name, "jobs": 0, "unmatched": 0, "error": str(e)}
+    name = Path(workflow).name
+    rows, unmatched = [], []
+    for agent in agents:
+        job_id = labels.get(agent.label)
+        if job_id is None:
+            unmatched.append(agent.label)
+            continue
+        rows.append({"job_id": job_id, "label": agent.label, "cell": cell_of(job_id), "model": agent.model,
+                     "input": agent.input, "output": agent.output, "cache_read": agent.cache_read,
+                     "cache_write": agent.cache_write, "cost": agent.cost})
+    data = _read_optional_json(out)
+    if not isinstance(data, dict):
+        if out.is_file():
+            print(f"경고: 기존 {out.name}이 JSON 객체가 아니어서 덮어쓴다. 다른 Workflow의 기록이 있었다면 CF usage를 다시 돌린다")
+        data = {}
+    workflows = data["workflows"] if isinstance(data.get("workflows"), dict) else {}
+    skipped = data["unmatched"] if isinstance(data.get("unmatched"), dict) else {}
+    s.write_json(out, {"prices_as_of": workflow_usage.PRICES_AS_OF, "price_source": workflow_usage.PRICE_SOURCE,
+                       "workflows": {**workflows, name: rows}, "unmatched": {**skipped, name: unmatched}})
+    if unmatched:
+        print(f"경고: 이름표가 작업과 일치하지 않는 에이전트는 어느 칸에도 넣지 않았다: {', '.join(unmatched)}")
+    return {"workflow": name, "jobs": len(rows), "unmatched": len(unmatched), "error": None}
+
+
+def cmd_usage(args) -> int:
+    if bool(args.run_dir) == bool(args.review_dir):
+        raise s.CliError("--run-dir(과 --round)와 --review-dir 중 하나만 준다", ExitCodes.PARSE_ERROR)
+    if args.run_dir:
+        if args.round is None:
+            raise s.CliError("--run-dir은 --round와 함께 쓴다", ExitCodes.PARSE_ERROR)
+        run_dir = Path(args.run_dir)
+        ledger = s.load_ledger(run_dir)
+        rnd = s.get_round(ledger, args.round)
+        rd = s.round_dir(run_dir, rnd.no)
+        labels = _label_job_ids([rd / name for name in s.CLAUDE_JOB_FILES])
+        mode = ledger.mode
+
+        def cell_of(job_id: str) -> str | None:
+            return assignment.job_cell_key(mode, job_id.rsplit(":", 1)[-1])
+    else:
+        rd = Path(args.review_dir)
+        if not rd.is_dir():
+            raise s.CliError(f"첫 검토 폴더가 아니다: {rd}", ExitCodes.PARSE_ERROR)
+        meta = _read_optional_json(rd / REVIEW_META)
+        role = meta.get("role") if isinstance(meta, dict) else None
+        labels = _label_job_ids([rd / "review-args.json"])
+
+        def cell_of(job_id: str) -> str | None:
+            return role
+    out = rd / s.USAGE_FILE
+    result = _usage_record(args.workflow, labels, cell_of, out)
+    if args.run_dir:
+        ledger = s.load_ledger(run_dir)
+        s.mark(s.get_round(ledger, args.round), "usage", **result)
+        s.save_ledger(run_dir, ledger)
+    if result["error"]:
+        print(f"Claude 토큰 미측정: {result['error']}")
+    else:
+        print(f"Claude 토큰: Workflow {result['workflow']} 작업 {result['jobs']}건 기록, 일치하지 않음 {result['unmatched']}건 → {out}")
+    return 0
+
+
 def cmd_status(args) -> int:
     run_dir = Path(args.run_dir)
     ledger = s.load_ledger(run_dir)
@@ -1664,6 +1771,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fallback-from", help="실패한 첫 검토 runner(codex·cursor). 마지막으로 시도한 runner와 같아야 한다")
     p.add_argument("--reason", help=f"--fallback-from의 사유(기본 {REVIEW_DEFAULT_REASON})")
     add("jobs", cmd_jobs, round_no=True)
+    p = add("usage", cmd_usage, run_dir=False, force=False)
+    p.add_argument("--run-dir")
+    p.add_argument("--round", type=int)
+    p.add_argument("--review-dir", help="CF review가 만든 첫 검토 폴더(review_dir=로 찍힌 곳)")
+    p.add_argument("--workflow", required=True, help="Workflow 실행 id 또는 그 기록 폴더 경로")
     p = add("workers", cmd_workers, round_no=True)
     p.add_argument("--stage", choices=(s.STAGE1, s.STAGE_CHECKER), required=True)
     p = add("judge", cmd_judge, round_no=True)

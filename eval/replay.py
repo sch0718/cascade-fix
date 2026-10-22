@@ -8,6 +8,9 @@ import tomllib
 from pathlib import Path
 
 SKILL_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(SKILL_ROOT))
+from cascade import assignment, cli_steps  # noqa: E402
+from cascade.jobs import RUNNER_CLAUDE  # noqa: E402
 
 
 def default_repos_toml() -> Path:
@@ -19,6 +22,8 @@ REQUIRED = ("id", "repo", "commit", "source", "finding", "truth", "baseline_opus
 SOURCES = ("codex-doc", "codex-code", "claude-doc", "claude-code", "cursor-doc", "cursor-code", "pr-comment")
 ROUND = "1"
 WORKERS_CLAUDE, WORKERS_EXTERNAL = "claude", "external"
+FINDINGS_INPUT = "findings-input.json"
+INIT_LINE_PREFIXES = ("프로필:", "덮음:", "대체:", "역할:", "전송 동의:")
 
 
 def load_sample(path) -> list[dict]:
@@ -122,8 +127,59 @@ def has_jobs(path: Path) -> bool:
     return path.is_file() and bool(read_json(path).get("jobs"))
 
 
-def run_item(item: dict, out: Path, repos_toml: Path, fake: Path | None, workers: str = WORKERS_CLAUDE,
-             adopt_on_both_pass: bool = False) -> None:
+def init_args(item: dict, wt: Path, *, profile: str | None, workers: str | None, adopt_on_both_pass: bool) -> list[str]:
+    repo = Path(item["repo"]).resolve()
+    args = ["init", "--source", item["source"], "--findings-json", str(wt.parent / FINDINGS_INPUT), "--dry-run"]
+    if profile:
+        args += ["--profile", profile]
+    if workers:
+        args += ["--workers", workers]
+    if item.get("doc"):
+        args += ["--doc", doc_arg(item["doc"], repo, wt)]
+    if adopt_on_both_pass:
+        args.append("--adopt-on-both-pass")
+    return args
+
+
+def worker_cells(ledger: dict) -> dict[str, dict]:
+    roles, mode = ledger["profile"]["roles"], ledger["mode"]
+    return {assignment.job_cell_key(mode, role): cell for role, cell in assignment.mode_workers(roles, mode).items()}
+
+
+def is_external(cell: dict) -> bool:
+    return RUNNER_CLAUDE != cell["runner"] or RUNNER_CLAUDE != (cell.get("fallback") or cell)["runner"]
+
+
+def external_cells(ledger: dict) -> list[str]:
+    return [f"{key}={cell['runner']}(대체 {(cell.get('fallback') or cell)['runner']})"
+            for key, cell in worker_cells(ledger).items() if is_external(cell)]
+
+
+def confirmed_roles(ledger: dict) -> dict[str, dict]:
+    roles = ledger["profile"]["roles"]
+    adjudicator = f"{ledger['mode']}.adjudicator"
+    return {**worker_cells(ledger), adjudicator: roles[adjudicator]}
+
+
+def roles_text(roles: dict[str, dict]) -> str:
+    return ", ".join(f"{key}={cell['runner']}({cell['model'] or '기본'}, {cell['effort']})" for key, cell in roles.items())
+
+
+def echo_init(item_id: str, base: Path, text: str) -> None:
+    lines = [line for line in text.splitlines() if line.startswith(INIT_LINE_PREFIXES)]
+    (base / "init.txt").write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
+    for line in lines:
+        print(f"{item_id}: {line}")
+
+
+def refuse_external(ledger: dict) -> None:
+    external = external_cells(ledger)
+    if external:
+        raise RuntimeError(f"--fake-results는 모델을 부르지 않으므로 외부 runner 칸이 있는 구성은 돌릴 수 없다: {', '.join(external)}")
+
+
+def run_item(item: dict, out: Path, repos_toml: Path, fake: Path | None, workers: str | None = None,
+             adopt_on_both_pass: bool = False, profile: str | None = None) -> None:
     repo = Path(item["repo"]).resolve()
     base = (out / item["id"]).resolve()
     wt = base / "wt"
@@ -143,17 +199,17 @@ def run_item(item: dict, out: Path, repos_toml: Path, fake: Path | None, workers
                 raise RuntimeError(f"기존 워크트리의 HEAD {head[:12]}가 표본의 커밋 {wanted[:12]}와 다르다")
         wt = wt.resolve()
         write_worktree_toml(repos_toml, repo, wt, base / "repos.toml")
-        findings = base / "findings-input.json"
-        write_json(findings, [item["finding"]])
-        args = ["init", "--source", item["source"], "--findings-json", str(findings), "--workers", workers, "--dry-run"]
-        if item.get("doc"):
-            args += ["--doc", doc_arg(item["doc"], repo, wt)]
-        if adopt_on_both_pass:
-            args.append("--adopt-on-both-pass")
-        out_text = cli(wt, env, *args)
+        write_json(base / FINDINGS_INPUT, [item["finding"]])
+        out_text = cli(wt, env, *init_args(item, wt, profile=profile, workers=workers, adopt_on_both_pass=adopt_on_both_pass))
         run_dir = Path(next(x for x in out_text.splitlines() if x.startswith("run_dir=")).split("=", 1)[1])
         rd = str(run_dir)
+        echo_init(item["id"], base, out_text)
+        if fake is not None:
+            refuse_external(read_json(run_dir / "ledger.json"))
         cli(wt, env, "jobs", "--run-dir", rd, "--round", ROUND)
+        meta["roles"] = confirmed_roles(read_json(run_dir / "ledger.json"))
+        write_json(base / "meta.json", meta)
+        print(f"{item['id']}: 역할 확정: {roles_text(meta['roles'])}")
         round_dir = run_dir / "round-1"
         if (round_dir / "stage1-cli-args.json").is_file():
             cli(wt, env, "workers", "--run-dir", rd, "--round", ROUND, "--stage", "stage1")
@@ -190,6 +246,21 @@ def run_item(item: dict, out: Path, repos_toml: Path, fake: Path | None, workers
     finish_item(base, repo, wt, run_dir, env)
 
 
+def unfinished(run_dir: Path) -> list[str]:
+    ledger = cli_steps.load_ledger(run_dir)
+    first, last = ledger.rounds[0], ledger.rounds[-1]
+    missing = [] if cli_steps.step_done(first, "apply") else ["1회차 apply 완료 이벤트"]
+    if not (run_dir / f"round-{last.no}" / "apply.json").is_file():
+        missing.append(f"회차 {last.no} apply.json")
+    for rnd in ledger.rounds:
+        missing += [f"회차 {rnd.no} 의견 {fid}" for fid in cli_steps.pending_opinions(ledger, run_dir / f"round-{rnd.no}")]
+    if not (run_dir / "report.md").is_file():
+        missing.append("report.md")
+    if not any(e.get("step") == "report" and e.get("round") == last.no for e in last.events):
+        missing.append("원장 report 이벤트")
+    return missing
+
+
 def collect_item(item: dict, out: Path, repos_toml: Path) -> bool:
     base = (out / item["id"]).resolve()
     meta_path = base / "meta.json"
@@ -199,10 +270,10 @@ def collect_item(item: dict, out: Path, repos_toml: Path) -> bool:
     pending = meta.get("pending_run_dir")
     if not pending:
         return False
-    ledger = read_json(Path(pending) / "ledger.json")
-    last = ledger["rounds"][-1]["no"]
-    if not (Path(pending) / f"round-{last}" / "apply.json").is_file():
+    missing = unfinished(Path(pending))
+    if missing:
         write_json(meta_path, {**meta, "incomplete": True})
+        print(f"{item['id']}: 끝나지 않았다 — {', '.join(missing)}")
         return False
     repo = Path(item["repo"]).resolve()
     wt = (base / "wt").resolve()
@@ -218,15 +289,19 @@ def main(argv=None) -> int:
     parser.add_argument("--sample", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--limit", type=int)
-    parser.add_argument("--workers", choices=(WORKERS_CLAUDE, WORKERS_EXTERNAL), default=WORKERS_CLAUDE,
-                        help="작업자. external이면 CLI 작업을 workers 단계로 돌리고 남은 Claude 작업만 Workflow에 맡긴다. "
-                        "--fake-results와 함께 쓸 수 없다")
+    parser.add_argument("--profile", help="init에 넘긴다. 역할 프로필 이름(주지 않으면 init의 기본 선택)")
+    parser.add_argument("--workers", choices=(WORKERS_CLAUDE, WORKERS_EXTERNAL),
+                        help="init에 넘긴다(주지 않으면 넘기지 않는다). external이면 CLI 작업을 workers 단계로 돌리고 "
+                        "남은 Claude 작업만 Workflow에 맡긴다. --fake-results와 함께 쓸 수 없다")
     parser.add_argument("--fake-results", help="<id>/stage1.json(·adj.json·checker.json)을 두는 폴더. 모델을 부르지 않는다. "
-                        "모델을 부르는 external 작업자와 함께 쓸 수 없다")
+                        "모델을 부르는 external 작업자와 함께 쓸 수 없고, init 뒤 확정 배정에 외부 runner(또는 외부 대체)가 "
+                        "있는 항목은 jobs 전에 오류로 멈춘다")
     parser.add_argument("--repos-toml", default=str(default_repos_toml()))
     parser.add_argument("--adopt-on-both-pass", action="store_true",
-                        help="init에 넘긴다. 같은 판정에 패치가 달라도 둘 다 검증을 통과하면 판가름 없이 작은 패치를 채택")
-    parser.add_argument("--collect", action="store_true", help="모델을 부르는 실제 실행이 끝난 항목의 원장을 모으고 정리한다")
+                        help="init에 넘긴다(켜기만 한다). 같은 판정에 패치가 달라도 둘 다 검증을 통과하면 판가름 없이 작은 패치를 채택")
+    parser.add_argument("--collect", action="store_true",
+                        help="모델을 부르는 실제 실행이 끝난 항목의 원장을 모으고 정리한다. 1회차 apply 완료 이벤트·마지막 회차 apply.json·"
+                        "남은 의견 단계 없음·report.md와 원장의 report 이벤트가 모두 있어야 끝난 것으로 본다")
     args = parser.parse_args(argv)
     if args.fake_results and args.workers == WORKERS_EXTERNAL:
         parser.error("--fake-results는 모델을 부르지 않으므로 --workers external과 함께 쓸 수 없다(external은 Codex·Cursor를 부른다)")
@@ -238,9 +313,9 @@ def main(argv=None) -> int:
     for item in items:
         try:
             if args.collect:
-                print(f"{item['id']}: {'수집' if collect_item(item, out, toml) else '건너뜀(대기 중이 아니거나 apply 전)'}")
+                print(f"{item['id']}: {'수집' if collect_item(item, out, toml) else '건너뜀(대기 중이 아니거나 끝나지 않음)'}")
             else:
-                run_item(item, out, toml, fake, args.workers, args.adopt_on_both_pass)
+                run_item(item, out, toml, fake, args.workers, args.adopt_on_both_pass, args.profile)
                 print(f"{item['id']}: 완료" if fake else "")
         except Exception as e:
             failed += 1

@@ -148,10 +148,10 @@ Codex 검토 결과(review.final) 반영해줘
 
    바뀐 파일이 모두 문서면 문서 모드로 갑니다. 코드와 문서가 섞였으면 코드 모드로 가고, 문서만 따로 볼 명령을 함께 알려 줍니다. 테스트가 없거나 처리할 것이 없으면 여기서 멈춥니다.
 2. **계획 확인 한 번**: 입력·모드·프로필(역할 배정)·검토자와 예상 에이전트 수, 전송 동의 항목을 보여 줍니다. 「진행 / Critical·Warning만 / dry-run」 중에서 고릅니다. 검증 명령 등록이 필요하면 이때 함께 확인합니다.
-3. **끝까지 진행**: 리뷰, 작업자 2명, 검증, 판가름, 적용, 재검토를 차례로 돕니다. 단계마다 다시 묻지 않습니다.
+3. **끝까지 진행**: 리뷰, 작업자 2명, 검증, 판가름, 적용, 재검토를 차례로 돕니다. 단계마다 다시 묻지 않습니다. Workflow를 돌릴 때마다 `CF usage`로 Claude 토큰을 기록합니다([역할별 사용량](#보고서의-역할-절)).
    - 적용 뒤 재검토에서 새 지적이 나오면 다음 회차를 엽니다. 재검토는 실행당 최대 2회입니다(`--max-rechecks`).
    - 앞 패치와 같은 파일을 고쳐 적용하지 못한 지적은 다음 회차에서 바뀐 코드로 다시 고칩니다.
-4. **보고**: 회차별 표, 역할 배정(「역할 배정」·「역할별 사용량」), 사람이 볼 목록 네 칸을 보여 줍니다.
+4. **보고**: 회차별 표, 역할 배정(「역할 배정」·「역할별 사용량」: 칸별 호출 수와 Claude 토큰·추정 비용), 사람이 볼 목록 네 칸을 보여 줍니다.
    - 반박
    - 설계 결정: 판정자 근거와, 문서 모드면 작성자가 낸 선택지·장단점(작성자가 안 하나를 골라 고쳤으면 그 수정안과 패치 경로)
    - 판단 불가
@@ -317,7 +317,7 @@ tests = ["pytest {files}"]
 
 `CF review --profile …`가 `<모드>.review` 칸을 따릅니다(`--profile`을 생략하면 같은 순서로 고릅니다). `detect`는 첫 검토를 늘 `CF review …`로 권합니다.
 
-- claude 칸: `review-args.json`을 만들고 Workflow를 안내합니다. 모델·effort는 칸 값이고 `--review-model`·`--review-effort`는 이 칸만 덮습니다.
+- claude 칸: `review-args.json`을 만들고 Workflow를 안내합니다. 모델·effort는 칸 값이고 `--review-model`·`--review-effort`는 이 칸만 덮습니다. Workflow가 끝나면 **`init`보다 먼저** `CF usage --review-dir <review_dir> --workflow <Workflow 실행 id>`를 돌립니다. `init`이 그때 `<review_dir>/claude-usage.json`을 읽어 원장 `profile.first_review.usage`에 넣으므로, `init` 뒤에 돌리면 보고서에 반영되지 않습니다.
 - codex·cursor 칸: Claude 작업을 만들지 않고 `RR`·`CR` 명령과 그 결과로 이어 갈 init 줄(`--source codex-*`·`cursor-*`, `--input <review_dir>/review.out.final`)을 찍습니다. 코드 모드의 `RR`은 `--repo`를 무시하고 현재 디렉터리 저장소를 보므로 명령이 `cd <저장소 루트> && RR …`로 나옵니다. 이 칸에 `--review-model`·`--review-effort`를 주면 종료 코드 5로 거절합니다.
 - 프로필을 명시했으면 「다음:」의 init 줄에 `--profile <이름>`을 붙이고, 아니면(내장 `default`) 옛 옵션을 그대로 넘깁니다.
 - 외부 첫 검토가 한도·오류로 실패하면 `CF review --review-dir <처음 폴더> --fallback-from <실패한 runner> --reason <사유>`로 fallback 칸 작업을 같은 폴더에 만듭니다. fallback 칸을 따라 codex → cursor → claude로 이어 갈 수 있고, 동의 밖이거나 이미 실패한 runner로는 가지 않습니다. 이력은 `<review_dir>/review-meta.json`에 남고 init이 읽어 보고서에 보입니다.
@@ -348,7 +348,7 @@ tests = ["pytest {files}"]
 - CLI 작업은 `workers` 명령이 한 번에 돌리고 Claude 작업의 Workflow와 동시에 진행합니다. 메인 세션이 읽는 출력은 요약 몇 줄입니다.
 - Cursor 쓰기 역할(코드 작업자, 문서 작성자)은 작업마다 `cursor-agent -p --sandbox enabled`로, 읽기 역할(문서 판정자, 점검자)은 `cursor-agent acp` 상주 서버(최대 4개, 작업마다 새 세션)로 돕니다. 읽기 역할은 셸·쓰기·Web·MCP가 막혀 Read·Grep·Glob만 씁니다. 2026-10-21 실측에서 `-p`는 시작 단계(팀 플러그인 MCP 설치) 탓에 건당 75~185초였고, ACP 읽기 작업 8건은 동시 4로 26초였습니다. ACP에서는 셸이 샌드박스 없이 돌아 쓰기 역할은 옮기지 않았습니다.
 - 한도 초과·로그인 풀림·시간 초과(작업당 900초)·실행 오류·무효 결과가 나면 그 작업만 **그 칸의 fallback**으로 다시 돕니다(칸마다 따로). fallback이 외부 runner면 같은 `CF workers` 호출 안에서 다시 돌립니다. 동의 밖 수신처나, 그 회차에 한도·로그인 실패가 났거나 샌드박스 점검에 실패한 CLI로는 가지 않고 `claude-only` 값으로 돕니다.
-- 보고서의 「역할 배정」 절에 대체 실행 내역이, 「역할별 사용량」 표에 칸별 호출 수·대체 실행 사유별 건수·CLI별 토큰이 남습니다. ACP 작업은 토큰 사용량이 없어 「기록 없음(건)」으로 셉니다.
+- 보고서의 「역할 배정」 절에 대체 실행 내역이, 「역할별 사용량」 표에 칸별 호출 수·대체 실행 사유별 건수·Claude 토큰과 추정 비용·CLI 토큰이 남습니다. ACP 작업은 토큰 사용량이 없어 「기록 없음」으로 셉니다(0으로 세지 않습니다).
 - Cursor ACP 격리 점검: 스킬 디렉터리에서 `python3 -m cascade.cursor_acp_check`(누출 0건이면 종료 코드 0)와 `python3 -m cascade.cursor_acp_check --control`(시험이 누출을 잡으면 0). 2026-10-21에 Read·셸·쓰기·검색·Web·MCP 6건이 모두 막혔고 대조는 성공했습니다. Cursor CLI가 바뀌면 다시 돌립니다.
 - 2026-10-18에 진짜 `codex`·`cursor-agent`로 실측했습니다. Cursor 임시 HOME 격리는 로그인을 유지했고 MCP·Web·셸·쓰기와 홈 민감 경로 읽기를 막았습니다. 외부 작업자 전체 흐름이 Claude 작업자 호출 없이 돌았습니다. 사전 점검은 `codex sandbox -P :workspace`로 하며, 워크트리 안 쓰기만 되고 저장소 루트·홈 쓰기와 네트워크가 막혀 `exec -s workspace-write`와 같았습니다(codex-cli 0.163.0-alpha.10.2).
 - 아직 실측하지 않은 것: 이용 한도·인증 실패 문구가 나오는 위치, 작업자 프로필에서 Shell로 민감 경로를 읽는 우회, Codex 동시 실행 때 토큰 갱신 경합, 표본 품질·비용 비교.
@@ -358,7 +358,19 @@ tests = ["pytest {files}"]
 ### 보고서의 역할 절
 
 - 「역할 배정」: 프로필 이름·출처, 이 모드의 칸별 runner·모델·effort·fallback 표, 덮은 칸, 배정 때 바꾼 칸(init·jobs), 첫 검토 이력, 실행 중 대체(칸·사유·회차)와 로그인이 풀린 CLI의 안내. 항상 들어갑니다.
-- 「역할별 사용량」: 칸마다 호출 수, 대체 실행 수(사유별), CLI 토큰. 첫 검토·의견·재검토는 실제로 맡은 runner별로 나뉩니다.
+- 「역할별 사용량」: 칸마다 호출 수, 대체 실행 수(사유별), Claude 토큰, Claude 비용(추정), CLI 토큰. 첫 검토·의견·재검토는 실제로 맡은 runner별로 나뉩니다.
+
+  ```
+  | 역할 | 호출 | 대체 실행(사유) | Claude 토큰(입력/출력/캐시 읽기) | Claude 비용(추정) | CLI 토큰 |
+  ```
+
+  - Claude 토큰·비용 열은 `CF usage`가 Workflow 기록(`~/.claude/projects/<프로젝트>/<세션>/subagents/workflows/wf_*/`)에서 읽어 `round-N/claude-usage.json`에 적은 값입니다. 스킬이 Workflow를 돌릴 때마다 이 명령을 부릅니다.
+  - 비용은 **추정**입니다. `CF usage`가 기록할 때 모델별 Anthropic 공개 단가(입력·출력·캐시 읽기·캐시 쓰기)로 작업마다 계산해 저장한 값을 더하고, 보고서가 다시 계산하지 않습니다. 표 아래 「단가 기준:」 줄이 저장된 단가 기준 날짜와 출처를 보입니다.
+  - 「미측정」은 그 칸에 Claude 작업이 있는데 `CF usage` 기록이 없는 경우입니다. Workflow 기록 폴더를 읽지 못해도(문서화되지 않은 내부 형식입니다) 실행은 멈추지 않고 `Claude 토큰 미측정: <이유>`로 끝나며 그 칸이 「미측정」이 됩니다. 일부 작업만 기록됐으면 `… 외 미측정 N건`으로 나뉩니다.
+  - 「기록 없음」은 CLI 열의 값입니다. Cursor ACP 읽기 역할은 응답에 토큰을 남기지 않아 「기록 없음」으로 적고 0으로 세지 않습니다. 「미측정」(Claude 쪽 기록이 빠짐)과 다릅니다.
+  - 표 아래에 합계 줄(`합계: Claude 토큰 입력 … · 출력 … · 캐시 읽기 …, 추정 비용 …`)이 붙습니다. 합계에서 빠진 미측정 작업 수는 줄 끝에 적힙니다.
+  - `jobs --force`로 회차를 다시 열면 이전 `claude-usage.json`은 `claude-usage.superseded-<k>.json`으로 옮겨지고, 보고서에 「다시 연 회차의 이전 Claude 비용: …(별도, 합계에 넣지 않음)」 줄이 붙습니다.
+  - 옛 실행(`CF usage` 이전)의 결과는 그대로 읽히고 그 열만 「미측정」입니다.
 - v1.2.0의 「외부 작업자」·「호출 수와 시간」 절은 이 둘로 대체됐습니다.
 
 ## 비용
@@ -373,6 +385,7 @@ tests = ["pytest {files}"]
 판단 불가 1건마다 의견 1이 더 붙고, 재검토는 회차마다 1입니다(Claude·Codex·Cursor 중 칸이 정한 runner). 외부 runner를 쓰면 호출이 Claude 대신 Codex·Cursor로 나뉘고, `init`의 「규모:」 줄이 이를 보입니다. 프로필을 명시했으면 줄 끝에 runner별 합계가 붙습니다(예: `… — Claude 최대 Haiku 1·Opus 1/지적, Codex 1/지적 + 의견·재검토`). 대체 실행은 그만큼 fallback 호출로 돌아옵니다.
 
 - `detect`와 `init`이 예상 개수를 먼저 보여 줍니다.
+- 돈 뒤의 실제 사용량과 Claude 추정 비용은 보고서 「역할별 사용량」에 칸별로 나옵니다([보고서의 역할 절](#보고서의-역할-절)).
 - 지적이 많으면 `--severity Critical,Warning`으로 먼저 돌립니다. 빠진 등급은 보류 후보로 남고, 나중에 「지금 반영」으로 이어서 처리할 수 있습니다.
 
 ## 결과물
@@ -385,6 +398,10 @@ tests = ["pytest {files}"]
 - `prepared/replies.json`: PR 답글 초안 (PR 모드)
 - `prepared/resolve.json`: resolve 대상 (PR 모드)
 - `round-N/patch-*.diff`: 작업자·판가름자 패치
+- `round-N/claude-usage.json`: `CF usage`가 쓴 작업별 Claude 토큰과 추정 비용, 단가 기준 날짜·출처. 첫 검토는 `<review_dir>/claude-usage.json`에 쓰이고 `init`이 원장에 넣습니다. 회차를 다시 열면 이전 것이 `claude-usage.superseded-<k>.json`으로 남습니다.
+- `round-N/decisions-pre-final.json`: `apply`가 전체 테스트를 돌리기 전의 판정. 측정 도구(`eval/score.py --pre-final`)가 읽습니다.
+- `round-N/apply.json`의 `final_history`: 전체 테스트 결과 이력(`apply --force`로 다시 돌려도 앞 결과가 남습니다). 측정 도구가 회귀를 셀 때 씁니다.
+- `round-N/lossy.json`(코드 모드): 작업자 패치에 UTF-8로 읽히지 않아 바꿔 읽은 바이트가 있었는지. 측정 도구(`eval/adopt_recalc.py`)가 읽습니다.
 
 채택한 패치는 작업 트리에 적용되고 커밋되지는 않습니다. `--dry-run`이면 작업 트리를 건드리지 않고 임시 워크트리에만 적용합니다. 끝나면 스킬이 `cleanup`으로 임시 브랜치와 워크트리를 지웁니다.
 
@@ -405,6 +422,7 @@ PYTHONPATH=<스킬 경로> python3 -m cascade.cli <명령> [옵션]
 | `jobs` / `judge` / `adjudicate` / `opinion` / `apply` / `recheck` | 회차 단계(`--run-dir`·`--round`) |
 | `workers --stage stage1\|checker` | 외부 runner 칸이 있는 회차에서 CLI 작업(Codex·Cursor)을 돌리고 결과를 `stage1-cli.json`(점검자는 `checker-cli.json`)에 씁니다. 실패한 작업은 그 칸의 fallback으로 같은 호출에서 다시 돌리고(외부 fallback), Claude로 대체할 작업이 있으면 `*-fallback-args.json`을 만듭니다. 한 번에 하나만 돌립니다. |
 | `resume --choices F` | 보류 후보마다 「지금 반영 / 구현 때 테스트로 / 보류」를 받습니다. 「지금 반영」이 있으면 회차를 엽니다. |
+| `usage (--run-dir D --round N \| --review-dir D) --workflow W` | Workflow 기록을 읽어 작업별 Claude 토큰과 추정 비용을 `round-N/claude-usage.json`(첫 검토는 `<review_dir>/claude-usage.json`)에 씁니다. `W`는 Workflow 실행 id 또는 그 기록 폴더 경로입니다. 같은 Workflow를 다시 넣으면 그 몫만 바뀌고 두 번 더해지지 않습니다. 이름표가 작업과 맞지 않는 에이전트는 어느 칸에도 넣지 않고 경고합니다. 기록 폴더를 읽지 못하면 `Claude 토큰 미측정: <이유>`를 출력하고 종료 코드 0으로 끝납니다. 첫 검토는 `init`보다 먼저 돌립니다. |
 | `report` / `status` / `cleanup` | 보고서, 다음 할 일, 정리 |
 
 - `detect`·`review`·`init`은 `--root`로 대상 저장소 루트를 받습니다. 없으면 현재 디렉터리의 저장소입니다. 나머지 명령은 `init`이 출력한 `--run-dir`로 실행을 찾습니다.
@@ -439,9 +457,9 @@ PYTHONPATH=<스킬 경로> python3 -m cascade.cli <명령> [옵션]
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-- 테스트는 1005개입니다. `codex-review` 스킬이 없으면 그 스크립트를 쓰는 테스트는 건너뜁니다. 보관한 스크립트로 돌리려면 `CASCADE_RUN_REVIEW="$PWD/docs/codex-review-changes/run-review.sh"`를 앞에 붙입니다.
+- 테스트는 1292개입니다. `codex-review` 스킬이 없으면 그 스크립트를 쓰는 테스트는 건너뜁니다. 보관한 스크립트로 돌리려면 `CASCADE_RUN_REVIEW="$PWD/docs/codex-review-changes/run-review.sh"`를 앞에 붙입니다.
 - 디렉터리: `cascade/`(CLI와 단계 로직), `prompts/`(작업자·판정자·판가름·검토자 프롬프트), `scripts/run-jobs.js`(Workflow 스크립트), `eval/`(측정 도구), `docs/`(설계 검토 기록, 고친 `codex-review` 스크립트, `cursor-review` 사본, 외부 작업자 측정 계획)
-- 측정: `eval/replay.py`가 과거 지적 표본을 그 커밋에서 다시 돌리고, `eval/score.py`가 판정 일치율·채택 경로·Opus 호출 절감을 채점합니다. 표본 형식과 순서는 [eval/sample-format.md](eval/sample-format.md)에 있습니다. `--workers external`과 Claude 작업자를 같은 표본에서 비교하는 절차는 [측정 계획](docs/2026-10-18-workers-measurement-plan.md)에 있습니다.
+- 측정: `eval/replay.py`가 과거 지적 표본을 그 커밋에서 다시 돌리고, `eval/score.py`가 정확도·판정 일치율·채택 경로·Opus 호출 절감·Claude 비용을 채점합니다. 그 위에 `eval/adopt_recalc.py`(채택 규칙 반사실), `eval/select_profiles.py`(반복한 후보에서 고르기), `eval/first_review.py`(첫 검토 세 결과 합치기·검토자별 채점), `eval/regress.py`(실제 실행의 프로필별 회귀 세기)가 있습니다. 표본 형식과 순서는 [eval/sample-format.md](eval/sample-format.md)에 있습니다. `--workers external`과 Claude 작업자를 같은 표본에서 비교하는 절차는 [측정 계획](docs/2026-10-18-workers-measurement-plan.md)에 있습니다.
 - 출력 스키마를 바꾸면 `cascade/jobs.py`의 `SCHEMAS`와 `scripts/run-jobs.js`의 `SCHEMAS` 블록을 같이 고칩니다(테스트가 두 쪽이 같은지 확인합니다).
 - 배포할 때는 `.claude-plugin/plugin.json`과 `.claude-plugin/marketplace.json`의 `version`을 함께 올립니다(테스트가 둘이 같은지 확인합니다). 버전이 같으면 설치한 사람에게 업데이트로 보이지 않습니다.
 - 매니페스트 검사: `claude plugin validate .`

@@ -3,7 +3,8 @@ from datetime import datetime
 from pathlib import Path
 
 from cascade import assignment
-from cascade.cli_steps import exhausted_runners, review_cell
+from cascade import usage as price_table
+from cascade.cli_steps import CLAUDE_JOB_FILES, USAGE_FILE, exhausted_runners, review_cell
 from cascade.consensus import (
     OUTCOME_ADJUDICATE,
     OUTCOME_AGREED_FACT,
@@ -13,8 +14,8 @@ from cascade.consensus import (
     OUTCOME_UNDECIDABLE,
     REASON_BOTH_PASS,
 )
+from cascade.jobs import RUNNER_CLAUDE
 from cascade.profiles import ROLE_KEYS
-from cascade.review import CLAUDE_SOURCES
 from cascade.review import label as reviewer_label
 from cascade.rounds import Ledger
 from cascade.runners import STATUS_AUTH, STATUS_OK
@@ -41,7 +42,10 @@ DRY_RUN_NOT_APPLIED = "적용 안 됨(dry-run)"
 REPLY_ADOPTED = "반영했습니다."
 REPLY_REBUTTAL = "확인 결과 고치지 않았습니다."
 REPLY_PENDING = "검토 중입니다."
-UNTIMED_STEPS = ("report",)
+UNTIMED_STEPS = ("report", "usage")
+UNMEASURED = "미측정"
+NOT_RECORDED = "기록 없음"
+SUPERSEDED_GLOB = "claude-usage.superseded-*.json"
 TABLE_FOOTNOTE = (
     "합의-아님은 합의 칸에 한 번 세고 사람이 볼 목록의 반박 칸에도 오른다. "
     "판가름 회부는 판가름에 들어간 지적 전부이고, 판가름 채택은 그 가운데 패치를 채택한 지적이다. "
@@ -564,38 +568,49 @@ def _worker_fallbacks(ledger: Ledger, run_dir: Path | None) -> tuple[dict[str, d
             status = first.get(outcome["id"], outcome).get("status")
             if status != STATUS_OK:
                 _add_reason(reasons, key, FALLBACK_LABELS.get(status, str(status)))
-            total = tokens.setdefault(key, {"input": 0, "output": 0})
+            total = tokens.setdefault(key, {"input": 0, "output": 0, UNRECORDED: 0})
             for run in (outcome, first.get(outcome["id"])):
                 usage = (run or {}).get("usage") or {}
                 for name, usage_key in CLI_TOKEN_KEYS:
                     total[name] += usage.get(usage_key, 0)
+                total[UNRECORDED] += usage.get(UNRECORDED, 0)
     return reasons, tokens
 
 
 def _token_text(tokens: dict[str, int] | None) -> str:
-    return f"입력 {tokens['input']} · 출력 {tokens['output']}" if tokens else "-"
+    if not tokens:
+        return "-"
+    unrecorded = tokens.get(UNRECORDED, 0)
+    if unrecorded and not (tokens["input"] or tokens["output"]):
+        return NOT_RECORDED
+    text = f"입력 {tokens['input']} · 출력 {tokens['output']}"
+    return f"{text} · {NOT_RECORDED} {unrecorded}건" if unrecorded else text
 
 
 def _first_review_runner(ledger: Ledger) -> str | None:
-    actual = (assignment.ledger_profile(ledger).get("first_review") or {}).get("actual") or {}
-    if actual.get("runner"):
-        return actual["runner"]
-    return "claude" if ledger.source in CLAUDE_SOURCES else None
+    return assignment.first_review_runner(assignment.ledger_profile(ledger).get("first_review"), ledger.source)
 
 
 def _first_review_attempts(ledger: Ledger) -> list[dict]:
     return (assignment.ledger_profile(ledger).get("first_review") or {}).get("attempts") or []
 
 
-def _review_rows(runners: list[str], events: list[dict | None], fallback: str, what: str) -> list[str]:
+def _review_rows(runners: list[str], events: list[dict | None], fallback: str, what: str,
+                 claude: "_ClaudeUsage", cell: str) -> list[str]:
     counts: dict[str, int] = {}
     reasons: dict[str, dict[str, int]] = {}
     for runner, event in zip(runners, events):
         counts[runner] = counts.get(runner, 0) + 1
         if event and event.get("fallback"):
             _add_reason(reasons, runner, str(event["fallback"].get("reason", "")))
-    rows = [f"| {reviewer_label(r)} {what} | {n} | {_reason_text(reasons.get(r, {}))} | - |" for r, n in counts.items()]
-    return rows or [f"| {reviewer_label(fallback)} {what} | 0 | 0 | - |"]
+    rows = []
+    for r, n in counts.items():
+        if r == RUNNER_CLAUDE:
+            tokens, cost = claude.columns(claude.rows.get(cell, []), claude.jobs.get(cell, set()), True)
+        else:
+            tokens, cost = "-", "-"
+        rows.append(f"| {reviewer_label(r)} {what} | {n} | {_reason_text(reasons.get(r, {}))} | {tokens} | {cost} | - |")
+    return rows or [f"| {reviewer_label(fallback)} {what} | 0 | 0 | - | - | - |"]
 
 
 def _cli_usage(ledger: Ledger) -> dict[str, dict[str, int]]:
@@ -608,25 +623,137 @@ def _cli_usage(ledger: Ledger) -> dict[str, dict[str, int]]:
     return usage
 
 
+def _stored_number(value) -> int | float | None:
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def _money(amount: float) -> str:
+    return "<$0.0001" if 0 < amount < 0.0001 else f"${amount:.4f}"
+
+
+def _read_usage_rows(data) -> list[dict]:
+    workflows = data.get("workflows") if isinstance(data, dict) else None
+    rows = [row for share in (workflows.values() if isinstance(workflows, dict) else []) if isinstance(share, list)
+            for row in share if isinstance(row, dict)]
+    return rows
+
+
+class _ClaudeUsage:
+    """칸별 Claude 토큰과 추정 비용. CF usage가 저장한 작업별 cost를 더할 뿐 단가로 다시 계산하지 않는다."""
+
+    def __init__(self, ledger: Ledger, run_dir: Path | None):
+        self.known = run_dir is not None
+        self.rows: dict[str, list[dict]] = {}
+        self.jobs: dict[str, set[tuple[int, str]]] = {}
+        self.basis: list[tuple[str, str]] = []
+        self.superseded: list[float] | None = None
+        self.first_review_rows: list[dict] = []
+        self.shown: list[dict] = []
+        self.unmeasured = 0
+        self._collect_first_review(ledger)
+        for rnd in ledger.rounds if run_dir is not None else []:
+            rd = Path(run_dir) / f"round-{rnd.no}"
+            data = _read_json(rd / USAGE_FILE)
+            self._note_date(data)
+            for old in sorted(rd.glob(SUPERSEDED_GLOB)):
+                self.superseded = [*(self.superseded or []), *self._costs(_read_usage_rows(_read_json(old)))]
+            for row in _read_usage_rows(data):
+                if isinstance(row.get("cell"), str):
+                    self.rows.setdefault(row["cell"], []).append({**row, "round": rnd.no})
+            for name in CLAUDE_JOB_FILES:
+                listed = _read_json(rd / name)
+                for entry in listed.get("jobs", []) if isinstance(listed, dict) and isinstance(listed.get("jobs"), list) else []:
+                    cell = _cell_of(ledger, entry["id"]) if isinstance(entry, dict) and isinstance(entry.get("id"), str) else None
+                    if cell:
+                        self.jobs.setdefault(cell, set()).add((rnd.no, entry["id"]))
+
+    def _collect_first_review(self, ledger: Ledger) -> None:
+        data = (assignment.ledger_profile(ledger).get("first_review") or {}).get("usage")
+        self._note_date(data)
+        self.first_review_rows = _read_usage_rows(data)
+
+    @staticmethod
+    def _costs(rows: list[dict]) -> list[float]:
+        return [c for c in (_stored_number(row.get("cost")) for row in rows) if c is not None]
+
+    def _note_date(self, data) -> None:
+        stored = data.get("prices_as_of") if isinstance(data, dict) else None
+        if isinstance(stored, str):
+            source = data.get("price_source")
+            entry = (stored, source if isinstance(source, str) else price_table.PRICE_SOURCE)
+            if entry not in self.basis:
+                self.basis.append(entry)
+
+    def columns(self, rows: list[dict], jobs: set[tuple[int, str]], work: bool) -> tuple[str, str]:
+        """(토큰, 비용) 칸 글자. 이 칸에 Claude 작업이 있는데(work나 jobs) 기록이 없으면 미측정, 작업이 없으면 -."""
+        if not rows and not (work or jobs):
+            return "-", "-"
+        missing = len(jobs - {(row.get("round"), row.get("job_id")) for row in rows})
+        if not rows:
+            self.unmeasured += max(missing, 1)
+            return UNMEASURED, UNMEASURED
+        costs = [_stored_number(row.get("cost")) for row in rows]
+        no_price = sum(1 for c in costs if c is None)
+        self.shown.extend(rows)
+        self.unmeasured += missing + no_price
+        tokens = "/".join(str(sum(_stored_number(row.get(k)) or 0 for row in rows)) for k in ("input", "output", "cache_read"))
+        known = [c for c in costs if c is not None]
+        cost = _money(sum(known)) if known else UNMEASURED
+        return (f"{tokens} 외 {UNMEASURED} {missing}건" if missing else tokens,
+                f"{cost} 외 {UNMEASURED} {missing + no_price}건" if known and missing + no_price else cost)
+
+    def total_lines(self) -> list[str]:
+        if not self.shown:
+            if self.unmeasured:
+                total = f"Claude 토큰·비용 {UNMEASURED}({UNMEASURED} {self.unmeasured}건)"
+            else:
+                total = "Claude 작업 없음" if self.known else "알 수 없다(run-dir 없음)"
+            return [f"합계: {total}", "", self._basis(), *self._superseded_lines()]
+        sums = [sum(_stored_number(row.get(k)) or 0 for row in self.shown) for k in ("input", "output", "cache_read")]
+        known = self._costs(self.shown)
+        cost = _money(sum(known)) if known else UNMEASURED
+        note = f" ({UNMEASURED} {self.unmeasured}건은 합계에서 빠졌다)" if self.unmeasured else ""
+        return [f"합계: Claude 토큰 입력 {sums[0]} · 출력 {sums[1]} · 캐시 읽기 {sums[2]}, 추정 비용 {cost}{note}", "",
+                self._basis(), *self._superseded_lines()]
+
+    def _basis(self) -> str:
+        entries = self.basis or [(price_table.PRICES_AS_OF, price_table.PRICE_SOURCE)]
+        return "단가 기준: " + "; ".join(f"{as_of} {source}" for as_of, source in entries)
+
+    def _superseded_lines(self) -> list[str]:
+        if self.superseded is None:
+            return []
+        cost = _money(sum(self.superseded)) if self.superseded else UNMEASURED
+        return ["", f"다시 연 회차의 이전 Claude 비용: {cost}(별도, 합계에 넣지 않음)"]
+
+
 def _calls_section(ledger: Ledger, run_dir: Path | None) -> list[str]:
     profile = assignment.ledger_profile(ledger)
     calls = _cell_calls(ledger, run_dir)
     reasons, tokens = _worker_fallbacks(ledger, run_dir)
-    out = ["## 역할별 사용량", "", "| 역할 | 호출 | 대체 실행(사유) | CLI 토큰 |", "| --- | ---: | ---: | ---: |"]
+    claude = _ClaudeUsage(ledger, run_dir)
+    out = ["## 역할별 사용량", "",
+           "| 역할 | 호출 | 대체 실행(사유) | Claude 토큰(입력/출력/캐시 읽기) | Claude 비용(추정) | CLI 토큰 |",
+           "| --- | ---: | ---: | ---: | ---: | ---: |"]
     for key in assignment.work_keys(profile["roles"], ledger.mode):
         fallback = _reason_text(reasons[key]) if key in reasons else "0" if calls is not None else "-"
-        out.append(f"| {key} | {calls.get(key, 0) if calls is not None else '-'} | {fallback} | {_token_text(tokens.get(key))} |")
+        claude_tokens, claude_cost = claude.columns(claude.rows.get(key, []), claude.jobs.get(key, set()), False)
+        out.append(f"| {key} | {calls.get(key, 0) if calls is not None else '-'} | {fallback} | {claude_tokens} | "
+                   f"{claude_cost} | {_token_text(tokens.get(key))} |")
     first = _first_review_runner(ledger)
     if first:
         attempts = _first_review_attempts(ledger)
         fallback = {attempts[-1].get("reason", "")} if attempts else set()
-        out.append(f"| {reviewer_label(first)} 첫 검토 | 1 | {_reason_text({r: 1 for r in fallback})} | - |")
+        claude_tokens, claude_cost = claude.columns(claude.first_review_rows, set(), first == RUNNER_CLAUDE)
+        out.append(f"| {reviewer_label(first)} 첫 검토 | 1 | {_reason_text({r: 1 for r in fallback})} | {claude_tokens} | "
+                   f"{claude_cost} | - |")
     opinions = list(ledger.opinions)
     out.extend(_review_rows([_opinion_runner(ledger, fid) for fid in opinions], [_opinion_event(ledger, fid) for fid in opinions],
-                            review_cell(ledger, "opinion")["runner"], "의견"))
+                            review_cell(ledger, "opinion")["runner"], "의견", claude, f"{ledger.mode}.opinion"))
     rechecks = [r for r in ledger.rounds if r.recheck_opened]
     out.extend(_review_rows([_recheck_runner(ledger, r) for r in rechecks], [_recheck_event(ledger, r) for r in rechecks],
-                            review_cell(ledger, "recheck")["runner"], "재검토"))
+                            review_cell(ledger, "recheck")["runner"], "재검토", claude, f"{ledger.mode}.recheck"))
+    out.extend(["", *claude.total_lines()])
     usage = _cli_usage(ledger)
     if usage:
         out.extend(["", "| CLI | 입력 토큰 | 출력 토큰 | 캐시 읽기 토큰 | 기록 없음(건) |", "| --- | ---: | ---: | ---: | ---: |"])
