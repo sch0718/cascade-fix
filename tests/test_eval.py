@@ -417,6 +417,18 @@ class ScoreAccuracyTest(unittest.TestCase):
         self.assertFalse(score.is_regression({"final_ok": False, "baseline_failed": False,
                                               "final_history": [{"final_ok": False, "baseline_failed": True}]}))
 
+    def test_force_rerun_with_history_is_measured_regression(self):
+        apply = {"final_ok": None, "baseline_failed": False,
+                 "final_history": [{"final_ok": False, "baseline_failed": False}, {"final_ok": None, "baseline_failed": False}]}
+        make_cf_run(self.runs, "r", [{"no": 1, "decisions": [decision("합의-사실", "a")], "apply": apply}])
+        m = score.compute(self.runs, sample_of(sample_line("x", run="r")))
+        self.assertTrue(m["regression_measured"])
+        self.assertEqual(m["regressions"], 1)
+        text = score.render(m)
+        self.assertIn("| 회귀 건수 | 1 |", text)
+        self.assertNotIn("미측정", text)
+        self.assertNotIn("측정 불가", text)
+
     def test_regressions_count_runs_not_rounds_and_legacy_items(self):
         bad = {"final_ok": False, "baseline_failed": False}
         make_cf_run(self.runs, "r", [{"no": 1, "decisions": [decision("합의-사실", "a")], "apply": bad},

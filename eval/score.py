@@ -148,6 +148,10 @@ def workers_stats(ledger: dict) -> tuple[int, dict[str, int], int, dict[str, dic
     return sum(counts.values()), fallback, counts.get(STATUS_INVALID, 0), usage
 
 
+def measured_checks(apply: dict) -> list[dict]:
+    return [apply, *(apply.get("final_history") or [])]
+
+
 def is_regression(apply: dict) -> bool:
     return any(h.get("final_ok") is False and not h.get("baseline_failed") for h in apply.get("final_history") or [apply])
 
@@ -189,7 +193,7 @@ def add_run_metrics(m: dict, run: dict, round_no: int | None) -> tuple[int, int]
     for runner, tokens in usage.items():
         add_counts(m["usage"].setdefault(runner, dict.fromkeys(USAGE_KEYS, 0)), tokens)
     applies = list(round_files(run_dir, "apply.json", round_no))
-    m["regression_measured"] |= any(a.get("final_ok") is not None for a in applies)
+    m["regression_measured"] |= any(h.get("final_ok") is not None for a in applies for h in measured_checks(a))
     m["regressions"] += any(is_regression(a) for a in applies)
     return checker_stats(ledger, run_dir, round_no)
 
@@ -271,8 +275,8 @@ def compute(runs, sample: dict[str, dict], *, round_no: int | None = None, pre_f
     m["opus_ratio"] = m["opus_calls"] / m["baseline_calls"] if m["baseline_calls"] else None
     m["agreement"] = m["agree"] / m["judged"] if m["judged"] else None
     m["accuracy"] = m["correct"] / m["total"] if m["total"] else None
-    unscored = m["errors"] + m["incomplete"] + m["missing"]
-    m["completion"] = (m["total"] - unscored) / m["total"] if m["total"] else None
+    m["scored"] = m["total"] - m["errors"] - m["incomplete"] - m["missing"]
+    m["completion"] = m["scored"] / m["total"] if m["total"] else None
     m["checker"] = (checker_fixed, checker_false)
     return m
 
@@ -342,7 +346,7 @@ def render(m: dict) -> str:
     paths = ", ".join(f"{k} {v}" for k, v in m["paths"].items())
     rows = [
         ("정확도", f"{pct(m['correct'], m['total'])} — 맞음/표본 전체"),
-        ("완료율", f"{pct(m['total'] - m['errors'] - m['incomplete'] - m['missing'], m['total'])} — 채점됨/표본 전체"),
+        ("완료율", f"{pct(m['scored'], m['total'])} — 채점됨/표본 전체"),
         ("판정 일치율", f"{pct(m['agree'], m['judged'])} — 일치/판정 있음"),
         ("아님→사실 채택", str(m["false_fact"])),
         ("사람 목록", str(m["to_human"])),
