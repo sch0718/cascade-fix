@@ -126,6 +126,38 @@ class UsageRecordTest(UsageCliBase):
         self.usage(wf)
         self.assertEqual(len(self.recorded()["workflows"][wf.name]), 2)
 
+    def test_invalid_json_record_is_replaced_with_a_warning(self):
+        wf = self.workflow()
+        (self.rd / "claude-usage.json").write_text("{not json", encoding="utf-8")
+        proc = self.usage(wf)
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("경고: 기존 claude-usage.json이 JSON 객체가 아니어서 덮어쓴다", proc.stdout)
+        self.assertEqual(len(self.recorded()["workflows"][wf.name]), 2)
+
+    def test_valid_record_is_replaced_without_that_warning(self):
+        wf = self.workflow()
+        self.usage(wf)
+        self.assertNotIn("덮어쓴다", self.usage(wf).stdout)
+
+    def test_usage_event_does_not_make_the_report_look_stale(self):
+        ledger = self.ledger()
+        ledger.status = "종료"
+        ledger.save(self.run_dir / "ledger.json")
+        self.cli("report", "--run-dir", str(self.run_dir))
+        before = cli_steps.next_steps(self.ledger(), self.run_dir)
+        self.usage(self.workflow())
+        self.assertEqual(cli_steps.next_steps(self.ledger(), self.run_dir), before)
+        self.assertNotIn("report --run-dir", " ".join(before))
+
+    def test_report_shows_the_recorded_usage(self):
+        before = self.cli("report", "--run-dir", str(self.run_dir)).stdout
+        self.assertIn("| code.a | 2 | 0 | 미측정 | 미측정 | - |", before)
+        self.usage(self.workflow())
+        after = self.cli("report", "--run-dir", str(self.run_dir)).stdout
+        cost = usage.cost(SONNET, 3, 20, 500, 40)
+        self.assertIn(f"| code.a | 2 | 0 | 3/20/500 외 미측정 1건 | ${cost:.4f} 외 미측정 1건 |", after)
+        self.assertIn("단가 기준: " + usage.PRICES_AS_OF, after)
+
     def test_opinion_and_recheck_jobs_map_to_cells(self):
         (self.rd / "opinion-args.json").write_text(json.dumps(
             {"jobs": [{"id": "r1-01:opinion", "label": "r1-01 opinion"}]}), encoding="utf-8")

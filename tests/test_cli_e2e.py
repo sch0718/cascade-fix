@@ -281,6 +281,13 @@ class CliEndToEndTest(CliTestBase):
         p = self.cli("report", "--run-dir", str(self.run_dir))
         self.assertIn("| 1 | 2 | 1 | 1 | 0 | 1 | 2 |", p.stdout)
 
+    def test_pre_final_decisions_keep_apply_failures(self):
+        self.run_to_apply_with_conflict()
+        pre = {d["finding_id"]: d for d in json.loads(
+            (self.run_dir / "round-1" / "decisions-pre-final.json").read_text(encoding="utf-8"))}
+        self.assertEqual(pre["r1-01"]["outcome"], "판단불가")
+        self.assertTrue(any(r.startswith("패치 적용 실패: ") for r in pre["r1-01"]["reasons"]))
+
     def test_broken_full_suite_marks_interference_and_keeps_tree(self):
         toml = write_repos_toml(self.tmp, {str(self.repo): {
             "tests": ["python3 -m unittest {files}"],
@@ -1283,6 +1290,115 @@ class CliStepsTest(unittest.TestCase):
 
     def test_next_step_paths_are_shell_quoted(self):
         self.assertIn("--run-dir '/a b/run'", cli_steps._cmd("report", Path("/a b/run")))
+
+
+class FinalSuiteRecordTest(CliTestBase):
+    """전체 검사 직전 판정(decisions-pre-final.json)과 전체 검사 이력(apply.json의 final_history)."""
+
+    def failing_full_suite(self):
+        toml = write_repos_toml(self.tmp, {str(self.repo): {
+            "tests": ["python3 -m unittest {files}"],
+            "full_tests": ["python3 -c \"import sys; sys.exit(3 if 'a * b' in open('calc.py').read() else 0)\""],
+        }})
+        self.env["CASCADE_REPOS_TOML"] = str(toml)
+
+    def read(self, name):
+        return json.loads((self.run_dir / "round-1" / name).read_text(encoding="utf-8"))
+
+    def apply_force(self):
+        return self.cli("apply", "--run-dir", str(self.run_dir), "--round", "1", "--force")
+
+    def test_pre_final_decisions_written_before_final_suite(self):
+        self.failing_full_suite()
+        self.run_to_apply()
+        pre = {d["finding_id"]: d for d in self.read("decisions-pre-final.json")}
+        self.assertEqual(pre["r1-01"]["outcome"], "합의-사실")
+        self.assertEqual((pre["r1-02"]["outcome"], pre["r1-02"]["patch_from"]), ("판가름", "adjudicator"))
+        self.assertEqual({d["finding_id"]: d["outcome"] for d in self.read("decisions.json")},
+                         {"r1-01": "판단불가", "r1-02": "판단불가"})
+
+    def test_pre_final_survives_apply_rerun(self):
+        self.failing_full_suite()
+        self.run_to_apply()
+        before = (self.run_dir / "round-1" / "decisions-pre-final.json").read_text(encoding="utf-8")
+        self.apply_force()
+        self.assertEqual((self.run_dir / "round-1" / "decisions-pre-final.json").read_text(encoding="utf-8"), before)
+        self.assertEqual(self.read("decisions-pre-final.json")[0]["outcome"], "합의-사실")
+
+    def test_pre_final_survives_resume_after_patching(self):
+        self.failing_full_suite()
+        self.run_to_apply()
+        before = (self.run_dir / "round-1" / "decisions-pre-final.json").read_text(encoding="utf-8")
+        ledger = self.ledger()
+        ledger.rounds[0].events = [e for e in ledger.rounds[0].events if e["step"] != "apply"]
+        ledger.status = "진행"
+        ledger.save(self.run_dir / "ledger.json")
+        p = self.cli("apply", "--run-dir", str(self.run_dir), "--round", "1")
+        self.assertIn("적용을 건너뛰고", p.stdout)
+        self.assertEqual((self.run_dir / "round-1" / "decisions-pre-final.json").read_text(encoding="utf-8"), before)
+
+    def test_dry_run_writes_neither_pre_final_nor_history(self):
+        self.run_to_apply("--dry-run")
+        self.assertFalse((self.run_dir / "round-1" / "decisions-pre-final.json").exists())
+        self.assertNotIn("final_history", self.read("apply.json"))
+
+    def test_final_history_records_a_passing_suite(self):
+        self.run_to_apply()
+        apply = self.read("apply.json")
+        [entry] = apply["final_history"]
+        self.assertEqual((entry["final_ok"], entry["baseline_failed"], entry["interference"], entry["applied"]),
+                         (True, False, False, ["r1-01", "r1-02"]))
+        self.assertTrue(entry["at"])
+        self.assertIs(apply["final_ok"], True)
+
+    def test_final_history_keeps_failure_after_force_rerun(self):
+        self.failing_full_suite()
+        self.run_to_apply()
+        self.apply_force()
+        apply = self.read("apply.json")
+        hist = apply["final_history"]
+        self.assertEqual([h["final_ok"] for h in hist], [False, None])
+        self.assertEqual((hist[0]["interference"], hist[0]["baseline_failed"], hist[0]["applied"]),
+                         (True, False, ["r1-01", "r1-02"]))
+        self.assertEqual((hist[1]["interference"], hist[1]["applied"]), (False, []))
+        self.assertIsNone(apply["final_ok"])
+        self.assertIs(apply["interference"], True)
+
+    def test_final_history_records_baseline_failure(self):
+        toml = write_repos_toml(self.tmp, {str(self.repo): {
+            "tests": ["python3 -m unittest {files}"], "full_tests": ["python3 -c 'import sys; sys.exit(3)'"]}})
+        self.env["CASCADE_REPOS_TOML"] = str(toml)
+        self.run_to_apply()
+        [entry] = self.read("apply.json")["final_history"]
+        self.assertEqual((entry["final_ok"], entry["baseline_failed"]), (False, True))
+
+
+class LossyRecordTest(CliTestBase):
+    def judge_with_notes(self, bad_roles):
+        self.init()
+        self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1")
+        for role in ("a", "b"):
+            wt = self.wt(f"r1-01-{role}")
+            (wt / "calc.py").write_text(fix(CALC, "return a - b", "return a + b"), encoding="utf-8")
+            (wt / "notes.txt").write_bytes(b"na\xefve\n" if role in bad_roles else "naive\n".encode())
+        stage1 = self.run_dir / "round-1" / "stage1.json"
+        shutil.copyfile(FIXTURES / "workflow-stage1.json", stage1)
+        self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1))
+        return json.loads((self.run_dir / "round-1" / "lossy.json").read_text(encoding="utf-8"))
+
+    def test_judge_records_lossy_per_worker(self):
+        lossy = self.judge_with_notes({"a"})
+        self.assertEqual(lossy["r1-01"], {"a": True, "b": False})
+
+    def test_judge_records_lossy_for_both_workers_even_when_neither_is_adopted(self):
+        lossy = self.judge_with_notes({"a", "b"})
+        self.assertEqual(lossy["r1-01"], {"a": True, "b": True})
+        d = {x["finding_id"]: x for x in self.ledger().rounds[0].decisions}
+        self.assertEqual(d["r1-01"]["reasons"][-1], "UTF-8 아닌 패치")
+
+    def test_every_judged_finding_has_an_entry(self):
+        lossy = self.judge_with_notes(set())
+        self.assertEqual(lossy, {"r1-01": {"a": False, "b": False}, "r1-02": {"a": False, "b": False}})
 
 
 if __name__ == "__main__":

@@ -740,7 +740,9 @@ def cmd_review(args) -> int:
     return 0
 
 
-_JUDGE_OUTPUTS = ("decisions.json", "results.json", "verify.json", "adj-args.json", "adj.json", s.OPINION_ARGS,
+LOSSY_FILE = "lossy.json"
+PRE_FINAL_DECISIONS = "decisions-pre-final.json"
+_JUDGE_OUTPUTS = ("decisions.json", "results.json", "verify.json", LOSSY_FILE, "adj-args.json", "adj.json", s.OPINION_ARGS,
                   s.OPINION_RESULTS, s.STAGE_ARGS[s.STAGE_CHECKER], f"{s.STAGE_CHECKER}-cli-args.json",
                   s.STAGE_OUTPUTS[s.STAGE_CHECKER])
 
@@ -981,7 +983,8 @@ def _judge_code(ledger, rnd, f, results, snap, cfg, baseline, repro):
     d = s.without_empty_patch(d, {"a": pa, "b": pb}, adjudicated=False)
     d = s.without_lossy_patch(d, lambda role: s.worktree(snap, f.id, role), base)
     workers = {"a": a, "b": b}
-    return d, workers, {"a": [r.to_dict() for r in ra], "b": [r.to_dict() for r in rb]}
+    lossy = {"a": s.is_lossy(wt_a, base), "b": s.is_lossy(wt_b, base)}
+    return d, workers, {"a": [r.to_dict() for r in ra], "b": [r.to_dict() for r in rb]}, lossy
 
 
 def _judge_doc_inputs(ledger, rnd, f, results, snap, cfg):
@@ -1022,6 +1025,7 @@ def cmd_judge(args) -> int:
     pending: list = []
     writer_patches: dict[str, str] = {}
     doc_problems: dict[str, list[str]] = {}
+    lossy: dict[str, dict[str, bool]] = {}
     for f in findings:
         if ledger.mode == "doc":
             workers, problems, snippets = _judge_doc_inputs(ledger, rnd, f, results, snap, cfg)
@@ -1033,7 +1037,7 @@ def cmd_judge(args) -> int:
                 if checker_results is not None and f"{f.id}:checker" in checker_results:
                     workers["checker"] = checker_results[f"{f.id}:checker"]
         else:
-            d, workers, verify[f.id] = _judge_code(ledger, rnd, f, results, snap, cfg, baseline, repro)
+            d, workers, verify[f.id], lossy[f.id] = _judge_code(ledger, rnd, f, results, snap, cfg, baseline, repro)
             decisions.append(d)
         for role, w in workers.items():
             merged[f"{f.id}:{role}"] = w.to_dict()
@@ -1041,6 +1045,8 @@ def cmd_judge(args) -> int:
                 s.patch_path(rd, f.id, role).write_text(w.patch, encoding="utf-8")
     s.write_json(rd / "results.json", merged)
     s.write_json(rd / "verify.json", verify)
+    if ledger.mode == "code":
+        s.write_json(rd / LOSSY_FILE, lossy)
 
     if ledger.mode == "doc":
         if pending and checker_results is None:
@@ -1386,8 +1392,13 @@ def cmd_apply(args) -> int:
     if not ledger.dry_run:
         _remove_round_worktrees(ledger, rnd)
         base_wt = s.snapshot_of(ledger).worktrees.get(s.base_name(rnd))
+        if not (rd / PRE_FINAL_DECISIONS).exists():
+            s.write_json(rd / PRE_FINAL_DECISIONS, rnd.decisions)
         final = _final_suite(root, base_wt, cfg, ledger.mode, changed) if applied else {"final_ok": None, "final_tail": ""}
         data.update(final)
+        data["final_history"] = [*data.get("final_history", []), {
+            "final_ok": final["final_ok"], "baseline_failed": bool(final.get("baseline_failed")),
+            "interference": final["final_ok"] is False, "applied": applied, "at": s.now()}]
         if final["final_ok"] is False:
             data["interference"] = True
             reason = REASON_FINAL_BASELINE_FAILED if final.get("baseline_failed") else REASON_INTERFERENCE
@@ -1593,10 +1604,6 @@ def cmd_cleanup(args) -> int:
     return 0
 
 
-CLAUDE_JOB_FILES = ("stage1-args.json", "stage1-fallback-args.json", "checker-args.json",
-                    "checker-fallback-args.json", "adj-args.json", s.OPINION_ARGS, s.RECHECK_ARGS)
-
-
 def _label_job_ids(files: list[Path]) -> dict[str, str]:
     labels: dict[str, str] = {}
     for path in files:
@@ -1624,7 +1631,10 @@ def _usage_record(workflow: str, labels: dict[str, str], cell_of, out: Path) -> 
                      "input": agent.input, "output": agent.output, "cache_read": agent.cache_read,
                      "cache_write": agent.cache_write, "cost": agent.cost})
     data = _read_optional_json(out)
-    data = data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        if out.is_file():
+            print(f"경고: 기존 {out.name}이 JSON 객체가 아니어서 덮어쓴다. 다른 Workflow의 기록이 있었다면 CF usage를 다시 돌린다")
+        data = {}
     workflows = data["workflows"] if isinstance(data.get("workflows"), dict) else {}
     skipped = data["unmatched"] if isinstance(data.get("unmatched"), dict) else {}
     s.write_json(out, {"prices_as_of": workflow_usage.PRICES_AS_OF, "workflows": {**workflows, name: rows},
@@ -1644,7 +1654,7 @@ def cmd_usage(args) -> int:
         ledger = s.load_ledger(run_dir)
         rnd = s.get_round(ledger, args.round)
         rd = s.round_dir(run_dir, rnd.no)
-        labels = _label_job_ids([rd / name for name in CLAUDE_JOB_FILES])
+        labels = _label_job_ids([rd / name for name in s.CLAUDE_JOB_FILES])
         mode = ledger.mode
 
         def cell_of(job_id: str) -> str | None:
