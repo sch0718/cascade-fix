@@ -1,4 +1,3 @@
-import os
 import shlex
 from pathlib import Path
 
@@ -13,6 +12,7 @@ from cascade.runners import (
     STATUS_LIMIT,
     STATUS_SKIPPED,
     STATUS_TIMEOUT,
+    UNRECORDED,
     Outcome,
     codex_available,
     codex_model,
@@ -26,7 +26,7 @@ WORKER_ROLES = ("a", "b", "writer", "checker")
 
 _SEATS = {"A·writer": ("a", "writer"), "B·checker": ("b", "checker")}
 _LABELS = {RUNNER_CLAUDE: "Claude", RUNNER_CODEX: "Codex", RUNNER_CURSOR: "Cursor"}
-_RECIPIENTS = {RUNNER_CODEX: "OpenAI", RUNNER_CURSOR: "Cursor(팀 프라이버시 모드)"}
+RECIPIENTS = {RUNNER_CODEX: "OpenAI", RUNNER_CURSOR: "Cursor(팀 프라이버시 모드)"}
 FALLBACK_LABELS = {
     STATUS_LIMIT: "한도", STATUS_INVALID: "무효", STATUS_AUTH: "로그인",
     STATUS_TIMEOUT: "시간 초과", STATUS_ERROR: "오류", STATUS_SKIPPED: "건너뜀",
@@ -62,18 +62,10 @@ def assign_available(choice: str, cursor_model: str) -> dict[str, dict]:
     return assign(choice, available, codex_model(Path.home() / ".codex"), cursor_model)
 
 
-def workers_flags(choice: str, cursor_model: str) -> str:
-    """후속 명령에 붙일 작업자 옵션. CASCADE_WORKERS가 다른 값이면 claude도 적어 환경 변수가 선택을 뒤집지 않게 한다."""
-    if choice == WORKERS_CLAUDE and (os.environ.get("CASCADE_WORKERS") or WORKERS_CLAUDE) == WORKERS_CLAUDE:
-        return ""
-    flags = f" --workers {choice}"
-    if choice == WORKERS_EXTERNAL and cursor_model != DEFAULT_CURSOR_MODEL:
-        flags += f" --cursor-model {shlex.quote(cursor_model)}"
-    return flags
-
-
-def demote(workers: dict[str, dict], runner: str) -> dict[str, dict]:
-    return {role: _claude(role) if spec["runner"] == runner else dict(spec) for role, spec in workers.items()}
+def workers_flags(workers: str | None, cursor_model: str | None) -> str:
+    """후속 명령에 붙일 작업자 옵션. 받은 값은 기본값과 같아도 넘긴다(프로필 칸을 덮는 옵션이라 빠지면 프로필 값으로 돌아간다)."""
+    flags = f" --workers {workers}" if workers else ""
+    return flags + (f" --cursor-model {shlex.quote(cursor_model)}" if cursor_model else "")
 
 
 def expected_model_id(spec: dict) -> str:
@@ -96,7 +88,7 @@ def has_external(workers: dict[str, dict] | None) -> bool:
 
 def consent_line(workers: dict[str, dict] | None) -> str:
     used = {spec["runner"] for spec in (workers or {}).values()}
-    targets = [_RECIPIENTS[r] for r in (RUNNER_CODEX, RUNNER_CURSOR) if r in used]
+    targets = [RECIPIENTS[r] for r in (RUNNER_CODEX, RUNNER_CURSOR) if r in used]
     return f"작업자 전송 동의: 워크트리의 코드·문서를 {', '.join(targets)}로 보낸다" if targets else ""
 
 
@@ -112,4 +104,6 @@ def usage_totals(outcomes: list[Outcome]) -> dict[str, dict[str, int]]:
         total = totals.setdefault(outcome.runner, dict.fromkeys(_USAGE_KEYS, 0))
         for name, key in _USAGE_KEYS.items():
             total[name] += outcome.usage.get(key, 0)
+        if outcome.usage.get(UNRECORDED):
+            total[UNRECORDED] = total.get(UNRECORDED, 0) + outcome.usage[UNRECORDED]
     return totals

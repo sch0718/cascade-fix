@@ -5,6 +5,7 @@ from pathlib import Path
 
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SKILL_ROOT))
+from cascade.consensus import REASON_BOTH_PASS  # noqa: E402
 from cascade.runners import STATUS_INVALID  # noqa: E402
 from cascade.workers import FALLBACK_LABELS  # noqa: E402
 
@@ -20,9 +21,10 @@ OUTCOME_AGREED = ("합의-사실", "합의-아님")
 OUTCOME_ADJUDICATED = "판가름"
 OUTCOMES_TO_HUMAN = ("판단불가", "설계결정", "보류후보")
 REASON_PATCH_DIFFERS = "패치가 다름"
+BOTH_PASS_REASONS = (REASON_PATCH_DIFFERS, REASON_BOTH_PASS)
 REASON_ADJUDICATED_NO = "판가름: 아님"
 UNMEASURED = "측정 불가(dry-run은 전체 테스트를 돌리지 않음)"
-PATH_KEYS = ("합의", "판가름", "Codex 검토", "사람")
+PATH_KEYS = ("합의", "규칙 채택", "판가름", "Codex 검토", "사람")
 CLAUDE_FAMILIES = ("sonnet", "haiku", "opus")
 CLAUDE_JOB_FILES = ("stage1-args.json", "stage1-fallback-args.json", "checker-args.json", "checker-fallback-args.json",
                     "adj-args.json")
@@ -68,7 +70,7 @@ def path_of(decision: dict | None, opinions: dict, finding_id: str) -> str | Non
         return None
     outcome = decision.get("outcome")
     if outcome in OUTCOME_AGREED:
-        return "합의"
+        return "규칙 채택" if any(REASON_BOTH_PASS in r for r in decision.get("reasons", [])) else "합의"
     if outcome == OUTCOME_ADJUDICATED:
         return "판가름"
     if outcome in OUTCOMES_TO_HUMAN:
@@ -170,8 +172,8 @@ def compute(runs, sample: dict[str, dict]) -> dict:
         path = path_of(decision, ledger.get("opinions", {}), fid)
         if path:
             m["paths"][path] += 1
-        if any(REASON_PATCH_DIFFERS in r for rnd in ledger.get("rounds", []) for d in rnd.get("decisions", [])
-               if d.get("finding_id") == fid for r in d.get("reasons", [])):
+        if any(key in r for rnd in ledger.get("rounds", []) for d in rnd.get("decisions", [])
+               if d.get("finding_id") == fid for r in d.get("reasons", []) for key in BOTH_PASS_REASONS):
             m["patch_differs"] += 1
         m["opus_calls"] += len(count_roles(run_dir, "adjudicator"))
         m["baseline_calls"] += item.get("baseline_opus_calls", 1)

@@ -3,10 +3,12 @@ import json
 import os
 import shutil
 import tempfile
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+from cascade.assignment import claude_only_cell, fallback_target
 from cascade.config import RepoConfig
 from cascade.runners import (
     RUNNER_CODEX,
@@ -24,7 +26,7 @@ from cascade.runners import (
     tree_of,
 )
 from cascade.verify import FILES, TIMEOUT, run_commands
-from cascade.workers import DEFAULT_CURSOR_MODEL, demote
+from cascade.workers import DEFAULT_CURSOR_MODEL
 
 INCONCLUSIVE = -1
 PROBE = "true"
@@ -136,7 +138,8 @@ def _save(path: Path, data: dict) -> None:
 
 def _default_checks(workers: dict) -> dict[str, Check]:
     checks: dict[str, Check] = {RUNNER_CODEX: lambda wt, cmds: run_codex(find_codex(), wt, cmds)}
-    model = next((spec["model"] for spec in workers.values() if spec["runner"] == RUNNER_CURSOR), DEFAULT_CURSOR_MODEL)
+    model = next((spec["model"] for cell in workers.values() for spec in (cell, cell.get("fallback") or {})
+                  if spec.get("runner") == RUNNER_CURSOR), DEFAULT_CURSOR_MODEL)
 
     def cursor(wt: Path, cmds: list[str]) -> dict[str, int]:
         exe = find_cursor_agent()
@@ -146,13 +149,35 @@ def _default_checks(workers: dict) -> dict[str, Check]:
     return checks
 
 
+def _used(workers: dict) -> list[str]:
+    return [r for r in (RUNNER_CODEX, RUNNER_CURSOR) if any(spec["runner"] == r for spec in workers.values())]
+
+
+def _replace(workers: dict, runner: str, consented: set[str], stopped: set[str]) -> dict:
+    out = {}
+    for role, spec in workers.items():
+        if spec["runner"] == runner:
+            out[role] = fallback_target(spec, consented, stopped, role)
+        elif (spec.get("fallback") or {}).get("runner") == runner:
+            out[role] = {**spec, "fallback": claude_only_cell(role)}
+        else:
+            out[role] = spec
+    return out
+
+
+def _replacement(workers: dict, runner: str, after: dict) -> str:
+    runners = {after[role]["runner"] for role, spec in workers.items() if spec["runner"] == runner}
+    return "Claude 작업자" if runners == {"claude"} else f"대체 작업자({', '.join(sorted(runners))})"
+
+
 def ensure(root: Path, cfg: RepoConfig, base_wt: Path, workers: dict, baseline_failed: list[str],
-           runners: dict[str, Check] | None = None) -> tuple[dict, list[str]]:
+           checks: dict[str, Check] | None = None, consented: Iterable[str] = ()) -> tuple[dict, list[str]]:
     cmds = [c for c in commands(cfg) if c not in baseline_failed]
-    used = [r for r in (RUNNER_CODEX, RUNNER_CURSOR) if any(spec["runner"] == r for spec in workers.values())]
-    if not cmds or not used:
+    queue = _used(workers)
+    if not cmds or not queue:
         return workers, []
-    checks = runners or _default_checks(workers)
+    checks = checks or _default_checks(workers)
+    consented = set(consented)
     path = check_file()
     saved = _load(path)
     outside: dict[str, bool] = {}
@@ -166,9 +191,15 @@ def ensure(root: Path, cfg: RepoConfig, base_wt: Path, workers: dict, baseline_f
         return {cmd for cmd in pending if outside[cmd]}
 
     lines = []
+    stopped: set[str] = set()
+    seen: set[str] = set()
     before = tree_of(base_wt)
     try:
-        for runner in used:
+        while queue:
+            runner = queue.pop(0)
+            if runner in seen:
+                continue
+            seen.add(runner)
             key = cache_key(root, runner, cmds)
             entry = saved.get(key)
             probe_failure = ""
@@ -186,14 +217,18 @@ def ensure(root: Path, cfg: RepoConfig, base_wt: Path, workers: dict, baseline_f
                 if not any(exits.get(cmd, INCONCLUSIVE) == INCONCLUSIVE for cmd in cmds):
                     saved[key] = entry
                     _save(path, saved)
-            if probe_failure:
-                workers = demote(workers, runner)
-                lines.append(f"{runner} 샌드박스 점검 명령 자체가 실패했다({probe_failure}). 검증 명령 탓이 아니라 점검을 못 한 것이라 "
-                             "결과를 저장하지 않고, 이 저장소에서는 Claude 작업자를 쓴다")
-            elif not entry.get("ok"):
-                workers = demote(workers, runner)
-                lines.append(f"{runner} 샌드박스에서 검증 명령이 실패해 이 저장소에서는 Claude 작업자를 쓴다: "
-                             f"{', '.join(entry.get('failed', []))}")
+            if probe_failure or not entry.get("ok"):
+                stopped.add(runner)
+                replaced = _replace(workers, runner, consented, stopped)
+                to = _replacement(workers, runner, replaced)
+                workers = replaced
+                queue += [r for r in _used(workers) if r not in seen]
+                if probe_failure:
+                    lines.append(f"{runner} 샌드박스 점검 명령 자체가 실패했다({probe_failure}). 검증 명령 탓이 아니라 점검을 못 한 것이라 "
+                                 f"결과를 저장하지 않고, 이 저장소에서는 {to}를 쓴다")
+                else:
+                    lines.append(f"{runner} 샌드박스에서 검증 명령이 실패해 이 저장소에서는 {to}를 쓴다: "
+                                 f"{', '.join(entry.get('failed', []))}")
     finally:
         restore_tree(base_wt, before)
     return workers, lines

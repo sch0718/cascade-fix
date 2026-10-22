@@ -68,6 +68,12 @@ class DocParserTest(unittest.TestCase):
         self.assertEqual(cm.exception.line_no, 1)
         self.assertEqual(cm.exception.line, "아무 말")
 
+    def test_doc_parser_accepts_unindented_field_lines(self):
+        text = "Warning\n\n1. 들여쓰지 않은 항목\n위치: a.md:3\n근거: 모호하다\n\n2. 둘째\n   위치: b.md:1\n"
+        f = findings.parse_codex_doc(text, 1)
+        self.assertEqual([x.location for x in f], ["a.md:3", "b.md:1"])
+        self.assertEqual(f[0].evidence, "모호하다")
+
     def test_doc_parser_rejects_item_without_location(self):
         text = "Warning\n\n1. 위치가 없는 항목\n   - 근거: 어딘가\n"
         with self.assertRaises(findings.ParseError) as cm:
@@ -109,6 +115,15 @@ class CodeParserTest(unittest.TestCase):
         self.assertEqual([x.id for x in f], ["r3-01", "r3-02"])
         self.assertEqual([x.severity for x in f], ["Critical", "Suggestion"])
 
+    def test_code_parser_location_with_spaces(self):
+        f = findings.parse_codex_code("- [P2] 제목 — 다른 말 — some dir/a b.py:3-4\n  본문.\n", 1)
+        self.assertEqual([(x.body.splitlines()[0], x.location) for x in f], [("제목 — 다른 말", "some dir/a b.py:3")])
+
+    def test_unparsed_code_items_lists_item_lines_the_parser_skips(self):
+        text = "- [P1] 첫째 — a.py:1\n  본문.\n- [P2] 위치 없는 항목\n  본문.\n"
+        self.assertEqual(len(findings.parse_codex_code(text, 1)), 1)
+        self.assertEqual(findings.unparsed_code_items(text), ["- [P2] 위치 없는 항목"])
+
     def test_code_parser_no_items_is_empty(self):
         self.assertEqual(findings.parse_codex_code("문제를 찾지 못했습니다.", 1), [])
 
@@ -130,6 +145,11 @@ class PrFindingsTest(unittest.TestCase):
         self.assertEqual([x.severity for x in f], ["Warning", "Suggestion"])
         self.assertEqual(findings.pr_severity("그냥 의견입니다"), "Warning")
         self.assertEqual(findings.pr_severity("**Critical** 문제\nWarning 아님"), "Critical")
+
+    def test_pr_severity_needs_a_leading_label(self):
+        self.assertEqual(findings.pr_severity("🔴 critical: 데이터가 사라집니다"), "Critical")
+        self.assertEqual(findings.pr_severity("This is not critical, just a nit"), "Warning")
+        self.assertEqual(findings.pr_severity("Noncritical: rename"), "Warning")
 
     def test_pr_location_and_evidence(self):
         f = pr_findings()
@@ -155,6 +175,40 @@ class PrFindingsTest(unittest.TestCase):
                 else:
                     os.environ["CASCADE_FAKE_GH_FILE"] = old
         self.assertEqual([x.thread_id for x in f], ["T4"])
+
+    def test_pr_warns_when_threads_or_comments_have_more_pages(self):
+        data = json.loads((FIX / "pr-threads.json").read_text(encoding="utf-8"))
+        threads = data["data"]["repository"]["pullRequest"]["reviewThreads"]
+        threads["pageInfo"] = {"hasNextPage": True}
+        threads["nodes"][1]["comments"]["pageInfo"] = {"hasNextPage": True}
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "t.json"
+            path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            old = os.environ.get("CASCADE_FAKE_GH_FILE")
+            os.environ["CASCADE_FAKE_GH_FILE"] = str(path)
+            warnings = []
+            try:
+                f = findings.fetch_pr_findings("o", "r", 7, me="sch0718", gh=FAKE_GH, warnings=warnings)
+            finally:
+                if old is None:
+                    del os.environ["CASCADE_FAKE_GH_FILE"]
+                else:
+                    os.environ["CASCADE_FAKE_GH_FILE"] = old
+        self.assertEqual([x.thread_id for x in f], ["T2", "T4"])
+        self.assertEqual(len(warnings), 2)
+        self.assertIn("100", warnings[0])
+        self.assertIn(threads["nodes"][1]["id"], warnings[1])
+        self.assertEqual(findings.PR_QUERY.count("pageInfo { hasNextPage }"), 2)
+
+    def test_pr_gh_timeout_raises(self):
+        old = findings.GH_TIMEOUT
+        findings.GH_TIMEOUT = 1
+        try:
+            with self.assertRaises(RuntimeError) as cm:
+                findings.fetch_pr_findings("o", "r", 7, me="x", gh=[sys.executable, "-c", "import time; time.sleep(30)"])
+        finally:
+            findings.GH_TIMEOUT = old
+        self.assertIn("시간 초과", str(cm.exception))
 
     def test_pr_gh_failure_raises(self):
         with self.assertRaises(RuntimeError):

@@ -46,19 +46,26 @@ def git(cwd, *args, check=True) -> str:
 def toml_value(value) -> str:
     if isinstance(value, list):
         return "[" + ", ".join(toml_value(v) for v in value) + "]"
+    if isinstance(value, dict):
+        return "{" + ", ".join(f"{json.dumps(k, ensure_ascii=False)} = {toml_value(v)}" for k, v in value.items()) + "}"
     return json.dumps(value, ensure_ascii=False)
 
 
 def write_worktree_toml(src: Path, repo: Path, wt: Path, dest: Path) -> None:
     data = tomllib.loads(src.read_text(encoding="utf-8")) if src.is_file() else {}
-    entry = data.get("repos", {}).get(str(repo.resolve()))
-    lines = ["[repos]"]
+    root = repo.resolve()
+    entry = next((v for k, v in data.get("repos", {}).items() if Path(k).expanduser().resolve() == root), None)
+    lines = [f"default_profile = {toml_value(data['default_profile'])}"] if "default_profile" in data else []
+    lines.append("[repos]")
     if entry is not None:
         key = json.dumps(str(wt))
         tables = {k: v for k, v in entry.items() if isinstance(v, dict)}
         lines += [f"[repos.{key}]", *(f"{k} = {toml_value(v)}" for k, v in entry.items() if k not in tables)]
         for name, table in tables.items():
             lines += [f"[repos.{key}.{name}]", *(f"{k} = {toml_value(v)}" for k, v in table.items())]
+    for name, table in data.get("profiles", {}).items():
+        lines += [f"[profiles.{json.dumps(name, ensure_ascii=False)}]",
+                  *(f"{json.dumps(k, ensure_ascii=False)} = {toml_value(v)}" for k, v in table.items())]
     dest.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -115,7 +122,8 @@ def has_jobs(path: Path) -> bool:
     return path.is_file() and bool(read_json(path).get("jobs"))
 
 
-def run_item(item: dict, out: Path, repos_toml: Path, fake: Path | None, workers: str = WORKERS_CLAUDE) -> None:
+def run_item(item: dict, out: Path, repos_toml: Path, fake: Path | None, workers: str = WORKERS_CLAUDE,
+             adopt_on_both_pass: bool = False) -> None:
     repo = Path(item["repo"]).resolve()
     base = (out / item["id"]).resolve()
     wt = base / "wt"
@@ -140,6 +148,8 @@ def run_item(item: dict, out: Path, repos_toml: Path, fake: Path | None, workers
         args = ["init", "--source", item["source"], "--findings-json", str(findings), "--workers", workers, "--dry-run"]
         if item.get("doc"):
             args += ["--doc", doc_arg(item["doc"], repo, wt)]
+        if adopt_on_both_pass:
+            args.append("--adopt-on-both-pass")
         out_text = cli(wt, env, *args)
         run_dir = Path(next(x for x in out_text.splitlines() if x.startswith("run_dir=")).split("=", 1)[1])
         rd = str(run_dir)
@@ -167,7 +177,7 @@ def run_item(item: dict, out: Path, repos_toml: Path, fake: Path | None, workers
             shutil.copyfile(item_fake / "checker.json", checker)
             judge += ["--checker-results", str(checker)]
         cli(wt, env, *judge)
-        if (item_fake / "adj.json").is_file():
+        if (item_fake / "adj.json").is_file() and (round_dir / "adj-args.json").is_file():
             adj = round_dir / "adj.json"
             shutil.copyfile(item_fake / "adj.json", adj)
             cli(wt, env, "adjudicate", "--run-dir", rd, "--round", ROUND, "--results", str(adj))
@@ -214,6 +224,8 @@ def main(argv=None) -> int:
     parser.add_argument("--fake-results", help="<id>/stage1.json(·adj.json·checker.json)을 두는 폴더. 모델을 부르지 않는다. "
                         "모델을 부르는 external 작업자와 함께 쓸 수 없다")
     parser.add_argument("--repos-toml", default=str(default_repos_toml()))
+    parser.add_argument("--adopt-on-both-pass", action="store_true",
+                        help="init에 넘긴다. 같은 판정에 패치가 달라도 둘 다 검증을 통과하면 판가름 없이 작은 패치를 채택")
     parser.add_argument("--collect", action="store_true", help="모델을 부르는 실제 실행이 끝난 항목의 원장을 모으고 정리한다")
     args = parser.parse_args(argv)
     if args.fake_results and args.workers == WORKERS_EXTERNAL:
@@ -228,7 +240,7 @@ def main(argv=None) -> int:
             if args.collect:
                 print(f"{item['id']}: {'수집' if collect_item(item, out, toml) else '건너뜀(대기 중이 아니거나 apply 전)'}")
             else:
-                run_item(item, out, toml, fake, args.workers)
+                run_item(item, out, toml, fake, args.workers, args.adopt_on_both_pass)
                 print(f"{item['id']}: 완료" if fake else "")
         except Exception as e:
             failed += 1

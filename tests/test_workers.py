@@ -53,12 +53,6 @@ class AssignTest(unittest.TestCase):
             model, effort = jobs.ROLES[role]
             self.assertEqual(w[role], {"runner": "claude", "model": model, "effort": effort})
 
-    def test_demote_returns_seat_to_claude(self):
-        w = workers.demote(assigned(), "codex")
-        self.assertEqual((w["a"], w["writer"]), (CLAUDE_SONNET, CLAUDE_SONNET))
-        self.assertEqual(w["b"]["runner"], "cursor")
-        self.assertEqual(assigned()["a"]["runner"], "codex")
-
     def test_expected_model_id(self):
         w = assigned()
         self.assertEqual(workers.expected_model_id(w["a"]), "codex:gpt-x")
@@ -137,8 +131,9 @@ class InitWorkersTest(ExternalWorkersBase):
         p = self.init("--workers", "external", "--reviewer", "claude")
         ledger = self.ledger()
         self.assertEqual(ledger.workers_choice, "external")
-        self.assertEqual(ledger.workers["a"], {"runner": "codex", "model": "gpt-test", "effort": "low"})
-        self.assertEqual(ledger.workers["checker"]["runner"], "cursor")
+        self.assertEqual({k: ledger.workers["a"][k] for k in ("runner", "model", "effort")},
+                         {"runner": "codex", "model": "gpt-test", "effort": "low"})
+        self.assertEqual(ledger.workers["b"]["runner"], "cursor")
         self.assertIn("작업자: A·writer=Codex(gpt-test), B·checker=Cursor(composer-2.5)", p.stdout)
         self.assertIn("작업자 4(Claude 0·Codex 2·Cursor 2)", p.stdout)
         self.assertIn("전송 동의", p.stdout)
@@ -198,13 +193,13 @@ class InitWorkersTest(ExternalWorkersBase):
         self.use_fakes()
         r = self.detect("--workers", "external")
         self.assertEqual(r["workers"]["a"]["runner"], "codex")
-        self.assertTrue(any(a.startswith("작업자 전송 동의") and "OpenAI" in a and "Cursor" in a for a in r["approvals"]))
+        self.assertTrue(any(a.startswith("전송 동의") and "OpenAI" in a and "Cursor" in a for a in r["approvals"]))
         self.assertEqual(r["recommendation"]["estimate"]["stage1_by_runner"], {"claude": 0, "codex": 2, "cursor": 2})
         self.assertIn("--workers external", r["recommendation"]["steps"][0])
 
     def test_detect_external_without_cli_notes_fallback(self):
         r = self.detect("--workers", "external")
-        self.assertFalse(any("작업자 전송 동의" in a for a in r["approvals"]))
+        self.assertFalse(any("전송 동의" in a for a in r["approvals"]))
         self.assertTrue(any("쓸 수 있는 외부 CLI가 없다" in n for n in r["notes"]))
 
     def test_detect_default_is_unchanged(self):
@@ -212,7 +207,7 @@ class InitWorkersTest(ExternalWorkersBase):
         r = self.detect()
         self.assertEqual(r["workers"], {})
         self.assertNotIn("--workers", r["recommendation"]["steps"][0])
-        self.assertFalse(any("작업자 전송 동의" in a for a in r["approvals"]))
+        self.assertFalse(any("전송 동의" in a for a in r["approvals"]))
 
     def test_detect_claude_keeps_flag_when_env_selects_external(self):
         self.use_fakes()

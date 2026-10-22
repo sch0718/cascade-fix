@@ -1,14 +1,18 @@
+import json
 import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from cascade import config  # noqa: E402
+from cascade import cli_steps, config, profiles  # noqa: E402
 from helpers import make_repo, run_cli, write_repos_toml  # noqa: E402
+
+SKILL_ROOT = Path(__file__).resolve().parent.parent
 
 
 class ConfigTest(unittest.TestCase):
@@ -63,6 +67,16 @@ class ConfigTest(unittest.TestCase):
     def test_returns_none_when_root_missing(self):
         cfg = write_repos_toml(self.tmp, {"/some/other/repo": {"tests": ["pytest"]}})
         self.assertIsNone(config.load_repo_config(self.repo, cfg))
+
+    def test_key_through_symlink_or_home_matches_resolved_root(self):
+        link = self.tmp / "link"
+        link.symlink_to(self.tmp)
+        cfg = write_repos_toml(self.tmp, {str(link / "repo"): {"tests": ["pytest"]}})
+        self.assertEqual(config.load_repo_config(self.repo, cfg).tests, ["pytest"])
+        self.assertEqual(config.load_repo_config(link / "repo", cfg).tests, ["pytest"])
+        cfg = write_repos_toml(self.tmp, {"~/repo": {"tests": ["make test"]}})
+        with mock.patch.dict(os.environ, {"HOME": str(link)}):
+            self.assertEqual(config.load_repo_config(self.repo, cfg).tests, ["make test"])
 
     def test_returns_none_when_file_missing(self):
         self.assertIsNone(config.load_repo_config(self.repo, self.tmp / "nope.toml"))
@@ -192,6 +206,25 @@ class RepoTomlLocationTest(unittest.TestCase):
             "tests/test_c.py": "from unittest import mock\n\n\ndef test_m():\n    assert mock.Mock()\n",
         })
         self.assertEqual(config.detect_candidates(mock)["tests"], ["pytest {files}"])
+
+    def test_sample_repos_toml_profiles_parse(self):
+        found, data = profiles.load_profiles(SKILL_ROOT / "repos.toml")
+        self.assertIn("local", found)
+        self.assertEqual(data["repos"], {})
+        self.assertNotIn("default_profile", data)
+        examples = set(data["profiles"]) - set(profiles.BUILTIN_NAMES)
+        self.assertTrue(examples)
+        self.assertTrue(set(data["profiles"]) <= set(found))
+        self.assertNotIn("claude-only", data["profiles"])
+
+    def test_sample_repos_toml_is_not_read_without_repo_entries(self):
+        self.assertFalse(cli_steps._has_repos(SKILL_ROOT / "repos.toml"))
+
+    def test_plugin_and_marketplace_versions(self):
+        plugin = json.loads((SKILL_ROOT / ".claude-plugin/plugin.json").read_text(encoding="utf-8"))
+        market = json.loads((SKILL_ROOT / ".claude-plugin/marketplace.json").read_text(encoding="utf-8"))
+        self.assertEqual(plugin["version"], "1.3.0")
+        self.assertEqual([p["version"] for p in market["plugins"]], ["1.3.0"])
 
 
 if __name__ == "__main__":

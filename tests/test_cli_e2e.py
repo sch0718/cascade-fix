@@ -8,7 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from cascade import cli_steps  # noqa: E402
+from cascade import cli, cli_steps  # noqa: E402
 from cascade.rounds import Ledger, RoundRecord  # noqa: E402
 from cascade.snapshot import commit_worktree  # noqa: E402
 from helpers import git, make_repo, run_cli, write_repos_toml  # noqa: E402
@@ -462,6 +462,75 @@ class CliEndToEndTest(CliTestBase):
         self.assertEqual(self.ledger().rounds[0].adopted, [])
         self.assertEqual(self.ledger().status, "종료")
 
+    def test_adopt_on_both_pass_takes_smaller_patch_without_opus(self):
+        p = self.init("--adopt-on-both-pass")
+        self.assertIn("둘 다 검증을 통과하면 작은 패치를 채택한다", p.stdout)
+        self.assertTrue(self.ledger().adopt_on_both_pass)
+        self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1")
+        (self.wt("r1-01-a") / "calc.py").write_text(
+            fix(CALC, "return a - b", "total = a + b\n    return total"), encoding="utf-8")
+        (self.wt("r1-01-b") / "calc.py").write_text(fix(CALC, "return a - b", "return a + b"), encoding="utf-8")
+        stage1 = results_json(self.run_dir / "round-1" / "stage1.json", [
+            ("r1-01:a", worker_output("사실", "claude-sonnet-5-5")),
+            ("r1-01:b", worker_output("사실", "claude-haiku-5-5")),
+            ("r1-02:a", worker_output("아님", "claude-sonnet-5-5")),
+            ("r1-02:b", worker_output("아님", "claude-haiku-5-5")),
+        ])
+        self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1))
+        d = {x["finding_id"]: x for x in self.ledger().rounds[0].decisions}
+        self.assertEqual((d["r1-01"]["outcome"], d["r1-01"]["patch_from"]), ("합의-사실", "b"))
+        self.assertEqual(d["r1-01"]["reasons"], ["둘 다 검증 통과: 작은 패치 b 채택"])
+        self.assertFalse((self.run_dir / "round-1" / "adj-args.json").exists())
+        self.cli("apply", "--run-dir", str(self.run_dir), "--round", "1")
+        self.assertIn("return a + b\n\n\ndef ident", (self.repo / "calc.py").read_text(encoding="utf-8"))
+        p = self.cli("report", "--run-dir", str(self.run_dir))
+        self.assertIn("| 1 | 2 | 2 | 0 | 0 | 0 | 0 |", p.stdout)
+        self.assertIn("이번 실행은 --adopt-on-both-pass 로 돌았다", p.stdout)
+        self.assertIn("이 규칙으로 채택한 지적 1건", p.stdout)
+
+    def _recheck(self, text):
+        self.run_to_apply()
+        result = self.tmp / "recheck.final"
+        result.write_text(text, encoding="utf-8")
+        return self.cli("recheck", "--run-dir", str(self.run_dir), "--round", "1", "--result", str(result))
+
+    def test_recheck_without_resolution_section_warns_once(self):
+        p = self._recheck(RECHECK_RESULT.split("Critical", 1)[1].join(["Critical", ""]))
+        self.assertIn("절이 없다", p.stdout)
+        self.assertNotIn("해소 여부가 없는 지적", p.stdout)
+
+    def test_recheck_with_unreadable_resolution_lines_warns(self):
+        p = self._recheck(RECHECK_RESULT.replace("r1-01: 해소됨", "r1-01 해소됨").replace("r1-02: 해소됨", "r1-02 해소됨"))
+        self.assertIn("경고: 해소 여부가 없는 지적은 해소 안 됨으로 본다: r1-01, r1-02", p.stdout)
+
+    def test_non_utf8_patch_is_not_adopted(self):
+        self.init()
+        self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1")
+        for name in ("r1-01-a", "r1-01-b"):
+            wt = self.wt(name)
+            (wt / "calc.py").write_text(fix(CALC, "return a - b", "return a + b"), encoding="utf-8")
+            (wt / "notes.txt").write_bytes(b"na\xefve\n")
+        stage1 = self.run_dir / "round-1" / "stage1.json"
+        shutil.copyfile(FIXTURES / "workflow-stage1.json", stage1)
+        self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1))
+        d = {x["finding_id"]: x for x in self.ledger().rounds[0].decisions}
+        self.assertEqual((d["r1-01"]["outcome"], d["r1-01"]["patch_from"]), ("판단불가", None))
+        self.assertEqual(d["r1-01"]["reasons"][-1], "UTF-8 아닌 패치")
+
+    def test_utf8_replacement_character_in_the_file_is_not_lossy(self):
+        self.init()
+        self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1")
+        for name in ("r1-01-a", "r1-01-b"):
+            wt = self.wt(name)
+            (wt / "calc.py").write_text(fix(CALC, "return a - b", "return a + b"), encoding="utf-8")
+            (wt / "notes.txt").write_text("대체 문자 \ufffd\n", encoding="utf-8")
+        stage1 = self.run_dir / "round-1" / "stage1.json"
+        shutil.copyfile(FIXTURES / "workflow-stage1.json", stage1)
+        self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1))
+        d = {x["finding_id"]: x for x in self.ledger().rounds[0].decisions}
+        self.assertEqual(d["r1-01"]["outcome"], "합의-사실")
+        self.assertNotIn("UTF-8 아닌 패치", d["r1-01"]["reasons"])
+
     def test_missing_full_tests_falls_back_to_tests_with_warning(self):
         toml = write_repos_toml(self.tmp, {str(self.repo): {"tests": ["python3 -m unittest {files}"]}})
         self.env["CASCADE_REPOS_TOML"] = str(toml)
@@ -533,12 +602,23 @@ class CliCodexResultTest(CliTestBase):
         log.write_text("codex 시작\nERROR: stream disconnected\n", encoding="utf-8")
         final = Path(f"{log}.final")
         final.write_text("\n", encoding="utf-8")
-        p = self.opinion(final)
-        self.assertNotEqual(p.returncode, 0)
-        self.assertIn("비어 있다", p.stdout)
-        self.assertIn("stream disconnected", p.stdout)
-        self.assertNotIn("인증 실패 흔적", p.stdout)
-        self.assertIn("codex login", p.stdout)
+        with self.assertRaises(cli_steps.CliError) as ctx:
+            cli._external_result_text(final, "의견", "codex")
+        message = str(ctx.exception)
+        self.assertIn("비어 있다", message)
+        self.assertIn("stream disconnected", message)
+        self.assertNotIn("인증 실패 흔적", message)
+        self.assertIn("codex login", message)
+
+    def test_empty_opinion_final_after_run_error_falls_back_to_claude(self):
+        log = self.run_to_opinion()
+        log.write_text("codex 시작\nERROR: stream disconnected\n", encoding="utf-8")
+        final = Path(f"{log}.final")
+        final.write_text("\n", encoding="utf-8")
+        p = self.cli("opinion", "--run-dir", str(self.run_dir), "--round", "1", "--id", "r1-02", "--result", str(final))
+        self.assertIn("대체: code.opinion codex → claude — 실행 오류", p.stdout)
+        self.assertNotIn("r1-02", self.ledger().opinions)
+        self.assertTrue((self.run_dir / "round-1" / "opinion-args.json").is_file())
 
     def test_missing_log_is_reported(self):
         log = self.run_to_opinion()
@@ -621,6 +701,69 @@ class CliDocModeTest(CliTestBase):
         self.assertIn("add가 더하게", (self.repo / "plan.md").read_text(encoding="utf-8"))
         self.assertTrue((self.run_dir / "round-1" / "recheck-prompt.md").is_file())
 
+    def _judge_doc_writer_line(self, line):
+        (self.repo / "helm").mkdir()
+        (self.repo / "helm" / "values-local.yaml").write_text("x: 1\n", encoding="utf-8")
+        (self.repo / "plan.md").write_text(self.PLAN, encoding="utf-8")
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-qm", "plan")
+        raw = self.tmp / "doc.final"
+        raw.write_text("Warning\n1. 단계가 모호하다\n   위치: plan.md:3\n   근거: 무엇을 고치는지 없다\n", encoding="utf-8")
+        p = self.cli("init", "--source", "codex-doc", "--input", str(raw), "--doc", str(self.repo / "plan.md"))
+        self.run_dir = Path(next(x for x in p.stdout.splitlines() if x.startswith("run_dir=")).split("=", 1)[1])
+        self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1")
+        wt = self.wt("r1-01-writer")
+        (wt / "plan.md").write_text(self.PLAN + line, encoding="utf-8")
+        commit_worktree(wt, "writer")
+        stage1 = results_json(self.run_dir / "round-1" / "stage1.json", [
+            ("r1-01:a", worker_output("사실", "claude-sonnet-5-5")),
+            ("r1-01:b", worker_output("사실", "claude-haiku-5-5")),
+            ("r1-01:writer", worker_output("사실", "claude-sonnet-5-5")),
+        ])
+        self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1))
+
+    def test_doc_new_names_and_shortened_paths_reach_checker(self):
+        self._judge_doc_writer_line(
+            "\n노드 `execute-left/right`, `finalize-left/right`에 라벨 `replay.example.com/description`을 단다."
+            " `values-local.yaml`도 고친다.\n"
+        )
+        checker_args = json.loads((self.run_dir / "round-1" / "checker-args.json").read_text(encoding="utf-8"))
+        self.assertEqual([j["id"] for j in checker_args["jobs"]], ["r1-01:checker"])
+        self.assertEqual(self.ledger().rounds[0].decisions, [])
+
+    def test_doc_missing_file_path_still_escalates(self):
+        self._judge_doc_writer_line("\n자세한 내용은 `docs/없는파일.md`에 둔다.\n")
+        self.assertFalse((self.run_dir / "round-1" / "checker-args.json").exists())
+        decisions = self.ledger().rounds[0].decisions
+        self.assertEqual([d["outcome"] for d in decisions], ["판가름"])
+        self.assertIn("참조 없음: docs/없는파일.md", decisions[0]["reasons"])
+
+    def test_doc_mode_writer_patch_touching_non_doc_file_is_not_adopted(self):
+        (self.repo / "plan.md").write_text(self.PLAN, encoding="utf-8")
+        raw = self.tmp / "doc.final"
+        raw.write_text("Warning\n1. 단계가 모호하다\n   위치: plan.md:3\n   근거: 무엇을 고치는지 없다\n", encoding="utf-8")
+        p = self.cli("init", "--source", "codex-doc", "--input", str(raw), "--doc", str(self.repo / "plan.md"))
+        self.run_dir = Path(next(x for x in p.stdout.splitlines() if x.startswith("run_dir=")).split("=", 1)[1])
+        self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1")
+        wt = self.wt("r1-01-writer")
+        (wt / "plan.md").write_text(self.PLAN.replace("고친다", "고쳐 add가 더하게 한다"), encoding="utf-8")
+        (wt / "auth.py").write_text("TOKEN = 1\n", encoding="utf-8")
+        stage1 = results_json(self.run_dir / "round-1" / "stage1.json", [
+            ("r1-01:a", worker_output("사실", "claude-sonnet-5-5")),
+            ("r1-01:b", worker_output("사실", "claude-haiku-5-5")),
+            ("r1-01:writer", worker_output("사실", "claude-sonnet-5-5")),
+        ])
+        self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1))
+        checker = results_json(self.run_dir / "round-1" / "checker.json", [
+            ("r1-01:checker", {**worker_output("사실", "claude-haiku-5-5"), "checker_ok": True}),
+        ])
+        self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1),
+                 "--checker-results", str(checker))
+        d = self.ledger().rounds[0].decisions[0]
+        self.assertEqual((d["outcome"], d["patch_from"]), ("판단불가", None))
+        self.assertEqual(d["reasons"][-1], "문서 밖 파일 수정: auth.py")
+        self.cli("apply", "--run-dir", str(self.run_dir), "--round", "1")
+        self.assertFalse((self.repo / "auth.py").exists())
 
     def _run_doc_to_apply(self, doc, location):
         doc.write_text(self.PLAN, encoding="utf-8")
@@ -766,13 +909,20 @@ class CliPrCommentTest(CliTestBase):
 class CliInitTest(CliTestBase):
     def test_zero_findings_warns_and_ends(self):
         raw = self.tmp / "empty.final"
-        raw.write_text("검토 결과\n- [P2] 위치에 공백 — some file.py:3\n", encoding="utf-8")
+        raw.write_text("검토 결과\n- [P2] 위치가 빠진 항목\n", encoding="utf-8")
         p = self.cli("init", "--source", "codex-code", "--input", str(raw))
         self.assertIn("지적 0건 — 원문을 확인하라", p.stdout)
         self.assertIn("검토 결과", p.stdout)
-        self.assertIn("[P", p.stdout)
+        self.assertIn("경고: 형식을 읽지 못한 항목 1건: - [P2] 위치가 빠진 항목", p.stdout)
         self.assertIn("status=종료", p.stdout)
         self.assertFalse((self.repo / ".cascade-fix").exists())
+
+    def test_partly_unparsed_code_items_warn(self):
+        raw = self.tmp / "code.final"
+        raw.write_text("- [P2] add가 뺀다 — calc.py:2\n  본문.\n- [P2] 위치가 빠진 항목\n  본문.\n", encoding="utf-8")
+        p = self.cli("init", "--source", "codex-code", "--input", str(raw))
+        self.assertIn("경고: 형식을 읽지 못한 항목 1건: - [P2] 위치가 빠진 항목", p.stdout)
+        self.assertIn("run_dir=", p.stdout)
 
     def test_doc_parse_error_exits_5_with_line(self):
         raw = self.tmp / "doc.final"
@@ -822,12 +972,41 @@ class CliSafetyTest(CliTestBase):
         self.assertFalse(cli_steps.step_done(self.ledger().rounds[0], "judge"))
 
         (self.repo / "calc.py").write_text(CALC, encoding="utf-8")
-        git(self.repo, "branch", "stray")
+        self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1))
+
+    def _jobs_then_stage1(self):
+        self.init()
+        self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1")
+        stage1 = self.run_dir / "round-1" / "stage1.json"
+        shutil.copyfile(FIXTURES / "workflow-stage1.json", stage1)
+        return stage1
+
+    def test_judge_warns_and_continues_when_only_branches_change(self):
+        git(self.repo, "branch", "other-session")
+        stage1 = self._jobs_then_stage1()
+        git(self.repo, "branch", "-D", "other-session")
+        git(self.repo, "branch", "fetched")
+        p = self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1))
+        self.assertIn("경고", p.stdout)
+        self.assertIn("- refs/heads/other-session", p.stdout)
+        self.assertIn("+ refs/heads/fetched", p.stdout)
+        self.assertTrue(cli_steps.step_done(self.ledger().rounds[0], "judge"))
+
+    def test_judge_stops_when_user_checkout_switches_branch(self):
+        stage1 = self._jobs_then_stage1()
+        git(self.repo, "switch", "-q", "-c", "side")
         p = self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1), ok=False)
         self.assertEqual(p.returncode, 6, p.stdout)
-        self.assertIn("+ refs/heads/stray", p.stdout)
-        git(self.repo, "branch", "-D", "stray")
-        self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1))
+        self.assertIn("refs/heads/main → refs/heads/side", p.stdout)
+        self.assertFalse(cli_steps.step_done(self.ledger().rounds[0], "judge"))
+
+    def test_judge_stops_when_worker_worktree_attaches_to_branch(self):
+        stage1 = self._jobs_then_stage1()
+        git(self.wt("r1-01-a"), "switch", "-q", "-c", "worker-branch")
+        p = self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1), ok=False)
+        self.assertEqual(p.returncode, 6, p.stdout)
+        self.assertIn("r1-01-a refs/heads/worker-branch", p.stdout)
+        self.assertFalse(cli_steps.step_done(self.ledger().rounds[0], "judge"))
 
     def test_baseline_failures_are_excluded_and_setup_runs_in_worktrees(self):
         lint = "python3 -c 'import sys; sys.exit(1)'"
@@ -925,6 +1104,31 @@ class CliSafetyTest(CliTestBase):
         self.assertTrue(apply["final_ok"])
         self.assertEqual(self.ledger().rounds[0].adopted, ["r1-01", "r1-02"])
         self.assertEqual(sum(1 for e in self.ledger().rounds[0].events if e["step"] == "apply-patched"), 1)
+
+    def test_apply_rerun_after_snapshot_failure_keeps_patched_record(self):
+        state = {}
+
+        def break_snapshot_branch():
+            state["branch"] = self.ledger().snapshot["branch"]
+            state["commit"] = git(self.repo, "rev-parse", state["branch"])
+            git(self.repo, "branch", "-D", state["branch"])
+
+        cli = self.cli
+        self.cli = lambda *args, ok=True: cli(*args, ok=ok and args[0] != "apply")
+        p = self.run_to_apply(before_apply=break_snapshot_branch)
+        self.cli = cli
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("return a * b", (self.repo / "calc.py").read_text(encoding="utf-8"))
+        self.assertTrue(any(e["step"] == "apply-patched" for e in self.ledger().rounds[0].events))
+        git(self.repo, "branch", state["branch"], state["commit"])
+        p = self.cli("apply", "--run-dir", str(self.run_dir), "--round", "1")
+        self.assertIn("적용을 건너뛰고", p.stdout)
+        apply = json.loads((self.run_dir / "round-1" / "apply.json").read_text(encoding="utf-8"))
+        self.assertEqual((apply["applied"], apply["failed"]), (["r1-01", "r1-02"], []))
+        rnd = self.ledger().rounds[0]
+        self.assertEqual(rnd.adopted, ["r1-01", "r1-02"])
+        self.assertTrue(rnd.result_commit)
+        self.assertNotEqual(rnd.result_commit, state["commit"])
 
     def test_recheck_diff_excludes_test_artifacts_and_other_user_edits(self):
         toml = write_repos_toml(self.tmp, {str(self.repo): {
@@ -1029,6 +1233,17 @@ class CliResumeTest(unittest.TestCase):
 
 
 class CliStepsTest(unittest.TestCase):
+    def test_gh_call_that_hangs_is_a_failed_call(self):
+        from cascade import cli
+        old = cli.GH_TIMEOUT
+        cli.GH_TIMEOUT = 1
+        try:
+            p = cli._run_gh([sys.executable, "-c", "import time; time.sleep(30)"])
+        finally:
+            cli.GH_TIMEOUT = old
+        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(p.stdout, "")
+
     def _ledger(self, severity):
         done = [RoundRecord(no=n, findings=[], decisions=[], adopted=[], recheck_opened=True) for n in (1, 2)]
         rnd = RoundRecord(no=3, findings=[{"id": "r3-01", "severity": severity}], decisions=[],

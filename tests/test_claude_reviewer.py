@@ -83,6 +83,31 @@ class ClaudeReviewCommandTest(CliTestBase):
         self.assertIn("init --source claude-code", p.stdout)
         self.assertIn(".cascade-fix/", git(self.repo, "status", "--porcelain", "--ignored"))
 
+    def test_review_writes_meta_and_keeps_old_init_line_for_default_profile(self):
+        p = self.cli("review", "--kind", "code", "--base", "main", "--review-model", "claude-sonnet-5-5")
+        out = self.review_dir(p)
+        meta = json.loads((out / "review-meta.json").read_text(encoding="utf-8"))
+        cell = {"runner": "claude", "model": "claude-sonnet-5-5", "effort": review.DEFAULT_EFFORT}
+        fallback = {"runner": "claude", "model": review.DEFAULT_MODEL, "effort": review.DEFAULT_EFFORT}
+        self.assertEqual((meta["role"], meta["requested"], meta["actual"], meta["fallback_reason"], meta["attempts"]),
+                         ("code.review", {**cell, "fallback": fallback}, cell, None, []))
+        self.assertEqual(meta["consented"], [])
+        self.assertEqual((meta["profile"], meta["explicit"]), ("default", False))
+        self.assertEqual(meta["args"]["base"], "main")
+        init_line = next(x for x in p.stdout.splitlines() if " init --source " in x)
+        self.assertIn("--review-model claude-sonnet-5-5", init_line)
+        self.assertNotIn("--profile", init_line)
+        self.assertNotIn("--review-effort", init_line)
+
+    def test_review_dir_without_fallback_is_rejected(self):
+        p = self.cli("review", "--review-dir", str(self.tmp), ok=False)
+        self.assertEqual(p.returncode, 5)
+
+    def test_review_rejects_a_model_the_claude_cell_cannot_take(self):
+        p = self.cli("review", "--kind", "code", "--base", "main", "--review-model", "composer-2.5", ok=False)
+        self.assertEqual(p.returncode, 5)
+        self.assertIn("--review-model composer-2.5", p.stdout)
+
     def test_review_with_root_keeps_target_in_init(self):
         caller = make_repo(self.tmp / "caller", {"x.py": "x = 1\n"})
         (self.repo / "calc.py").write_text(CALC + "\n", encoding="utf-8")

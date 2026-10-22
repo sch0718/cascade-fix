@@ -3,11 +3,12 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from cascade import cli_steps  # noqa: E402
+from cascade import cli, cli_steps  # noqa: E402
 from cascade.rounds import RoundRecord  # noqa: E402
 from fake_cli import fenced, result_json  # noqa: E402
 from test_cli_e2e import CALC, FIXTURES, fix, results_json, section_of, worker_output  # noqa: E402
@@ -21,6 +22,10 @@ CODE_FIXES = {
 PLAN = "# 계획\n\n1단계는 `calc.py`를 고친다.\n"
 CHECKER_RESULT = json.dumps({"verdict": "사실", "needs_design_decision": False, "reason": "해소한다",
                              "checker_ok": True, "model_id": "x"}, ensure_ascii=False)
+
+
+def role_sections(report):
+    return section_of(report, "## 역할 배정") + section_of(report, "## 역할별 사용량")
 
 
 class WorkersTestBase(ExternalWorkersBase):
@@ -61,6 +66,7 @@ class WorkersCommandTest(WorkersTestBase):
         self.start()
         p = self.workers()
         self.assertIn("CLI 작업 4건: 성공 4, 대체 실행 0", p.stdout)
+        self.assertNotIn("외부 재실행", p.stdout)
         cli = self.read("stage1-cli.json")
         self.assertEqual([o["status"] for o in cli["outcomes"]], ["ok"] * 4)
         self.assertEqual([r["id"] for r in cli["results"]], ["r1-01:a", "r1-01:b", "r1-02:a", "r1-02:b"])
@@ -82,7 +88,8 @@ class WorkersCommandTest(WorkersTestBase):
         self.assertIn("return a + b\n\n\ndef ident", calc)
         self.assertIn("return a * b", calc)
         report = self.cli("report", "--run-dir", str(self.run_dir)).stdout
-        self.assertIn("## 외부 작업자", report)
+        self.assertIn("## 역할 배정", report)
+        self.assertIn("## 역할별 사용량", report)
 
     def test_empty_codex_model_reports_default_model_id_without_warning(self):
         (self.home / ".codex" / "config.toml").write_text("", encoding="utf-8")
@@ -98,7 +105,7 @@ class WorkersCommandTest(WorkersTestBase):
         self.cursor_results([dict(LIMIT_ENTRY, match="r1-02-b")])
         self.start()
         p = self.workers()
-        self.assertIn("CLI 작업 4건: 성공 3, 대체 실행 1(한도 1)", p.stdout)
+        self.assertIn("CLI 작업 4건: 성공 3, 대체 실행 1(한도 1) → 외부 재실행 성공 0, Claude 대체 1", p.stdout)
         fallback = self.read("stage1-fallback-args.json")
         self.assertEqual(len(fallback["jobs"]), 1)
         job = fallback["jobs"][0]
@@ -340,6 +347,149 @@ class WorkersCommandTest(WorkersTestBase):
         self.assertIn("--results", p.stdout)
 
 
+CODEX_LIMIT = {"FAKE_CODEX_EXIT": "1", "FAKE_CODEX_STDERR": "You've hit your usage limit"}
+OK_CURSOR = [{"result": fenced(result_json())}]
+
+
+class ProfileFallbackTest(WorkersTestBase):
+    def add_profile(self, *lines):
+        path = Path(self.env["CASCADE_REPOS_TOML"])
+        path.write_text(path.read_text(encoding="utf-8") + "\n[profiles.mine]\nbase = \"claude-only\"\n" + "\n".join(lines) + "\n",
+                        encoding="utf-8")
+
+    def start_profile(self, cell, *init_extra, cursor=OK_CURSOR):
+        self.add_profile(f'"code.a" = {cell}')
+        self.use_fakes()
+        self.env["FAKE_CURSOR_RESULTS"] = json.dumps(cursor, ensure_ascii=False)
+        self.init("--profile", "mine", *init_extra)
+        self.args("jobs")
+
+    def calls(self, name):
+        return len(list((self.tmp / "log").glob(f"{name}-[0-9]*.args.json")))
+
+    def test_claude_only_stage1_args_unchanged(self):
+        self.use_fakes()
+        shapes = []
+        for extra in (("--profile", "claude-only"), ("--workers", "claude", "--reviewer", "claude")):
+            self.init(*extra)
+            self.args("jobs")
+            jobs = self.read("stage1-args.json")["jobs"]
+            shapes.append([{k: v for k, v in j.items() if k != "promptPath"} for j in jobs])
+        self.assertEqual(shapes[0], shapes[1])
+        self.assertEqual([(j["id"], j["model"], j["effort"]) for j in shapes[0]][:2],
+                         [("r1-01:a", "claude-sonnet-5-5", "low"), ("r1-01:b", "claude-haiku-5-5", "low")])
+
+    def test_custom_claude_cell_model_reaches_stage1_args(self):
+        self.add_profile('"code.a" = { model = "claude-haiku-5-5", effort = "medium" }')
+        self.init("--profile", "mine")
+        self.args("jobs")
+        first = self.read("stage1-args.json")["jobs"][0]
+        self.assertEqual((first["id"], first["model"], first["effort"]), ("r1-01:a", "claude-haiku-5-5", "medium"))
+        self.assertNotIn("runner", first)
+
+    def test_external_fallback_runs_in_same_workers_call(self):
+        self.start_profile('{ runner = "codex", fallback = { runner = "cursor" } }')
+        self.env.update(CODEX_LIMIT)
+        p = self.workers()
+        cli = self.read("stage1-cli.json")
+        self.assertEqual([(o["id"], o["runner"], o["status"]) for o in cli["outcomes"]],
+                         [("r1-01:a", "cursor", "ok"), ("r1-02:a", "cursor", "ok")])
+        self.assertEqual(cli["outcomes"][0]["output"]["model_id"], "cursor:composer-2.5")
+        self.assertFalse((self.rd() / "stage1-fallback-args.json").exists())
+        event = self.event("workers-stage1")
+        self.assertEqual(event["fallback_runs"], {"r1-01:a": "cursor", "r1-02:a": "cursor"})
+        self.assertEqual((event["counts"], event["fallback"]), ({"limit": 1, "skipped": 1}, ["r1-01:a", "r1-02:a"]))
+        self.assertEqual(event["exhausted"].keys(), {"codex"})
+        self.assertEqual(self.calls("codex"), 1)
+        self.assertEqual(self.calls("cursor-agent"), 2)
+        self.assertIn("CLI 작업 2건: 성공 0, 대체 실행 2(한도 1, 건너뜀 1) → 외부 재실행 성공 2, Claude 대체 0", p.stdout)
+        self.assertIn("외부 CLI로 다시 돌린 작업 2건: r1-01:a→cursor, r1-02:a→cursor", p.stdout)
+        merged, expected = cli_steps.load_stage_results(self.rd(), "stage1", None)
+        self.assertEqual(expected, {"r1-01:a": "cursor:composer-2.5", "r1-02:a": "cursor:composer-2.5"})
+        self.assertEqual(len(merged["results"]), 2)
+        section = self.section()
+        self.assertIn("대체 실행 2건(한도 1, 건너뜀 1)", section)
+        self.assertIn("| cursor | 200 | 40 | 10 |", section)
+
+    def section(self):
+        return role_sections(self.cli("report", "--run-dir", str(self.run_dir)).stdout)
+
+    def test_fallback_outside_consent_goes_claude_only(self):
+        self.start_profile('{ runner = "codex", fallback = { runner = "cursor" } }', "--consent", "codex")
+        self.assertEqual(self.ledger().profile["consented"], ["codex"])
+        self.env.update(CODEX_LIMIT)
+        self.workers()
+        job = self.read("stage1-fallback-args.json")["jobs"][0]
+        self.assertEqual((job["id"], job["model"], job["effort"]), ("r1-01:a", "claude-sonnet-5-5", "low"))
+        self.assertEqual(self.calls("cursor-agent"), 0)
+        self.assertEqual(self.event("workers-stage1")["fallback_runs"], {})
+
+    def test_runtime_guard_blocks_runner_missing_from_ledger_consent(self):
+        self.start_profile('{ runner = "codex", fallback = { runner = "cursor" } }')
+        path = self.run_dir / "ledger.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["profile"]["consented"] = ["codex"]
+        path.write_text(json.dumps(data), encoding="utf-8")
+        self.env.update(CODEX_LIMIT)
+        self.workers()
+        self.assertEqual([j["model"] for j in self.read("stage1-fallback-args.json")["jobs"]], ["claude-sonnet-5-5"] * 2)
+        self.assertEqual(self.calls("cursor-agent"), 0)
+
+    def test_sandbox_failed_cli_is_not_the_runtime_fallback_of_another_cell(self):
+        self.add_profile('"code.a" = { runner = "cursor", fallback = { runner = "codex" } }', '"code.b" = { runner = "codex" }')
+        self.use_fakes()
+        self.cursor_results([dict(LIMIT_ENTRY, match="r1-0")])
+        self.env["FAKE_CODEX_SANDBOX_EXIT"] = "1"
+        self.init("--profile", "mine")
+        self.args("jobs")
+        self.assertEqual([j["id"] for j in self.read("stage1-cli-args.json")["jobs"]], ["r1-01:a", "r1-02:a"])
+        self.workers()
+        self.assertEqual([(j["id"], j["model"]) for j in self.read("stage1-fallback-args.json")["jobs"]],
+                         [("r1-01:a", "claude-sonnet-5-5"), ("r1-02:a", "claude-sonnet-5-5")])
+        self.assertEqual(self.event("workers-stage1")["fallback_runs"], {})
+        self.assertEqual(self.calls("codex"), 0)
+
+    def test_old_ledger_without_profile_falls_back_to_claude(self):
+        self.start()
+        path = self.run_dir / "ledger.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        del data["profile"]
+        path.write_text(json.dumps(data), encoding="utf-8")
+        self.env.update(CODEX_LIMIT)
+        self.workers()
+        self.assertEqual([(j["id"], j["model"]) for j in self.read("stage1-fallback-args.json")["jobs"]],
+                         [("r1-01:a", "claude-sonnet-5-5"), ("r1-02:a", "claude-sonnet-5-5")])
+        self.assertEqual(self.event("workers-stage1")["fallback_runs"], {})
+
+    def test_exhausted_fallback_runner_goes_claude_only(self):
+        self.start_profile('{ runner = "codex", fallback = { runner = "codex", model = "gpt-other" } }')
+        self.env.update(CODEX_LIMIT)
+        self.workers()
+        self.assertEqual([j["model"] for j in self.read("stage1-fallback-args.json")["jobs"]], ["claude-sonnet-5-5"] * 2)
+        self.assertEqual(self.calls("codex"), 1)
+        self.assertEqual(self.event("workers-stage1")["fallback_runs"], {})
+
+    def test_failed_external_fallback_goes_claude_only(self):
+        self.start_profile('{ runner = "codex", fallback = { runner = "cursor" } }', cursor=[dict(LIMIT_ENTRY)])
+        self.env.update(CODEX_LIMIT)
+        self.workers()
+        cli = self.read("stage1-cli.json")
+        self.assertEqual({o["runner"] for o in cli["outcomes"]}, {"cursor"})
+        self.assertTrue(all(o["status"] in ("limit", "skipped") for o in cli["outcomes"]))
+        self.assertEqual([j["model"] for j in self.read("stage1-fallback-args.json")["jobs"]], ["claude-sonnet-5-5"] * 2)
+        self.assertEqual(self.event("workers-stage1")["exhausted"].keys(), {"codex", "cursor"})
+
+    def test_claude_fallback_cell_model_is_the_fallback_job_and_expected_model(self):
+        self.start_profile('{ runner = "codex", fallback = { model = "claude-haiku-5-5" } }')
+        self.env.update(CODEX_LIMIT)
+        self.workers()
+        jobs = self.read("stage1-fallback-args.json")["jobs"]
+        self.assertEqual([(j["model"], j["effort"]) for j in jobs], [("claude-haiku-5-5", "low")] * 2)
+        results_json(self.rd() / "stage1-fallback.json", [(j["id"], worker_output("사실", "claude-haiku-5-5")) for j in jobs])
+        _, expected = cli_steps.load_stage_results(self.rd(), "stage1", None)
+        self.assertEqual(expected, {"r1-01:a": "claude-haiku-5-5", "r1-02:a": "claude-haiku-5-5"})
+
+
 class DocWorkersTest(WorkersTestBase):
     def setUp(self):
         super().setUp()
@@ -388,6 +538,20 @@ class DocWorkersTest(WorkersTestBase):
         self.args("apply")
         self.assertIn("add가 더하게", (self.repo / "plan.md").read_text(encoding="utf-8"))
 
+    def test_report_counts_unrecorded_acp_usage(self):
+        self.use_fakes()
+        p = self.cli("init", *self.doc_args, "--workers", "external", "--reviewer", "claude")
+        self.run_dir = Path(next(x for x in p.stdout.splitlines() if x.startswith("run_dir=")).split("=", 1)[1])
+        self.args("jobs")
+        self.workers()
+        self.assertEqual(self.event("workers-stage1")["usage"]["cursor"],
+                         {"input": 0, "output": 0, "cache_read": 0, "unrecorded": 1})
+        report = self.cli("report", "--run-dir", str(self.run_dir)).stdout
+        section = role_sections(report)
+        self.assertIn("| CLI | 입력 토큰 | 출력 토큰 | 캐시 읽기 토큰 | 기록 없음(건) |", section)
+        self.assertIn("| cursor | 0 | 0 | 0 | 1 |", section)
+        self.assertIn("| codex | 22 | 14 | 6 | 0 |", section)
+
 
     def start_doc(self, *workers):
         self.use_fakes()
@@ -434,7 +598,7 @@ class DocWorkersTest(WorkersTestBase):
         self.assertIn("r1-01:b에서 limit", outcome["detail"])
         self.assertEqual([j["id"] for j in self.read("checker-fallback-args.json")["jobs"]], ["r1-01:checker"])
         report = self.cli("report", "--run-dir", str(self.run_dir)).stdout
-        section = section_of(report, "## 외부 작업자")
+        section = role_sections(report)
         self.assertIn("회차 1 stage1: CLI 작업 3건, 대체 실행 1건(한도 1)", section)
         self.assertIn("회차 1 checker: CLI 작업 1건, 대체 실행 1건(건너뜀 1)", section)
 
@@ -509,7 +673,7 @@ class DocWorkersTest(WorkersTestBase):
 class ReportWorkersTest(WorkersTestBase):
     def section(self):
         report = self.cli("report", "--run-dir", str(self.run_dir)).stdout
-        return section_of(report, "## 외부 작업자")
+        return role_sections(report)
 
     def test_report_shows_fallback_and_usage(self):
         self.cursor_results([dict(LIMIT_ENTRY, match="r1-02-b")])
@@ -551,10 +715,28 @@ class ReportWorkersTest(WorkersTestBase):
         self.assertIn("대체 실행 0", p.stdout)
         self.assertNotIn("codex login", self.section())
 
-    def test_report_without_external_workers_has_no_section(self):
+    def test_report_without_external_workers_has_no_cli_lines(self):
         self.init("--reviewer", "claude")
         report = self.cli("report", "--run-dir", str(self.run_dir)).stdout
         self.assertNotIn("외부 작업자", report)
+        self.assertIn("## 역할 배정", report)
+        self.assertNotIn("CLI 작업", report)
+        self.assertNotIn("배정: A·writer", report)
+
+
+class RunCliJobsTest(unittest.TestCase):
+    def test_closes_runners_even_when_run_all_fails(self):
+        closed = []
+
+        class Pooled:
+            def close(self):
+                closed.append(True)
+
+        with mock.patch.object(cli, "_cli_runners", return_value={"cursor": Pooled(), "codex": object()}), \
+                mock.patch.object(cli, "run_all", side_effect=RuntimeError("실패")):
+            with self.assertRaises(RuntimeError):
+                cli._run_cli_jobs([], {})
+        self.assertEqual(closed, [True])
 
 
 class StageResultsTest(unittest.TestCase):

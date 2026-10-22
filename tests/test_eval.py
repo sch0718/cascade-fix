@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -16,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import replay  # noqa: E402
 import score  # noqa: E402
+from cascade.consensus import REASON_BOTH_PASS, REASON_SENSITIVE  # noqa: E402
 from fake_cli import fenced, result_json  # noqa: E402
 from helpers import git, make_repo, run_cli, write_repos_toml  # noqa: E402
 from test_cli_workers import LIMIT_ENTRY, WorkersTestBase  # noqa: E402
@@ -102,7 +104,7 @@ class ScoreTest(unittest.TestCase):
         self.assertEqual((m["agree"], m["judged"]), (2, 2))
         self.assertEqual((m["opus_calls"], m["baseline_calls"]), (2, 3))
         self.assertAlmostEqual(m["opus_ratio"], 2 / 3)
-        self.assertEqual(m["paths"], {"합의": 1, "판가름": 1, "Codex 검토": 0, "사람": 1})
+        self.assertEqual(m["paths"], {"합의": 1, "규칙 채택": 0, "판가름": 1, "Codex 검토": 0, "사람": 1})
         self.assertEqual(m["patch_differs"], 1)
         self.assertEqual(m["items"], 3)
         self.assertEqual(m["regressions"], 0)
@@ -163,7 +165,19 @@ class ScoreTest(unittest.TestCase):
         m = score.compute(self.runs, score.load_sample(self.sample))
         self.assertEqual(m["predicted"], {"s1": "판정 없음", "s2": "재현 불가", "s3": "아님"})
         self.assertEqual((m["agree"], m["judged"]), (1, 2))
-        self.assertEqual(m["paths"], {"합의": 0, "판가름": 1, "Codex 검토": 1, "사람": 1})
+        self.assertEqual(m["paths"], {"합의": 0, "규칙 채택": 0, "판가름": 1, "Codex 검토": 1, "사람": 1})
+
+    def test_adopt_on_both_pass_counts_rule_path_and_patch_differs(self):
+        make_run(self.runs, "s1", [decision("합의-사실", "b", [f"{REASON_BOTH_PASS}: 작은 패치 b 채택"])])
+        make_run(self.runs, "s2", [decision("판단불가", None, [f"{REASON_BOTH_PASS}: 크기가 같아 a 채택", REASON_SENSITIVE])])
+        make_run(self.runs, "s3", [decision("합의-아님")])
+        m = score.compute(self.runs, score.load_sample(self.sample))
+        self.assertEqual(m["paths"], {"합의": 1, "규칙 채택": 1, "판가름": 0, "Codex 검토": 0, "사람": 1})
+        self.assertEqual(m["patch_differs"], 2)
+        self.assertEqual(m["predicted"], {"s1": "사실", "s2": "판정 없음", "s3": "아님"})
+        text = score.render(m)
+        self.assertIn("| 채택 경로 분포 | 합의 1, 규칙 채택 1, 판가름 0, Codex 검토 0, 사람 1 |", text)
+        self.assertIn("| 패치 다르지만 둘 다 통과 | 2/3 (66.7%) |", text)
 
     def test_doc_checker_accuracy(self):
         make_run(self.runs, "s1", [decision("판가름", "writer", ["점검자 아니오", "판가름: 고친다"])],
@@ -362,6 +376,57 @@ class ReplayTest(unittest.TestCase):
         m = score.compute(self.out, score.load_sample(sample))
         self.assertEqual((m["agree"], m["judged"]), (1, 1))
 
+    def test_replay_fake_skips_adjudicate_without_adj_args(self):
+        sample = self.write_sample([self.item("item-01")])
+        fake = self.write_fake("item-01")
+        write_json(fake / "item-01" / "adj.json", {"results": [
+            {"id": "r1-01:adjudicator", "output": {"verdict": "사실", "needs_design_decision": False, "reason": "x",
+                                                   "verify": [], "model_id": "claude-opus-5-5"}}]})
+        self.assertEqual(self.run_replay(sample, "--fake-results", str(fake)), 0)
+        base = self.out / "item-01"
+        self.assertNotIn("error", json.loads((base / "meta.json").read_text(encoding="utf-8")))
+        ledger = json.loads((base / "ledger.json").read_text(encoding="utf-8"))
+        self.assertEqual(ledger["rounds"][0]["decisions"][0]["outcome"], "합의-아님")
+        self.assertFalse((base / "run" / "round-1" / "adj.json").exists())
+
+    def test_replay_passes_adopt_on_both_pass_to_init(self):
+        sample = self.write_sample([self.item("item-01")])
+        fake = self.write_fake("item-01")
+        self.assertEqual(self.run_replay(sample, "--fake-results", str(fake), "--adopt-on-both-pass"), 0)
+        ledger = json.loads((self.out / "item-01" / "ledger.json").read_text(encoding="utf-8"))
+        self.assertIs(ledger["adopt_on_both_pass"], True)
+
+    def test_replay_doc_mode_uses_fake_results_and_writes_ledgers(self):
+        (self.repo / "plan.md").write_text("# 계획\n\n1단계는 `calc.py`를 고친다.\n", encoding="utf-8")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-qm", "plan")
+        item = {"id": "doc-01", "repo": str(self.repo), "commit": git(self.repo, "rev-parse", "HEAD"),
+                "source": "codex-doc", "doc": "plan.md",
+                "finding": {**FINDING, "source": "codex-doc", "location": "plan.md:3", "body": "단계가 모호하다"},
+                "truth": {"verdict": "아님", "accepted_patch": None}, "baseline_opus_calls": 1}
+        sample = self.write_sample([item])
+        fake = self.tmp / "fake"
+        write_json(fake / "doc-01" / "stage1.json", {"results": [
+            {"id": f"r1-01:{r}", "output": {"verdict": "아님", "needs_design_decision": False, "reason": "이미 구체적이다",
+                                            "verify": [], "model_id": m}}
+            for r, m in (("a", "claude-sonnet-5-5"), ("b", "claude-haiku-5-5"), ("writer", "claude-sonnet-5-5"))]})
+        self.assertEqual(self.run_replay(sample, "--fake-results", str(fake)), 0)
+        base = self.out / "doc-01"
+        meta = json.loads((base / "meta.json").read_text(encoding="utf-8"))
+        self.assertNotIn("error", meta)
+        ledger = json.loads((base / "ledger.json").read_text(encoding="utf-8"))
+        self.assertEqual((ledger["mode"], ledger["source"]), ("doc", "codex-doc"))
+        self.assertEqual(list(ledger["docs"]), ["plan.md"])
+        self.assertEqual(ledger["rounds"][0]["decisions"][0]["outcome"], "합의-아님")
+        self.assertTrue((base / "run" / "round-1" / "results.json").is_file())
+        self.assertTrue((base / "run" / "report.md").is_file())
+        self.assertFalse((base / "wt").exists())
+        self.assertEqual(git(self.repo, "worktree", "list", "--porcelain").count("worktree "), 1)
+        self.assertEqual(git(self.repo, "branch", "--list", "cascade-fix/*"), "")
+        self.assertEqual(git(self.repo, "status", "--porcelain"), "")
+        m = score.compute(self.out, score.load_sample(sample))
+        self.assertEqual((m["agree"], m["judged"]), (1, 1))
+
     def test_replay_worktree_add_skips_user_hooks(self):
         marker = self.tmp / "hook-ran"
         hook = self.repo / ".git" / "hooks" / "post-checkout"
@@ -415,6 +480,34 @@ class ReplayTest(unittest.TestCase):
         self.assertTrue((base / "ledger.json").is_file())
         self.assertFalse((base / "wt").exists())
         self.assertEqual(git(self.repo, "worktree", "list", "--porcelain").count("worktree "), 1)
+
+    def test_worktree_toml_matches_key_written_through_symlink(self):
+        link = self.tmp / "link"
+        link.symlink_to(self.tmp)
+        (self.tmp / "cfg").mkdir()
+        toml = write_repos_toml(self.tmp / "cfg", {str(link / "repo"): {"tests": ["make test"]}})
+        dest = self.tmp / "wt.toml"
+        replay.write_worktree_toml(toml, self.repo, self.tmp / "wt", dest)
+        self.assertIn('tests = ["make test"]', dest.read_text(encoding="utf-8"))
+
+    def test_worktree_toml_keeps_profile_definitions_the_repo_selects(self):
+        src = self.tmp / "src.toml"
+        src.write_text(f'[profiles.mine]\nbase = "claude-only"\nadopt_on_both_pass = false\n'
+                       f'"code.a" = {{ runner = "codex", model = "", effort = "low", '
+                       f'fallback = {{ runner = "claude", model = "claude-sonnet-5-5", effort = "low" }} }}\n'
+                       f'[repos."{self.repo}"]\ntests = ["make test"]\nprofile = "mine"\n', encoding="utf-8")
+        dest, wt = self.tmp / "wt.toml", self.tmp / "wt"
+        replay.write_worktree_toml(src, self.repo, wt, dest)
+        written = tomllib.loads(dest.read_text(encoding="utf-8"))
+        self.assertEqual(written["profiles"], tomllib.loads(src.read_text(encoding="utf-8"))["profiles"])
+        self.assertEqual(written["repos"][str(wt)]["profile"], "mine")
+
+    def test_worktree_toml_keeps_default_profile(self):
+        src = self.tmp / "src.toml"
+        src.write_text(f'default_profile = "claude-only"\n[repos."{self.repo}"]\ntests = ["make test"]\n', encoding="utf-8")
+        dest = self.tmp / "wt.toml"
+        replay.write_worktree_toml(src, self.repo, self.tmp / "wt", dest)
+        self.assertEqual(tomllib.loads(dest.read_text(encoding="utf-8"))["default_profile"], "claude-only")
 
     def test_replay_rejects_reused_worktree_at_other_commit(self):
         (self.repo / "calc.py").write_text(CALC + "\n", encoding="utf-8")

@@ -1,5 +1,4 @@
 import re
-import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -7,7 +6,7 @@ from typing import Literal
 from cascade.config import RepoConfig
 from cascade.consensus import VERDICT_UNDECIDED, VERDICTS, WorkerResult
 from cascade.findings import Finding
-from cascade.verify import format_command, related_tests
+from cascade.verify import NO_TESTS_SKIP_TAG, format_command, related_tests, test_commands
 
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
@@ -178,14 +177,18 @@ def _carried_note(f: Finding) -> str:
     )
 
 
+def _data_text(text: str) -> str:
+    return text.replace("<<<", "‹‹‹").replace(">>>", "›››")
+
+
 def _finding_values(f: Finding, role: str, worktree: Path) -> dict[str, str]:
     return {
         "finding_id": f.id,
         "role": role,
         "severity": f.severity,
         "location": worktree_location(f.location, worktree),
-        "finding_body": f.body,
-        "evidence": f.evidence or "(없음)",
+        "finding_body": _data_text(f.body),
+        "evidence": _data_text(f.evidence or "(없음)"),
         "worktree": str(worktree),
         "doc_target": _doc_target(f, worktree),
         "carried": _carried_note(f),
@@ -203,8 +206,8 @@ def _lines(items: list[str]) -> str:
 def _code_verify_cmds(cfg: RepoConfig, worktree: Path, location: str) -> str:
     path = location_file(location)
     files = [path] if path else []
-    tests = " ".join(shlex.quote(t) for t in related_tests(worktree, files)) if files else ""
-    cmds = [c.replace("{files}", tests).rstrip() for c in cfg.tests]
+    tests = related_tests(worktree, files) if files else []
+    cmds = [cmd for _, cmd, tag in test_commands(cfg, tests) if tag != NO_TESTS_SKIP_TAG]
     formats = [format_command(c, files) for c in cfg.format] if files else list(cfg.format)
     return _lines([*cmds, *cfg.build, *cfg.typecheck, *cfg.lint, *formats])
 
@@ -325,7 +328,8 @@ def _format_verify(results: list[dict]) -> str:
         return "(돌린 검증 없음)"
     lines = []
     for r in results:
-        lines.append(f"- {r.get('cmd', '?')}: {'통과' if r.get('ok') else '실패'}")
+        status = "실행 안 함" if r.get("skipped") else "통과" if r.get("ok") else "실패"
+        lines.append(f"- {r.get('cmd', '?')}: {status}")
         tail = (r.get("tail") or "").rstrip("\n")
         if tail:
             lines.extend(f"    {line}" for line in tail.splitlines()[-_TAIL_LINES:])
@@ -353,7 +357,7 @@ def _adj_verify_cmds(cfg: RepoConfig | None, item: "AdjInput") -> str:
     return _code_verify_cmds(cfg, item.worktree, item.finding.location)
 
 
-def build_adjudicator_jobs(items: list[AdjInput]) -> dict:
+def build_adjudicator_jobs(items: list[AdjInput], cell: dict | None = None) -> dict:
     jobs = []
     for item in items:
         f = item.finding
@@ -373,7 +377,8 @@ def build_adjudicator_jobs(items: list[AdjInput]) -> dict:
             "verify_b": _format_verify(item.verify_b),
             "rules": RULES,
         }
-        jobs.append(_job(f.id, "adjudicator", _render("adjudicator.md", values)))
+        job = _job(f.id, "adjudicator", _render("adjudicator.md", values))
+        jobs.append(job | {"model": cell["model"], "effort": cell["effort"]} if cell else job)
     return {"jobs": jobs}
 
 

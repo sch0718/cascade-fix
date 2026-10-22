@@ -162,9 +162,22 @@ def user_tree_fingerprint(root: Path, run_dir: Path) -> dict:
         stash = _git(root, "rev-parse", "-q", "--verify", "refs/stash")
     except RuntimeError:
         stash = ""
+    head_ref = _git(root, "rev-parse", "--symbolic-full-name", "HEAD")
     refs = _git(root, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads")
     branches = sorted(line for line in refs.splitlines() if not line.startswith(f"refs/heads/{BRANCH_PREFIX}"))
-    return {"tree": tree, "head": head, "stash": stash, "branches": branches}
+    return {"tree": tree, "head": head, "head_ref": head_ref, "stash": stash,
+            "attached": _attached_run_worktrees(root, run_dir), "branches": branches}
+
+
+def _attached_run_worktrees(root: Path, run_dir: Path) -> list[str]:
+    wt_dir = (Path(run_dir) / "wt").resolve()
+    attached, path = [], None
+    for line in _git(root, "worktree", "list", "--porcelain").splitlines():
+        if line.startswith("worktree "):
+            path = Path(line.removeprefix("worktree ")).resolve()
+        elif line.startswith("branch ") and path is not None and path.parent == wt_dir:
+            attached.append(f"{path.name} {line.removeprefix('branch ')}")
+    return sorted(attached)
 
 
 def tree_diff_stat(root: Path, old_tree: str, new_tree: str) -> str:
@@ -176,7 +189,7 @@ def tree_diff_stat(root: Path, old_tree: str, new_tree: str) -> str:
 
 def commit_worktree(wt: Path, message: str) -> str | None:
     wt = Path(wt)
-    no_hooks = _no_hooks(wt.parent.parent)
+    no_hooks = ["-c", "core.hooksPath=/dev/null"]
     _git(wt, *no_hooks, "add", "-A")
     if _git(wt, *no_hooks, "status", "--porcelain") == "":
         return None

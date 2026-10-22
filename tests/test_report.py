@@ -1,3 +1,4 @@
+import copy
 import json
 import sys
 import tempfile
@@ -7,11 +8,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from cascade import report  # noqa: E402
+from cascade import profiles, report  # noqa: E402
 from cascade.consensus import (  # noqa: E402
     OUTCOME_ADJUDICATE,
     OUTCOME_AGREED_FACT,
     OUTCOME_AGREED_NO,
+    OUTCOME_CARRIED,
     OUTCOME_DESIGN,
     OUTCOME_HOLD,
     OUTCOME_UNDECIDABLE,
@@ -102,7 +104,23 @@ def full_ledger():
         decision("F6", OUTCOME_HOLD, None, ["제안 수준"]),
         decision("F7", OUTCOME_ADJUDICATE, None, ["패치가 다름", "판가름: 아님 — 이미 있음"]),
     ]
-    return make_ledger(findings, decisions, opinions={"F5": "Codex 의견 1\nCodex 의견 2"})
+    return make_ledger(findings, decisions, opinions={"F5": "Codex 의견 1\nCodex 의견 2"}, events=[{"step": "opinion:F5"}])
+
+
+def rerun_ledger(r2_decision, r3_decision, source="pr-comment", opinions=None, r3_events=None):
+    f = finding("r1-03", thread_id="T3", body="같은 지적")
+    r1 = RoundRecord(no=1, findings=[], decisions=[decision("r1-03", OUTCOME_HOLD, None, ["등급 선택"])],
+                     adopted=[], recheck_opened=False, hold_findings=[f])
+    r2 = RoundRecord(no=2, findings=[f], decisions=[r2_decision], adopted=[], recheck_opened=False, final=True)
+    r3 = RoundRecord(no=3, findings=[f], decisions=[r3_decision], adopted=[], recheck_opened=False, final=True,
+                     events=r3_events or [])
+    return Ledger(run_id="run-1", source=source, mode="code", root="/tmp/x", snapshot={}, dry_run=False,
+                  rounds=[r1, r2, r3], opinions=opinions or {})
+
+
+def write_round_file(run_dir, no, name, payload):
+    (run_dir / f"round-{no}").mkdir(exist_ok=True)
+    (run_dir / f"round-{no}" / name).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
 
 class RenderTest(unittest.TestCase):
@@ -126,7 +144,8 @@ class RenderTest(unittest.TestCase):
             decision("R2", OUTCOME_ADJUDICATE, None, ["판정이 갈림: a=아님, b=사실", "판가름: 아님", "판가름: 원문 그대로"]),
             decision("R3", OUTCOME_DESIGN, None, ["설계 결정 필요 여부 갈림", "판가름: 작성자가 정한다"]),
         ]
-        text = report.render(make_ledger(findings, decisions, opinions={"R1": "의견"}), dry_run=True)
+        ledger = make_ledger(findings, decisions, opinions={"R1": "의견"}, events=[{"step": "opinion:R1"}])
+        text = report.render(ledger, dry_run=True)
         table = section(text, "## 회차별 지적과 채택 경로")
         self.assertIn("| 1 | 3 | 0 | 3 | 0 | 1 | 3 |", table)
 
@@ -254,6 +273,20 @@ class RenderTest(unittest.TestCase):
         self.assertEqual(first_body, "**적용하지 않음(dry-run)**")
         self.assertNotIn("적용하지 않음(dry-run)", report.render(ledger, dry_run=False))
 
+    def test_adopt_on_both_pass_note_counts_rule_adoptions(self):
+        decisions = [
+            decision("A1", OUTCOME_AGREED_FACT, "b", ["둘 다 검증 통과: 작은 패치 b 채택"]),
+            decision("A2", OUTCOME_AGREED_FACT, "a"),
+            decision("A3", OUTCOME_UNDECIDABLE, None, ["둘 다 검증 통과: 작은 패치 a 채택", "보안 경로"]),
+        ]
+        ledger = make_ledger([finding("A1"), finding("A2"), finding("A3")], decisions)
+        self.assertNotIn("--adopt-on-both-pass", report.render(ledger, dry_run=False))
+        ledger.adopt_on_both_pass = True
+        table = section(report.render(ledger, dry_run=False), "## 회차별 지적과 채택 경로")
+        self.assertIn("| 1 | 3 | 2 | 0 | 0 | 0 | 1 |", table)
+        self.assertIn("이번 실행은 --adopt-on-both-pass 로 돌았다", table)
+        self.assertIn("이 규칙으로 채택한 지적 1건", table)
+
     def test_header_line(self):
         text = report.render(full_ledger(), dry_run=False)
         self.assertIn("출처: local · 모드: code · 검토자: Codex · 상태: 진행", text)
@@ -324,7 +357,8 @@ class RenderTest(unittest.TestCase):
         self.assertIn("확인 결과", replies)
         self.assertIn("코드에 없음", replies)
         self.assertIn("thread T4:", replies)
-        self.assertIn("검토 중입니다. 설계결정", replies)
+        self.assertIn("thread T4:\n검토 중입니다.\n", replies)
+        self.assertNotIn("설계결정", replies)
         self.assertNotIn("F5", replies)
         resolve = section(text, "### resolve 대상")
         self.assertIn("T1", resolve)
@@ -392,7 +426,7 @@ class RenderTest(unittest.TestCase):
     def test_claude_first_review_counted_in_calls(self):
         ledger = make_ledger([finding("F1")], [decision("F1", OUTCOME_AGREED_FACT, "a")], source="claude-code")
         ledger.reviewer = "claude"
-        calls = section(report.render(ledger, False), "## 호출 수와 시간")
+        calls = section(report.render(ledger, False), "## 역할별 사용량")
         self.assertIn("| Claude 첫 검토 | 1 |", calls)
         self.assertIn("| Claude 의견 | 0 |", calls)
 
@@ -417,12 +451,10 @@ class RenderTest(unittest.TestCase):
             results["F2:a"] = worker("F2", "a")
             (run_dir / "round-1" / "results.json").write_text(json.dumps(results), encoding="utf-8")
             text = report.render(ledger, False, run_dir=run_dir)
-        calls = section(text, "## 호출 수와 시간")
-        self.assertIn("| a | 2 |", calls)
-        self.assertIn("| b | 1 |", calls)
-        self.assertIn("| writer | 1 |", calls)
-        self.assertIn("| checker | 1 |", calls)
-        self.assertIn("| adjudicator | 0 |", calls)
+        calls = section(text, "## 역할별 사용량")
+        self.assertIn("| code.a | 2 |", calls)
+        self.assertIn("| code.b | 1 |", calls)
+        self.assertIn("| code.adjudicator | 0 |", calls)
         self.assertIn("| Codex 의견 | 1 |", calls)
         self.assertNotIn("첫 검토", calls)
         self.assertIn("| Codex 재검토 | 1 |", calls)
@@ -430,7 +462,7 @@ class RenderTest(unittest.TestCase):
 
     def test_elapsed_dash_when_fewer_than_two_events(self):
         text = report.render(full_ledger(), False)
-        self.assertIn("| 1 | - |", section(text, "## 호출 수와 시간"))
+        self.assertIn("| 1 | - |", section(text, "## 역할별 사용량"))
 
     def test_bucket_decisions_matches_render(self):
         ledger = full_ledger()
@@ -448,6 +480,248 @@ class RenderTest(unittest.TestCase):
                 self.assertIn(f"**{fid}**", body)
         for f, d in buckets["반박"]:
             self.assertEqual(f["id"], d["finding_id"])
+
+
+def profile_record(name="claude-only", **extra):
+    record = {"name": name, "source": "--profile", "explicit": True, "roles": copy.deepcopy(profiles.builtin(name)["roles"]),
+              "overrides": [], "substituted": [], "consented": [], "first_review": {}}
+    return {**record, **extra}
+
+
+def profile_ledger(record, mode="code", source="local", events=None, **kwargs):
+    ledger = make_ledger([finding("F1")], [decision("F1", OUTCOME_AGREED_FACT, "a")], source=source, events=events,
+                         **kwargs)
+    ledger.mode = mode
+    ledger.profile = record
+    return ledger
+
+
+def write_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+
+def job(job_id, runner="claude"):
+    return {"id": job_id, "role": job_id.rsplit(":", 1)[-1], "runner": runner}
+
+
+class RoleSectionTest(unittest.TestCase):
+    def render(self, ledger, run_dir=None):
+        return report.render(ledger, dry_run=True, run_dir=run_dir)
+
+    def test_role_section_always_present(self):
+        text = self.render(profile_ledger(profile_record()))
+        self.assertIn("## 역할 배정", text)
+        self.assertIn("프로필: claude-only (--profile)", text)
+        self.assertIn("| 역할 | runner | 모델 | effort | fallback |", text)
+        self.assertIn("| code.a | claude | claude-sonnet-5-5 | low |", text)
+
+    def test_old_ledger_report_still_renders(self):
+        ledger = make_ledger([finding("F1")], [decision("F1", OUTCOME_AGREED_FACT, "a")])
+        text = self.render(ledger)
+        self.assertIn("프로필: legacy", text)
+        self.assertIn("| code.a | claude |", text)
+        self.assertIn("## 역할별 사용량", text)
+
+    def test_table_lists_only_the_ledger_mode_cells(self):
+        code = section(self.render(profile_ledger(profile_record())), "## 역할 배정")
+        self.assertIn("| code.review |", code)
+        self.assertNotIn("| doc.", code)
+        doc = section(self.render(profile_ledger(profile_record(), mode="doc", source="claude-doc")), "## 역할 배정")
+        self.assertIn("| doc.writer | claude |", doc)
+        self.assertNotIn("| code.", doc)
+
+    def test_cell_table_shows_codex_cell_with_fallback(self):
+        text = section(self.render(profile_ledger(profile_record("local"))), "## 역할 배정")
+        self.assertIn("| code.a | codex | - | low | claude(claude-sonnet-5-5 low) |", text)
+
+    def test_overrides_and_worker_assignment_are_shown(self):
+        record = profile_record("local", overrides=["code.a ← --workers external"])
+        ledger = profile_ledger(record)
+        ledger.workers_choice = "external"
+        ledger.workers = {"a": {"runner": "codex", "model": "gpt-test", "effort": "low"},
+                          "b": {"runner": "cursor", "model": "composer-2.5", "effort": ""}}
+        text = section(self.render(ledger), "## 역할 배정")
+        self.assertIn("덮음: code.a ← --workers external", text)
+        self.assertIn("배정: A·writer=Codex(gpt-test), B·checker=Cursor(composer-2.5)", text)
+
+    def test_substitutions_are_filtered_to_the_ledger_mode(self):
+        record = profile_record("local", substituted=[
+            {"role": "code.a", "from": "codex", "to": "claude", "reason": "미설치 또는 로그인 필요"},
+            {"role": "code.b(대체)", "from": "cursor", "to": "claude", "reason": "샌드박스 점검 실패"},
+            {"role": "doc.writer", "from": "codex", "to": "claude", "reason": "미설치 또는 로그인 필요"}])
+        text = section(self.render(profile_ledger(record)), "## 역할 배정")
+        self.assertIn("code.a codex → claude — 미설치 또는 로그인 필요", text)
+        self.assertIn("code.b(대체) cursor → claude — 샌드박스 점검 실패", text)
+        self.assertNotIn("doc.writer codex", text)
+
+    def test_runtime_substitutions_are_filtered_and_listed_apart(self):
+        claude = profiles.builtin("claude-only")["roles"]
+        record = profile_record("local", substituted=[
+            {"role": "code.a", "from": "codex", "to": "claude", "reason": "미설치 또는 로그인 필요"}],
+            runtime_substitutions=[
+                {"role": "code.opinion", "from": "codex", "to": "claude", "cell": claude["code.opinion"],
+                 "reason": "이용 한도", "round": 1},
+                {"role": "doc.recheck", "from": "cursor", "to": "claude", "cell": claude["doc.recheck"],
+                 "reason": "실행 오류", "round": 1}])
+        text = section(self.render(profile_ledger(record)), "## 역할 배정")
+        runtime = section(text, "### 실행 중 대체")
+        self.assertIn("code.opinion codex → claude — 이용 한도 (회차 1)", runtime)
+        self.assertNotIn("doc.recheck", text)
+        setup = section(text, "### 배정 때 바꾼 칸")
+        self.assertIn("code.a codex → claude", setup)
+        self.assertNotIn("code.opinion", setup)
+
+    def test_first_review_history_is_shown(self):
+        first = {"role": "code.review", "requested": {"runner": "codex", "model": "", "effort": ""},
+                 "actual": {"runner": "claude", "model": "claude-fable-5-1", "effort": "high"},
+                 "fallback_reason": "한도", "attempts": [{"runner": "codex", "reason": "한도"}]}
+        text = section(self.render(profile_ledger(profile_record("local", first_review=first), source="claude-code")),
+                       "## 역할 배정")
+        self.assertIn("첫 검토 Codex → Claude(한도)", text)
+
+    def test_first_review_chain_names_every_attempt(self):
+        first = {"role": "code.review", "requested": {"runner": "codex", "model": "", "effort": ""},
+                 "actual": {"runner": "claude", "model": "claude-fable-5-1", "effort": "high"}, "fallback_reason": "오류",
+                 "attempts": [{"runner": "codex", "reason": "한도"}, {"runner": "cursor", "reason": "오류"}]}
+        text = self.render(profile_ledger(profile_record("local", first_review=first), source="claude-code"))
+        self.assertIn("첫 검토 Codex → Cursor(한도) → Claude(오류)", text)
+
+    def test_first_review_without_fallback_names_the_runner(self):
+        first = {"role": "code.review", "requested": {"runner": "codex", "model": "", "effort": ""},
+                 "actual": {"runner": "codex", "model": "", "effort": ""}, "fallback_reason": None, "attempts": []}
+        text = self.render(profile_ledger(profile_record("local", first_review=first), source="codex-code"))
+        self.assertIn("첫 검토 Codex — 대체 없음", text)
+
+    def test_in_call_external_rerun_is_listed_apart_from_runtime_substitution(self):
+        events = [{"step": "workers-stage1", "at": "t", "counts": {"limit": 1, "skipped": 1}, "fallback": ["F1:a", "F2:a"],
+                   "fallback_runs": {"F1:a": "cursor"}, "usage": {}}]
+        text = section(self.render(profile_ledger(profile_record("local"), events=events)), "## 역할 배정")
+        runtime = section(text, "### 실행 중 대체")
+        self.assertIn("회차 1 stage1: CLI 작업 2건, 대체 실행 2건(한도 1, 건너뜀 1)", runtime)
+        self.assertIn("회차 1 stage1 외부 CLI로 다시 돌림: F1:a → cursor", runtime)
+
+    def test_login_hint_survives_in_role_section(self):
+        events = [{"step": "workers-stage1", "at": "t", "counts": {"auth": 1}, "fallback": ["F1:a"], "fallback_runs": {},
+                   "usage": {}, "exhausted": {"codex": {"status": "auth", "detail": "x"}}}]
+        text = self.render(profile_ledger(profile_record("local"), events=events))
+        self.assertIn("codex login", section(text, "## 역할 배정"))
+        self.assertNotIn("cursor-agent login", text)
+
+
+class RoleUsageTest(unittest.TestCase):
+    def render(self, ledger, run_dir):
+        return report.render(ledger, dry_run=True, run_dir=run_dir)
+
+    def local_with_one_fallback(self, run_dir, mode="code"):
+        record = profile_record("local")
+        ledger = profile_ledger(record, mode=mode)
+        ledger.workers_choice = "external"
+        rd = run_dir / "round-1"
+        write_json(rd / "stage1-args.json", {"jobs": [job("F1:b"), job("F2:b")]})
+        write_json(rd / "stage1-cli-args.json", {"jobs": [job("F1:a", "codex"), job("F2:a", "codex")]})
+        write_json(rd / "stage1-cli.json", {
+            "results": [], "fallback_runs": {},
+            "outcomes": [{"id": "F1:a", "runner": "codex", "status": "limit", "output": None,
+                          "usage": {"input_tokens": 10, "output_tokens": 4}, "detail": ""},
+                         {"id": "F2:a", "runner": "codex", "status": "ok", "output": {},
+                          "usage": {"input_tokens": 12, "output_tokens": 6}, "detail": ""}],
+            "replaced": []})
+        ledger.rounds[0].events.append({"step": "workers-stage1", "at": "t", "counts": {"limit": 1, "ok": 1},
+                                        "fallback": ["F1:a"], "fallback_runs": {},
+                                        "usage": {"codex": {"input": 22, "output": 10, "cache_read": 0}}})
+        return ledger
+
+    def test_role_usage_counts_per_cell(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            text = self.render(self.local_with_one_fallback(Path(tmp)), Path(tmp))
+        usage = section(text, "## 역할별 사용량")
+        self.assertIn("| 역할 | 호출 | 대체 실행(사유) | CLI 토큰 |", usage)
+        self.assertIn("| code.a | 2 | 1(한도) |", usage)
+        self.assertIn("| code.b | 2 | 0 |", usage)
+        self.assertIn("| code.adjudicator | 0 | 0 |", usage)
+
+    def test_cli_tokens_are_attributed_to_the_cell(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            text = self.render(self.local_with_one_fallback(Path(tmp)), Path(tmp))
+        usage = section(text, "## 역할별 사용량")
+        self.assertIn("| code.a | 2 | 1(한도) | 입력 22 · 출력 10 |", usage)
+        self.assertIn("| code.b | 2 | 0 | - |", usage)
+        self.assertIn("| codex | 22 | 10 | 0 |", usage)
+
+    def test_fallback_reasons_follow_the_first_failure_when_rerun_succeeds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            ledger = self.local_with_one_fallback(run_dir)
+            cli = json.loads((run_dir / "round-1" / "stage1-cli.json").read_text(encoding="utf-8"))
+            cli["outcomes"][0] = {"id": "F1:a", "runner": "cursor", "status": "ok", "output": {}, "usage": {}, "detail": ""}
+            cli["replaced"] = [{"id": "F1:a", "runner": "codex", "status": "auth", "output": None, "usage": {}, "detail": ""}]
+            cli["fallback_runs"] = {"F1:a": {"runner": "cursor", "model": "composer-2.5", "effort": ""}}
+            write_json(run_dir / "round-1" / "stage1-cli.json", cli)
+            usage = section(self.render(ledger, run_dir), "## 역할별 사용량")
+        self.assertIn("| code.a | 2 | 1(로그인) |", usage)
+
+    def test_doc_mode_counts_use_doc_cells(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            ledger = profile_ledger(profile_record(), mode="doc", source="claude-doc")
+            write_json(run_dir / "round-1" / "results.json",
+                       {f"F1:{role}": worker("F1", role) for role in ("a", "b", "writer", "checker", "adjudicator")})
+            usage = section(self.render(ledger, run_dir), "## 역할별 사용량")
+        for key in ("doc.judge_a", "doc.judge_b", "doc.writer", "doc.checker", "doc.adjudicator"):
+            self.assertIn(f"| {key} | 1 | 0 |", usage)
+        self.assertNotIn("| code.", usage)
+
+    def test_calls_are_counted_once_when_job_files_and_results_overlap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            ledger = profile_ledger(profile_record())
+            write_json(run_dir / "round-1" / "stage1-args.json", {"jobs": [job("F1:a"), job("F1:b")]})
+            write_json(run_dir / "round-1" / "results.json", {"F1:a": worker("F1", "a"), "F1:b": worker("F1", "b")})
+            write_json(run_dir / "round-1" / "adj-args.json", {"jobs": [job("F1:adjudicator")]})
+            usage = section(self.render(ledger, run_dir), "## 역할별 사용량")
+        self.assertIn("| code.a | 1 | 0 |", usage)
+        self.assertIn("| code.adjudicator | 1 | 0 |", usage)
+
+    def test_dash_without_run_dir(self):
+        usage = section(report.render(profile_ledger(profile_record()), dry_run=True), "## 역할별 사용량")
+        self.assertIn("| code.a | - | - |", usage)
+
+    def test_first_review_row_is_named_by_the_first_review_runner_not_the_opinion_cell(self):
+        first = {"role": "code.review", "requested": {"runner": "codex", "model": "", "effort": ""},
+                 "actual": {"runner": "claude", "model": "claude-fable-5-1", "effort": "high"},
+                 "fallback_reason": "한도", "attempts": [{"runner": "codex", "reason": "한도"}]}
+        record = profile_record("local", first_review=first)
+        usage = section(report.render(profile_ledger(record, source="claude-code", opinions={"F1": "의견"}), False),
+                        "## 역할별 사용량")
+        self.assertIn("| Claude 첫 검토 | 1 | 1(한도) |", usage)
+        self.assertIn("| Codex 의견 | 1 |", usage)
+        self.assertNotIn("Codex 첫 검토", usage)
+
+    def test_first_review_row_names_an_external_first_review(self):
+        first = {"role": "code.review", "requested": {"runner": "codex", "model": "", "effort": ""},
+                 "actual": {"runner": "codex", "model": "", "effort": ""}, "fallback_reason": None, "attempts": []}
+        record = profile_record("local", first_review=first)
+        usage = section(report.render(profile_ledger(record, source="codex-code"), False), "## 역할별 사용량")
+        self.assertIn("| Codex 첫 검토 | 1 | 0 |", usage)
+
+    def test_review_rows_count_fallback_executions_with_reasons(self):
+        events = [{"step": "opinion:F1", "at": "t", "runner": "codex", "model": ""},
+                  {"step": "opinion:F2", "at": "t", "runner": "claude", "model": "claude-fable-5-1",
+                   "fallback": {"from": "codex", "to": "claude", "reason": "이용 한도"}},
+                  {"step": "recheck", "at": "t", "runner": "claude", "model": "claude-fable-5-1",
+                   "fallback": {"from": "codex", "to": "claude", "reason": "실행 오류"}}]
+        ledger = profile_ledger(profile_record("local"), events=events, opinions={"F1": "a", "F2": "b"}, recheck=True)
+        usage = section(report.render(ledger, False), "## 역할별 사용량")
+        self.assertIn("| Codex 의견 | 1 | 0 |", usage)
+        self.assertIn("| Claude 의견 | 1 | 1(이용 한도) |", usage)
+        self.assertIn("| Claude 재검토 | 1 | 1(실행 오류) |", usage)
+
+    def test_legacy_ledger_usage_without_events_keeps_old_rows(self):
+        usage = section(report.render(full_ledger(), False), "## 역할별 사용량")
+        self.assertIn("| Codex 의견 | 1 | 0 | - |", usage)
+        self.assertIn("| Codex 재검토 | 0 | 0 | - |", usage)
+        self.assertIn("| 회차 | 소요 |", usage)
 
 
 class PreparedTest(unittest.TestCase):
@@ -500,6 +774,154 @@ class PreparedTest(unittest.TestCase):
             report.write_prepared(run_dir, ledger)
             self.assertEqual(json.loads((run_dir / "prepared" / "replies.json").read_text(encoding="utf-8")), {})
             self.assertEqual(json.loads((run_dir / "prepared" / "resolve.json").read_text(encoding="utf-8")), [])
+
+
+class ReplyDraftTest(unittest.TestCase):
+    def _replies(self, findings, decisions, results=None, apply=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            if results is not None:
+                write_round_file(run_dir, 1, "results.json", results)
+            if apply is not None:
+                write_round_file(run_dir, 1, "apply.json", apply)
+            report.write_prepared(run_dir, make_ledger(findings, decisions, source="pr-comment"))
+            prepared = run_dir / "prepared"
+            return (json.loads((prepared / "replies.json").read_text(encoding="utf-8")),
+                    json.loads((prepared / "resolve.json").read_text(encoding="utf-8")))
+
+    def test_replies_hide_internal_reasons(self):
+        findings = [finding(f"F{i}", thread_id=f"T{i}", body=f"지적 {i}\n둘째 줄") for i in range(1, 8)]
+        decisions = [
+            decision("F1", OUTCOME_AGREED_FACT, "a", ["검증기 없음"]),
+            decision("F2", OUTCOME_ADJUDICATE, "adjudicator", ["패치가 다름", "판가름: b가 맞다"]),
+            decision("F3", OUTCOME_ADJUDICATE, None, ["판정이 갈림: a=사실, b=아님", "판가름: 아님", "판가름: 이미 있다"]),
+            decision("F4", OUTCOME_UNDECIDABLE, None, ["보안 경로"]),
+            decision("F5", OUTCOME_AGREED_NO, None, ["a: 짧은 a", "b: 짧은 b"]),
+            decision("F6", OUTCOME_AGREED_NO, None, ["a: 코드에 없음", "b: 코드에 없음"]),
+            decision("F7", OUTCOME_ADJUDICATE, None, ["판정이 갈림: a=사실, b=아님", "판가름: 아님"]),
+        ]
+        results = {
+            "F3:a": worker("F3", "a", "고쳐야 한다"),
+            "F3:b": worker("F3", "b", "이미 있다"),
+            "F5:a": worker("F5", "a", "A 근거 상세"),
+            "F5:b": worker("F5", "b", "B 근거 상세"),
+        }
+        replies, _ = self._replies(findings, decisions, results)
+        self.assertEqual(replies, {
+            "T1": "반영했습니다. 지적 1",
+            "T2": "반영했습니다. 지적 2",
+            "T3": "확인 결과 고치지 않았습니다. 이미 있다",
+            "T4": "검토 중입니다.",
+            "T5": "확인 결과 고치지 않았습니다. A 근거 상세 / B 근거 상세",
+            "T6": "확인 결과 고치지 않았습니다. 코드에 없음",
+            "T7": "확인 결과 고치지 않았습니다.",
+        })
+
+    def test_rebuttal_reply_prefers_adjudicator_result(self):
+        findings = [finding("F1", thread_id="T1")]
+        decisions = [decision("F1", OUTCOME_ADJUDICATE, None, ["패치가 다름", "판가름: 아님", "판가름: 짧은 판가름"])]
+        results = {"F1:adjudicator": worker("F1", "adjudicator", "판가름 상세 근거\n")}
+        replies, _ = self._replies(findings, decisions, results)
+        self.assertEqual(replies["T1"], "확인 결과 고치지 않았습니다. 판가름 상세 근거")
+
+    def test_one_thread_with_two_findings_merges_replies(self):
+        findings = [finding("F1", thread_id="T1", body="고칠 것"), finding("F2", thread_id="T1", body="아닌 것")]
+        decisions = [decision("F1", OUTCOME_AGREED_FACT, "a", []),
+                     decision("F2", OUTCOME_AGREED_NO, None, ["a: 코드에 없음", "b: 코드에 없음"])]
+        replies, resolve = self._replies(findings, decisions)
+        self.assertEqual(replies, {"T1": "> 고칠 것\n반영했습니다.\n\n> 아닌 것\n확인 결과 고치지 않았습니다. 코드에 없음"})
+        self.assertEqual(resolve, [])
+
+    def test_thread_resolved_only_when_every_finding_applied(self):
+        findings = [finding("F1", thread_id="T1", body="고칠 것 1"), finding("F2", thread_id="T1", body="고칠 것 2"),
+                    finding("F3", thread_id="T2", body="고칠 것 3"), finding("F4", thread_id="T2", body="고칠 것 4")]
+        decisions = [decision(fid, OUTCOME_AGREED_FACT, "a", []) for fid in ("F1", "F2", "F3", "F4")]
+        replies, resolve = self._replies(findings, decisions, apply={"applied": ["F1", "F2", "F3"],
+                                                                     "failed": [["F4", "충돌"]]})
+        self.assertEqual(resolve, ["T1"])
+        self.assertEqual(replies["T2"], "> 고칠 것 3\n반영했습니다.\n\n> 고칠 것 4\n적용 실패: 충돌. 검토 중입니다.")
+
+
+class RerunRoundsTest(unittest.TestCase):
+    def test_resolve_follows_final_decision(self):
+        ledger = rerun_ledger(decision("r1-03", OUTCOME_AGREED_FACT, "a", []),
+                              decision("r1-03", OUTCOME_UNDECIDABLE, None, ["둘 다 검증 실패"]))
+        text = report.render(ledger, False)
+        self.assertIn("thread T3:\n검토 중입니다.\n", section(text, "### PR 답글 초안"))
+        self.assertNotIn("- T3", section(text, "### resolve 대상"))
+        readopted = rerun_ledger(decision("r1-03", OUTCOME_UNDECIDABLE, None, ["둘 다 검증 실패"]),
+                                 decision("r1-03", OUTCOME_AGREED_FACT, "a", []))
+        self.assertIn("- T3", section(report.render(readopted, False), "### resolve 대상"))
+
+    def test_carried_finding_replaces_its_original_in_the_thread(self):
+        original = finding("r1-02", thread_id="T2", body="겹친 지적")
+        carried = {**finding("r2-01", thread_id="T2", body="겹친 지적"), "carried_from": "r1-02"}
+        r1 = RoundRecord(no=1, findings=[original], decisions=[decision("r1-02", OUTCOME_CARRIED, None, ["겹침"])],
+                         adopted=[], recheck_opened=False)
+        r2 = RoundRecord(no=2, findings=[carried], decisions=[decision("r2-01", OUTCOME_AGREED_FACT, "a", [])],
+                         adopted=["r2-01"], recheck_opened=False, final=True)
+        ledger = Ledger(run_id="run-1", source="pr-comment", mode="code", root="/tmp/x", snapshot={}, dry_run=False,
+                        rounds=[r1, r2])
+        text = report.render(ledger, False)
+        self.assertIn("thread T2:\n반영했습니다. 겹친 지적\n", section(text, "### PR 답글 초안"))
+        self.assertIn("- T2", section(text, "### resolve 대상"))
+
+    def test_reviewer_column_counts_only_round_with_opinion_event(self):
+        ledger = rerun_ledger(decision("r1-03", OUTCOME_AGREED_FACT, "a", []),
+                              decision("r1-03", OUTCOME_UNDECIDABLE, None, ["판가름 못 정함"]),
+                              source="codex-code", opinions={"r1-03": "회차 3 의견"},
+                              r3_events=[{"step": "opinion:r1-03", "at": "2026-10-17T10:00:00+00:00"}])
+        table = section(report.render(ledger, False), "## 회차별 지적과 채택 경로")
+        self.assertIn("| 2 | 1 | 1 | 0 | 0 | 0 | 0 |", table)
+        self.assertIn("| 3 | 1 | 0 | 1 | 0 | 1 | 1 |", table)
+
+    def test_apply_failure_in_later_round_keeps_earlier_applied_commit(self):
+        ledger = rerun_ledger(decision("r1-03", OUTCOME_AGREED_FACT, "a", []), decision("r1-03", OUTCOME_AGREED_FACT, "a", []))
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            write_round_file(run_dir, 2, "apply.json", {"applied": ["r1-03"], "failed": []})
+            write_round_file(run_dir, 3, "apply.json", {"applied": [], "failed": [["r1-03", "patch failed"]]})
+            report.write_prepared(run_dir, ledger)
+            prepared = run_dir / "prepared"
+            message = (prepared / "commit-message.txt").read_text(encoding="utf-8")
+            replies = json.loads((prepared / "replies.json").read_text(encoding="utf-8"))
+            resolve = json.loads((prepared / "resolve.json").read_text(encoding="utf-8"))
+        self.assertEqual(message, "fix: 같은 지적\n\n- r1-03 src/a.py:10: 같은 지적\n")
+        self.assertEqual(replies, {"T3": "적용 실패: patch failed. 검토 중입니다."})
+        self.assertEqual(resolve, [])
+
+
+class ReportMinorTest(unittest.TestCase):
+    def test_commit_bullet_without_body_has_no_trailing_space(self):
+        ledger = make_ledger([finding("F1", body=""), finding("F2", body="둘째")],
+                             [decision("F1", OUTCOME_AGREED_FACT, "a"), decision("F2", OUTCOME_AGREED_FACT, "a")])
+        bullets = [line for line in report._commit_message(ledger, {}).splitlines() if line.startswith("- ")]
+        self.assertEqual(bullets, ["- F1 src/a.py:10", "- F2 src/a.py:10: 둘째"])
+
+    def _undecidable(self, mode, adj_patch):
+        ledger = make_ledger([finding("r1-01", location="plan.md:3")],
+                             [decision("r1-01", OUTCOME_UNDECIDABLE, None, ["점검자 아니오", "판가름 패치 검증 실패"])])
+        ledger.mode = mode
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "round-1").mkdir()
+            if adj_patch:
+                (run_dir / "round-1" / "patch-r1-01-adj.diff").write_text("--- a/x\n+++ b/x\n", encoding="utf-8")
+            return section(report.render(ledger, False, run_dir=run_dir), "### 판단 불가")
+
+    def test_undecidable_patch_paths_follow_mode_and_adjudicator_patch(self):
+        doc = self._undecidable("doc", adj_patch=False)
+        self.assertIn("  - 패치 작성자: round-1/patch-r1-01-writer.diff", doc)
+        self.assertNotIn("patch-r1-01-a.diff", doc)
+        self.assertNotIn("patch-r1-01-b.diff", doc)
+        self.assertNotIn("patch-r1-01-adj.diff", doc)
+        self.assertIn("  - 패치 판가름: round-1/patch-r1-01-adj.diff", self._undecidable("doc", adj_patch=True))
+        code = self._undecidable("code", adj_patch=True)
+        self.assertIn("  - 패치 a: round-1/patch-r1-01-a.diff", code)
+        self.assertIn("  - 패치 b: round-1/patch-r1-01-b.diff", code)
+        self.assertIn("  - 패치 판가름: round-1/patch-r1-01-adj.diff", code)
+        self.assertNotIn("writer.diff", code)
+        self.assertNotIn("adj.diff", self._undecidable("code", adj_patch=False))
 
 
 class BaselineAndTimingTest(unittest.TestCase):

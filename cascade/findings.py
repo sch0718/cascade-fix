@@ -9,14 +9,18 @@ SEVERITIES = ("Critical", "Warning", "Suggestion")
 
 PR_QUERY = (
     "query($owner:String!,$repo:String!,$number:Int!){ repository(owner:$owner,name:$repo){ "
-    "pullRequest(number:$number){ reviewThreads(first:100){ nodes { id isResolved isOutdated path line startLine "
-    "comments(first:50){ nodes { id databaseId author { login } body createdAt pullRequestReview { id state } } } } } } } }"
+    "pullRequest(number:$number){ reviewThreads(first:100){ pageInfo { hasNextPage } nodes { id isResolved isOutdated path line "
+    "startLine comments(first:50){ pageInfo { hasNextPage } nodes { id databaseId author { login } body createdAt "
+    "pullRequestReview { id state } } } } } } } }"
 )
 
 _DOC_HEADER = re.compile(r"^[\s#*]*(Critical|Warning|Suggestion)[\s*:]*$")
 _DOC_ITEM = re.compile(r"^\d+\.\s+(.+?)\s*$")
 _DOC_FIELD = re.compile(r"^\s*(?:[-*]\s*)?(위치|근거|제안)\s*:\s*(.*?)\s*$")
-_CODE_ITEM = re.compile(r"^\s*-\s*\[(P\d+)\]\s*(.+)\s+—\s+(\S+)\s*$")
+_CODE_START = re.compile(r"^\s*-\s*\[P\d+\]")
+_CODE_ITEM = re.compile(r"^\s*-\s*\[(P\d+)\]\s*(.+)\s+—\s+(\S+|.+?:\d+(?:-\d+)?)\s*$")
+_PR_LABEL = re.compile(r"^\W*(Critical|Warning|Suggestion)\b", re.I)
+GH_TIMEOUT = 60
 _LABEL = re.compile(r"^(Critical|Warning|Suggestion):\s*")
 _LOCATION = re.compile(r"^(.*?):(\d+)(?:-\d+)?$")
 _EVIDENCE = re.compile(r"\*\*확인한 내용(?:\*\*:|:\*\*)\s*(.*?)(?:\n\s*\n|\Z)", re.S)
@@ -97,7 +101,7 @@ def parse_codex_doc(text, round_no):
         title = item.group(1)
         i += 1
         block = []
-        while i < len(lines) and (not lines[i].strip() or lines[i][0] in " \t"):
+        while i < len(lines) and (not lines[i].strip() or lines[i][0] in " \t" or _DOC_FIELD.match(lines[i])):
             block.append(lines[i])
             i += 1
         fields_found = {}
@@ -121,6 +125,10 @@ def parse_codex_doc(text, round_no):
             evidence=fields_found.get("근거", ""),
         ))
     return result
+
+
+def unparsed_code_items(text):
+    return [line.strip() for line in text.splitlines() if _CODE_START.match(line) and not _CODE_ITEM.match(line)]
 
 
 def parse_codex_code(text, round_no):
@@ -160,8 +168,8 @@ def parse_codex_code(text, round_no):
 
 def pr_severity(body):
     first_line = body.strip().splitlines()[0] if body.strip() else ""
-    m = re.search(r"Critical|Warning|Suggestion", first_line, re.I)
-    return m.group(0).capitalize() if m else "Warning"
+    m = _PR_LABEL.match(first_line)
+    return m.group(1).capitalize() if m else "Warning"
 
 
 def _pr_evidence(body):
@@ -183,20 +191,33 @@ def _login(comment):
     return (comment.get("author") or {}).get("login") or ""
 
 
-def fetch_pr_findings(owner, repo, number, me, gh, round_no=1):
-    proc = subprocess.run(
-        [*gh, "api", "graphql", "-f", f"query={PR_QUERY}", "-f", f"owner={owner}", "-f", f"repo={repo}", "-F", f"number={number}"],
-        capture_output=True,
-        text=True,
-    )
+def _has_next_page(connection):
+    return bool((connection.get("pageInfo") or {}).get("hasNextPage"))
+
+
+def fetch_pr_findings(owner, repo, number, me, gh, round_no=1, warnings=None):
+    try:
+        proc = subprocess.run(
+            [*gh, "api", "graphql", "-f", f"query={PR_QUERY}", "-f", f"owner={owner}", "-f", f"repo={repo}",
+             "-F", f"number={number}"],
+            capture_output=True,
+            text=True,
+            timeout=GH_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"gh graphql 호출 시간 초과({GH_TIMEOUT}초)") from None
     if proc.returncode != 0:
         raise RuntimeError(f"gh graphql 호출 실패: {proc.stderr.strip()}")
     data = json.loads(proc.stdout)
-    threads = data["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+    connection = data["data"]["repository"]["pullRequest"]["reviewThreads"]
+    if _has_next_page(connection) and warnings is not None:
+        warnings.append("경고: 리뷰 스레드가 100개를 넘는다. 앞의 100개만 읽었다")
     result = []
-    for thread in threads:
+    for thread in connection["nodes"]:
         if thread.get("isResolved"):
             continue
+        if _has_next_page(thread["comments"]) and warnings is not None:
+            warnings.append(f"경고: 스레드 {thread['id']}의 코멘트가 50개를 넘는다. 앞의 50개만 읽었다")
         comments = thread["comments"]["nodes"]
         if not comments or _is_pending(comments[0]) or _login(comments[0]) == me:
             continue

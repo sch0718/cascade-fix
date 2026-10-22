@@ -19,6 +19,8 @@ OUTCOME_CARRIED = "다음 회차"
 REASON_SENSITIVE = "보안 경로"
 REASON_NO_VERIFIER = "검증기 없음"
 REASON_SENSITIVE_NO_ADOPT = "보안 경로: 자동 채택 안 함"
+REASON_BOTH_PASS = "둘 다 검증 통과"
+REASON_TESTS_NOT_RUN = "테스트가 돌지 않음"
 VERDICTS = (VERDICT_FACT, VERDICT_NO, VERDICT_UNREPRODUCIBLE, VERDICT_UNDECIDED)
 
 
@@ -61,7 +63,7 @@ class Decision:
 
 
 def _all_ok(results: list[VerifyResult]) -> bool:
-    return all(r.ok for r in results)
+    return all(r.ok for r in results if not r.skipped)
 
 
 def _decision(a: WorkerResult, outcome: str, reasons: list[str], patch_from: str | None = None) -> Decision:
@@ -77,7 +79,7 @@ def _agree_on_verdict(a: WorkerResult, b: WorkerResult) -> Decision | None:
     _check_verdict(a)
     _check_verdict(b)
     if a.verdict == VERDICT_UNDECIDED and b.verdict == VERDICT_UNDECIDED:
-        return _decision(a, OUTCOME_UNDECIDABLE, ["호출 실패"])
+        return _decision(a, OUTCOME_UNDECIDABLE, ["둘 다 못 정함", f"a: {a.reason}", f"b: {b.reason}"])
     if a.verdict != b.verdict:
         return _decision(a, OUTCOME_ADJUDICATE, [f"판정이 갈림: a={a.verdict}, b={b.verdict}"])
     if a.verdict == VERDICT_NO:
@@ -108,24 +110,52 @@ def decide(
     pa: str,
     pb: str,
     sensitive: bool = False,
+    adopt_on_both_pass: bool = False,
 ) -> Decision:
     d = _agree_on_verdict(a, b)
     if d is None:
-        d = _decide_facts(a, va, vb, pa, pb)
+        d = _decide_facts(a, va, vb, pa, pb, adopt_on_both_pass)
     return _flag_sensitive(d, sensitive)
 
 
-def _decide_facts(a: WorkerResult, va: list[VerifyResult], vb: list[VerifyResult], pa: str, pb: str) -> Decision:
+def _decide_facts(
+    a: WorkerResult, va: list[VerifyResult], vb: list[VerifyResult], pa: str, pb: str, adopt_on_both_pass: bool
+) -> Decision:
     notes = [REASON_NO_VERIFIER] if not va or not vb else []
+    if any(r.skipped for r in (*va, *vb)):
+        notes.append(REASON_TESTS_NOT_RUN)
     a_ok = _all_ok(va)
     b_ok = _all_ok(vb)
     if a_ok and b_ok:
         if same(pa, pb):
             return _decision(a, OUTCOME_AGREED_FACT, notes, "a")
+        if adopt_on_both_pass and not notes and pa.strip() and pb.strip():
+            return _adopt_smaller(a, pa, pb)
         return _decision(a, OUTCOME_ADJUDICATE, ["패치가 다름", *notes])
     if a_ok or b_ok:
         return _decision(a, OUTCOME_ADJUDICATE, ["한쪽만 검증 통과", *notes], "a" if a_ok else "b")
     return _decision(a, OUTCOME_ADJUDICATE, ["둘 다 검증 실패"])
+
+
+def _changed_lines(diff: str) -> int:
+    count = 0
+    in_hunk = False
+    for line in diff.split("\n"):
+        if line.startswith("diff --git "):
+            in_hunk = False
+        elif line.startswith("@@"):
+            in_hunk = True
+        elif in_hunk and line.startswith(("+", "-")):
+            count += 1
+    return count
+
+
+def _adopt_smaller(a: WorkerResult, pa: str, pb: str) -> Decision:
+    size_a, size_b = _changed_lines(pa), _changed_lines(pb)
+    if size_a == size_b:
+        return _decision(a, OUTCOME_AGREED_FACT, [f"{REASON_BOTH_PASS}: 크기가 같아 a 채택"], "a")
+    pick = "a" if size_a < size_b else "b"
+    return _decision(a, OUTCOME_AGREED_FACT, [f"{REASON_BOTH_PASS}: 작은 패치 {pick} 채택"], pick)
 
 
 def decide_doc(

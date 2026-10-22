@@ -57,13 +57,38 @@ class VerifyTest(unittest.TestCase):
         self.assertTrue(all(x.ok for x in r[1:]))
         self.assertEqual(set(r[0].to_dict()), {"cmd", "ok", "tail"})
 
-    def test_run_verifiers_without_related_tests_still_runs_command(self):
+    def test_without_related_tests_runs_full_tests_once_instead(self):
         repo = make_repo(self.tmp / "repo", {"a.py": "x=1\n"})
-        cfg = RepoConfig(tests=["true {files}"])
+        cfg = RepoConfig(
+            tests=['test -z "{files}" || false {files}', "false {files}"],
+            full_tests=["echo full-ran"],
+            lint=["true"],
+        )
+        r = verify.run_worker_verifiers(repo, cfg, ["a.py"])
+        self.assertEqual([t for t, _ in r], ['test -z "{files}" || false {files}', "true"])
+        self.assertEqual(r[0][1].cmd, verify.NO_TESTS_FULL_TAG + "echo full-ran")
+        self.assertTrue(r[0][1].ok)
+        self.assertFalse(r[0][1].skipped)
+        self.assertIn("full-ran", r[0][1].tail)
+
+    def test_without_related_tests_or_full_tests_skips_and_does_not_count_as_pass(self):
+        repo = make_repo(self.tmp / "repo", {"a.py": "x=1\n"})
+        cfg = RepoConfig(tests=['touch ran; test -z "{files}" || true {files}'])
         r = verify.run_verifiers(repo, cfg, ["a.py"], "worker")
         self.assertEqual(len(r), 1)
-        self.assertTrue(r[0].ok)
+        self.assertTrue(r[0].skipped)
+        self.assertFalse(r[0].ok)
+        self.assertTrue(r[0].cmd.startswith(verify.NO_TESTS_SKIP_TAG))
         self.assertNotIn("{files}", r[0].cmd)
+        self.assertFalse((repo / "ran").exists())
+        self.assertIs(r[0].to_dict()["skipped"], True)
+
+    def test_tests_command_without_files_placeholder_runs_as_is(self):
+        repo = make_repo(self.tmp / "repo", {"a.py": "x=1\n"})
+        cfg = RepoConfig(tests=["echo suite"], full_tests=["echo full"])
+        r = verify.run_verifiers(repo, cfg, ["a.py"], "worker")
+        self.assertEqual([x.cmd for x in r], ["echo suite"])
+        self.assertFalse(r[0].skipped)
 
     def test_final_stage_runs_only_full_tests(self):
         repo = make_repo(self.tmp / "repo", {"a.py": "x=1\n"})
@@ -217,6 +242,24 @@ class VerifyTest(unittest.TestCase):
         doc.write_text("`../outside.py` `/nonexistent/abs.py` `ghost.py` http://h/x.py:3\n", encoding="utf-8")
         self.assertEqual(verify.check_doc_refs(repo, doc), ["ghost.py"])
 
+    def test_check_doc_refs_skips_new_names_and_finds_shortened_paths(self):
+        repo = make_repo(self.tmp / "repo", {
+            "20. Helm/replay-runner/values-local.yaml": "x: 1\n",
+            "docs/real.md": "r\n",
+        })
+        doc = repo / "docs" / "design.md"
+        doc.write_text(
+            "라벨 `replay.example.com/description`, `replay.example.com/display-name` 을 붙인다.\n"
+            "`values-local.yaml` 과 `replay-runner/values-local.yaml` 을 고친다.\n"
+            "DAG 노드는 `execute-left/right`, `finalize-left/right` 이다.\n"
+            "`docs/없는파일.md` 와 `docs/real.md`, `docs/없는폴더`, `ghost.yaml`, `nope/values-local.yaml` 을 본다.\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            verify.check_doc_refs(repo, doc),
+            ["docs/없는파일.md", "docs/없는폴더", "ghost.yaml", "nope/values-local.yaml"],
+        )
+
     def test_run_repro_requires_fail_before_and_pass_after(self):
         base = self.tmp / "base"
         fix = self.tmp / "fix"
@@ -227,6 +270,73 @@ class VerifyTest(unittest.TestCase):
         self.assertEqual([x.ok for x in r], [True, False, False])
         self.assertIn("수정 전 rc=1 / 수정 후 rc=0", r[0].tail)
         self.assertIn("수정 전 rc=0 / 수정 후 rc=0", r[1].tail)
+
+    def test_repro_cmds_skip_comment_lines(self):
+        bare = "**확인한 내용**: 재현\n```sh\n# 재현 절차\npytest tests/test_a.py\n```\n"
+        self.assertEqual(verify.repro_cmds(finding(bare)), ["pytest tests/test_a.py"])
+        prompted = "**확인한 내용**: 재현\n```sh\n$ # 준비\n$ pytest tests/test_a.py\n# 출력\n```\n"
+        self.assertEqual(verify.repro_cmds(finding(prompted)), ["pytest tests/test_a.py"])
+        only = "**확인한 내용**: 재현\n```sh\n# 설명만 있다\n```\n"
+        self.assertEqual(verify.repro_cmds(finding(only)), [])
+
+    def test_related_tests_parenthesized_multiline_import(self):
+        repo = make_repo(self.tmp / "repo", {
+            "pkg/__init__.py": "",
+            "pkg/mod.py": "x = 1\n",
+            "tests/test_paren.py": "from pkg import (\n    other,\n    mod,\n)\n",
+            "tests/test_paren_other.py": "from pkg import (\n    other,\n)\nmod = 1\n",
+        })
+        self.assertEqual(verify.related_tests(repo, ["pkg/mod.py"]), ["tests/test_paren.py"])
+
+    def test_related_tests_ignores_stem_in_import_comment(self):
+        repo = make_repo(self.tmp / "repo", {
+            "pkg/mod.py": "x = 1\n",
+            "tests/test_other.py": "from pkg import other  # mod 대신 other를 쓴다\n",
+            "tests/test_paren_comment.py": "from pkg import (\n    other,  # mod 대신\n)\n",
+        })
+        self.assertEqual(verify.related_tests(repo, ["pkg/mod.py"]), [])
+
+    def test_related_tests_reads_each_test_file_once(self):
+        repo = make_repo(self.tmp / "repo", {
+            "src/a.py": "x\n", "src/b.py": "x\n", "src/c.py": "x\n",
+            "tests/test_x.py": "import os\n", "tests/test_y.py": "from src import b\n",
+        })
+        reads = []
+        orig = Path.read_text
+
+        def spy(path, *args, **kwargs):
+            reads.append(path.name)
+            return orig(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", spy):
+            found = verify.related_tests(repo, ["src/a.py", "src/b.py", "src/c.py"])
+        self.assertEqual(found, ["tests/test_y.py"])
+        self.assertEqual(sorted(reads), ["test_x.py", "test_y.py"])
+
+    def test_result_tail_keeps_last_tail_chars(self):
+        repo = make_repo(self.tmp / "repo", {"a.py": "x\n"})
+        r = verify.run_commands(repo, ["python3 -c \"print('A' * 3000 + 'END')\""])
+        self.assertEqual(len(r[0].tail), verify.TAIL_CHARS)
+        self.assertTrue(r[0].tail.endswith("END\n"))
+
+    def test_run_repro_reports_timeout_as_failure(self):
+        base = self.tmp / "base"
+        fix = self.tmp / "fix"
+        base.mkdir()
+        fix.mkdir()
+        with mock.patch.object(verify, "TIMEOUT", 0.2):
+            r = verify.run_repro(base, fix, ["sleep 5"])
+        self.assertFalse(r[0].ok)
+        self.assertIn("수정 전 rc=시간 초과 / 수정 후 rc=시간 초과", r[0].tail)
+
+    def test_check_doc_refs_checks_local_paths_starting_with_http(self):
+        repo = make_repo(self.tmp / "repo", {"a.py": "x\n", "http/real.py": "x\n"})
+        doc = repo / "doc.md"
+        doc.write_text(
+            "`httpx_client.py` 와 `http/server.py`, `http/real.py` 를 본다. https://h/a.py http://h/b.py\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(verify.check_doc_refs(repo, doc), ["http/server.py", "httpx_client.py"])
 
 
 if __name__ == "__main__":

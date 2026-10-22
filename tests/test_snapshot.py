@@ -109,6 +109,21 @@ class SnapshotTest(unittest.TestCase):
         self.assertRegex(sha, r"^[0-9a-f]{40}$")
         self.assertEqual(git(repo, "rev-parse", f"{sha}^"), snap.commit)
 
+    def test_commit_worktree_outside_run_dir_skips_hooks_without_stray_dir(self):
+        repo = make_repo(self.tmp / "repo", {"a.py": "x=1\n"})
+        marker = self.tmp / "hook-ran"
+        hook = repo / ".git" / "hooks" / "post-commit"
+        hook.write_text(f"#!/bin/sh\ntouch '{marker}'\n")
+        hook.chmod(0o755)
+        wt = self.tmp / "elsewhere" / "wt"
+        wt.parent.mkdir()
+        git(repo, "-c", "core.hooksPath=/dev/null", "worktree", "add", "--detach", str(wt), "HEAD")
+        (wt / "a.py").write_text("x=2\n")
+        sha = snapshot.commit_worktree(wt, "바깥 워크트리")
+        self.assertRegex(sha, r"^[0-9a-f]{40}$")
+        self.assertFalse(marker.exists())
+        self.assertFalse((self.tmp / "no-hooks").exists())
+
     def test_cleanup_removes_branch_and_worktrees(self):
         repo = make_repo(self.tmp / "repo", {"a.py": "x=1\n"})
         snap = snapshot.create_snapshot(repo, "run1", [])
@@ -232,6 +247,14 @@ class SnapshotTest(unittest.TestCase):
         new_wt = snapshot.add_worktree(snap, "new", new)
         self.assertEqual((old_wt / "a.py").read_text(), "x=1\n")
         self.assertEqual((new_wt / "a.py").read_text(), "x=2\n")
+
+    def test_make_repo_ignores_global_gpgsign(self):
+        global_cfg = self.tmp / "gitconfig"
+        global_cfg.write_text("[commit]\n\tgpgsign = true\n[gpg]\n\tprogram = false\n")
+        with mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(global_cfg), "GIT_CONFIG_NOSYSTEM": "1"}):
+            repo = make_repo(self.tmp / "repo", {"a.py": "x=1\n"})
+        self.assertEqual(git(repo, "config", "--local", "commit.gpgsign"), "false")
+        self.assertRegex(git(repo, "rev-parse", "HEAD"), r"^[0-9a-f]{40}$")
 
 if __name__ == "__main__":
     unittest.main()

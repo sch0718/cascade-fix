@@ -99,10 +99,147 @@ sys.exit(int(os.environ.get("FAKE_CODEX_EXIT", "0")))
 '''
 
 CURSOR_BODY = _COMMON + r'''
+def cursor_entry(n, workspace):
+    responses = json.loads(os.environ.get("FAKE_CURSOR_RESULTS", '[""]'))
+    matched = [e for e in responses if isinstance(e, dict) and e.get("match") and e["match"] in workspace]
+    plain = [e for e in responses if not (isinstance(e, dict) and "match" in e)] or [""]
+    entry = matched[0] if matched else plain[min(n, len(plain)) - 1]
+    return {"result": entry} if isinstance(entry, str) else entry
+
+
+def acp_send(message):
+    print(json.dumps({"jsonrpc": "2.0", **message}, ensure_ascii=False), flush=True)
+
+
+def acp_options(values):
+    models = json.loads(os.environ.get("FAKE_ACP_MODELS", '["auto-smart", "composer-2.5"]'))
+    return [{"id": key, "currentValue": value, "options": [{"value": m} for m in models] if key == "model" else []}
+            for key, value in values.items()]
+
+
+def acp_chunk(session, text):
+    acp_send({"method": "session/update", "params": {"sessionId": session, "update": {
+        "sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": text}}}})
+
+
+def acp_client_request(method, params):
+    acp_send({"id": "server-request", "method": method, "params": params})
+    return json.loads(sys.stdin.readline())
+
+
+def acp_linger():
+    import subprocess
+    code = ("import os, pathlib, signal, time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "home = pathlib.Path(os.environ['HOME'])\n"
+            "(home / 'linger.pid').write_text(str(os.getpid()))\n"
+            "end = time.monotonic() + 30\n"
+            "while time.monotonic() < end:\n"
+            "    (home / 'Library' / 'linger').mkdir(parents=True, exist_ok=True)\n"
+            "    time.sleep(0.01)\n")
+    subprocess.Popen([sys.executable, "-c", code], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL)
+    while not (Path(os.environ["HOME"]) / "linger.pid").exists():
+        time.sleep(0.01)
+
+
+def acp_prompt(server, request, session, state):
+    text = request["params"]["prompt"][0]["text"]
+    m = claim("acp-prompt")
+    record = {"server": server, "pid": os.getpid(), "sessionId": session, "cwd": state["cwd"], "prompt": text,
+              "mcpServers": state["mcpServers"], "values": dict(state["values"])}
+    mutate(state["cwd"])
+    sleep = float(os.environ.get("FAKE_CURSOR_SLEEP", "0"))
+    if sleep:
+        time.sleep(sleep)
+    entry = cursor_entry(m, state["cwd"])
+    sys.stderr.write(entry.get("stderr", ""))
+    sys.stderr.flush()
+    if "stdout" in entry:
+        sys.stderr.write(entry["stdout"])
+        sys.stderr.flush()
+        (log / f"acp-prompt-{m}.json").write_text(json.dumps(record, ensure_ascii=False))
+        sys.exit(entry.get("exit", 1))
+    if os.environ.get("FAKE_ACP_TOOL"):
+        acp_chunk(session, "파일을 읽겠습니다")
+        acp_send({"method": "session/update", "params": {"sessionId": session, "update": {
+            "sessionUpdate": "tool_call", "toolCallId": "tool-1", "status": "pending"}}})
+        options = json.loads(os.environ.get("FAKE_ACP_PERMISSION_OPTIONS", "null")) or [
+            {"optionId": "allow-once", "kind": "allow_once"}, {"optionId": "allow-always", "kind": "allow_always"},
+            {"optionId": "reject-once", "kind": "reject_once"}]
+        record["permission_response"] = acp_client_request(
+            "session/request_permission", {"sessionId": session, "toolCall": {"kind": "execute"}, "options": options})
+    if os.environ.get("FAKE_ACP_CLIENT_REQ"):
+        record["client_response"] = acp_client_request("fs/read_text_file", {"sessionId": session, "path": "/secret"})
+    (log / f"acp-prompt-{m}.json").write_text(json.dumps(record, ensure_ascii=False))
+    if entry.get("is_error") or entry.get("exit"):
+        message = entry.get("result", "") if entry.get("is_error") else f"exit {entry['exit']}"
+        if entry.get("echo_prompt"):
+            message = f"{message}\n{text}"
+        acp_send({"id": request["id"], "error": {"code": -32603, "message": message}})
+        return
+    answer = entry.get("result", "")
+    for offset in range(0, len(answer), 11):
+        acp_chunk(session, answer[offset:offset + 11])
+    acp_send({"id": request["id"], "result": {"stopReason": entry.get("stop", "end_turn")}})
+
+
+def run_acp():
+    server = claim("cursor-acp")
+    home = Path(os.environ["HOME"])
+    (log / f"cursor-acp-{server}.env.json").write_text(json.dumps({
+        k: os.environ.get(k) for k in ("HOME", "PYENV_ROOT", "UV_CACHE_DIR", "XDG_CACHE_HOME", "npm_config_cache")}))
+    (log / f"cursor-acp-{server}.pid").write_text(str(os.getpid()))
+    config = home / ".cursor" / "cli-config.json"
+    if config.is_file():
+        (log / f"cursor-acp-{server}.config.json").write_text(config.read_text())
+    if os.environ.get("FAKE_ACP_LINGER"):
+        acp_linger()
+    sessions = {}
+    for line in sys.stdin:
+        request = json.loads(line)
+        method, params = request.get("method"), request.get("params", {})
+        if method == "initialize":
+            (log / f"cursor-acp-{server}.initialize.json").write_text(json.dumps(params))
+            if os.environ.get("FAKE_ACP_INIT_ERROR"):
+                acp_send({"id": request["id"], "error": {"code": -32603, "message": os.environ["FAKE_ACP_INIT_ERROR"]}})
+                continue
+            result = {"protocolVersion": 1}
+        elif method == "session/new":
+            session = f"{os.getpid()}-s{len(sessions) + 1}"
+            sessions[session] = {"cwd": params.get("cwd"), "mcpServers": params.get("mcpServers"),
+                                 "values": {"mode": "agent", "model": "auto-smart"}}
+            result = {"sessionId": session, "configOptions": acp_options(sessions[session]["values"])}
+        elif method == "session/set_config_option":
+            values = sessions[params["sessionId"]]["values"]
+            key, value = params["configId"], params["value"]
+            models = json.loads(os.environ.get("FAKE_ACP_MODELS", '["auto-smart", "composer-2.5"]'))
+            if key == "model" and value not in models:
+                acp_send({"id": request["id"], "error": {"code": -32602, "message": f"Invalid model value: {value}"}})
+                continue
+            if key != os.environ.get("FAKE_ACP_IGNORE_CONFIG"):
+                values[key] = value
+                if key == "model":
+                    values["fast"] = "true"
+            result = {"configOptions": acp_options(values)}
+        elif method == "session/prompt":
+            acp_prompt(server, request, params["sessionId"], sessions[params["sessionId"]])
+            continue
+        elif "id" in request and "method" not in request:
+            continue
+        else:
+            acp_send({"id": request["id"], "error": {"code": -32601, "message": "지원하지 않는다"}})
+            continue
+        acp_send({"id": request["id"], "result": result})
+    sys.exit(0)
+
+
 if sys.argv[1:] == ["status"]:
     claim("cursor-status")
     print(os.environ.get("FAKE_CURSOR_STATUS", "✓ Logged in as tester@example.com"))
     sys.exit(0)
+if sys.argv[1:] == ["acp"]:
+    run_acp()
 n = claim("cursor-agent")
 stamp("cursor-agent", n, "start")
 home = Path(os.environ["HOME"])
@@ -118,12 +255,7 @@ if sleep:
     time.sleep(sleep)
 workspace = sys.argv[sys.argv.index("--workspace") + 1]
 mutate(workspace)
-responses = json.loads(os.environ.get("FAKE_CURSOR_RESULTS", '[""]'))
-matched = [e for e in responses if isinstance(e, dict) and e.get("match") and e["match"] in workspace]
-plain = [e for e in responses if not (isinstance(e, dict) and "match" in e)] or [""]
-entry = matched[0] if matched else plain[min(n, len(plain)) - 1]
-if isinstance(entry, str):
-    entry = {"result": entry}
+entry = cursor_entry(n, workspace)
 if "stdout" in entry:
     sys.stdout.write(entry["stdout"])
 else:
