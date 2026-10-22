@@ -81,6 +81,15 @@ class ClassifyInputTest(unittest.TestCase):
         self.assertEqual(detect.classify_input(code), ("cursor-code", 1))
 
 
+    def test_cf_review_folder_reads_the_actual_runner_from_review_meta(self):
+        meta = self.tmp / "review-meta.json"
+        for runner, loc, expected in (("cursor", "app.py:1", "cursor-code"), ("cursor", "plan.md:3", "cursor-doc"),
+                                      ("claude", "app.py:1", "claude-code")):
+            with self.subTest(runner=runner, loc=loc):
+                meta.write_text(json.dumps({"actual": {"runner": runner}}), encoding="utf-8")
+                result = self.write("review.out.final", SECTIONED.format(title="틀렸다", loc=loc))
+                self.assertEqual(detect.classify_input(result)[0], expected)
+
 class DetectCliTest(unittest.TestCase):
     def setUp(self):
         self._td = tempfile.TemporaryDirectory()

@@ -16,6 +16,7 @@ from cascade.review import (
     CURSOR_SOURCES,
     REVIEWER_AUTO,
     REVIEWER_CLAUDE,
+    REVIEW_META,
     label,
     read_review_results,
 )
@@ -169,12 +170,22 @@ def classify_input(path: Path) -> tuple[str | None, int]:
 
     Claude·Cursor 검토 결과와 codex-doc 결과는 같은 Critical/Warning/Suggestion 형식이라 형식으로는 못 가른다.
     지적 위치가 모두 문서 파일이면 문서 모드, 코드 파일이 하나라도 있으면 코드 모드로 본다.
-    파일명이 cursor-review 로 시작하면(cursor-review 스킬의 기본 이름) 같은 모드의 cursor-* 로 본다.
+    파일명이 cursor-review 로 시작하거나(cursor-review 스킬의 기본 이름) CF review 폴더의 review-meta.json이
+    실제 runner를 cursor로 적었으면 같은 모드의 cursor-* 로 본다.
     """
     source, found = _classify_format(path)
-    if path.name.startswith(CURSOR_RESULT_PREFIX):
+    if path.name.startswith(CURSOR_RESULT_PREFIX) or _review_meta_runner(path) == RUNNER_CURSOR:
         source = CURSOR_SOURCE_BY_FORMAT.get(source, source)
     return source, found
+
+
+def _review_meta_runner(path: Path) -> str | None:
+    meta = path.parent / REVIEW_META
+    try:
+        actual = json.loads(meta.read_text(encoding="utf-8")).get("actual") if meta.is_file() else None
+    except (OSError, ValueError, AttributeError):
+        return None
+    return actual.get("runner") if isinstance(actual, dict) else None
 
 
 def _classify_format(path: Path) -> tuple[str | None, int]:
