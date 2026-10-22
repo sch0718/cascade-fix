@@ -9,6 +9,9 @@ LEGACY_PROFILE = "legacy"
 UNKNOWN_PROFILE = "프로필 불명"
 STOP_RUNS, STOP_PATCHES = 10, 50
 REACHED_RUNS, REACHED_PATCHES, REACHED_BOTH = "runs", "patches", "both"
+SKIP_DRY_RUN = "dry-run 실행이라 세지 않는다"
+SKIP_UNREADABLE = "읽지 못한 실행이라 프로필을 알 수 없다"
+SKIP_NOT_IN_RUNS = "--runs에 없는 실행이다"
 TABLE_COLUMNS = (("프로필", "---"), ("실행", "---:"), ("dry-run 제외", "---:"), ("채택 패치", "---:"), ("간섭 회귀 실행", "---:"),
                  ("회귀 회차", "---:"), ("기준선도 실패", "---:"), ("되돌림", "---:"), ("회귀", "---:"))
 
@@ -17,11 +20,22 @@ class RegressError(Exception):
     pass
 
 
-def read_json(path: Path):
+class Result(dict):
+    def __init__(self, stop_runs: int, stop_patches: int):
+        super().__init__()
+        self.errors: list[str] = []
+        self.warnings: list[str] = []
+        self.stop = {"runs": stop_runs, "patches": stop_patches}
+
+    def to_dict(self) -> dict:
+        return {"profiles": dict(self), "errors": self.errors, "warnings": self.warnings, "stop": self.stop}
+
+
+def read_json(path: Path, run_id: str):
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
-        raise RegressError(f"{path.parent.name}: {path.name}을 읽지 못했다 ({exc})") from None
+        raise RegressError(f"{run_id}: {path.parent.name}/{path.name}을 읽지 못했다 ({exc})") from None
 
 
 def profile_name(ledger: dict) -> str:
@@ -37,12 +51,12 @@ def check_apply(run_id: str, apply) -> dict:
 
 
 def load_folder(folder: Path) -> dict:
-    ledger = read_json(folder / "ledger.json")
+    ledger = read_json(folder / "ledger.json", folder.name)
     if not isinstance(ledger, dict):
         raise RegressError(f"{folder.name}: ledger.json이 객체가 아니다")
     run = {"id": folder.name, "ledger": ledger, "applies": []}
     if not ledger.get("dry_run"):
-        run["applies"] = [check_apply(folder.name, read_json(path)) for path in sorted(folder.glob("round-*/apply.json"))]
+        run["applies"] = [check_apply(folder.name, read_json(path, folder.name)) for path in sorted(folder.glob("round-*/apply.json"))]
     return run
 
 
@@ -89,58 +103,61 @@ def revert_run_id(row) -> str:
     return row["run"]
 
 
-def add_unknown_revert(r: dict, hits: dict[str, set[str]], run_id: str, reason: str) -> None:
-    r["_warnings"].append(f"되돌림의 run {run_id}: {reason}. {UNKNOWN_PROFILE}으로 센다")
+def add_unknown_revert(r: Result, hits: dict[str, set[str]], run_id: str, reason: str) -> None:
+    r.warnings.append(f"되돌림의 run {run_id}: {reason}. {UNKNOWN_PROFILE}으로 센다")
     r.setdefault(UNKNOWN_PROFILE, new_stats(False))["reverts"] += 1
     hits.setdefault(UNKNOWN_PROFILE, set()).add(run_id)
 
 
-def apply_reverts(r: dict, reverts: list, ids: dict[str, str], dry_ids: set[str], hits: dict[str, set[str]]) -> None:
+def apply_reverts(r: Result, reverts: list, ids: dict[str, str], skipped: dict[str, str], hits: dict[str, set[str]]) -> None:
     for row in reverts:
         try:
             run_id = revert_run_id(row)
         except RegressError as exc:
-            r["_errors"].append(str(exc))
+            r.errors.append(str(exc))
             continue
         if run_id in ids:
             r[ids[run_id]]["reverts"] += 1
             hits[ids[run_id]].add(run_id)
+        elif skipped.get(run_id) == SKIP_DRY_RUN:
+            r.warnings.append(f"되돌림의 run {run_id}: dry-run 실행이라 세지 않는다")
         else:
-            add_unknown_revert(r, hits, run_id, "dry-run 실행이라 세지 않는다" if run_id in dry_ids else "--runs에 없는 실행이다")
+            add_unknown_revert(r, hits, run_id, skipped.get(run_id, SKIP_NOT_IN_RUNS))
 
 
-def compute(runs: list, reverts=None, *, stop_runs: int = STOP_RUNS, stop_patches: int = STOP_PATCHES) -> dict:
-    r = {"_errors": [], "_warnings": [], "_stop": {"runs": stop_runs, "patches": stop_patches}}
+def entry_id(entry) -> str:
+    return str(entry.get("id", "?")) if isinstance(entry, dict) else Path(entry).name
+
+
+def compute(runs: list, reverts=None, *, stop_runs: int = STOP_RUNS, stop_patches: int = STOP_PATCHES) -> Result:
+    r = Result(stop_runs, stop_patches)
     ids: dict[str, str] = {}
-    dry_ids: set[str] = set()
+    skipped: dict[str, str] = {}
     hits: dict[str, set[str]] = {}
     for entry in runs:
         try:
             run = load_run(entry)
-            if run["id"] in ids or run["id"] in dry_ids:
+            if run["id"] in ids or run["id"] in skipped:
                 raise RegressError(f"{run['id']}: 같은 이름의 실행 폴더가 이미 있다(run id가 겹친다)")
         except RegressError as exc:
-            r["_errors"].append(str(exc))
+            r.errors.append(str(exc))
+            skipped.setdefault(entry_id(entry), SKIP_UNREADABLE)
             continue
         name = profile_name(run["ledger"])
         stats = r.setdefault(name, new_stats(True))
         hits.setdefault(name, set())
         if run["ledger"].get("dry_run"):
             stats["dry_run_excluded"] += 1
-            dry_ids.add(run["id"])
+            skipped[run["id"]] = SKIP_DRY_RUN
             continue
         ids[run["id"]] = name
         if add_run(stats, run, stop_runs, stop_patches):
             hits[name].add(run["id"])
-    apply_reverts(r, reverts or [], ids, dry_ids, hits)
+    apply_reverts(r, reverts or [], ids, skipped, hits)
     for name, found in hits.items():
         r[name]["regression_runs"] = sorted(found)
         r[name]["regressions"] = len(found)
     return r
-
-
-def profiles_of(r: dict) -> list[str]:
-    return [name for name in r if not name.startswith("_")]
 
 
 def table_row(cells) -> str:
@@ -168,10 +185,10 @@ def progress_line(name: str, s: dict, stop: dict) -> str:
 
 
 def render(r: dict) -> str:
-    names = profiles_of(r)
+    names = list(r)
     header = [table_row(name for name, _ in TABLE_COLUMNS), table_row(align for _, align in TABLE_COLUMNS)]
     rows = [table_row(stats_cells(name, r[name])) for name in names]
-    progress = [progress_line(name, r[name], r["_stop"]) for name in names if "stop" in r[name]]
+    progress = [progress_line(name, r[name], r.stop) for name in names if "stop" in r[name]]
     notes = ["회귀 = 전체 검사 회귀가 있었던 실행 ∪ 되돌림이 있었던 실행(합집합 크기, 기준선도 실패한 실행은 제외)"]
     return "\n".join([*header, *rows, "", "종료 조건 진행(먼저 닿은 쪽에서 멈춘다)", "", *progress, "", *notes, ""])
 
@@ -210,19 +227,19 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     rows, errors = load_reverts(args.reverts) if args.reverts else ([], [])
     r = compute(args.runs, rows, stop_runs=args.stop_runs, stop_patches=args.stop_patches)
-    r["_errors"] = [*errors, *r["_errors"]]
+    r.errors = [*errors, *r.errors]
     print(render(r))
-    for message in r["_warnings"]:
+    for message in r.warnings:
         print(f"경고: {message}", file=sys.stderr)
-    for message in r["_errors"]:
+    for message in r.errors:
         print(f"오류: {message}", file=sys.stderr)
     if args.json:
         try:
-            Path(args.json).write_text(json.dumps(r, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            Path(args.json).write_text(json.dumps(r.to_dict(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         except OSError as exc:
             print(f"--json 파일을 쓰지 못했다: {args.json} ({exc})", file=sys.stderr)
             return 1
-    return 1 if r["_errors"] else 0
+    return 1 if r.errors else 0
 
 
 if __name__ == "__main__":

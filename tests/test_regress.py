@@ -104,14 +104,32 @@ class ComputeTest(RegressTestBase):
         r = regress.compute([run], reverts=[{"run": "elsewhere", "finding": "r1-01", "reason": "버그"}])
         self.assertEqual(r["local"]["regressions"], 0)
         self.assertEqual(r[regress.UNKNOWN_PROFILE]["regressions"], 1)
-        self.assertTrue(any("elsewhere" in w for w in r["_warnings"]))
+        self.assertTrue(any("elsewhere" in w for w in r.warnings))
         self.assertIn(regress.UNKNOWN_PROFILE, regress.render(r))
 
-    def test_revert_for_dry_run_is_not_counted_as_regression_of_profile(self):
+    def test_revert_for_dry_run_is_a_warning_only(self):
         run = self.make("dry", round_of(1, OK), dry_run=True)
         r = regress.compute([run], reverts=[{"run": "dry", "finding": "r1-01", "reason": "버그"}])
-        self.assertEqual(r["local"]["regressions"], 0)
+        self.assertEqual((r["local"]["regressions"], r["local"]["reverts"]), (0, 0))
+        self.assertNotIn(regress.UNKNOWN_PROFILE, r)
+        self.assertTrue(any("dry" in w and "dry-run 실행이라 세지 않는다" in w for w in r.warnings))
+
+    def test_revert_for_unreadable_run_says_so_and_counts_as_unknown(self):
+        bad = self.runs / "bad"
+        bad.mkdir()
+        r = regress.compute([bad], reverts=[{"run": "bad", "finding": "r1-01", "reason": "버그"}])
         self.assertEqual(r[regress.UNKNOWN_PROFILE]["regressions"], 1)
+        [warning] = r.warnings
+        self.assertIn("읽지 못한 실행", warning)
+        self.assertNotIn("--runs에 없는", warning)
+
+    def test_profile_named_with_underscore_is_listed_and_does_not_collide(self):
+        run = self.make("x", round_of(1, INTERFERENCE), profile={"name": "_errors"})
+        r = regress.compute([run, self.runs / "missing"])
+        self.assertEqual(r["_errors"]["regressions"], 1)
+        self.assertEqual(len(r.errors), 1)
+        self.assertIn("| _errors |", regress.render(r))
+        self.assertEqual(r.to_dict()["profiles"]["_errors"]["runs"], 1)
 
     def test_run_without_apply_json_counts_zero(self):
         run = self.make("plain", {"no": 1, "decisions": []})
@@ -126,13 +144,22 @@ class ComputeTest(RegressTestBase):
         missing = self.runs / "missing"
         r = regress.compute([bad, missing, good])
         self.assertEqual(r["local"]["regressions"], 1)
-        self.assertEqual(len(r["_errors"]), 2)
-        self.assertTrue(all("ledger.json" in e for e in r["_errors"]))
+        self.assertEqual(len(r.errors), 2)
+        self.assertTrue(all("ledger.json" in e for e in r.errors))
+
+    def test_broken_apply_json_is_an_error_item_with_run_id(self):
+        run = self.make("odd", round_of(1, OK))
+        (run / "round-1" / "apply.json").write_text("{깨짐", encoding="utf-8")
+        r = regress.compute([run])
+        [error] = r.errors
+        self.assertIn("odd", error)
+        self.assertIn("round-1/apply.json", error)
+        self.assertNotIn("local", r)
 
     def test_malformed_apply_applied_is_an_error_item(self):
         run = self.make("odd", round_of(1, {"applied": "r1-01", "final_ok": True}))
         r = regress.compute([run])
-        self.assertEqual(len(r["_errors"]), 1)
+        self.assertEqual(len(r.errors), 1)
         self.assertNotIn("local", r)
 
     def test_duplicate_run_folder_name_is_an_error_item(self):
@@ -142,7 +169,7 @@ class ComputeTest(RegressTestBase):
         first = self.make("ok", round_of(1, OK))
         r = regress.compute([first, Path(other.name) / "ok"])
         self.assertEqual(r["local"]["runs"], 1)
-        self.assertEqual(len(r["_errors"]), 1)
+        self.assertEqual(len(r.errors), 1)
 
     def test_runs_accepts_preloaded_dicts(self):
         loaded = {"id": "pre", "ledger": {"profile": LOCAL}, "applies": [INTERFERENCE]}
@@ -207,7 +234,8 @@ class RenderAndMainTest(RegressTestBase):
         self.assertEqual(code, 0)
         self.assertIn("| local |", out)
         data = json.loads(out_json.read_text(encoding="utf-8"))
-        self.assertEqual(data["local"]["regressions"], 1)
+        self.assertEqual(data["profiles"]["local"]["regressions"], 1)
+        self.assertEqual((data["errors"], data["warnings"], data["stop"]), ([], [], {"runs": 10, "patches": 50}))
 
     def test_main_reports_broken_run_in_korean_and_exits_one(self):
         good = self.make("good", round_of(1, OK))
