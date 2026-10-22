@@ -115,7 +115,7 @@ PYTHONPATH="${CLAUDE_SKILL_DIR}" python3 -m cascade.cli
 첫 검토 칸의 runner가 codex·cursor면 `CF review`는 Claude 작업을 만들지 않고 「다음:」에 `RR`·`CR` 명령과 그 결과로 이어 갈 init 줄(`--source codex-*`·`cursor-*`, `--input <review_dir>/review.out.final`)을 출력한다.
 
 1. **review** — 위와 같은 `CF review …`. 이 칸에 `--review-model`·`--review-effort`를 주면 종료 코드 5로 거절한다(두 옵션은 claude 칸에만 쓴다). 출력의 `검토자:` 줄이 실제 runner다. 쓸 수 없는 runner(미설치·검토 스크립트 없음)나 동의 밖 수신처면 `대체: <칸> codex → … — <사유>`와 함께 fallback으로 바뀐 명령이 나온다.
-2. **RR·CR** — 출력된 명령을 그대로 돌린다. codex 코드 모드는 `cd <저장소 루트> && RR …` 형태다. 한 번에 하나씩 돌린다(「규칙」).
+2. **RR·CR** — 출력된 명령을 그대로 돌린다. codex 코드 모드는 `cd <저장소 루트> && RR …` 형태다. 이 모드는 `--focus`를 받지 못해 명령에서 빼고 경고한다. 한 번에 하나씩 돌린다(「규칙」).
 3. **실패하면** — 결과(`review.out.final`)가 없으면 로그(`review.out`) 끝을 본다.
    - 한도(이용 한도·`CR` 종료 코드 75)·시간 초과·실행 오류: 멈추지 않고 `CF review --review-dir <처음 review_dir> --fallback-from <실패한 runner> --reason <사유>`를 돌린다(동의 범위와 작업자 옵션은 처음 `CF review`에 준 `--consent`·`--workers`·`--cursor-model`이 `review-meta.json`에 남아 이어지므로 다시 주지 않는다). `--fallback-from`은 마지막으로 시도한 runner(`codex`·`cursor`)와 같아야 한다. 사유 기본값은 「실행 오류」다. 같은 폴더에 fallback 칸의 작업이 만들어지고 새 「다음:」이 나온다. 그 칸의 fallback도 외부 CLI면 또 실패할 수 있고, 그러면 같은 명령으로 이어 간다(예: codex → cursor → claude). 동의 밖이거나 이미 실패한 runner로는 가지 않는다. 마지막은 Claude(`claude-only` 값)다.
    - 로그인 만료(401·refresh token, `CR` 종료 코드 77): 대체하지 않고 멈춘다. 사용자에게 `codex login`(Cursor는 `cursor-agent login`)을 하라고 알리고 로그인 뒤 그 `RR`·`CR`부터 다시 돌린다.

@@ -67,6 +67,7 @@ from cascade.review import (
     REVIEWER_CURSOR,
     build_review_prompt,
     claude_prompt,
+    codex_code_review,
     first_review_command,
     label,
     load_text,
@@ -643,6 +644,8 @@ def _emit_first_review(args, review_dir: Path, meta: dict, new_attempts: list[di
         to = new_attempts[i + 1]["runner"] if i + 1 < len(new_attempts) else actual["runner"]
         print(f"대체: {key} {attempt['runner']} → {to} — {attempt['reason']}")
     print(f"검토자: {reviewer}")
+    if scope["focus"] and codex_code_review(actual, scope):
+        print("경고: Codex 코드 검토는 --focus를 받지 못한다(codex review는 범위와 지시문을 함께 받지 않는다). 관점 없이 검토한다")
     if meta["explicit"]:
         carried = f" --profile {shlex.quote(meta['profile'])}"
     else:

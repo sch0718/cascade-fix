@@ -872,6 +872,14 @@ class FirstReviewTest(ExternalWorkersBase):
         self.assertEqual(self.meta(review_dir)["role"], "doc.review")
         self.assertEqual(self.meta(review_dir)["args"]["docs"], [str(self.repo / "plan.md")])
 
+    def test_codex_code_review_warns_that_focus_is_dropped(self):
+        p = self.review("--profile", "local", "--focus", "보안")
+        self.assertIn("경고: Codex 코드 검토는 --focus를 받지 못한다", p.stdout)
+        self.assertNotIn("--focus", self.next_lines(p)[0])
+        p = self.review("--profile", "cursor-first", "--focus", "보안")
+        self.assertNotIn("경고:", p.stdout)
+        self.assertIn("--focus", self.next_lines(p)[0])
+
     def test_review_cursor_cell_prints_cr_with_model(self):
         p = self.review("--profile", "cursor-first", "--uncommitted", scope=())
         command = self.next_lines(p)[0]
@@ -1249,7 +1257,7 @@ class FirstReviewCommandTest(unittest.TestCase):
         command, _ = review.first_review_command(codex, {**args, "base": None, "uncommitted": True, "focus": "보안"},
                                                  Path("/d"))
         self.assertTrue(command.startswith("cd '/r p' && "), command)
-        self.assertIn(" --uncommitted --focus ", command)
+        self.assertNotIn("--focus", command)
         docs = {**args, "kind": "doc", "base": None, "docs": ["/a.md", "/b c.md"]}
         command, _ = review.first_review_command(codex, docs, Path("/d"))
         self.assertIn(" --doc /a.md --doc '/b c.md' --repo ", command)

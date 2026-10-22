@@ -60,12 +60,18 @@ def first_review_command(cell: dict, args: dict, review_dir: Path) -> tuple[str,
     else:
         scope = f"--base {shlex.quote(args['base'])}"
     out = Path(review_dir) / REVIEW_OUT
-    command = (f"{shlex.quote(str(script))} {scope}" + (f" --focus {shlex.quote(args['focus'])}" if args["focus"] else "")
+    focus = args["focus"] and not codex_code_review(cell, args)
+    command = (f"{shlex.quote(str(script))} {scope}" + (f" --focus {shlex.quote(args['focus'])}" if focus else "")
                + f" --repo {shlex.quote(args['root'])} --out {shlex.quote(str(out))}"
                + (f" --model {shlex.quote(cell['model'])}" if cursor and cell["model"] else ""))
-    if args["kind"] == "code" and not cursor:
+    if codex_code_review(cell, args):
         command = f"cd {shlex.quote(args['root'])} && {command}"  # codex-review의 코드 모드는 --repo를 무시하고 현재 디렉터리를 본다
     return command, f"{out}.final"
+
+
+def codex_code_review(cell: dict, args: dict) -> bool:
+    """codex-review의 코드 모드(`codex review`)는 범위와 지시문을 함께 받지 못해 --focus를 쓰지 못한다."""
+    return args["kind"] == "code" and cell["runner"] == REVIEWER_CODEX
 
 
 def claude_prompt(prompt: str, repo: str | Path) -> str:
