@@ -1,4 +1,5 @@
 import difflib
+import os
 import shutil
 from pathlib import Path
 
@@ -43,7 +44,11 @@ def compare(name: str, target: Path) -> tuple[str, list[str]]:
             states.append(MISSING)
             lines.append(f"{rel}: {MISSING}")
         elif installed.read_bytes() == source.read_bytes():
-            states.append(SAME)
+            if installed.suffix == ".sh" and not os.access(installed, os.X_OK):
+                states.append(DIFFERENT)
+                lines.append(f"{rel}: 실행 권한 없음")
+            else:
+                states.append(SAME)
         else:
             added, removed = _line_counts(source, installed)
             states.append(DIFFERENT)

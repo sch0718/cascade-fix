@@ -67,6 +67,13 @@ class SkillScriptsTest(unittest.TestCase):
         skill_scripts.install("cursor-review", target, "20261024")
         self.assertTrue(os.access(script, os.X_OK))
 
+    def test_compare_script_without_exec_bit_is_different(self):
+        target = self.tmp / "codex-review"
+        skill_scripts.install("codex-review", target, "20261023")
+        (target / "scripts" / "run-review.sh").chmod(0o644)
+        self.assertEqual(skill_scripts.compare("codex-review", target),
+                         (skill_scripts.DIFFERENT, ["scripts/run-review.sh: 실행 권한 없음"]))
+
     def test_compare_reports_line_counts(self):
         target = self.tmp / "codex-review"
         skill_scripts.install("codex-review", target, "20261023")

@@ -642,6 +642,7 @@ class DetectSetupNoticeTest(CliSetupBase):
         claude = self.detect("--profile", "claude-only", "--input", str(self.result), env=env)
         self.assertNotIn("스크립트가 플러그인 판과 다르다", claude.stdout)
         script.write_bytes(CODEX_SCRIPT.read_bytes())
+        script.chmod(0o755)
         (script.parent.parent / "SKILL.md").write_bytes(skill_scripts.SKILLS["codex-review"]["SKILL.md"].read_bytes())
         same = self.detect("--profile", "local", "--input", str(self.result), env=env)
         self.assertNotIn("스크립트가 플러그인 판과 다르다", same.stdout)
