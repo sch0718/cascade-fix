@@ -41,6 +41,15 @@ def repo_entry(repos: dict, root: Path):
     return next((v for k, v in repos.items() if Path(k).expanduser().resolve() == root), None)
 
 
+def has_repos(path: Path) -> bool:
+    try:
+        return bool(tomllib.loads(path.read_text(encoding="utf-8")).get("repos"))
+    except tomllib.TOMLDecodeError:
+        return True  # 잘못된 파일이면 그대로 골라 오류를 보인다
+    except OSError:
+        return False
+
+
 def load_repo_config(root: Path, config_path: Path) -> RepoConfig | None:
     config_path = Path(config_path)
     if not config_path.is_file():

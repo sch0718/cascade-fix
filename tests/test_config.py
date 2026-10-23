@@ -218,7 +218,7 @@ class RepoTomlLocationTest(unittest.TestCase):
         self.assertNotIn("claude-only", data["profiles"])
 
     def test_sample_repos_toml_is_not_read_without_repo_entries(self):
-        self.assertFalse(cli_steps._has_repos(SKILL_ROOT / "repos.toml"))
+        self.assertFalse(config.has_repos(SKILL_ROOT / "repos.toml"))
 
     def test_plugin_and_marketplace_versions(self):
         plugin = json.loads((SKILL_ROOT / ".claude-plugin/plugin.json").read_text(encoding="utf-8"))
