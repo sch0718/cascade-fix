@@ -1,0 +1,27 @@
+# 기기 환경별 프로필 추천 표. `CF setup`이 읽는다.
+# - 갱신 절차: 측정 결과로 바꾸는 일은 측정 계획 5절 「내장값을 바꾸는 변경」과 같은 PR에서 한다.
+# - status = "measured"는 코드 모드 작업자 칸(code.a·code.b·code.adjudicator) 기준이다. 문서 모드·검토 칸은 재지 않았다.
+# - 내용이 바뀌면 version을 1 올린다. 플러그인 버전과 따로 센다.
+version = 1
+updated = "2026-10-23"
+source = ""
+
+[env.none]
+recommend = "claude-only"
+status = "measured"
+alternatives = []
+
+[env.codex]
+recommend = "claude-only"
+status = "provisional"
+alternatives = [{ profile = "local", status = "provisional", note = "측정 전 잠정값" }]
+
+[env.cursor]
+recommend = "claude-only"
+status = "provisional"
+alternatives = []
+
+[env."codex+cursor"]
+recommend = "claude-only"
+status = "provisional"
+alternatives = [{ profile = "local", status = "provisional", note = "측정 전 잠정값" }]
