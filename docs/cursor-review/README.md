@@ -1,13 +1,13 @@
 # cursor-review 스킬
 
-`cursor-review`는 Cursor CLI(`cursor-agent`)에 코드 변경이나 설계·계획 문서의 리뷰를 맡기는 개인 스킬이다. `codex-review`와 모드와 출력 계약이 같다. 그 스킬은 `~/.claude/skills/`에 있어 git 밖이므로 전체 사본을 여기 보관한다.
+`cursor-review`는 Cursor CLI(`cursor-agent`)에 코드 변경이나 설계·계획 문서의 리뷰를 맡기는 개인 스킬이다. `codex-review`와 모드와 출력 계약이 같다. 정본은 이 디렉터리의 플러그인 사본이고, `CF setup`이 개인 스킬(`~/.claude/skills/cursor-review/`)과 비교해 승인을 받고 설치한다.
 
 ## 무엇을 보관하는가
 
 | 파일 | 내용 |
 | --- | --- |
-| [SKILL.md](SKILL.md) | `~/.claude/skills/cursor-review/SKILL.md`의 사본(2026-10-18) |
-| [run-review.sh](run-review.sh) | `~/.claude/skills/cursor-review/scripts/run-review.sh`의 사본(2026-10-18) |
+| [SKILL.md](SKILL.md) | `cursor-review`의 SKILL.md 전체. `CF setup`이 `~/.claude/skills/cursor-review/SKILL.md`로 설치한다 |
+| [run-review.sh](run-review.sh) | `cursor-review`의 `run-review.sh` 전체. `CF setup`이 `~/.claude/skills/cursor-review/scripts/run-review.sh`로 설치한다 |
 
 `codex-review`와 다른 점은 셋이다.
 
@@ -21,7 +21,7 @@
 
 ## 설치
 
-저장소 사본을 개인 스킬 위치에 복사한다. 두 번째 명령은 차이가 없으면 아무것도 출력하지 않는다.
+`CF setup`이 설치한다. 손으로 하려면 저장소 사본을 개인 스킬 위치에 복사한다. 두 번째 명령은 차이가 없으면 아무것도 출력하지 않는다.
 
 ```bash
 mkdir -p ~/.claude/skills/cursor-review/scripts && cp docs/cursor-review/SKILL.md ~/.claude/skills/cursor-review/ && cp docs/cursor-review/run-review.sh ~/.claude/skills/cursor-review/scripts/
