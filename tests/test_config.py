@@ -226,6 +226,13 @@ class RepoTomlLocationTest(unittest.TestCase):
         self.assertEqual(plugin["version"], "1.5.0")
         self.assertEqual([p["version"] for p in market["plugins"]], ["1.5.0"])
 
+    def test_marketplace_schema_accepted_by_older_claude_code(self):
+        market = json.loads((SKILL_ROOT / ".claude-plugin/marketplace.json").read_text(encoding="utf-8"))
+        self.assertLessEqual(set(market), {"name", "owner", "plugins", "metadata"})
+        for p in market["plugins"]:
+            if isinstance(p["source"], str):
+                self.assertTrue(p["source"].startswith("./"), p["source"])
+
 
 if __name__ == "__main__":
     unittest.main()
