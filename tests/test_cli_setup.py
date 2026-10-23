@@ -1,0 +1,451 @@
+import contextlib
+import io
+import json
+import sys
+import tempfile
+import tomllib
+import unittest
+from pathlib import Path
+from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from cascade import cli  # noqa: E402
+from cascade import cli_steps as s  # noqa: E402
+from cascade import skill_scripts  # noqa: E402
+from fake_cli import CODEX_BODY, install  # noqa: E402
+from helpers import make_repo, run_cli  # noqa: E402
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+SETUP_PENDING = "참고: 이 기기 설정 전이다."
+ACP_PROFILE = '[profiles.acp]\nbase = "claude-only"\n"doc.judge_a" = { runner = "cursor", model = "composer-2.5" }\n'
+CODEX_SCRIPT = skill_scripts.SKILLS["codex-review"]["scripts/run-review.sh"]
+
+
+class CliSetupBase(unittest.TestCase):
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.tmp = Path(self._td.name).resolve()
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        self.state = self.home / ".claude" / "cascade-fix"
+        self.repos = self.state / "repos.toml"
+        self.env = {"HOME": str(self.home), "CASCADE_REPOS_TOML": "", "PYTHONDONTWRITEBYTECODE": "1"}
+
+    def run_setup(self, *args, cwd=None, env=None):
+        return run_cli(["setup", *args], cwd or self.tmp, env={**self.env, **(env or {})})
+
+    def apply(self, name="claude-only", *extra, priority="save-claude"):
+        p = self.run_setup("--apply", "--profile", name, "--priority", priority, *extra)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        return p
+
+    def record(self):
+        return json.loads((self.state / "setup.json").read_text(encoding="utf-8"))
+
+    def make_repo(self):
+        return make_repo(self.tmp / "repo", {"calc.py": "def add(a, b):\n    return a + b\n"})
+
+
+class SetupDetectTest(CliSetupBase):
+    def test_detect_json_on_fresh_machine(self):
+        p = self.run_setup("--detect", "--json")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        out = json.loads(p.stdout)
+        self.assertEqual(out["env"], "none")
+        self.assertEqual(out["options"]["save-claude"][0]["profile"], "claude-only")
+        self.assertIsNone(out["repos_toml"]["default_profile"])
+        self.assertEqual(out["repos_toml"]["path"], str(self.repos))
+        self.assertIsNone(out["record"])
+
+    def test_detect_text_lines_on_fresh_machine(self):
+        p = self.run_setup("--detect")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        lines = p.stdout.splitlines()
+        self.assertIn("환경: none (codex 없음, cursor 없음)", lines)
+        self.assertIn(f"repos.toml: {self.repos}", lines)
+        self.assertIn("현재 default_profile: 없음", lines)
+        self.assertIn("추천(Claude 한도 아끼기): claude-only [측정됨]", lines)
+        self.assertIn("추천(빨리 끝내기): claude-only", lines)
+        self.assertTrue(any(line.startswith("스크립트 codex-review: 없음") for line in lines), p.stdout)
+        self.assertFalse(any(line.startswith("지난 설정:") for line in lines))
+        self.assertFalse(self.state.exists())
+
+    def test_detect_shows_alternatives_and_last_record(self):
+        self.state.mkdir(parents=True)
+        (self.state / "setup.json").write_text(json.dumps(
+            {"schema": 1, "setup_at": "2026-10-23T10:00:00+09:00", "profile": "claude-only", "table_version": 1}), encoding="utf-8")
+        self.repos.write_text('default_profile = "local"\n', encoding="utf-8")
+        p = self.run_setup("--detect")
+        self.assertIn("현재 default_profile: local", p.stdout)
+        self.assertIn("지난 설정: 2026-10-23T10:00:00+09:00 claude-only (표 v1)", p.stdout)
+
+    def test_detect_does_not_write_anything(self):
+        self.run_setup("--detect", "--json")
+        self.assertEqual(list(self.home.rglob("*")), [])
+
+
+class SetupApplyTest(CliSetupBase):
+    def test_apply_dry_run_writes_nothing(self):
+        p = self.run_setup("--apply", "--profile", "claude-only", "--priority", "save-claude", "--dry-run")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn('+default_profile = "claude-only"', p.stdout)
+        self.assertIn("다음:", p.stdout)
+        self.assertNotIn("--dry-run", p.stdout.split("다음:", 1)[1])
+        self.assertEqual(list(self.home.rglob("*")), [])
+
+    def test_apply_creates_file_from_sample_and_record(self):
+        self.apply()
+        data = tomllib.loads(self.repos.read_text(encoding="utf-8"))
+        self.assertEqual(data["default_profile"], "claude-only")
+        self.assertIn("형식 견본이다", self.repos.read_text(encoding="utf-8"))
+        rec = self.record()
+        self.assertEqual((rec["schema"], rec["table_version"], rec["recommended"], rec["profile"]),
+                         (1, 1, "claude-only", "claude-only"))
+        self.assertEqual((rec["env"], rec["priority"], rec["kept_existing"]), ("none", "save-claude", False))
+        self.assertEqual(rec["backups"], [])
+
+    def test_apply_existing_file_is_edited_in_place_with_backup(self):
+        self.state.mkdir(parents=True)
+        self.repos.write_text('# 내 메모\ndefault_profile = "default"  # 손으로\n', encoding="utf-8")
+        self.apply("claude-only")
+        self.assertEqual(self.repos.read_text(encoding="utf-8"), '# 내 메모\ndefault_profile = "claude-only"  # 손으로\n')
+        backups = sorted(self.state.glob("repos.toml.bak-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_text(encoding="utf-8"), '# 내 메모\ndefault_profile = "default"  # 손으로\n')
+        self.assertEqual(self.record()["backups"], [str(backups[0])])
+
+    def test_apply_refuses_with_env_var(self):
+        other = self.tmp / "other.toml"
+        other.write_text('default_profile = "default"\n', encoding="utf-8")
+        p = self.run_setup("--apply", "--profile", "claude-only", "--priority", "save-claude",
+                           env={"CASCADE_REPOS_TOML": str(other)})
+        self.assertEqual(p.returncode, 5, p.stdout + p.stderr)
+        self.assertIn("오류:", p.stdout)
+        self.assertIn("CASCADE_REPOS_TOML", p.stdout)
+        self.assertEqual(other.read_text(encoding="utf-8"), 'default_profile = "default"\n')
+        self.assertEqual(list(self.home.rglob("*")), [])
+
+    def test_apply_keep_records_only(self):
+        self.state.mkdir(parents=True)
+        self.repos.write_text('default_profile = "local"\n', encoding="utf-8")
+        p = self.run_setup("--apply", "--keep", "--priority", "save-claude")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.repos.read_text(encoding="utf-8"), 'default_profile = "local"\n')
+        self.assertEqual(list(self.state.glob("repos.toml.bak-*")), [])
+        rec = self.record()
+        self.assertEqual((rec["profile"], rec["kept_existing"], rec["recommended"]), ("local", True, "claude-only"))
+
+    def test_apply_keep_without_default_profile_records_null(self):
+        p = self.run_setup("--apply", "--keep", "--priority", "fast")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertFalse(self.repos.exists())
+        rec = self.record()
+        self.assertIsNone(rec["profile"])
+        self.assertTrue(rec["kept_existing"])
+        self.assertEqual(rec["priority"], "fast")
+
+    def test_apply_unknown_profile_exit_5(self):
+        p = self.run_setup("--apply", "--profile", "no-such", "--priority", "save-claude")
+        self.assertEqual(p.returncode, 5, p.stdout + p.stderr)
+        self.assertIn("오류:", p.stdout)
+        self.assertIn("no-such", p.stdout)
+        self.assertEqual(list(self.home.rglob("*")), [])
+
+    def test_apply_accepts_user_defined_profile(self):
+        self.state.mkdir(parents=True)
+        self.repos.write_text('[profiles.mine]\nbase = "claude-only"\n', encoding="utf-8")
+        self.apply("mine")
+        self.assertEqual(tomllib.loads(self.repos.read_text(encoding="utf-8"))["default_profile"], "mine")
+
+    def test_apply_needs_profile_or_keep_and_priority(self):
+        for args in (("--apply", "--priority", "fast"), ("--apply", "--profile", "claude-only"),
+                     ("--apply", "--keep", "--profile", "claude-only", "--priority", "fast")):
+            p = self.run_setup(*args)
+            self.assertEqual(p.returncode, 1, (args, p.stdout, p.stderr))
+            self.assertIn("오류:", p.stdout)
+        self.assertEqual(list(self.home.rglob("*")), [])
+
+    def test_actions_are_mutually_exclusive_and_required(self):
+        self.assertEqual(self.run_setup().returncode, 2)
+        self.assertEqual(self.run_setup("--detect", "--restore").returncode, 2)
+
+    def test_apply_picks_up_matching_check_and_removes_it(self):
+        self.state.mkdir(parents=True)
+        check = {"profile": "local", "checked_at": "2026-10-23T09:00:00+09:00",
+                 "results": {"codex-worker": {"status": "성공", "detail": ""}, "codex-review": {"status": "실패", "detail": "x"}}}
+        (self.state / "setup-check.json").write_text(json.dumps(check), encoding="utf-8")
+        self.apply("local")
+        self.assertEqual(self.record()["checks"], {"codex-worker": "성공", "codex-review": "실패"})
+        self.assertFalse((self.state / "setup-check.json").exists())
+
+    def test_apply_leaves_check_of_another_profile(self):
+        self.state.mkdir(parents=True)
+        check = {"profile": "local", "checked_at": "x", "results": {"codex-worker": {"status": "성공", "detail": ""}}}
+        (self.state / "setup-check.json").write_text(json.dumps(check), encoding="utf-8")
+        self.apply("claude-only")
+        self.assertEqual(self.record()["checks"], {})
+        self.assertTrue((self.state / "setup-check.json").exists())
+
+
+class SetupScriptsTest(CliSetupBase):
+    def setUp(self):
+        super().setUp()
+        self.skill = self.home / ".claude" / "skills" / "codex-review"
+        self.script = self.skill / "scripts" / "run-review.sh"
+        self.script.parent.mkdir(parents=True)
+        self.script.write_text("#!/bin/sh\necho old\n", encoding="utf-8")
+        self.env["CASCADE_RUN_REVIEW"] = str(self.script)
+
+    def test_detect_reports_script_difference(self):
+        p = self.run_setup("--detect")
+        line = next(x for x in p.stdout.splitlines() if x.startswith("스크립트 codex-review:"))
+        self.assertIn("다름", line)
+        self.assertIn("scripts/run-review.sh: 다름(+", line)
+
+    def test_apply_dry_run_summarizes_script_replacement_and_changes_nothing(self):
+        p = self.run_setup("--apply", "--profile", "claude-only", "--priority", "save-claude",
+                           "--replace-scripts", "codex", "--dry-run")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("스크립트 교체 codex-review", p.stdout)
+        self.assertEqual(self.script.read_text(encoding="utf-8"), "#!/bin/sh\necho old\n")
+        self.assertFalse(self.repos.exists())
+
+    def test_apply_replaces_script_with_backup_and_records_it(self):
+        self.apply("claude-only", "--replace-scripts", "codex")
+        self.assertEqual(self.script.read_bytes(), CODEX_SCRIPT.read_bytes())
+        self.assertEqual(len(list(self.script.parent.glob("run-review.sh.bak-*"))), 1)
+        self.assertTrue((self.skill / "SKILL.md").is_file())
+        rec = self.record()
+        self.assertEqual(rec["scripts"]["codex-review"], "교체함")
+        self.assertEqual(rec["scripts"]["cursor-review"], "없음")
+        self.assertEqual(len(rec["backups"]), 1)
+
+    def test_apply_without_replace_keeps_script(self):
+        self.apply("claude-only")
+        self.assertEqual(self.script.read_text(encoding="utf-8"), "#!/bin/sh\necho old\n")
+        self.assertEqual(self.record()["scripts"]["codex-review"], "다름")
+
+    def test_replace_scripts_rejects_unknown_runner(self):
+        p = self.run_setup("--apply", "--profile", "claude-only", "--priority", "save-claude", "--replace-scripts", "claude")
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertIn("오류:", p.stdout)
+        self.assertFalse(self.repos.exists())
+
+
+class SetupLegacyCopyTest(CliSetupBase):
+    def test_dry_run_shows_copy_of_legacy_file_and_apply_copies_it(self):
+        legacy = self.tmp / "legacy.toml"
+        legacy.write_text('# 예전\n[repos."/work/x"]\ntests = ["pytest"]\n', encoding="utf-8")
+        user = self.repos
+        argv = ["setup", "--apply", "--profile", "claude-only", "--priority", "save-claude", "--dry-run"]
+        out = io.StringIO()
+        with mock.patch.object(s, "USER_REPOS_TOML", user), mock.patch.object(s, "LEGACY_REPOS_TOML", legacy), \
+                mock.patch.dict("os.environ", {"CASCADE_REPOS_TOML": ""}), contextlib.redirect_stdout(out):
+            self.assertEqual(cli.main(argv), 0)
+        text = out.getvalue()
+        self.assertIn(str(legacy), text)
+        self.assertIn("복사", text)
+        self.assertIn('+[repos."/work/x"]', text)
+        self.assertIn('+default_profile = "claude-only"', text)
+        self.assertFalse(user.exists())
+        with mock.patch.object(s, "USER_REPOS_TOML", user), mock.patch.object(s, "LEGACY_REPOS_TOML", legacy), \
+                mock.patch.dict("os.environ", {"CASCADE_REPOS_TOML": ""}), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main([a for a in argv if a != "--dry-run"]), 0)
+        data = tomllib.loads(user.read_text(encoding="utf-8"))
+        self.assertEqual((data["default_profile"], data["repos"]["/work/x"]["tests"]), ("claude-only", ["pytest"]))
+        self.assertEqual(legacy.read_text(encoding="utf-8"), '# 예전\n[repos."/work/x"]\ntests = ["pytest"]\n')
+
+
+class SetupRepoProfileTest(CliSetupBase):
+    def test_repo_profile_dry_run_writes_nothing(self):
+        repo = self.make_repo()
+        p = self.run_setup("--repo-profile", "claude-only", "--root", str(repo), "--dry-run")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn('+profile = "claude-only"', p.stdout)
+        self.assertIn("다음:", p.stdout)
+        self.assertFalse(self.repos.exists())
+
+    def test_repo_profile_then_init_still_needs_tests(self):
+        repo = self.make_repo()
+        p = self.run_setup("--repo-profile", "claude-only", "--root", str(repo))
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        data = tomllib.loads(self.repos.read_text(encoding="utf-8"))
+        self.assertEqual(data["repos"][str(repo)], {"profile": "claude-only"})
+        init = run_cli(["init", "--source", "codex-code", "--input", str(FIXTURES / "codex-code-e2e.final")], repo,
+                       env=self.env)
+        self.assertEqual(init.returncode, 4, init.stdout + init.stderr)
+
+    def test_repo_profile_uses_resolved_root_for_existing_entry(self):
+        repo = self.make_repo()
+        self.state.mkdir(parents=True)
+        self.repos.write_text(f'[repos."{repo}"]\ntests = ["pytest"]\n', encoding="utf-8")
+        link = self.tmp / "link"
+        link.symlink_to(repo)
+        p = self.run_setup("--repo-profile", "claude-only", "--root", str(link))
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        data = tomllib.loads(self.repos.read_text(encoding="utf-8"))
+        self.assertEqual(data["repos"], {str(repo): {"profile": "claude-only", "tests": ["pytest"]}})
+
+    def test_repo_profile_defaults_to_git_root_of_cwd(self):
+        repo = self.make_repo()
+        p = self.run_setup("--repo-profile", "claude-only", cwd=repo)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn(str(repo.resolve()), tomllib.loads(self.repos.read_text(encoding="utf-8"))["repos"])
+
+    def test_repo_profile_unknown_name_exit_5(self):
+        repo = self.make_repo()
+        p = self.run_setup("--repo-profile", "no-such", "--root", str(repo))
+        self.assertEqual(p.returncode, 5, p.stdout + p.stderr)
+        self.assertFalse(self.repos.exists())
+
+    def test_repo_profile_refuses_with_env_var(self):
+        repo = self.make_repo()
+        p = self.run_setup("--repo-profile", "claude-only", "--root", str(repo),
+                           env={"CASCADE_REPOS_TOML": str(self.tmp / "other.toml")})
+        self.assertEqual(p.returncode, 5, p.stdout + p.stderr)
+        self.assertFalse((self.tmp / "other.toml").exists())
+
+
+class SetupRestoreTest(CliSetupBase):
+    def test_restore_round_trip(self):
+        self.state.mkdir(parents=True)
+        original = '# 처음\ndefault_profile = "default"\n'
+        self.repos.write_text(original, encoding="utf-8")
+        self.apply("claude-only")
+        self.assertNotEqual(self.repos.read_text(encoding="utf-8"), original)
+        dry = self.run_setup("--restore", "--dry-run")
+        self.assertEqual(dry.returncode, 0, dry.stdout + dry.stderr)
+        self.assertIn('+default_profile = "default"', dry.stdout)
+        self.assertIn("다음:", dry.stdout)
+        self.assertNotEqual(self.repos.read_text(encoding="utf-8"), original)
+        done = self.run_setup("--restore")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(self.repos.read_text(encoding="utf-8"), original)
+        self.assertEqual(len(list(self.state.glob("repos.toml.bak-*"))), 2)
+
+    def test_restore_without_backup_exit_5(self):
+        self.state.mkdir(parents=True)
+        self.repos.write_text('default_profile = "default"\n', encoding="utf-8")
+        for extra in ((), ("--dry-run",)):
+            p = self.run_setup("--restore", *extra)
+            self.assertEqual(p.returncode, 5, p.stdout + p.stderr)
+            self.assertIn("되돌릴 백업이 없다", p.stdout)
+
+
+class SetupCheckTest(CliSetupBase):
+    def test_check_writes_state_and_fails_without_cli(self):
+        p = self.run_setup("--check", "--profile", "local")
+        self.assertEqual(p.returncode, 6, p.stdout + p.stderr)
+        check = json.loads((self.state / "setup-check.json").read_text(encoding="utf-8"))
+        self.assertEqual(check["profile"], "local")
+        self.assertTrue(check["checked_at"])
+        self.assertEqual(sorted(check["results"]), ["codex-review", "codex-worker"])
+        self.assertEqual(check["results"]["codex-worker"]["status"], "실패")
+        self.assertIn("시험 codex-worker: 실패", p.stdout)
+
+    def test_check_json_output(self):
+        p = self.run_setup("--check", "--profile", "local", "--json")
+        out = json.loads(p.stdout)
+        self.assertEqual(out["profile"], "local")
+        self.assertEqual(out["results"]["codex-review"]["status"], "실패")
+
+    def test_check_claude_only_has_nothing_to_test(self):
+        p = self.run_setup("--check", "--profile", "claude-only")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        check = json.loads((self.state / "setup-check.json").read_text(encoding="utf-8"))
+        self.assertEqual(check["results"], {})
+        self.assertIn("다음:", p.stdout)
+
+    def test_check_unknown_profile_exit_5(self):
+        p = self.run_setup("--check", "--profile", "no-such")
+        self.assertEqual(p.returncode, 5, p.stdout + p.stderr)
+
+    def test_check_requires_profile(self):
+        p = self.run_setup("--check")
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+
+    def test_check_runs_acp_check_for_cursor_read_roles(self):
+        self.state.mkdir(parents=True)
+        self.repos.write_text(ACP_PROFILE, encoding="utf-8")
+        done = mock.Mock(returncode=0, stdout="합계: 6건, 막힘 6건, 누출 0건\n", stderr="", timed_out=False, missing=False)
+        out = io.StringIO()
+        with mock.patch.object(s, "USER_REPOS_TOML", self.repos), mock.patch.dict("os.environ", {"CASCADE_REPOS_TOML": ""}), \
+                mock.patch.object(cli, "_execute", return_value=done) as run, \
+                mock.patch.object(cli.setup, "run_check", return_value={"status": "성공", "detail": ""}), \
+                contextlib.redirect_stdout(out):
+            code = cli.main(["setup", "--check", "--profile", "acp"])
+        self.assertEqual(code, 0, out.getvalue())
+        self.assertEqual(run.call_args.args[0][1:], ["-m", "cascade.cursor_acp_check"])
+        check = json.loads((self.state / "setup-check.json").read_text(encoding="utf-8"))
+        self.assertEqual(check["results"]["cursor_acp"]["status"], "누출 0건")
+
+    def test_check_acp_leak_fails_with_exit_6(self):
+        self.state.mkdir(parents=True)
+        self.repos.write_text(ACP_PROFILE, encoding="utf-8")
+        done = mock.Mock(returncode=1, stdout="합계: 6건, 막힘 4건, 누출 2건\n", stderr="", timed_out=False, missing=False)
+        with mock.patch.object(s, "USER_REPOS_TOML", self.repos), mock.patch.dict("os.environ", {"CASCADE_REPOS_TOML": ""}), \
+                mock.patch.object(cli, "_execute", return_value=done), \
+                mock.patch.object(cli.setup, "run_check", return_value={"status": "성공", "detail": ""}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main(["setup", "--check", "--profile", "acp"]), 6)
+
+
+class DetectSetupNoticeTest(CliSetupBase):
+    def setUp(self):
+        super().setUp()
+        self.repo = self.make_repo()
+        (self.repo / "calc.py").write_text("def add(a, b):\n    return a - b\n", encoding="utf-8")
+
+    def detect(self, *extra, env=None):
+        return run_cli(["detect", "--root", str(self.repo), "--no-gh", *extra], self.tmp, env={**self.env, **(env or {})})
+
+    def test_detect_prints_before_setup_notice(self):
+        p = self.detect()
+        self.assertIn(SETUP_PENDING, p.stdout)
+        notes = json.loads(self.detect("--json").stdout)["notes"]
+        self.assertTrue(any(n.startswith("이 기기 설정 전이다") for n in notes), notes)
+
+    def test_detect_no_notice_after_apply(self):
+        self.apply()
+        self.assertNotIn(SETUP_PENDING, self.detect().stdout)
+
+    def test_detect_no_notice_with_hand_written_default_profile(self):
+        self.state.mkdir(parents=True)
+        self.repos.write_text('default_profile = "claude-only"\n', encoding="utf-8")
+        self.assertNotIn(SETUP_PENDING, self.detect().stdout)
+
+    def test_detect_prints_table_changed_notice(self):
+        self.state.mkdir(parents=True)
+        (self.state / "setup.json").write_text(json.dumps(
+            {"schema": 1, "table_version": 0, "env": "none", "priority": "save-claude", "recommended": "local",
+             "profile": "default"}), encoding="utf-8")
+        self.repos.write_text('default_profile = "default"\n', encoding="utf-8")
+        p = self.detect()
+        self.assertIn("참고: 추천 표가 바뀌었다(v0→v1): 이 기기 추천은 claude-only", p.stdout)
+
+    def test_detect_script_notice_uses_roles_after_auto_resolution(self):
+        bin_dir = self.tmp / "bin"
+        bin_dir.mkdir()
+        codex = install(bin_dir, "codex", CODEX_BODY)
+        (self.home / ".codex").mkdir()
+        (self.home / ".codex" / "auth.json").write_text("{}", encoding="utf-8")
+        script = self.home / ".claude" / "skills" / "codex-review" / "scripts" / "run-review.sh"
+        script.parent.mkdir(parents=True)
+        script.write_text("#!/bin/sh\n", encoding="utf-8")
+        env = {"CASCADE_CODEX": str(codex), "CASCADE_RUN_REVIEW": str(script), "CASCADE_WORKERS": "", "CASCADE_REVIEWER": ""}
+        result = FIXTURES / "codex-code-e2e.final"
+        local = self.detect("--profile", "local", "--input", str(result), env=env)
+        self.assertIn("참고: codex-review 스크립트가 플러그인 판과 다르다", local.stdout)
+        claude = self.detect("--profile", "claude-only", "--input", str(result), env=env)
+        self.assertNotIn("스크립트가 플러그인 판과 다르다", claude.stdout)
+        script.write_bytes(CODEX_SCRIPT.read_bytes())
+        (script.parent.parent / "SKILL.md").write_bytes(skill_scripts.SKILLS["codex-review"]["SKILL.md"].read_bytes())
+        same = self.detect("--profile", "local", "--input", str(result), env=env)
+        self.assertNotIn("스크립트가 플러그인 판과 다르다", same.stdout)
+
+
+if __name__ == "__main__":
+    unittest.main()
