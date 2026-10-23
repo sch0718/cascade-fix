@@ -33,15 +33,15 @@ PYTHONPATH="${CLAUDE_SKILL_DIR}" python3 -m cascade.cli
 2. **질문** — AskUserQuestion으로 해당하는 것만 묻는다. 우선순위를 먼저 묻고 그 답으로 프로필을 이어서 묻는다.
    - 우선순위: 「Claude 한도 아끼기(권장)」(`--priority save-claude`)·「빨리 끝내기」(`--priority fast`. 추천은 늘 `claude-only`).
    - 프로필: 고른 우선순위의 `추천(…)` 줄을 첫 선택지로 둔다. `대안:`은 「잠정·미측정」을 붙여 뒤에 둔다. `현재 default_profile`이 있으면 「지금 값 유지」(`--keep`)도 둔다.
-   - 스크립트 교체: `스크립트 <이름>: 다름|없음`이고 고른 프로필의 검토 칸(`*.review`·`*.opinion`·`*.recheck`)이 그 runner를 쓸 때만 묻는다(codex-review는 codex, cursor-review는 cursor. 내장 중에는 `local`이 codex). 차이 요약을 보이고 「바꾼다(백업)」·「그대로 둔다」를 받는다. 프로필이 쓰지 않는 스크립트는 묻지 않고 알리기만 한다.
+   - 스크립트 교체: `스크립트 <이름>: 다름|없음`이고 고른 프로필(「지금 값 유지」면 현재 `default_profile`)이 그 runner(codex-review는 codex, cursor-review는 cursor)를 검토 칸(`*.review`·`*.opinion`·`*.recheck`)에 쓸 때만 묻는다. `claude-only`는 쓰지 않는다. `default`는 검토 칸이 `auto`라 그 CLI와 스크립트가 있으면 쓰므로 묻는다. `local`은 codex를 쓴다. 사용자 정의 프로필은 `CF detect --profile <이름>`의 `역할:` 줄이나 repos.toml의 `[profiles.<이름>]`으로 칸을 본다. 차이 요약을 보이고 「바꾼다(백업)」·「그대로 둔다」를 받는다. 프로필이 쓰지 않는 스크립트는 묻지 않고 알리기만 한다.
    - 동작 확인: 고른 프로필이 외부 runner(codex·cursor)를 쓸 때만. 「시험 문장만 보낸다, 코드는 보내지 않는다」를 적고 승인받는다.
 3. **미리 보기** — `CF setup --apply (--profile <이름> | --keep) --priority <save-claude|fast> [--replace-scripts codex,cursor] --dry-run`의 diff를 보이고 확인받는다. 바꾼다고 한 스크립트만 `--replace-scripts`에 넣는다.
 4. **쓰기** — 같은 명령을 `--dry-run` 없이 돌린다. repos.toml(백업을 남긴다)·승인받은 스크립트·`setup.json`을 쓴다.
-5. **동작 확인** — 2에서 승인받았을 때만 `CF setup --check --profile <이름>`(바뀐 스크립트를 시험하려고 쓰기 뒤에 돈다. 결과는 `setup.json`에 합쳐진다). 실패(종료 코드 6)하면 `시험 …: 실패 — …` 줄을 보이고 그 runner가 없는 선택지로 다시 물어 3부터 다시 한다(방금 쓴 것을 되돌리려면 아래 되돌리기).
+5. **동작 확인** — 2에서 승인받았을 때만 `CF setup --check --profile <이름>`(「지금 값 유지」면 현재 `default_profile` 이름을 준다. 없으면 건너뛴다. 바뀐 스크립트를 시험하려고 쓰기 뒤에 돈다. 결과는 `setup.json`에 합쳐진다). 종료 코드 6이면 `시험 <이름>: <상태> — …` 줄 중 상태가 성공이 아닌 것(실패·로그인 필요·한도·누출 있음·확인 못 함)을 보이고 그 runner가 없는 선택지로 다시 물어 3부터 다시 한다(방금 쓴 것을 되돌리려면 아래 되돌리기). `누출 있음`(Cursor 읽기 역할 격리)은 그 프로필을 다시 권하지 않는다. `확인 못 함`은 그대로 알리고 고를지는 사용자에게 맡긴다.
 6. **끝** — 「되돌리려면 『cascade-fix 설정 되돌려줘』」를 한 줄 알린다.
 
 - 되돌리기 요청이 오면 `CF setup --restore --dry-run`으로 diff를 보이고, 확인받은 뒤 `CF setup --restore`를 돌린다. repos.toml만 되돌리고 스크립트 백업(`--apply`가 출력한 `백업:` 경로)은 되돌리지 않는다. 그 경로를 알려 사용자가 손으로 되돌리게 한다.
-- 종료 코드 5(`오류: …`)는 그 줄을 보이고 멈춘다. `CASCADE_REPOS_TOML`이 잡혀 있으면 쓰는 동작이 모두 5로 멈추고, `CASCADE_RUN_REVIEW`·`CASCADE_CURSOR_REVIEW`가 잡혀 있으면 `--replace-scripts`가 5로 멈춘다. 변수를 지우고 다시 하라고 알린다. `--check`는 `--dry-run`을 받지 않는다.
+- 종료 코드 5(`오류: …`)는 그 줄을 보이고 멈춘다. `CASCADE_REPOS_TOML`이 잡혀 있으면 repos.toml을 쓰는 동작(`--apply`·`--repo-profile`·`--restore`)이 5로 멈추고, `CASCADE_RUN_REVIEW`·`CASCADE_CURSOR_REVIEW`가 잡혀 있으면 `--replace-scripts`가 5로 멈춘다. 변수를 지우고 다시 하라고 알린다. `--check`는 `--dry-run`을 받지 않는다.
 - 저장소별 「항상 Claude만」은 이 절이 아니라 「실행 전 확인」 1에서 받는다.
 
 ## 자동 진행(기본 흐름)
@@ -188,7 +188,7 @@ Claude·Cursor·`codex-doc` 결과는 형식이 같아 형식으로는 가릴 �
    - `detect`와 `init`의 `전송 동의:` 줄이 수신처별 칸을 보인다. 칸의 fallback이 외부 runner면 그 수신처도 「대체 실행 때 …」로 따로 적혀 있고, 주 runner와 같은 수신처여도 적힌다. 이 줄을 그대로 보이고 묻는다. `auto`는 init이 runner를 정한 뒤의 수신처다.
    - 전부 동의하면 `--consent`를 생략해도 된다(프로필이 쓰는 수신처 전부에 동의한 것으로 본다). 일부만 동의하면 `--consent codex`처럼 동의한 수신처만 쉼표로 적고, 모두 거절하면 `--consent none`이다. 같은 값을 `CF review`와 `init` 둘 다에 준다. `detect`는 읽기만 하므로 `--consent`가 없다. `CF review`의 「다음:」 init 줄에는 받은 `--consent`가 이미 붙어 있다.
    - 동의하지 않은 수신처를 쓰는 칸과 fallback은 내장 `claude-only` 값으로 바뀌고 `대체: … — 전송 동의 없음`이 찍힌다. 동의 밖 수신처로 실행 중 대체하는 경로는 없다. 원장 `profile.consented`(동의한 수신처 중 실제로 쓰는 것)에 없는 runner로는 대체 실행하지 않고 `claude-only` 값으로 돈다.
-   - 동의 질문에 선택지 「이 저장소는 항상 Claude만」을 더한다. 고르면 순서대로 한다. 같은 확인에서 검증 명령 등록도 골랐으면 그 항목을 repos.toml에 먼저 적는다(같은 표가 두 번 생기지 않게). 그다음 `CF setup --repo-profile claude-only --root <저장소 루트>`를 돌린다(`--dry-run`으로 diff를 먼저 볼 수 있다). 이번 실행은 `--consent none`으로 잇는다. 다음 실행부터는 저장소 항목의 `profile`이 쓰여 동의를 묻지 않는다. 풀려면 repos.toml에서 그 `profile` 줄을 지운다.
+   - 동의 질문에 선택지 「이 저장소는 항상 Claude만」을 더한다. 고르면 순서대로 한다. 같은 확인에서 검증 명령 등록도 골랐으면 그 항목을 repos.toml에 먼저 적는다(같은 표가 두 번 생기지 않게). 그다음 `CF setup --repo-profile claude-only --root <저장소 루트>`를 돌린다(`--dry-run`으로 diff를 먼저 볼 수 있다). `오류:`(종료 코드 5)로 멈추면 그 줄을 보이고 그 줄대로 손으로 넣게 하되 이번 실행은 계속한다. 이번 실행은 `--consent none`(또는 `--profile claude-only`)으로 잇는다. 다음 실행부터는 저장소 항목의 `profile`이 쓰여 동의를 묻지 않는다. 풀려면 repos.toml에서 그 `profile` 줄을 지운다.
    - 외부 runner가 없으면(init 출력에 「Claude 단독」, `전송 동의:` 줄 없음) 묻지 않는다. 사내규정 원문이 든 저장소는 동의하지 않으면 Claude로 돈다(`--consent none` 또는 `--profile claude-only`).
 2. **저장소 검증 설정.** `codex-code`·`cursor-code`·`claude-code`·`pr-comment`는 저장소 검증 설정 파일에 저장소 루트 절대 경로 항목이 있어야 한다. 파일은 `~/.claude/cascade-fix/repos.toml`이다(환경 변수 `CASCADE_REPOS_TOML`이 우선하고, 이 파일이 없으면 예전 위치인 스킬 디렉터리의 `repos.toml`에 항목이 있을 때 그것을 쓴다). 없으면 `init`이 종료 코드 4로 멈추고 후보를 보여 준다. `CF detect` 출력의 「확인 필요: 검증 명령 등록」 아래(`--json`이면 `config.candidates`)에도 후보가 나온다.
 

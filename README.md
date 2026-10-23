@@ -119,12 +119,12 @@ Claude Code에서 「cascade-fix 설정해줘」(또는 「이 기기에 맞게 
 | --- | --- |
 | `~/.claude/cascade-fix/repos.toml` | 최상위 `default_profile = "<이름>"` 한 줄(주석·다른 내용은 그대로). 기존 파일은 `repos.toml.bak-<날짜-시각>`로 백업하고 최근 5개만 남깁니다. 이 파일이 없고 예전 위치(스킬 폴더의 `repos.toml`)에 항목이 있으면 그 파일을 복사해 쓰며 예전 파일은 고치지 않습니다. |
 | `~/.claude/cascade-fix/setup.json` | 설정 기록(환경, 우선순위, 추천, 고른 프로필, 시험 결과, 백업 경로, 표 버전). 추천 표가 바뀌었는지 알리는 데 쓰입니다. |
-| `~/.claude/skills/codex-review/`·`cursor-review/` | 승인했을 때만. 원래 파일은 `<파일>.bak-<날짜>`로 남기고 플러그인 사본(`SKILL.md`와 `scripts/run-review.sh`)으로 바꿉니다. |
+| `~/.claude/skills/codex-review/`·`cursor-review/` | 승인했을 때만. 원래 파일은 `<파일>.bak-<날짜-시각>`(`YYYYMMDD-HHMMSS`)으로 남기고 플러그인 사본(`SKILL.md`와 `scripts/run-review.sh`)으로 바꿉니다. |
 
 - **어떤 프로필을 고를까**: 측정 전에는 모든 환경에서 `claude-only`를 권합니다. Codex가 있으면 `local`이 「잠정·미측정」 대안으로 보입니다. 추천은 `cascade/recommendations.toml`이 정하고, 「빨리 끝내기」를 고르면 늘 `claude-only`입니다(지난 측정에서 약 30분, 외부를 섞은 구성은 1.5~3시간).
 - **저장소별 예외**: setup은 기기 기본만 정합니다. 외부 도구를 쓰는 프로필에서 어떤 저장소는 코드를 밖으로 보내지 않으려면, 그 저장소의 첫 실행 전송 동의 질문에서 「이 저장소는 항상 Claude만」을 고릅니다(`CF setup --repo-profile claude-only --root <저장소>`가 그 저장소 항목에 `profile = "claude-only"`를 씁니다). 풀려면 repos.toml에서 그 줄을 지웁니다.
 - **다시 하기**: 같은 말로 다시 하면 지난 기록과 현재 값이 함께 보입니다. 추천 표가 바뀌어 이 기기 추천이 달라지거나 고른 프로필이 쓰는 검토 스크립트가 플러그인 사본과 다르면, 실행 때 `detect`가 `참고:` 줄로 알립니다.
-- **되돌리기**: 「cascade-fix 설정 되돌려줘」라고 말하면 `CF setup --restore`가 가장 최근 백업과의 diff를 보여 주고, 확인받아 repos.toml을 그 백업으로 되돌립니다(되돌리기 전 파일도 새 백업으로 남습니다). 스크립트 백업은 되돌리기 대상이 아니라 `.bak-<날짜>` 파일을 직접 되돌립니다.
+- **되돌리기**: 「cascade-fix 설정 되돌려줘」라고 말하면 `CF setup --restore`가 가장 최근 백업과의 diff를 보여 주고, 확인받아 repos.toml을 그 백업으로 되돌립니다(되돌리기 전 파일도 새 백업으로 남습니다). 스크립트 백업은 되돌리기 대상이 아니라 `.bak-<날짜-시각>` 파일을 직접 되돌립니다. `--restore`는 repos.toml만 되돌리므로 `setup.json`의 `profile`이 실제 값과 달라질 수 있습니다. 다시 설정하면 기록이 갱신됩니다.
 - **삭제**: 플러그인을 지워도 `~/.claude/cascade-fix/`(`repos.toml`·`setup.json`·백업)와 설치한 `codex-review`·`cursor-review`는 남습니다. 다 지우려면 직접 지웁니다.
 
 ## 처음 한 번: 저장소 검증 명령 등록
@@ -461,7 +461,7 @@ PYTHONPATH=<스킬 경로> python3 -m cascade.cli <명령> [옵션]
 | `setup --repo-profile P [--root R] [--dry-run]` | 저장소 `R`(기본: 현재 디렉터리의 git 루트) 항목의 `profile`을 `P`로 정합니다. 항목이 인라인 표라 찾지 못하면 쓰지 않고 넣을 줄을 보입니다. |
 | `setup --restore [--dry-run]` | repos.toml을 가장 최근 백업으로 되돌립니다. |
 
-- 쓰는 동작은 `CASCADE_REPOS_TOML`이 잡혀 있으면 종료 코드 5로 멈춥니다(측정용 임시 파일을 기기 설정으로 바꾸지 않으려는 것입니다). `--apply --replace-scripts`는 `CASCADE_RUN_REVIEW`·`CASCADE_CURSOR_REVIEW`가 잡혀 있어도 5로 멈춥니다. 쓴 파일은 `tomllib`로 다시 읽고 프로필을 검사하며, 실패하면 백업으로 되돌립니다.
+- repos.toml을 쓰는 동작(`--apply`·`--repo-profile`·`--restore`)은 `CASCADE_REPOS_TOML`이 잡혀 있으면 종료 코드 5로 멈춥니다(측정용 임시 파일을 기기 설정으로 바꾸지 않으려는 것입니다). `--apply --replace-scripts`는 `CASCADE_RUN_REVIEW`·`CASCADE_CURSOR_REVIEW`가 잡혀 있어도 5로 멈춥니다. 쓴 파일은 `tomllib`로 다시 읽고 프로필을 검사하며, 실패하면 백업으로 되돌립니다.
 
 - `detect`·`review`·`init`은 `--root`로 대상 저장소 루트를 받습니다. 없으면 현재 디렉터리의 저장소입니다. 나머지 명령은 `init`이 출력한 `--run-dir`로 실행을 찾습니다.
 - 회차 단계는 이미 한 단계를 다시 하지 않습니다. 다시 하려면 `--force`를 붙입니다.
