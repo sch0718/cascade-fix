@@ -4,6 +4,7 @@ import os
 import stat
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -310,15 +311,31 @@ class RunCheckTest(SetupTestBase):
         missing = self.tmp / "none.sh"
         result = setup.run_check("codex", "review", "", "", {"codex": missing})
         self.assertEqual(result, {"status": "실패", "detail": f"스크립트 없음: {missing}"})
-        self.assertEqual(setup.run_check("cursor", "review", "", "", {})["status"], "실패")
+        with mock.patch.dict(os.environ, {"HOME": str(self.tmp)}):
+            result = setup.run_check("cursor", "review", "", "", {})
+        self.assertEqual(result, {"status": "실패", "detail": f"스크립트 없음: {self.tmp}/.claude/skills/cursor-review/scripts/run-review.sh"})
 
-    def test_run_check_review_timeout(self):
+    def test_run_check_review_timeout_kills_grandchild(self):
+        pid_file = self.tmp / "child.pid"
         script = self.tmp / "run-review.sh"
-        script.write_text("#!/bin/sh\nsleep 5\n", encoding="utf-8")
+        script.write_text(f"#!/bin/sh\nsh -c 'echo $$ > \"{pid_file}\"; exec sleep 20' &\nwait\n", encoding="utf-8")
         script.chmod(script.stat().st_mode | stat.S_IXUSR)
-        result = setup.run_check("codex", "review", "", "", {"codex": script}, timeout=1)
+
+        def cleanup():
+            if pid_file.is_file():
+                try:
+                    os.kill(int(pid_file.read_text()), 9)
+                except (ProcessLookupError, ValueError):
+                    pass
+
+        self.addCleanup(cleanup)
+        result = setup.run_check("codex", "review", "", "", {"codex": script}, timeout=2)
         self.assertEqual(result["status"], "실패")
         self.assertIn("시간 초과", result["detail"])
+        pid = int(pid_file.read_text())
+        time.sleep(0.3)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
 
 
 class RunCheckWorkerTest(SetupTestBase):

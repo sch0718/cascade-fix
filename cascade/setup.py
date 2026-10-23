@@ -1,6 +1,6 @@
 import json
+import os
 import re
-import subprocess
 import tempfile
 import tomllib
 from pathlib import Path
@@ -15,6 +15,7 @@ from cascade.runners import (
     STATUS_OK,
     CodexRunner,
     CursorRunner,
+    _execute,
     classify_failure,
     codex_available,
     codex_model,
@@ -128,20 +129,19 @@ def _check_worker(runner: str, model: str, effort: str, timeout: int) -> dict:
 
 
 def _check_review(runner: str, model: str, script: Path | None, timeout: int) -> dict:
-    if script is None or not Path(script).is_file():
-        return {"status": CHECK_FAILED, "detail": f"스크립트 없음: {script or RUNNER_SKILLS[runner]}"}
+    script = script or Path.home() / ".claude" / "skills" / RUNNER_SKILLS[runner] / "scripts" / "run-review.sh"
+    if not script.is_file():
+        return {"status": CHECK_FAILED, "detail": f"스크립트 없음: {script}"}
     with tempfile.TemporaryDirectory(prefix="cascade-setup-check-") as tmp:
         prompt = Path(tmp) / "prompt.md"
         prompt.write_text(SMOKE_PROMPT, encoding="utf-8")
         cmd = [str(script), "--opinion", str(prompt), "--repo", tmp, "--out", str(Path(tmp) / "out"),
                *(["--model", model] if runner == RUNNER_CURSOR and model else [])]
-        try:
-            run = subprocess.run(cmd, cwd=tmp, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                                 timeout=timeout)
-        except subprocess.TimeoutExpired:
-            return {"status": CHECK_FAILED, "detail": f"시간 초과({timeout}초)"}
-        except OSError as e:
-            return {"status": CHECK_FAILED, "detail": f"스크립트를 실행하지 못했다: {e}"}
+        run = _execute(cmd, "", Path(tmp), dict(os.environ), timeout)
+    if run.timed_out:
+        return {"status": CHECK_FAILED, "detail": f"시간 초과({timeout}초)"}
+    if run.missing:
+        return {"status": CHECK_FAILED, "detail": f"스크립트를 실행하지 못했다: {run.stderr}"}
     tail = f"{run.stdout}\n{run.stderr}".strip()[-DETAIL_TAIL:]
     if run.returncode == 0:
         return {"status": CHECK_OK, "detail": ""}
