@@ -25,6 +25,7 @@ from cascade.runners import (
 )
 from cascade.skill_scripts import RUNNER_SKILLS, SAME
 from cascade.toml_edit import Target
+from cascade.workers import DEFAULT_CURSOR_MODEL
 
 SMOKE_PROMPT = "cascade-fix 설정 시험 호출이다. 다른 말 없이 OK라고만 답하라."
 LOGGED_IN, NEEDS_LOGIN, ABSENT = "로그인됨", "로그인 필요", "없음"
@@ -33,6 +34,7 @@ ACP_CLEAN, ACP_LEAK, ACP_UNKNOWN = "누출 0건", "누출 있음", "확인 못 �
 WORKER, REVIEW = "worker", "review"
 RECORD_SCHEMA = 1
 EXIT_NEEDS_LOGIN, EXIT_LIMIT = 77, 75
+LOG_TAIL_LINES = 20
 _EXTERNAL = (RUNNER_CODEX, RUNNER_CURSOR)
 _ACP_READ_KEYS = ("doc.judge_a", "doc.judge_b", "doc.checker")
 _LEAKS = re.compile(r"^합계:.*누출 (\d+)건", re.MULTILINE)
@@ -113,9 +115,9 @@ def cell_model(roles: dict, runner: str, path: str) -> tuple[str, str]:
     return model, effort
 
 
-def needs_acp_check(roles: dict) -> bool:
-    return any(RUNNER_CURSOR in (roles[key]["runner"], roles[key]["fallback"]["runner"])
-               for key in _ACP_READ_KEYS if key in roles)
+def acp_models(roles: dict) -> list[str]:
+    cells = [cell for key in _ACP_READ_KEYS if key in roles for cell in (roles[key], roles[key]["fallback"])]
+    return sorted({cell["model"] or DEFAULT_CURSOR_MODEL for cell in cells if cell["runner"] == RUNNER_CURSOR})
 
 
 def _check_worker(runner: str, model: str, effort: str, timeout: int) -> dict:
@@ -141,14 +143,16 @@ def _check_review(runner: str, model: str, script: Path | None, timeout: int) ->
             return {"status": CHECK_FAILED, "detail": f"빈 git 저장소를 만들지 못했다: {init.stderr.strip()}"}
         prompt = Path(tmp) / "prompt.md"
         prompt.write_text(SMOKE_PROMPT, encoding="utf-8")
-        cmd = [str(script), "--opinion", str(prompt), "--repo", tmp, "--out", str(Path(tmp) / "out"),
+        out = Path(tmp) / "out"
+        cmd = [str(script), "--opinion", str(prompt), "--repo", tmp, "--out", str(out),
                *(["--model", model] if runner == RUNNER_CURSOR and model else [])]
         run = _execute(cmd, "", Path(tmp), dict(os.environ), timeout)
+        log = "\n".join(out.read_text(encoding="utf-8", errors="replace").splitlines()[-LOG_TAIL_LINES:]) if out.is_file() else ""
     if run.timed_out:
         return {"status": CHECK_FAILED, "detail": f"시간 초과({timeout}초)"}
     if run.missing:
         return {"status": CHECK_FAILED, "detail": f"스크립트를 실행하지 못했다: {run.stderr}"}
-    tail = f"{run.stdout}\n{run.stderr}".strip()[-DETAIL_TAIL:]
+    tail = f"{log}\n{run.stdout}\n{run.stderr}".strip()[-DETAIL_TAIL:]
     if run.returncode == 0:
         return {"status": CHECK_OK, "detail": ""}
     if run.returncode == EXIT_NEEDS_LOGIN:

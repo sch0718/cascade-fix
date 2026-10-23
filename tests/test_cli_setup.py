@@ -19,7 +19,7 @@ from helpers import make_repo, run_cli  # noqa: E402
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 SETUP_PENDING = "참고: 이 기기 설정 전이다."
-ACP_PROFILE = '[profiles.acp]\nbase = "claude-only"\n"doc.judge_a" = { runner = "cursor", model = "composer-2.5" }\n'
+ACP_PROFILE = '[profiles.acp]\nbase = "claude-only"\n"doc.judge_a" = { runner = "cursor", model = "composer-2.6" }\n'
 CODEX_SCRIPT = skill_scripts.SKILLS["codex-review"]["scripts/run-review.sh"]
 
 
@@ -525,7 +525,7 @@ class SetupCheckTest(CliSetupBase):
             code, out = self.run_main("setup", "--check", "--profile", "acp",
                                       extra=[mock.patch.object(cli.setup, "run_check", return_value={"status": "성공", "detail": ""})])
         self.assertEqual(code, 0, out)
-        self.assertEqual(run.call_args.args[0][1:], ["-m", "cascade.cursor_acp_check"])
+        self.assertEqual(run.call_args.args[0][1:], ["-m", "cascade.cursor_acp_check", "--model", "composer-2.6"])
         check = json.loads((self.state / "setup-check.json").read_text(encoding="utf-8"))
         self.assertEqual(check["results"]["cursor_acp"]["status"], "누출 0건")
 

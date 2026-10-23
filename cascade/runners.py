@@ -219,7 +219,8 @@ def _without_prompt(text: str, prompt: str) -> str:
     return text.replace(prompt.strip(), "") if prompt.strip() else text
 
 
-def _execute(cmd: list[str], stdin: str, cwd: Path, env: dict, timeout: float) -> _Run:
+def _execute(cmd: list[str], stdin: str, cwd: Path, env: dict, timeout: float, grace: float = 0) -> _Run:
+    """시간 초과면 프로세스 그룹을 끝낸다. grace가 있으면 SIGTERM을 먼저 보내 그만큼 정리할 시간을 준다."""
     try:
         proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
@@ -230,6 +231,13 @@ def _execute(cmd: list[str], stdin: str, cwd: Path, env: dict, timeout: float) -
         stdout, stderr = proc.communicate(stdin, timeout=timeout)
         return _Run(proc.returncode, stdout, stderr)
     except subprocess.TimeoutExpired:
+        if grace:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+                stdout, stderr = proc.communicate(timeout=grace)
+                return _Run(proc.returncode, stdout, stderr, timed_out=True)
+            except (ProcessLookupError, subprocess.TimeoutExpired):
+                pass
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except ProcessLookupError:

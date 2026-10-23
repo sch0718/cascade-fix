@@ -60,11 +60,17 @@ class CheckPathsTest(unittest.TestCase):
         roles = with_cursor(LOCAL, "code.b")
         self.assertEqual(setup.check_paths(roles), [("codex", "review"), ("codex", "worker"), ("cursor", "worker")])
 
-    def test_needs_acp_check(self):
-        self.assertFalse(setup.needs_acp_check(LOCAL))
-        self.assertFalse(setup.needs_acp_check(with_cursor(CLAUDE_ONLY, "code.a")))
-        self.assertTrue(setup.needs_acp_check(with_cursor(CLAUDE_ONLY, "doc.judge_b")))
-        self.assertTrue(setup.needs_acp_check(with_cursor(CLAUDE_ONLY, "doc.checker", fallback_only=True)))
+    def test_acp_models_lists_cursor_read_role_models(self):
+        self.assertEqual(setup.acp_models(LOCAL), [])
+        roles = with_cursor(CLAUDE_ONLY, "doc.judge_b")
+        roles["doc.judge_b"]["model"] = "model-x"
+        roles = with_cursor(roles, "doc.checker", fallback_only=True)
+        self.assertEqual(setup.acp_models(roles), ["composer-2.5", "model-x"])
+
+    def test_acp_models_only_for_cursor_read_roles(self):
+        self.assertEqual(setup.acp_models(with_cursor(CLAUDE_ONLY, "code.a")), [])
+        self.assertEqual(setup.acp_models(with_cursor(CLAUDE_ONLY, "doc.judge_b")), ["composer-2.5"])
+        self.assertEqual(setup.acp_models(with_cursor(CLAUDE_ONLY, "doc.checker", fallback_only=True)), ["composer-2.5"])
 
 
 class CellModelTest(unittest.TestCase):
@@ -318,6 +324,15 @@ class RunCheckTest(SetupTestBase):
         script.chmod(script.stat().st_mode | stat.S_IXUSR)
         result = setup.run_check("codex", "review", "", "", {"codex": script}, timeout=20)
         self.assertEqual(result["status"], "한도")
+
+    def test_run_check_review_reads_out_log(self):
+        script = self.tmp / "run-review.sh"
+        script.write_text("#!/bin/sh\necho 'ERROR: You have hit your usage limit' > \"$6\"\n"
+                          "echo exit=1\necho \"full_log=$6\"\nexit 1\n", encoding="utf-8")
+        script.chmod(script.stat().st_mode | stat.S_IXUSR)
+        result = setup.run_check("codex", "review", "", "", {"codex": script}, timeout=20)
+        self.assertEqual(result["status"], "한도")
+        self.assertIn("usage limit", result["detail"])
 
     def test_run_check_review_script_missing(self):
         missing = self.tmp / "none.sh"

@@ -1711,6 +1711,7 @@ SETUP_CHECK = "setup-check.json"
 STATUS_LABELS = {recommend.MEASURED: "측정됨", recommend.PROVISIONAL: "잠정"}
 LOGIN_HINTS = {RUNNER_CODEX: "codex login", RUNNER_CURSOR: "cursor-agent login"}
 ACP_CHECK_TIMEOUT = 600
+ACP_STOP_GRACE = 30
 ENV_SCRIPT_REDIRECTS = ("CASCADE_RUN_REVIEW", "CASCADE_CURSOR_REVIEW")
 CHECK_DETAIL_CHARS = 200
 SCRIPTS_REPLACED = "교체함"
@@ -1833,9 +1834,9 @@ def _setup_detect(args) -> int:
     return 0
 
 
-def _acp_check() -> dict:
-    run = _execute([sys.executable, "-m", "cascade.cursor_acp_check"], "", s.SKILL_ROOT,
-                   {**os.environ, "PYTHONPATH": str(s.SKILL_ROOT)}, ACP_CHECK_TIMEOUT)
+def _acp_check(model: str) -> dict:
+    run = _execute([sys.executable, "-m", "cascade.cursor_acp_check", "--model", model], "", s.SKILL_ROOT,
+                   {**os.environ, "PYTHONPATH": str(s.SKILL_ROOT)}, ACP_CHECK_TIMEOUT, grace=ACP_STOP_GRACE)
     if run.timed_out or run.missing:
         return {"status": setup.ACP_UNKNOWN, "detail": "시간 초과" if run.timed_out else run.stderr}
     output = f"{run.stdout}\n{run.stderr}".strip()
@@ -1881,8 +1882,9 @@ def _setup_check(args) -> int:
     for runner, path in setup.check_paths(roles):
         model, effort = setup.cell_model(roles, runner, path)
         results[f"{runner}-{path}"] = setup.run_check(runner, path, model, effort, scripts)
-    if setup.needs_acp_check(roles):
-        results["cursor_acp"] = _acp_check()
+    models = setup.acp_models(roles)
+    for model in models:
+        results["cursor_acp" if len(models) == 1 else f"cursor_acp:{model}"] = _acp_check(model)
     check = {"profile": args.profile, "checked_at": s.now(), "results": results}
     if _merge_check_into_record(args.profile, results):
         (_state_dir() / SETUP_CHECK).unlink(missing_ok=True)

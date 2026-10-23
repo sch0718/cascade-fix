@@ -480,6 +480,14 @@ class CursorHomeTest(unittest.TestCase):
 
 
 class HelpersTest(unittest.TestCase):
+    def test_execute_grace_sends_term_before_kill(self):
+        with tempfile.TemporaryDirectory() as td:
+            done = Path(td) / "cleaned"
+            script = f"trap 'echo cleaned > \"{done}\"; exit 0' TERM\nsleep 30 &\nwait\n"
+            run = runners._execute(["sh", "-c", script], "", Path(td), dict(os.environ), 1, grace=5)
+            self.assertTrue(run.timed_out)
+            self.assertEqual(done.read_text(encoding="utf-8").strip(), "cleaned")
+
     def test_classify_failure(self):
         self.assertEqual(classify_failure("You've hit your usage limit"), STATUS_LIMIT)
         self.assertEqual(classify_failure("429 rate limit exceeded"), STATUS_LIMIT)
