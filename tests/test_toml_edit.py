@@ -242,6 +242,20 @@ class TomlEditTest(unittest.TestCase):
         with self.assertRaises(toml_edit.EditError):
             toml_edit.restore_latest(path, "20261023-100002")
 
+    def test_backups_ignore_hand_made_files(self):
+        path = self.tmp / "repos.toml"
+        path.write_text("# v0\n", encoding="utf-8")
+        mine = [self.tmp / f"repos.toml.bak-{name}" for name in ("mine", "zzz", "20261023-100000.orig", "20261023-100000-1")]
+        for p in mine:
+            p.write_text("# 손으로\n", encoding="utf-8")
+        made = [toml_edit.write_checked(path, f"# v{i}\n", f"20261023-10000{i}") for i in range(1, 7)]
+        self.assertEqual(toml_edit.backups(path), list(reversed(made[1:])))
+        self.assertTrue(all(p.exists() for p in mine))
+        used, _ = toml_edit.restore_latest(path, "20261023-100009")
+        self.assertEqual(used, made[-1])
+        self.assertEqual(path.read_text(encoding="utf-8"), "# v5\n")
+        self.assertTrue(all(p.exists() for p in mine))
+
     def test_backups_empty_when_dir_missing(self):
         self.assertEqual(toml_edit.backups(self.tmp / "no" / "repos.toml"), [])
 

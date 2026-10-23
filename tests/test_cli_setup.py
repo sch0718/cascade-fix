@@ -32,7 +32,8 @@ class CliSetupBase(unittest.TestCase):
         self.home.mkdir()
         self.state = self.home / ".claude" / "cascade-fix"
         self.repos = self.state / "repos.toml"
-        self.env = {"HOME": str(self.home), "CASCADE_REPOS_TOML": "", "PYTHONDONTWRITEBYTECODE": "1"}
+        self.env = {"HOME": str(self.home), "CASCADE_REPOS_TOML": "", "CASCADE_RUN_REVIEW": "", "CASCADE_CURSOR_REVIEW": "",
+                    "PYTHONDONTWRITEBYTECODE": "1"}
 
     def run_setup(self, *args, cwd=None, env=None):
         return run_cli(["setup", *args], cwd or self.tmp, env={**self.env, **(env or {})})
@@ -102,6 +103,23 @@ class SetupDetectTest(CliSetupBase):
         self.assertIn("현재 default_profile: local", p.stdout)
         self.assertIn("지난 설정: 2026-10-23T10:00:00+09:00 claude-only (표 v1)", p.stdout)
 
+    def test_detect_shows_script_locations_and_last_backups(self):
+        skills = self.home / ".claude" / "skills"
+        backups = [str(self.state / "repos.toml.bak-20261023-100000"),
+                   str(skills / "codex-review" / "scripts" / "run-review.sh.bak-20261023-100000")]
+        self.state.mkdir(parents=True)
+        (self.state / "setup.json").write_text(json.dumps(
+            {"schema": 1, "setup_at": "2026-10-23T10:00:00+09:00", "profile": "claude-only", "table_version": 1,
+             "backups": backups}), encoding="utf-8")
+        lines = self.run_setup("--detect").stdout.splitlines()
+        for name in ("codex-review", "cursor-review"):
+            self.assertTrue(any(line.startswith(f"스크립트 {name}: 없음 ({skills / name}) — ") for line in lines), lines)
+        last = lines.index("지난 설정: 2026-10-23T10:00:00+09:00 claude-only (표 v1)")
+        self.assertEqual(lines[last + 1:last + 3], [f"  백업: {b}" for b in backups])
+        out = json.loads(self.run_setup("--detect", "--json").stdout)
+        self.assertEqual(out["script_dirs"], {name: str(skills / name) for name in ("codex-review", "cursor-review")})
+        self.assertEqual(out["record"]["backups"], backups)
+
     def test_detect_does_not_write_anything(self):
         self.run_setup("--detect", "--json")
         self.assertEqual(list(self.home.rglob("*")), [])
@@ -127,10 +145,17 @@ class SetupApplyTest(CliSetupBase):
         self.assertEqual((rec["env"], rec["priority"], rec["kept_existing"]), ("none", "save-claude", False))
         self.assertEqual(rec["backups"], [])
 
+    def test_apply_on_fresh_machine_does_not_offer_restore(self):
+        p = self.apply()
+        self.assertIn("백업: 없음", p.stdout)
+        self.assertNotIn("--restore", p.stdout)
+        self.assertIn("setup --detect", p.stdout.split("다음:", 1)[1])
+
     def test_apply_existing_file_is_edited_in_place_with_backup(self):
         self.state.mkdir(parents=True)
         self.repos.write_text('# 내 메모\ndefault_profile = "default"  # 손으로\n', encoding="utf-8")
-        self.apply("claude-only")
+        p = self.apply("claude-only")
+        self.assertIn("setup --restore --dry-run", p.stdout.split("다음:", 1)[1])
         self.assertEqual(self.repos.read_text(encoding="utf-8"), '# 내 메모\ndefault_profile = "claude-only"  # 손으로\n')
         backups = sorted(self.state.glob("repos.toml.bak-*"))
         self.assertEqual(len(backups), 1)
@@ -279,6 +304,14 @@ class SetupScriptsTest(CliSetupBase):
         self.assertIn("setup --restore", out)
         self.assertEqual(tomllib.loads(self.repos.read_text(encoding="utf-8"))["default_profile"], "claude-only")
         self.assertFalse((self.state / "setup.json").exists())
+
+    def test_install_failure_on_fresh_machine_does_not_offer_restore(self):
+        with mock.patch.object(cli.skill_scripts, "install", side_effect=OSError("권한 없음")):
+            code, out = self.run_main("setup", "--apply", "--profile", "claude-only", "--priority", "save-claude",
+                                      "--replace-scripts", "codex")
+        self.assertEqual(code, 1, out)
+        self.assertIn(f"repos.toml {self.repos}를 새로 만들었다(백업 없음)", out)
+        self.assertNotIn("--restore", out)
 
     def test_replace_scripts_rejects_unknown_runner(self):
         p = self.run_setup("--apply", "--profile", "claude-only", "--priority", "save-claude", "--replace-scripts", "claude")
@@ -436,7 +469,21 @@ class SetupCheckTest(CliSetupBase):
         self.assertEqual(p.returncode, 6, p.stdout + p.stderr)
         self.assertEqual(self.record()["checks"], {"codex-worker": "실패", "codex-review": "실패"})
         self.assertEqual(self.record()["profile"], "local")
-        self.assertTrue((self.state / "setup-check.json").is_file())
+        self.assertFalse((self.state / "setup-check.json").exists())
+
+    def test_check_merged_into_record_removes_stale_check(self):
+        self.apply("local")
+        stale = {"profile": "local", "checked_at": "x", "results": {"codex-worker": {"status": "성공", "detail": ""}}}
+        (self.state / "setup-check.json").write_text(json.dumps(stale), encoding="utf-8")
+        self.run_setup("--check", "--profile", "local")
+        self.assertFalse((self.state / "setup-check.json").exists())
+        self.apply("local")
+        self.assertEqual(self.record()["checks"], {})
+
+    def test_check_without_matching_record_keeps_check_file(self):
+        self.apply("claude-only")
+        self.run_setup("--check", "--profile", "local")
+        self.assertEqual(json.loads((self.state / "setup-check.json").read_text(encoding="utf-8"))["profile"], "local")
 
     def test_check_after_apply_ignores_record_of_another_profile(self):
         self.apply("claude-only")
@@ -446,6 +493,29 @@ class SetupCheckTest(CliSetupBase):
     def test_check_requires_profile(self):
         p = self.run_setup("--check")
         self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+
+    def install_review_script(self, skill):
+        script = self.home / ".claude" / "skills" / skill / "scripts" / "run-review.sh"
+        script.parent.mkdir(parents=True)
+        script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        script.chmod(0o755)
+
+    def check_default(self, codex, cursor):
+        for skill in ("codex-review", "cursor-review"):
+            self.install_review_script(skill)
+        code, out = self.run_main("setup", "--check", "--profile", "default", "--json",
+                                  extra=[mock.patch.object(cli, "codex_available", return_value=codex),
+                                         mock.patch.object(cli, "cursor_available", return_value=cursor)])
+        return code, json.loads(out)["results"]
+
+    def test_check_default_resolves_auto_review_cells_to_codex(self):
+        self.assertEqual(self.check_default(codex=True, cursor=True), (0, {"codex-review": {"status": "성공", "detail": ""}}))
+
+    def test_check_default_resolves_auto_review_cells_to_cursor_without_codex(self):
+        self.assertEqual(self.check_default(codex=False, cursor=True), (0, {"cursor-review": {"status": "성공", "detail": ""}}))
+
+    def test_check_default_resolves_auto_review_cells_to_claude_without_usable_cli(self):
+        self.assertEqual(self.check_default(codex=False, cursor=False), (0, {}))
 
     def test_check_runs_acp_check_for_cursor_read_roles(self):
         self.state.mkdir(parents=True)
@@ -515,12 +585,38 @@ class DetectSetupNoticeTest(CliSetupBase):
         p = self.detect()
         self.assertIn("참고: 추천 표가 바뀌었다(v0→v1): 이 기기 추천은 claude-only", p.stdout)
 
+    def codex_env(self):
+        bin_dir = self.tmp / "bin"
+        bin_dir.mkdir()
+        codex = install(bin_dir, "codex", CODEX_BODY)
+        (self.home / ".codex").mkdir()
+        (self.home / ".codex" / "auth.json").write_text("{}", encoding="utf-8")
+        return {"CASCADE_CODEX": str(codex)}
+
     def test_detect_script_notice_for_explicit_codex_profile_when_script_is_missing(self):
-        local = self.detect("--profile", "local", "--input", str(self.result))
+        env = self.codex_env()
+        local = self.detect("--profile", "local", "--input", str(self.result), env=env)
         self.assertIn(self.SCRIPT_NOTICE, local.stdout)
         notes = json.loads(run_cli(["detect", "--root", str(self.repo), "--no-gh", "--json", "--profile", "local",
-                                    "--input", str(self.result)], self.tmp, env=self.env).stdout)["notes"]
+                                    "--input", str(self.result)], self.tmp, env={**self.env, **env}).stdout)["notes"]
         self.assertIn(self.SCRIPT_NOTICE.removeprefix("참고: "), notes)
+
+    def test_detect_no_script_notice_when_codex_cli_is_missing(self):
+        local = self.detect("--profile", "local", "--input", str(self.result))
+        self.assertIn("대체: code.opinion codex → claude — 미설치 또는 로그인 필요", local.stdout)
+        self.assertNotIn("스크립트가 플러그인 판과 다르다", local.stdout)
+        self.state.mkdir(parents=True)
+        self.repos.write_text('default_profile = "local"\n', encoding="utf-8")
+        default = self.detect("--input", str(self.result))
+        self.assertIn("프로필: local (repos.toml:default_profile)", default.stdout)
+        self.assertNotIn("스크립트가 플러그인 판과 다르다", default.stdout)
+
+    def test_detect_setup_notes_survive_os_error(self):
+        code, out = self.run_main("detect", "--root", str(self.repo), "--no-gh", "--input", str(self.result),
+                                  extra=[mock.patch.object(cli, "_script_states", side_effect=PermissionError(13, "권한 없음"))])
+        self.assertIn(code, (0, 6), out)
+        self.assertIn("프로필:", out)
+        self.assertIn("참고: 설정 알림을 건너뛴다:", out)
 
     def test_detect_no_script_notice_for_default_and_claude_only_without_script(self):
         for name in ("default", "claude-only"):

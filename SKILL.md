@@ -38,9 +38,9 @@ PYTHONPATH="${CLAUDE_SKILL_DIR}" python3 -m cascade.cli
 3. **미리 보기** — `CF setup --apply (--profile <이름> | --keep) --priority <save-claude|fast> [--replace-scripts codex,cursor] --dry-run`의 diff를 보이고 확인받는다. 바꾼다고 한 스크립트만 `--replace-scripts`에 넣는다.
 4. **쓰기** — 같은 명령을 `--dry-run` 없이 돌린다. repos.toml(백업을 남긴다)·승인받은 스크립트·`setup.json`을 쓴다.
 5. **동작 확인** — 2에서 승인받았을 때만 `CF setup --check --profile <이름>`(「지금 값 유지」면 현재 `default_profile` 이름을 준다. 없으면 건너뛴다. 바뀐 스크립트를 시험하려고 쓰기 뒤에 돈다. 결과는 `setup.json`에 합쳐진다). 종료 코드 6이면 `시험 <이름>: <상태> — …` 줄 중 상태가 성공이 아닌 것(실패·로그인 필요·한도·누출 있음·확인 못 함)을 보이고 그 runner가 없는 선택지로 다시 물어 3부터 다시 한다(방금 쓴 것을 되돌리려면 아래 되돌리기). `누출 있음`(Cursor 읽기 역할 격리)은 그 프로필을 다시 권하지 않는다. `확인 못 함`은 그대로 알리고 고를지는 사용자에게 맡긴다.
-6. **끝** — 「되돌리려면 『cascade-fix 설정 되돌려줘』」를 한 줄 알린다.
+6. **끝** — 4의 `--apply`가 repos.toml 백업 줄(`백업: …repos.toml.bak-…`)을 찍었을 때만 「되돌리려면 『cascade-fix 설정 되돌려줘』」를 한 줄 알린다. 새로 만든 파일은 되돌릴 백업이 없다.
 
-- 되돌리기 요청이 오면 `CF setup --restore --dry-run`으로 diff를 보이고, 확인받은 뒤 `CF setup --restore`를 돌린다. repos.toml만 되돌리고 스크립트 백업(`--apply`가 출력한 `백업:` 경로)은 되돌리지 않는다. 그 경로를 알려 사용자가 손으로 되돌리게 한다.
+- 되돌리기 요청이 오면 `CF setup --restore --dry-run`으로 diff를 보이고, 확인받은 뒤 `CF setup --restore`를 돌린다. repos.toml만 되돌리고 스크립트 백업(`--apply`가 출력했거나 `CF setup --detect`의 `지난 설정:` 아래 `백업:` 줄에 나온 경로)은 되돌리지 않는다. 그 경로를 알려 사용자가 손으로 되돌리게 한다.
 - 종료 코드 5(`오류: …`)는 그 줄을 보이고 멈춘다. `CASCADE_REPOS_TOML`이 잡혀 있으면 repos.toml을 쓰는 동작(`--apply`·`--repo-profile`·`--restore`)이 5로 멈추고, `CASCADE_RUN_REVIEW`·`CASCADE_CURSOR_REVIEW`가 잡혀 있으면 `--replace-scripts`가 5로 멈춘다. 변수를 지우고 다시 하라고 알린다. `--check`는 `--dry-run`을 받지 않는다.
 - 저장소별 「항상 Claude만」은 이 절이 아니라 「실행 전 확인」 1에서 받는다.
 

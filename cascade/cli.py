@@ -542,7 +542,8 @@ def cmd_detect(args) -> int:
                         workers_flag=_next_workers_flags(args, resolved.explicit))
     except profiles.ProfileError as e:
         raise s.CliError(str(profiles.explain_overrides(e, resolved.overrides)), ExitCodes.PARSE_ERROR) from None
-    result["notes"].extend(_setup_notes(_notice_roles(resolved.roles, result["profile"]["roles"])))
+    shown = result["profile"]
+    result["notes"].extend(_setup_notes(_notice_roles(resolved.roles, shown["roles"], shown["substituted"])))
     print(json.dumps(result, ensure_ascii=False, indent=2) if args.json else render_detect(result))
     return 0 if result["ok"] else ExitCodes.NEEDS_USER
 
@@ -1733,10 +1734,11 @@ def _default_profile() -> str | None:
     return value if isinstance(value, str) else None
 
 
-def _notice_roles(chosen: dict, shown: dict) -> dict:
-    """스크립트 알림은 고른 프로필이 명시한 외부 runner도 센다. 스크립트가 없어 detect가 Claude로 대체한 칸을 놓치지 않기 위해서다."""
-    return {key: chosen[key] if key in chosen and chosen[key]["runner"] in (RUNNER_CODEX, RUNNER_CURSOR) else cell
-            for key, cell in shown.items()}
+def _notice_roles(chosen: dict, shown: dict, substituted: list[dict]) -> dict:
+    """스크립트 알림은 검토 스크립트가 없어 detect가 대체한 칸만 대체 전 값으로 센다. CLI가 없어 대체한 칸은 이번 실행이 스크립트를 쓰지 않는다."""
+    no_script = {r["role"].removesuffix(assignment.FALLBACK_SUFFIX) for r in substituted
+                 if r["reason"] == assignment.NO_SCRIPT_REASON}
+    return {key: chosen[key] if key in no_script and key in chosen else cell for key, cell in shown.items()}
 
 
 def _setup_notes(roles: dict) -> list[str]:
@@ -1744,7 +1746,7 @@ def _setup_notes(roles: dict) -> list[str]:
         used = {skill_scripts.RUNNER_SKILLS[runner] for runner, path in setup.check_paths(roles) if path == setup.REVIEW}
         return setup.notices(record=setup.read_record(_state_dir() / SETUP_RECORD), table=recommend.load_table(),
                              default_profile=_default_profile(), roles=roles, scripts=_script_states(used))
-    except ConfigError as e:
+    except (ConfigError, OSError) as e:
         return [f"설정 알림을 건너뛴다: {e}"]
 
 
@@ -1787,6 +1789,7 @@ def _print_next_commands(*commands: str) -> None:
 def _setup_inspect(table: dict, target: toml_edit.Target | None, target_error: str | None) -> dict:
     return setup.inspect(table=table, availability=setup.availability(), codex_model=codex_model(Path.home() / ".codex"),
                          target=target, target_error=target_error, scripts=_script_states(),
+                         script_dirs={name: str(skill_scripts.skill_dir(script)) for name, script in _skill_scripts().items()},
                          record=setup.read_record(_state_dir() / SETUP_RECORD))
 
 
@@ -1811,10 +1814,12 @@ def _render_setup_detect(info: dict) -> str:
     lines.append(f"추천(빨리 끝내기): {fast[0]['profile']}")
     lines.extend(f"  대안: {o['profile']} [{STATUS_LABELS[o['status']]}] {o['note']}".rstrip() for o in saved[1:])
     for name, (state, details) in info["scripts"].items():
-        lines.append(f"스크립트 {name}: {state}" + (f" — {'; '.join(details)}" if details else ""))
+        lines.append(f"스크립트 {name}: {state} ({info['script_dirs'][name]})" + (f" — {'; '.join(details)}" if details else ""))
     record = info["record"]
     if record:
         lines.append(f"지난 설정: {record.get('setup_at')} {record.get('profile')} (표 v{record.get('table_version')})")
+        backups = record.get("backups")
+        lines.extend(f"  백업: {b}" for b in (backups if isinstance(backups, list) else []))
     return "\n".join(lines)
 
 
@@ -1841,14 +1846,26 @@ def _check_passed(result: dict) -> bool:
     return result["status"] in (setup.CHECK_OK, setup.ACP_CLEAN)
 
 
-def _merge_check_into_record(profile: str, results: dict) -> None:
+def _merge_check_into_record(profile: str, results: dict) -> bool:
     path = _state_dir() / SETUP_RECORD
     record = setup.read_record(path)
     if record is None or record.get("profile") != profile:
-        return
+        return False
     old = record.get("checks")
     checks = {**(old if isinstance(old, dict) else {}), **{name: result["status"] for name, result in results.items()}}
     setup.write_record(path, {**record, "checks": checks})
+    return True
+
+
+def _check_roles(name: str, roles: dict) -> dict:
+    """검토 칸의 auto를 Claude가 아닌 입력일 때처럼 푼다. codex는 스크립트와 CLI가 다 있을 때만 고른다."""
+    available: dict[str, bool] = {}
+    codex_ok = s.RUN_REVIEW.is_file() and _probe(available, (RUNNER_CODEX,))[RUNNER_CODEX]
+    try:
+        return assignment.resolve_auto(roles, f"{RUNNER_CODEX}-code", s.RUN_REVIEW if codex_ok else Path(os.devnull),
+                                       _cursor_reviewer_ok(available), name=name)
+    except profiles.ProfileError as e:
+        raise s.CliError(str(e), ExitCodes.PARSE_ERROR) from None
 
 
 def _setup_check(args) -> int:
@@ -1858,7 +1875,7 @@ def _setup_check(args) -> int:
         raise s.CliError("--check 는 --dry-run 을 받지 않는다(시험 문장을 실제로 보낸다)")
     known = _known_profiles(s.repos_toml())
     _require_known(args.profile, known)
-    roles = known[args.profile]["roles"]
+    roles = _check_roles(args.profile, known[args.profile]["roles"])
     scripts = {runner: _skill_scripts()[skill] for runner, skill in skill_scripts.RUNNER_SKILLS.items()}
     results = {}
     for runner, path in setup.check_paths(roles):
@@ -1867,8 +1884,10 @@ def _setup_check(args) -> int:
     if setup.needs_acp_check(roles):
         results["cursor_acp"] = _acp_check()
     check = {"profile": args.profile, "checked_at": s.now(), "results": results}
-    setup.write_record(_state_dir() / SETUP_CHECK, check)
-    _merge_check_into_record(args.profile, results)
+    if _merge_check_into_record(args.profile, results):
+        (_state_dir() / SETUP_CHECK).unlink(missing_ok=True)
+    else:
+        setup.write_record(_state_dir() / SETUP_CHECK, check)
     passed = all(_check_passed(result) for result in results.values())
     if args.json:
         _dump(check)
@@ -1947,16 +1966,16 @@ def _setup_apply(args) -> int:
             _print_next_commands(_apply_command(args, args.replace_scripts))
         return 0
     stamp = _backup_stamp()
-    backups: list[Path] = []
-    if diff:
-        backup = toml_edit.write_checked(target.path, new_text, stamp)
-        backups.extend([backup] if backup else [])
+    repos_backup = toml_edit.write_checked(target.path, new_text, stamp) if diff else None
+    backups: list[Path] = [repos_backup] if repos_backup else []
     try:
         for name in replacing:
             backups.extend(skill_scripts.install(name, skill_scripts.skill_dir(_skill_scripts()[name]), stamp))
     except OSError as e:
-        written = (f"repos.toml {target.path}는 이미 고쳤다(백업: {', '.join(map(str, backups)) or '없음'}). "
-                   f"되돌리려면 {s.CLI} setup --restore") if diff else "repos.toml은 바꾸지 않았다"
+        if repos_backup:
+            written = f"repos.toml {target.path}는 이미 고쳤다(백업: {', '.join(map(str, backups))}). 되돌리려면 {s.CLI} setup --restore"
+        else:
+            written = f"repos.toml {target.path}를 새로 만들었다(백업 없음)" if diff else "repos.toml은 바꾸지 않았다"
         raise s.CliError(f"스크립트 설치에 실패했다: {e}. {written}. 설정 기록은 쓰지 않았다") from None
     profile = info["repos_toml"]["default_profile"] if args.keep else args.profile
     check_path = _state_dir() / SETUP_CHECK
@@ -1985,7 +2004,7 @@ def _setup_apply(args) -> int:
     print("\n".join(f"백업: {b}" for b in backups) or "백업: 없음")
     for name in replacing:
         print(f"스크립트 교체함: {name}")
-    _print_next_commands(f"{s.CLI} setup --restore --dry-run  # repos.toml을 되돌리려면" if diff else f"{s.CLI} setup --detect")
+    _print_next_commands(f"{s.CLI} setup --restore --dry-run  # repos.toml을 되돌리려면" if repos_backup else f"{s.CLI} setup --detect")
     return 0
 
 

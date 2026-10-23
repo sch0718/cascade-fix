@@ -118,7 +118,7 @@ class InspectTest(SetupTestBase):
 
     def inspect(self, **overrides):
         args = dict(table=TABLE, availability={"codex": "로그인됨", "cursor": "없음"}, codex_model="gpt-x",
-                    target=Target(self.user, None), target_error=None, scripts={}, record=None)
+                    target=Target(self.user, None), target_error=None, scripts={}, script_dirs={}, record=None)
         args.update(overrides)
         return setup.inspect(**args)
 
@@ -133,12 +133,15 @@ class InspectTest(SetupTestBase):
     def test_inspect_reports_table_options_and_passthrough(self):
         record = {"schema": 1}
         scripts = {"codex-review": ("같음", [])}
-        r = self.inspect(availability={"codex": "로그인됨", "cursor": "로그인됨"}, record=record, scripts=scripts)
+        dirs = {"codex-review": "/h/.claude/skills/codex-review"}
+        r = self.inspect(availability={"codex": "로그인됨", "cursor": "로그인됨"}, record=record, scripts=scripts,
+                         script_dirs=dirs)
         self.assertEqual(r["env"], "codex+cursor")
         self.assertEqual(r["table_version"], TABLE["version"])
         self.assertEqual(r["codex_model"], "gpt-x")
         self.assertIs(r["record"], record)
         self.assertEqual(r["scripts"], scripts)
+        self.assertEqual(r["script_dirs"], dirs)
         self.assertEqual(set(r["options"]), {"save-claude", "fast"})
         self.assertEqual(r["options"]["fast"], recommend.options(TABLE, "codex+cursor", "fast"))
         self.assertTrue(r["options"]["save-claude"][0]["recommended"])
@@ -287,6 +290,15 @@ class RunCheckTest(SetupTestBase):
         self.assertEqual(args[1], str(Path(args[3]) / "prompt.md"))
         self.assertEqual((self.tmp / "log.prompt").read_text(encoding="utf-8"), setup.SMOKE_PROMPT)
         self.assertFalse(Path(args[3]).exists())
+
+    def test_run_check_review_repo_is_git_work_tree(self):
+        script = self.tmp / "run-review.sh"
+        log = self.tmp / "git.log"
+        script.write_text(f'#!/bin/sh\ngit -C "$4" rev-parse --is-inside-work-tree > "{log}" 2>&1\n', encoding="utf-8")
+        script.chmod(script.stat().st_mode | stat.S_IXUSR)
+        result = setup.run_check("codex", "review", "", "", {"codex": script}, timeout=20)
+        self.assertEqual(log.read_text(encoding="utf-8").strip(), "true")
+        self.assertEqual(result, {"status": "성공", "detail": ""})
 
     def test_run_check_cursor_review_passes_model(self):
         self.assertEqual(self.review("cursor", model="composer-2.5")["status"], "성공")

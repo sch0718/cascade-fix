@@ -13,6 +13,7 @@ from cascade.config import ConfigError, has_repos
 ENV_VAR = "CASCADE_REPOS_TOML"
 TABLE_HEADER = re.compile(r"^\s*\[")
 STRING_VALUE = r'(?:"(?:[^"\\\n]|\\.)*"|\'[^\'\n]*\')'
+BACKUP_STAMP = re.compile(r"\.bak-\d{8}-\d{6}(?:-\d{2})?")
 
 
 class EditError(ConfigError):
@@ -139,8 +140,9 @@ def diff(old: str, new: str, path: Path) -> str:
 def backups(path: Path) -> list[Path]:
     if not path.parent.is_dir():
         return []
-    prefix = f"{path.name}.bak-"
-    return sorted((p for p in path.parent.iterdir() if p.name.startswith(prefix)), key=lambda p: p.name, reverse=True)
+    return sorted((p for p in path.parent.iterdir()
+                   if p.name.startswith(path.name) and BACKUP_STAMP.fullmatch(p.name[len(path.name):])),
+                  key=lambda p: p.name, reverse=True)
 
 
 def _backup(path: Path, stamp: str) -> Path:

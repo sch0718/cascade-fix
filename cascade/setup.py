@@ -73,7 +73,8 @@ def _repos_toml(target: Target | None, target_error: str | None) -> dict:
 
 
 def inspect(*, table: dict, availability: dict[str, str], codex_model: str, target: Target | None,
-            target_error: str | None, scripts: dict[str, tuple[str, list[str]]], record: dict | None) -> dict:
+            target_error: str | None, scripts: dict[str, tuple[str, list[str]]], script_dirs: dict[str, str],
+            record: dict | None) -> dict:
     env = recommend.env_key(availability.get(RUNNER_CODEX) == LOGGED_IN, availability.get(RUNNER_CURSOR) == LOGGED_IN)
     return {
         "env": env,
@@ -81,6 +82,7 @@ def inspect(*, table: dict, availability: dict[str, str], codex_model: str, targ
         "codex_model": codex_model,
         "repos_toml": _repos_toml(target, target_error),
         "scripts": scripts,
+        "script_dirs": script_dirs,
         "record": record,
         "table_version": table["version"],
         "options": {priority: recommend.options(table, env, priority) for priority in recommend.PRIORITIES},
@@ -134,6 +136,9 @@ def _check_review(runner: str, model: str, script: Path | None, timeout: int) ->
     if not script.is_file():
         return {"status": CHECK_FAILED, "detail": f"스크립트 없음: {script}"}
     with tempfile.TemporaryDirectory(prefix="cascade-setup-check-") as tmp:
+        init = _execute(["git", "init", "-q", tmp], "", Path(tmp), dict(os.environ), timeout)
+        if init.returncode != 0:
+            return {"status": CHECK_FAILED, "detail": f"빈 git 저장소를 만들지 못했다: {init.stderr.strip()}"}
         prompt = Path(tmp) / "prompt.md"
         prompt.write_text(SMOKE_PROMPT, encoding="utf-8")
         cmd = [str(script), "--opinion", str(prompt), "--repo", tmp, "--out", str(Path(tmp) / "out"),
