@@ -227,6 +227,27 @@ class CodexRunnerTest(RunnerTestBase):
         self.assertEqual(out.status, STATUS_TIMEOUT)
         self.assertLess(time.monotonic() - started, 3)
 
+    def test_codex_ask_returns_text(self):
+        with mock.patch.dict(os.environ, {"FAKE_CODEX_RESULT": "OK\n"}):
+            out = CodexRunner(self.codex, codex_dir=self.codex_dir).ask(self.wt, "시험 문장", "gpt-test", "low")
+        args = self.log_args("codex")
+        self.assertEqual(out.status, STATUS_OK)
+        self.assertEqual(out.output, {"text": "OK"})
+        self.assertEqual(args[args.index("-s") + 1], "read-only")
+        self.assertNotIn("--output-schema", args)
+        self.assertEqual(args[args.index("-m") + 1], "gpt-test")
+        self.assertIn("시험 문장", self.log_text("codex", "stdin"))
+        env = json.loads(self.log_text("codex", "env.json"))
+        self.assertNotEqual(env["CODEX_HOME"], str(self.codex_dir))
+
+    def test_codex_ask_failures_are_classified(self):
+        with mock.patch.dict(os.environ, {"FAKE_CODEX_EXIT": "1", "FAKE_CODEX_STDERR": "usage limit reached"}):
+            out = CodexRunner(self.codex, codex_dir=self.codex_dir).ask(self.wt, "시험 문장", "", "low")
+        self.assertEqual(out.status, STATUS_LIMIT)
+        (self.codex_dir / "auth.json").unlink()
+        out = CodexRunner(self.codex, codex_dir=self.codex_dir).ask(self.wt, "시험 문장", "", "low")
+        self.assertEqual(out.status, STATUS_AUTH)
+
     def test_cache_env_is_passed_outside_worktree(self):
         self.run_codex()
         env = json.loads(self.log_text("codex", "env.json"))

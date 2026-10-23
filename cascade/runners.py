@@ -416,18 +416,18 @@ class CodexRunner:
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
-    def _run(self, job: CliJob, prompt: str, tmp: Path) -> Outcome:
-        home, schema_file, result_file = tmp / "codex-home", tmp / "schema.json", tmp / "result.json"
+    def _exec(self, job: CliJob, prompt: str, tmp: Path, sandbox: str, result_file: Path,
+              schema_args: list[str]) -> tuple[_Run, str]:
+        home = tmp / "codex-home"
         snapshot = self._prepare_home(home, job)
-        schema_file.write_text(json.dumps(SCHEMAS[job.kind], ensure_ascii=False), encoding="utf-8")
         cmd = [
             self.exe, "exec",
-            "-s", "workspace-write" if job.writable else "read-only",
+            "-s", sandbox,
             "--ephemeral", "--json", "--skip-git-repo-check",
             "-C", str(job.worktree),
             *(["-m", job.model] if job.model else []),
             "-c", f"model_reasoning_effort={json.dumps(job.effort)}",
-            "--output-schema", str(schema_file),
+            *schema_args,
             "-o", str(result_file),
             "-",
         ]
@@ -436,13 +436,44 @@ class CodexRunner:
             run = _execute(cmd, prompt, job.worktree, env, self.timeout)
         finally:
             conflict = self._write_back(home / "auth.json", snapshot)
+        return run, conflict
+
+    def _run(self, job: CliJob, prompt: str, tmp: Path) -> Outcome:
+        schema_file, result_file = tmp / "schema.json", tmp / "result.json"
+        schema_file.write_text(json.dumps(SCHEMAS[job.kind], ensure_ascii=False), encoding="utf-8")
+        run, conflict = self._exec(job, prompt, tmp, "workspace-write" if job.writable else "read-only", result_file,
+                                   ["--output-schema", str(schema_file)])
         usage = _codex_usage(run.stdout)
         outcome = self._outcome(job, run, prompt, usage, result_file)
         if conflict:
             outcome.detail = f"{outcome.detail}; {conflict}" if outcome.detail else conflict
         return outcome
 
-    def _outcome(self, job: CliJob, run: _Run, prompt: str, usage: dict, result_file: Path) -> Outcome:
+    def ask(self, worktree: Path, prompt: str, model: str, effort: str) -> Outcome:
+        """프롬프트 하나를 읽기 전용 샌드박스로 보내고 결과 텍스트를 output["text"]에 담아 돌려 준다."""
+        job = CliJob("ask", "a", "worker", RUNNER_CODEX, model, effort, Path(), Path(worktree), False)
+        if not (self.codex_dir / "auth.json").is_file():
+            return Outcome(job.id, job.runner, STATUS_AUTH, None, {}, f"{self.codex_dir / 'auth.json'} 없음: codex login 필요")
+        tmp = Path(tempfile.mkdtemp(prefix="cascade-cache-"))
+        try:
+            result_file = tmp / "result.txt"
+            run, conflict = self._exec(job, prompt, tmp, "read-only", result_file, [])
+            usage = _codex_usage(run.stdout)
+            outcome = self._failed(job, run, prompt, usage)
+            if outcome is None and not result_file.is_file():
+                outcome = Outcome(job.id, job.runner, STATUS_ERROR, None, usage, "결과 파일이 없다")
+            if outcome is None:
+                text = result_file.read_text(encoding="utf-8", errors="replace").strip()
+                outcome = Outcome(job.id, job.runner, STATUS_OK, {"text": text}, usage, "")
+            if conflict:
+                outcome.detail = f"{outcome.detail}; {conflict}" if outcome.detail else conflict
+            return outcome
+        except Exception as e:
+            return _unexpected(job, e)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def _failed(self, job: CliJob, run: _Run, prompt: str, usage: dict) -> Outcome | None:
         failed = _failure(job, run, usage, self.timeout)
         if failed:
             return failed
@@ -450,6 +481,12 @@ class CodexRunner:
             text = _without_prompt(_codex_failure_text(run.stdout, run.stderr), prompt)
             return Outcome(job.id, job.runner, classify_failure(text), None, usage,
                            f"종료 코드 {run.returncode}: {_tail(text) or _tail(run.stdout)}")
+        return None
+
+    def _outcome(self, job: CliJob, run: _Run, prompt: str, usage: dict, result_file: Path) -> Outcome:
+        failed = self._failed(job, run, prompt, usage)
+        if failed:
+            return failed
         if not result_file.is_file():
             return Outcome(job.id, job.runner, STATUS_ERROR, None, usage, "결과 파일이 없다")
         try:
