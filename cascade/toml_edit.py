@@ -75,7 +75,29 @@ def _next_table(lines: list[str], start: int) -> int:
     return next((i for i in range(start, len(lines)) if TABLE_HEADER.match(lines[i])), len(lines))
 
 
+def _parse(text: str) -> dict:
+    try:
+        return tomllib.loads(text)
+    except tomllib.TOMLDecodeError as e:
+        raise EditError(f"repos.toml을 읽지 못했다: {e}") from e
+
+
+def _checked(out: str, expected: dict, manual: str) -> str:
+    try:
+        edited = tomllib.loads(out)
+    except tomllib.TOMLDecodeError:
+        edited = None
+    if edited != expected:
+        raise EditError(f"고친 결과가 예상과 달라 자동으로 고치지 않는다. 직접 {manual} 줄을 넣어라")
+    return out
+
+
 def set_default_profile(text: str, name: str) -> str:
+    expected = {**_parse(text), "default_profile": name}
+    return _checked(_default_profile_text(text, name), expected, f"맨 위에 default_profile = {_quote(name)}")
+
+
+def _default_profile_text(text: str, name: str) -> str:
     lines = text.splitlines(keepends=True)
     first_table = _next_table(lines, 0)
     found = _find_assignment(lines, "default_profile", 0, first_table)
@@ -103,10 +125,7 @@ def _header_pattern(key: str) -> re.Pattern:
 
 
 def set_repo_profile(text: str, root: Path, name: str) -> str:
-    try:
-        data = tomllib.loads(text)
-    except tomllib.TOMLDecodeError as e:
-        raise EditError(f"repos.toml을 읽지 못했다: {e}") from e
+    data = _parse(text)
     repos = data.get("repos", {})
     key = _repo_key(repos, root) if isinstance(repos, dict) else None
     if key is None:
@@ -128,7 +147,8 @@ def set_repo_profile(text: str, root: Path, name: str) -> str:
     else:
         lines[header] = _with_newline(lines[header])
         lines.insert(header + 1, f"profile = {_quote(name)}\n")
-    return "".join(lines)
+    expected = {**data, "repos": {**repos, key: {**repos[key], "profile": name}}}
+    return _checked("".join(lines), expected, f"[repos.{_quote(key)}] 항목에 profile = {_quote(name)}")
 
 
 def diff(old: str, new: str, path: Path) -> str:

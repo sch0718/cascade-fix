@@ -114,6 +114,18 @@ class TomlEditTest(unittest.TestCase):
             toml_edit.set_repo_profile(text, Path("/w/app"), "claude-only")
         self.assertIn('profile = "claude-only"', str(cm.exception))
 
+    def test_set_repo_profile_refuses_profile_line_inside_multiline_string(self):
+        text = '[repos."/w/app"]\ntests = ["""python - <<X\nprofile = "production"\nX"""]\n'
+        with self.assertRaises(toml_edit.EditError) as cm:
+            toml_edit.set_repo_profile(text, Path("/w/app"), "claude-only")
+        self.assertIn('profile = "claude-only"', str(cm.exception))
+
+    def test_set_default_profile_refuses_line_inside_multiline_string(self):
+        text = 'note = """\ndefault_profile = "x"\n"""\n'
+        with self.assertRaises(toml_edit.EditError) as cm:
+            toml_edit.set_default_profile(text, "local")
+        self.assertIn('default_profile = "local"', str(cm.exception))
+
     def test_edit_error_is_config_error(self):
         self.assertTrue(issubclass(toml_edit.EditError, config.ConfigError))
 
