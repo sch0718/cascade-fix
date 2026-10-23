@@ -45,8 +45,8 @@
 - Python 3.11 이상. 외부 패키지는 필요 없습니다.
 - git
 - (PR 모드) 로그인된 `gh` CLI
-- (선택) Codex를 검토자로 쓰려면 `codex-review` 스킬과 `codex` CLI. 이 스킬은 `run-review.sh`의 `--opinion`·`--recheck` 모드를 씁니다. 원래 `codex-review`에는 없는 모드라 [docs/codex-review-changes/](docs/codex-review-changes/README.md)에 보관한 `run-review.sh`로 바꿔야 합니다. 이 스크립트는 임시 CODEX_HOME에서 스킬 목록을 꺼 Codex 프롬프트도 줄입니다. 없으면 그 칸은 fallback(기본 Claude)으로 바뀝니다.
-- (선택) Cursor를 검토자나 작업자로 쓰려면 `cursor-review` 스킬(`~/.claude/skills/cursor-review/`, 사본은 [docs/cursor-review/](docs/cursor-review/README.md))과 로그인된 `cursor-agent` CLI(`cursor-agent login`). Codex를 작업자로 쓰려면 `codex` CLI와 로그인이 필요합니다.
+- (선택) Codex를 검토자로 쓰려면 `codex-review` 스킬과 `codex` CLI. 이 스킬은 `run-review.sh`의 `--opinion`·`--recheck` 모드를 씁니다. 원래 `codex-review`에는 없는 모드라 [docs/codex-review-changes/](docs/codex-review-changes/README.md)의 플러그인 사본이 필요하고, [이 기기 설정](#처음-한-번-이-기기-설정)이 그 사본을 `~/.claude/skills/codex-review/`에 설치합니다. 이 스크립트는 임시 CODEX_HOME에서 스킬 목록을 꺼 Codex 프롬프트도 줄입니다. 없으면 그 칸은 fallback(기본 Claude)으로 바뀝니다.
+- (선택) Cursor를 검토자나 작업자로 쓰려면 `cursor-review` 스킬(`~/.claude/skills/cursor-review/`, 플러그인 사본은 [docs/cursor-review/](docs/cursor-review/README.md))과 로그인된 `cursor-agent` CLI(`cursor-agent login`). 이 스킬도 setup이 플러그인 사본을 설치합니다. Codex를 작업자로 쓰려면 `codex` CLI와 로그인이 필요합니다.
 
 ## 설치
 
@@ -101,6 +101,31 @@ ln -s ~/src/cascade-fix ~/.claude/skills/cascade-fix
 ```
 
 업데이트는 `git -C ~/src/cascade-fix pull`로 합니다.
+
+## 처음 한 번: 이 기기 설정
+
+Claude Code에서 「cascade-fix 설정해줘」(또는 「이 기기에 맞게 cascade-fix 설정」)라고 말하면 시작합니다. 설정하지 않아도 cascade-fix는 돌지만, 설정하기 전에 실행하면 `detect`가 `참고: 이 기기 설정 전이다…` 줄로 알리고 계획 확인에서 「먼저 설정」을 고를 수 있습니다.
+
+흐름은 다음과 같습니다. 판단은 모두 `CF setup`이 하고, 스킬은 묻는 일만 맡습니다.
+
+1. **감지**: 쓸 수 있는 도구(`codex`·`cursor-agent`와 로그인 여부), Codex 모델, 검토 스크립트(`codex-review`·`cursor-review`)가 플러그인 사본과 같은지, 현재 `default_profile`을 읽습니다. 파일을 쓰지 않고 코드도 보내지 않습니다.
+2. **질문**: 우선순위(「Claude 한도 아끼기」·「빨리 끝내기」), 프로필, 다른 스크립트를 바꿀지, 외부 도구 동작 확인을 할지 묻습니다.
+3. **미리 보기와 쓰기**: 바뀔 내용을 diff로 보여 주고 확인받은 뒤 씁니다.
+4. **동작 확인**: 고른 프로필이 외부 도구를 쓰고 승인했을 때만, 그 도구에 시험 문장 하나를 보냅니다. 코드·문서는 보내지 않습니다. 실패하면 그 도구를 뺀 선택지로 다시 고릅니다.
+
+쓰는 것은 다음뿐입니다.
+
+| 파일 | 내용 |
+| --- | --- |
+| `~/.claude/cascade-fix/repos.toml` | 최상위 `default_profile = "<이름>"` 한 줄(주석·다른 내용은 그대로). 기존 파일은 `repos.toml.bak-<날짜-시각>`로 백업하고 최근 5개만 남깁니다. 이 파일이 없고 예전 위치(스킬 폴더의 `repos.toml`)에 항목이 있으면 그 파일을 복사해 쓰며 예전 파일은 고치지 않습니다. |
+| `~/.claude/cascade-fix/setup.json` | 설정 기록(환경, 우선순위, 추천, 고른 프로필, 시험 결과, 백업 경로, 표 버전). 추천 표가 바뀌었는지 알리는 데 쓰입니다. |
+| `~/.claude/skills/codex-review/`·`cursor-review/` | 승인했을 때만. 원래 파일은 `<파일>.bak-<날짜-시각>`(`YYYYMMDD-HHMMSS`)으로 남기고 플러그인 사본(`SKILL.md`와 `scripts/run-review.sh`)으로 바꿉니다. |
+
+- **어떤 프로필을 고를까**: 측정 전에는 모든 환경에서 `claude-only`를 권합니다. Codex가 있으면 `local`이 「잠정·미측정」 대안으로 보입니다. 추천은 `cascade/recommendations.toml`이 정하고, 「빨리 끝내기」를 고르면 늘 `claude-only`입니다(지난 측정에서 약 30분, 외부를 섞은 구성은 1.5~3시간).
+- **저장소별 예외**: setup은 기기 기본만 정합니다. 외부 도구를 쓰는 프로필에서 어떤 저장소는 코드를 밖으로 보내지 않으려면, 그 저장소의 첫 실행 전송 동의 질문에서 「이 저장소는 항상 Claude만」을 고릅니다(`CF setup --repo-profile claude-only --root <저장소>`가 그 저장소 항목에 `profile = "claude-only"`를 씁니다). 풀려면 repos.toml에서 그 줄을 지웁니다.
+- **다시 하기**: 같은 말로 다시 하면 지난 기록과 현재 값이 함께 보입니다. 추천 표가 바뀌어 이 기기 추천이 달라지거나 고른 프로필이 쓰는 검토 스크립트가 플러그인 사본과 다르면, 실행 때 `detect`가 `참고:` 줄로 알립니다.
+- **되돌리기**: 「cascade-fix 설정 되돌려줘」라고 말하면 `CF setup --restore`가 가장 최근 백업과의 diff를 보여 주고, 확인받아 repos.toml을 그 백업으로 되돌립니다(되돌리기 전 파일도 새 백업으로 남습니다). 스크립트 백업은 되돌리기 대상이 아니라 `.bak-<날짜-시각>` 파일을 직접 되돌립니다(경로는 감지 출력의 `지난 설정:` 아래 `백업:` 줄에 보입니다). `--restore`는 repos.toml만 되돌리므로 `setup.json`의 `profile`이 실제 값과 달라질 수 있습니다. 다시 설정하면 기록이 갱신됩니다.
+- **삭제**: 플러그인을 지워도 `~/.claude/cascade-fix/`(`repos.toml`·`setup.json`·백업)와 설치한 `codex-review`·`cursor-review`는 남습니다. 다 지우려면 직접 지웁니다.
 
 ## 처음 한 번: 저장소 검증 명령 등록
 
@@ -424,6 +449,19 @@ PYTHONPATH=<스킬 경로> python3 -m cascade.cli <명령> [옵션]
 | `resume --choices F` | 보류 후보마다 「지금 반영 / 구현 때 테스트로 / 보류」를 받습니다. 「지금 반영」이 있으면 회차를 엽니다. |
 | `usage (--run-dir D --round N \| --review-dir D) --workflow W` | Workflow 기록을 읽어 작업별 Claude 토큰과 추정 비용을 `round-N/claude-usage.json`(첫 검토는 `<review_dir>/claude-usage.json`)에 씁니다. `W`는 Workflow 실행 id 또는 그 기록 폴더 경로입니다. 같은 Workflow를 다시 넣으면 그 몫만 바뀌고 두 번 더해지지 않습니다. 이름표가 작업과 맞지 않는 에이전트는 어느 칸에도 넣지 않고 경고합니다. 기록 폴더를 읽지 못하면 `Claude 토큰 미측정: <이유>`를 출력하고 종료 코드 0으로 끝납니다. 첫 검토는 `init`보다 먼저 돌립니다. |
 | `report` / `status` / `cleanup` | 보고서, 다음 할 일, 정리 |
+| `setup` | 이 기기 설정. 다음 다섯 동작 중 하나를 고르며 모두 `--json`을 받습니다. 아래 표를 보세요. |
+
+`setup`의 동작입니다.
+
+| 동작 | 하는 일 |
+| --- | --- |
+| `setup --detect` | 환경(`none`·`codex`·`cursor`·`codex+cursor`), repos.toml 경로, 현재 `default_profile`, 추천(`save-claude`·`fast`), 검토 스크립트의 플러그인 사본 일치 여부, 지난 설정을 보입니다. 읽기만 합니다. |
+| `setup --check --profile P` | 프로필 `P`가 쓰는 외부 도구에 경로마다(작업자·검토) 시험 문장 하나를 보냅니다. 한 가지라도 성공이 아니면 종료 코드 6입니다. Cursor 읽기 역할을 쓰면 ACP 격리 점검도 돌립니다. 결과를 `setup-check.json`에 쓰고, `setup.json`의 프로필이 같으면 거기에도 합칩니다. `--dry-run`을 받지 않습니다. |
+| `setup --apply (--profile P \| --keep) --priority save-claude\|fast [--replace-scripts codex,cursor] [--dry-run]` | repos.toml의 `default_profile`(`--keep`이면 건드리지 않음)·승인한 스크립트·`setup.json`을 씁니다. `--dry-run`은 diff만 보입니다. |
+| `setup --repo-profile P [--root R] [--dry-run]` | 저장소 `R`(기본: 현재 디렉터리의 git 루트) 항목의 `profile`을 `P`로 정합니다. 항목이 인라인 표라 찾지 못하면 쓰지 않고 넣을 줄을 보입니다. |
+| `setup --restore [--dry-run]` | repos.toml을 가장 최근 백업으로 되돌립니다. |
+
+- repos.toml을 쓰는 동작(`--apply`·`--repo-profile`·`--restore`)은 `CASCADE_REPOS_TOML`이 잡혀 있으면 종료 코드 5로 멈춥니다(측정용 임시 파일을 기기 설정으로 바꾸지 않으려는 것입니다). `--apply --replace-scripts`는 `CASCADE_RUN_REVIEW`·`CASCADE_CURSOR_REVIEW`가 잡혀 있어도 5로 멈춥니다. 쓴 파일은 `tomllib`로 다시 읽고 프로필을 검사하며, 실패하면 백업으로 되돌립니다.
 
 - `detect`·`review`·`init`은 `--root`로 대상 저장소 루트를 받습니다. 없으면 현재 디렉터리의 저장소입니다. 나머지 명령은 `init`이 출력한 `--run-dir`로 실행을 찾습니다.
 - 회차 단계는 이미 한 단계를 다시 하지 않습니다. 다시 하려면 `--force`를 붙입니다.
@@ -457,8 +495,8 @@ PYTHONPATH=<스킬 경로> python3 -m cascade.cli <명령> [옵션]
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-- 테스트는 1292개입니다. `codex-review` 스킬이 없으면 그 스크립트를 쓰는 테스트는 건너뜁니다. 보관한 스크립트로 돌리려면 `CASCADE_RUN_REVIEW="$PWD/docs/codex-review-changes/run-review.sh"`를 앞에 붙입니다.
-- 디렉터리: `cascade/`(CLI와 단계 로직), `prompts/`(작업자·판정자·판가름·검토자 프롬프트), `scripts/run-jobs.js`(Workflow 스크립트), `eval/`(측정 도구), `docs/`(설계 검토 기록, 고친 `codex-review` 스크립트, `cursor-review` 사본, 외부 작업자 측정 계획)
+- 테스트는 1482개입니다. `codex-review` 스킬이 없으면 그 스크립트를 쓰는 테스트는 건너뜁니다. 보관한 스크립트로 돌리려면 `CASCADE_RUN_REVIEW="$PWD/docs/codex-review-changes/run-review.sh"`를 앞에 붙입니다.
+- 디렉터리: `cascade/`(CLI와 단계 로직. `recommendations.toml`은 `CF setup`이 읽는 환경별 프로필 추천 표이고, 측정 결과로 갱신하는 절차는 `cascade/recommendations.toml` 머리 주석에 있습니다), `prompts/`(작업자·판정자·판가름·검토자 프롬프트), `scripts/run-jobs.js`(Workflow 스크립트), `eval/`(측정 도구), `docs/`(설계 검토 기록, 고친 `codex-review` 스크립트, `cursor-review` 사본, 외부 작업자 측정 계획)
 - 측정: `eval/replay.py`가 과거 지적 표본을 그 커밋에서 다시 돌리고, `eval/score.py`가 정확도·판정 일치율·채택 경로·Opus 호출 절감·Claude 비용을 채점합니다. 그 위에 `eval/adopt_recalc.py`(채택 규칙 반사실), `eval/select_profiles.py`(반복한 후보에서 고르기), `eval/first_review.py`(첫 검토 세 결과 합치기·검토자별 채점), `eval/regress.py`(실제 실행의 프로필별 회귀 세기)가 있습니다. 표본 형식과 순서는 [eval/sample-format.md](eval/sample-format.md)에 있습니다. `--workers external`과 Claude 작업자를 같은 표본에서 비교하는 절차는 [측정 계획](docs/2026-10-18-workers-measurement-plan.md)에 있습니다.
 - 출력 스키마를 바꾸면 `cascade/jobs.py`의 `SCHEMAS`와 `scripts/run-jobs.js`의 `SCHEMAS` 블록을 같이 고칩니다(테스트가 두 쪽이 같은지 확인합니다).
 - 배포할 때는 `.claude-plugin/plugin.json`과 `.claude-plugin/marketplace.json`의 `version`을 함께 올립니다(테스트가 둘이 같은지 확인합니다). 버전이 같으면 설치한 사람에게 업데이트로 보이지 않습니다.

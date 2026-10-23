@@ -227,6 +227,27 @@ class CodexRunnerTest(RunnerTestBase):
         self.assertEqual(out.status, STATUS_TIMEOUT)
         self.assertLess(time.monotonic() - started, 3)
 
+    def test_codex_ask_returns_text(self):
+        with mock.patch.dict(os.environ, {"FAKE_CODEX_RESULT": "OK\n"}):
+            out = CodexRunner(self.codex, codex_dir=self.codex_dir).ask(self.wt, "시험 문장", "gpt-test", "low")
+        args = self.log_args("codex")
+        self.assertEqual(out.status, STATUS_OK)
+        self.assertEqual(out.output, {"text": "OK"})
+        self.assertEqual(args[args.index("-s") + 1], "read-only")
+        self.assertNotIn("--output-schema", args)
+        self.assertEqual(args[args.index("-m") + 1], "gpt-test")
+        self.assertIn("시험 문장", self.log_text("codex", "stdin"))
+        env = json.loads(self.log_text("codex", "env.json"))
+        self.assertNotEqual(env["CODEX_HOME"], str(self.codex_dir))
+
+    def test_codex_ask_failures_are_classified(self):
+        with mock.patch.dict(os.environ, {"FAKE_CODEX_EXIT": "1", "FAKE_CODEX_STDERR": "usage limit reached"}):
+            out = CodexRunner(self.codex, codex_dir=self.codex_dir).ask(self.wt, "시험 문장", "", "low")
+        self.assertEqual(out.status, STATUS_LIMIT)
+        (self.codex_dir / "auth.json").unlink()
+        out = CodexRunner(self.codex, codex_dir=self.codex_dir).ask(self.wt, "시험 문장", "", "low")
+        self.assertEqual(out.status, STATUS_AUTH)
+
     def test_cache_env_is_passed_outside_worktree(self):
         self.run_codex()
         env = json.loads(self.log_text("codex", "env.json"))
@@ -459,6 +480,14 @@ class CursorHomeTest(unittest.TestCase):
 
 
 class HelpersTest(unittest.TestCase):
+    def test_execute_grace_sends_term_before_kill(self):
+        with tempfile.TemporaryDirectory() as td:
+            done = Path(td) / "cleaned"
+            script = f"trap 'echo cleaned > \"{done}\"; exit 0' TERM\nsleep 30 &\nwait\n"
+            run = runners._execute(["sh", "-c", script], "", Path(td), dict(os.environ), 1, grace=5)
+            self.assertTrue(run.timed_out)
+            self.assertEqual(done.read_text(encoding="utf-8").strip(), "cleaned")
+
     def test_classify_failure(self):
         self.assertEqual(classify_failure("You've hit your usage limit"), STATUS_LIMIT)
         self.assertEqual(classify_failure("429 rate limit exceeded"), STATUS_LIMIT)

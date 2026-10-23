@@ -8,6 +8,7 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import sqlite3
 import sys
 import tempfile
@@ -168,7 +169,13 @@ def _run(exe: str, model: str, control: bool, root: Path) -> int:
         pool.close()
 
 
+def exit_on_term() -> None:
+    """SIGTERM을 정상 종료로 바꿔 finally와 atexit가 ACP 서버(별도 세션)와 임시 폴더를 정리하게 한다."""
+    signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
+
+
 def main(argv: list[str] | None = None) -> int:
+    exit_on_term()
     parser = argparse.ArgumentParser(description="Cursor ACP 읽기 역할 프로필의 도구 격리를 짧은 시험 문장으로 확인한다")
     parser.add_argument("--control", action="store_true", help="거부 설정을 비우고 Read만 돌려 시험이 누출을 잡는지 본다")
     parser.add_argument("--model", default=DEFAULT_CURSOR_MODEL)

@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 from cascade.assignment import claude_fallback, fallback_target, ledger_profile
-from cascade.config import ConfigError, ExitCodes, RepoConfig, detect_candidates, is_sensitive_path, load_repo_config
+from cascade.config import ConfigError, ExitCodes, RepoConfig, detect_candidates, has_repos, is_sensitive_path, load_repo_config
 from cascade.consensus import (
     OUTCOME_ADJUDICATE,
     OUTCOME_AGREED_FACT,
@@ -140,22 +140,13 @@ def git_toplevel(cwd: Path) -> Path:
     return Path(p.stdout.strip()).resolve()
 
 
-def _has_repos(path: Path) -> bool:
-    try:
-        return bool(tomllib.loads(path.read_text(encoding="utf-8")).get("repos"))
-    except tomllib.TOMLDecodeError:
-        return True  # 잘못된 파일이면 그대로 골라 오류를 보인다
-    except OSError:
-        return False
-
-
 def repos_toml() -> Path:
     """저장소 검증 설정 파일. 환경 변수 > ~/.claude/cascade-fix/repos.toml > 스킬 폴더의 repos.toml(예전 위치, 항목이 있을 때만)."""
     if os.environ.get("CASCADE_REPOS_TOML"):
         return Path(os.environ["CASCADE_REPOS_TOML"])
     if USER_REPOS_TOML.is_file():
         return USER_REPOS_TOML
-    if LEGACY_REPOS_TOML.is_file() and _has_repos(LEGACY_REPOS_TOML):
+    if LEGACY_REPOS_TOML.is_file() and has_repos(LEGACY_REPOS_TOML):
         return LEGACY_REPOS_TOML
     return USER_REPOS_TOML
 

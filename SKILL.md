@@ -1,7 +1,7 @@
 ---
 name: cascade-fix
-description: 리뷰 지적(Claude·Codex·Cursor 리뷰 결과, PR 리뷰 코멘트)을 지적 하나씩 싼 작업자 둘(Sonnet 5.5·Haiku 5.5)이 독립으로 고치고, 테스트 등 기계 검증과 합의로 채택하며, 갈린 것만 Opus 5.5가 판가름하고, 남은 결정은 사람 목록으로 넘긴다. Claude 단독으로도 돌고, 역할 프로필로 첫 검토·작업자·의견·재검토를 Claude·Codex·Cursor에 나눠 맡길 수 있다. 설계·계획 문서 초안의 검토-수정에도 쓰고, 설계 결정은 선택지와 근거를 붙여 사람에게 묻는다. 커밋·push·resolve·답글은 하지 않고 「준비됨」으로 넘긴다.
-when_to_use: 사용자가 리뷰에서 나온 지적을 고치게 할 때 쓴다. 예 "이번 변경 리뷰하고 고쳐줘", "리뷰 돌리고 지적 반영해줘", "PR 코멘트 반영해줘/해소해줘", "Codex 검토 결과 반영해줘", "이 리뷰 결과 파일 처리해줘", "설계 문서 리뷰 지적 고쳐줘", "스펙 초안 검토하고 고쳐줘", "계획서 리뷰 돌려서 반영해줘", "brainstorming으로 쓴 설계 문서 검토해줘", "cascade-fix". 리뷰만 원하고 고치지 말라는 요청, 문서를 처음부터 새로 쓰는 일(초안 작성), 여러 파일 리팩터링, 테스트가 없는 저장소의 코드 수정, 한두 줄짜리 단순 수정에는 쓰지 않는다.
+description: 리뷰 지적(Claude·Codex·Cursor 리뷰 결과, PR 리뷰 코멘트)을 지적 하나씩 싼 작업자 둘(Sonnet 5.5·Haiku 5.5)이 독립으로 고치고, 테스트 등 기계 검증과 합의로 채택하며, 갈린 것만 Opus 5.5가 판가름하고, 남은 결정은 사람 목록으로 넘긴다. Claude 단독으로도 돌고, 역할 프로필로 첫 검토·작업자·의견·재검토를 Claude·Codex·Cursor에 나눠 맡길 수 있다. 설계·계획 문서 초안의 검토-수정에도 쓰고, 설계 결정은 선택지와 근거를 붙여 사람에게 묻는다. 커밋·push·resolve·답글은 하지 않고 「준비됨」으로 넘긴다. 이 기기에 맞는 프로필을 감지해 설정하는 일(「cascade-fix 설정해줘」, 「이 기기에 맞게 cascade-fix 설정」)과 그 되돌리기도 맡는다.
+when_to_use: 사용자가 리뷰에서 나온 지적을 고치게 할 때 쓴다. 예 "이번 변경 리뷰하고 고쳐줘", "리뷰 돌리고 지적 반영해줘", "PR 코멘트 반영해줘/해소해줘", "Codex 검토 결과 반영해줘", "이 리뷰 결과 파일 처리해줘", "설계 문서 리뷰 지적 고쳐줘", "스펙 초안 검토하고 고쳐줘", "계획서 리뷰 돌려서 반영해줘", "brainstorming으로 쓴 설계 문서 검토해줘", "cascade-fix". 이 기기 설정을 맡길 때도 쓴다. 예 "cascade-fix 설정해줘", "이 기기에 맞게 cascade-fix 설정", "cascade-fix 설정 되돌려줘". 리뷰만 원하고 고치지 말라는 요청, 문서를 처음부터 새로 쓰는 일(초안 작성), 여러 파일 리팩터링, 테스트가 없는 저장소의 코드 수정, 한두 줄짜리 단순 수정에는 쓰지 않는다.
 ---
 
 # cascade-fix
@@ -25,6 +25,25 @@ PYTHONPATH="${CLAUDE_SKILL_DIR}" python3 -m cascade.cli
 
 `RR`은 `codex-review` 스킬의 `run-review.sh`다(칸의 runner가 codex일 때만 쓴다. 코드 모드의 `RR`은 `--repo`를 무시하고 현재 디렉터리의 저장소를 보므로 대상 저장소 루트에서 돌린다. 찾는 순서: 환경 변수 `CASCADE_RUN_REVIEW`, 이 스킬 옆의 `codex-review/`, `~/.claude/skills/codex-review/`). `CR`은 `cursor-review` 스킬의 `run-review.sh`다(칸의 runner가 cursor일 때만 쓴다. 찾는 순서: 환경 변수 `CASCADE_CURSOR_REVIEW`, 이 스킬 옆의 `cursor-review/`, `~/.claude/skills/cursor-review/`). `init`이 쓰는 경로를 출력한다. `RR`·`CR`은 한 번에 하나씩 돌린다(「규칙」).
 
+## 설정
+
+사용자가 「cascade-fix 설정해줘」·「이 기기에 맞게 cascade-fix 설정」처럼 기기 설정을 맡기면 이 절을 따른다(리뷰 지적 처리가 아니므로 「자동 진행」으로 가지 않는다). 판단은 모두 `CF setup`이 하고 이 절은 묻는 일만 맡는다. 코드·문서는 어디로도 보내지 않는다. 쓰는 것은 `~/.claude/cascade-fix/`의 `repos.toml`(`default_profile`)·`setup.json`과 승인받은 검토 스크립트뿐이다.
+
+1. **감지** — `CF setup --detect`(읽기만 한다). 환경·repos.toml 경로·현재 `default_profile`·추천·스크립트 상태·지난 설정 줄을 짧게 보인다. `안내:` 줄(로그인 필요)은 로그인 명령과 함께 그대로 알린다.
+2. **질문** — AskUserQuestion으로 해당하는 것만 묻는다. 우선순위를 먼저 묻고 그 답으로 프로필을 이어서 묻는다.
+   - 우선순위: 「Claude 한도 아끼기(권장)」(`--priority save-claude`)·「빨리 끝내기」(`--priority fast`. 추천은 늘 `claude-only`).
+   - 프로필: 고른 우선순위의 `추천(…)` 줄을 첫 선택지로 둔다. `대안:`은 「잠정·미측정」을 붙여 뒤에 둔다. `현재 default_profile`이 있으면 「지금 값 유지」(`--keep`)도 둔다.
+   - 스크립트 교체: `스크립트 <이름>: 다름|없음`이고 고른 프로필(「지금 값 유지」면 현재 `default_profile`)이 그 runner(codex-review는 codex, cursor-review는 cursor)를 검토 칸(`*.review`·`*.opinion`·`*.recheck`)에 쓸 때만 묻는다. `claude-only`는 쓰지 않는다. `default`는 검토 칸이 `auto`라 그 CLI와 스크립트가 있으면 쓰므로 묻는다. `local`은 codex를 쓴다. 사용자 정의 프로필은 `CF detect --profile <이름>`의 `역할:` 줄이나 repos.toml의 `[profiles.<이름>]`으로 칸을 본다. 차이 요약을 보이고 「바꾼다(백업)」·「그대로 둔다」를 받는다. 프로필이 쓰지 않는 스크립트는 묻지 않고 알리기만 한다.
+   - 동작 확인: 고른 프로필이 외부 runner(codex·cursor)를 쓸 때만. 「시험 문장만 보낸다, 코드는 보내지 않는다」를 적고 승인받는다.
+3. **미리 보기** — `CF setup --apply (--profile <이름> | --keep) --priority <save-claude|fast> [--replace-scripts codex,cursor] --dry-run`의 diff를 보이고 확인받는다. 바꾼다고 한 스크립트만 `--replace-scripts`에 넣는다.
+4. **쓰기** — 같은 명령을 `--dry-run` 없이 돌린다. repos.toml(백업을 남긴다)·승인받은 스크립트·`setup.json`을 쓴다.
+5. **동작 확인** — 2에서 승인받았을 때만 `CF setup --check --profile <이름>`(「지금 값 유지」면 현재 `default_profile` 이름을 준다. 없으면 건너뛴다. 바뀐 스크립트를 시험하려고 쓰기 뒤에 돈다. 결과는 `setup.json`에 합쳐진다). 종료 코드 6이면 `시험 <이름>: <상태> — …` 줄 중 상태가 성공이 아닌 것(실패·로그인 필요·한도·누출 있음·확인 못 함)을 보이고 그 runner가 없는 선택지로 다시 물어 3부터 다시 한다(방금 쓴 것을 되돌리려면 아래 되돌리기). `누출 있음`(Cursor 읽기 역할 격리)은 그 프로필을 다시 권하지 않는다. `확인 못 함`은 그대로 알리고 고를지는 사용자에게 맡긴다.
+6. **끝** — 4의 `--apply`가 repos.toml 백업 줄(`백업: …repos.toml.bak-…`)을 찍었을 때만 「되돌리려면 『cascade-fix 설정 되돌려줘』」를 한 줄 알린다. 새로 만든 파일은 되돌릴 백업이 없다.
+
+- 되돌리기 요청이 오면 `CF setup --restore --dry-run`으로 diff를 보이고, 확인받은 뒤 `CF setup --restore`를 돌린다. repos.toml만 되돌리고 스크립트 백업(`--apply`가 출력했거나 `CF setup --detect`의 `지난 설정:` 아래 `백업:` 줄에 나온 경로)은 되돌리지 않는다. 그 경로를 알려 사용자가 손으로 되돌리게 한다.
+- 종료 코드 5(`오류: …`)는 그 줄을 보이고 멈춘다. `CASCADE_REPOS_TOML`이 잡혀 있으면 repos.toml을 쓰는 동작(`--apply`·`--repo-profile`·`--restore`)이 5로 멈추고, `CASCADE_RUN_REVIEW`·`CASCADE_CURSOR_REVIEW`가 잡혀 있으면 `--replace-scripts`가 5로 멈춘다. 변수를 지우고 다시 하라고 알린다. `--check`는 `--dry-run`을 받지 않는다.
+- 저장소별 「항상 Claude만」은 이 절이 아니라 「실행 전 확인」 1에서 받는다.
+
 ## 자동 진행(기본 흐름)
 
 사용자가 단계별 지시 없이 「리뷰하고 고쳐줘」처럼 맡기면 이 흐름으로 간다. 사람에게 묻는 것은 계획 확인 한 번과 아래 「멈추는 곳」뿐이다.
@@ -35,6 +54,7 @@ PYTHONPATH="${CLAUDE_SKILL_DIR}" python3 -m cascade.cli
 2. **계획 확인(한 번)** — AskUserQuestion 한 번으로 계획을 보이고 고르게 한다. 내용: 입력(`--source`)·모드·프로필(`detect`의 `프로필:`·`덮음:`·`역할:` 줄, `참고: 대체: …`), `detect`의 규모(Claude 첫 검토가 있으면 그 1개 + 지적 1건당 에이전트 수), 「확인 필요:」 항목(검증 명령 등록 후보, 전송 동의), 「참고:」 항목. 선택지는 「진행(권장)」, 「Critical·Warning만」(→ `init --severity Critical,Warning`), 「dry-run」(→ `init --dry-run`, 작업 트리를 건드리지 않음), 그리고 직접 입력.
    - `전송 동의:` 줄이 있으면 같은 질문에서 수신처별로 동의를 받는다(「실행 전 확인」 1). 받은 동의는 `CF review`·`init`에 `--consent`로 넘긴다.
    - 검증 명령 등록이 필요하면 같은 질문에서 `detect`가 낸 후보 명령을 보이고 확인받는다. 승인되면 `~/.claude/cascade-fix/repos.toml`(없으면 만든다)에 `[repos."<저장소 루트>"]` 항목을 적는다. 형식은 스킬 디렉터리의 `repos.toml` 머리 주석에 있다.
+   - `detect`에 `참고: 이 기기 설정 전이다…` 줄이 있으면 선택지에 「먼저 설정」을 더한다. 고르면 「설정」 절을 마친 뒤 `detect`부터 다시 한다.
    - 사용자가 처음부터 `/cascade-fix`로 부르며 옵션까지 정했거나 「묻지 말고 진행」이라고 했으면 이 질문을 건너뛴다.
    - 이 확인(또는 사용자의 명시적 호출)이 이번 실행에서 Workflow 도구를 쓰라는 사용자의 요청이다. 사용자가 이 스킬을 직접 요청하지 않았고 확인도 받지 않았으면 Workflow를 돌리지 않는다.
 3. **끝까지 진행** — 아래 「절차」를 각 명령의 「다음:」 출력을 따라 이어 간다. 단계 사이에 사용자에게 묻지 않고, 진행 상황은 한 줄씩만 알린다. 첫 검토가 필요하면 「첫 검토」(`CF review`)부터 한다. 첫 검토 칸이 claude면 「Claude 단독 첫 검토」, codex·cursor면 「외부 첫 검토와 대체」를 따른다.
@@ -168,6 +188,7 @@ Claude·Cursor·`codex-doc` 결과는 형식이 같아 형식으로는 가릴 �
    - `detect`와 `init`의 `전송 동의:` 줄이 수신처별 칸을 보인다. 칸의 fallback이 외부 runner면 그 수신처도 「대체 실행 때 …」로 따로 적혀 있고, 주 runner와 같은 수신처여도 적힌다. 이 줄을 그대로 보이고 묻는다. `auto`는 init이 runner를 정한 뒤의 수신처다.
    - 전부 동의하면 `--consent`를 생략해도 된다(프로필이 쓰는 수신처 전부에 동의한 것으로 본다). 일부만 동의하면 `--consent codex`처럼 동의한 수신처만 쉼표로 적고, 모두 거절하면 `--consent none`이다. 같은 값을 `CF review`와 `init` 둘 다에 준다. `detect`는 읽기만 하므로 `--consent`가 없다. `CF review`의 「다음:」 init 줄에는 받은 `--consent`가 이미 붙어 있다.
    - 동의하지 않은 수신처를 쓰는 칸과 fallback은 내장 `claude-only` 값으로 바뀌고 `대체: … — 전송 동의 없음`이 찍힌다. 동의 밖 수신처로 실행 중 대체하는 경로는 없다. 원장 `profile.consented`(동의한 수신처 중 실제로 쓰는 것)에 없는 runner로는 대체 실행하지 않고 `claude-only` 값으로 돈다.
+   - 동의 질문에 선택지 「이 저장소는 항상 Claude만」을 더한다. 고르면 순서대로 한다. 같은 확인에서 검증 명령 등록도 골랐으면 그 항목을 repos.toml에 먼저 적는다(같은 표가 두 번 생기지 않게). 그다음 `CF setup --repo-profile claude-only --root <저장소 루트>`를 돌린다(`--dry-run`으로 diff를 먼저 볼 수 있다). `오류:`(종료 코드 5)로 멈추면 그 줄을 보이고 그 줄대로 손으로 넣게 하되 이번 실행은 계속한다. 이번 실행은 `--consent none`(또는 `--profile claude-only`)으로 잇는다. 다음 실행부터는 저장소 항목의 `profile`이 쓰여 동의를 묻지 않는다. 풀려면 repos.toml에서 그 `profile` 줄을 지운다.
    - 외부 runner가 없으면(init 출력에 「Claude 단독」, `전송 동의:` 줄 없음) 묻지 않는다. 사내규정 원문이 든 저장소는 동의하지 않으면 Claude로 돈다(`--consent none` 또는 `--profile claude-only`).
 2. **저장소 검증 설정.** `codex-code`·`cursor-code`·`claude-code`·`pr-comment`는 저장소 검증 설정 파일에 저장소 루트 절대 경로 항목이 있어야 한다. 파일은 `~/.claude/cascade-fix/repos.toml`이다(환경 변수 `CASCADE_REPOS_TOML`이 우선하고, 이 파일이 없으면 예전 위치인 스킬 디렉터리의 `repos.toml`에 항목이 있을 때 그것을 쓴다). 없으면 `init`이 종료 코드 4로 멈추고 후보를 보여 준다. `CF detect` 출력의 「확인 필요: 검증 명령 등록」 아래(`--json`이면 `config.candidates`)에도 후보가 나온다.
 

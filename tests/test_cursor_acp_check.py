@@ -54,6 +54,26 @@ class AssessTest(unittest.TestCase):
         self.assertTrue(assess("web", "", [blob], self.probe)[0])
 
 
+class TermHandlerTest(unittest.TestCase):
+    def test_sigterm_runs_exit_cleanup(self):
+        import signal
+        import subprocess
+        with tempfile.TemporaryDirectory() as td:
+            done = Path(td) / "cleaned"
+            code = ("import atexit, sys, time\nfrom cascade import cursor_acp_check\n"
+                    "cursor_acp_check.exit_on_term()\n"
+                    f"atexit.register(lambda: open({str(done)!r}, 'w').write('x'))\n"
+                    "print('ready', flush=True)\ntime.sleep(30)\n")
+            env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parent.parent)}
+            proc = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True, env=env)
+            self.addCleanup(proc.kill)
+            self.assertEqual(proc.stdout.readline().strip(), "ready")
+            proc.send_signal(signal.SIGTERM)
+            proc.wait(timeout=10)
+            proc.stdout.close()
+            self.assertTrue(done.is_file())
+
+
 class StoreBlobsTest(unittest.TestCase):
     def test_reads_blobs_from_session_stores(self):
         with tempfile.TemporaryDirectory() as td:

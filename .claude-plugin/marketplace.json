@@ -6,7 +6,7 @@
     {
       "name": "cascade-fix",
       "source": ".",
-      "version": "1.4.0",
+      "version": "1.5.0",
       "description": "리뷰 지적을 작업자 둘·기계 검증·Opus 판가름으로 고치는 스킬. Claude 단독 모드 지원, 역할 프로필로 Codex·Cursor 배정.",
       "category": "development"
     }

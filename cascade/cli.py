@@ -13,7 +13,7 @@ from pathlib import Path
 
 from cascade import assignment
 from cascade import cli_steps as s
-from cascade import profiles
+from cascade import profiles, recommend, setup, skill_scripts, toml_edit
 from cascade import usage as workflow_usage
 from cascade.config import ConfigError, ExitCodes
 from cascade.consensus import (
@@ -90,12 +90,14 @@ from cascade.rounds import (
     parse_recheck,
 )
 from cascade.runners import (
+    DETAIL_TAIL,
     RUNNER_CODEX,
     RUNNER_CURSOR,
     STATUS_OK,
     CliJob,
     CodexRunner,
     CursorRunner,
+    _execute,
     codex_available,
     codex_model,
     cursor_available,
@@ -540,6 +542,8 @@ def cmd_detect(args) -> int:
                         workers_flag=_next_workers_flags(args, resolved.explicit))
     except profiles.ProfileError as e:
         raise s.CliError(str(profiles.explain_overrides(e, resolved.overrides)), ExitCodes.PARSE_ERROR) from None
+    shown = result["profile"]
+    result["notes"].extend(_setup_notes(_notice_roles(resolved.roles, shown["roles"], shown["substituted"])))
     print(json.dumps(result, ensure_ascii=False, indent=2) if args.json else render_detect(result))
     return 0 if result["ok"] else ExitCodes.NEEDS_USER
 
@@ -1702,6 +1706,377 @@ def cmd_status(args) -> int:
     return 0
 
 
+SETUP_RECORD = "setup.json"
+SETUP_CHECK = "setup-check.json"
+STATUS_LABELS = {recommend.MEASURED: "측정됨", recommend.PROVISIONAL: "잠정"}
+LOGIN_HINTS = {RUNNER_CODEX: "codex login", RUNNER_CURSOR: "cursor-agent login"}
+ACP_CHECK_TIMEOUT = 600
+ACP_STOP_GRACE = 30
+ENV_SCRIPT_REDIRECTS = ("CASCADE_RUN_REVIEW", "CASCADE_CURSOR_REVIEW")
+CHECK_DETAIL_CHARS = 200
+SCRIPTS_REPLACED = "교체함"
+
+
+def _state_dir() -> Path:
+    return s.USER_REPOS_TOML.parent
+
+
+def _skill_scripts() -> dict[str, Path]:
+    return {skill_scripts.RUNNER_SKILLS[RUNNER_CODEX]: s.RUN_REVIEW, skill_scripts.RUNNER_SKILLS[RUNNER_CURSOR]: s.CURSOR_REVIEW}
+
+
+def _script_states(names: set[str] | None = None) -> dict[str, tuple[str, list[str]]]:
+    return {name: skill_scripts.compare(name, skill_scripts.skill_dir(script))
+            for name, script in _skill_scripts().items() if names is None or name in names}
+
+
+def _default_profile() -> str | None:
+    value = profiles.load_profiles(s.repos_toml())[1].get("default_profile")
+    return value if isinstance(value, str) else None
+
+
+def _notice_roles(chosen: dict, shown: dict, substituted: list[dict]) -> dict:
+    """스크립트 알림은 검토 스크립트가 없어 detect가 대체한 칸만 대체 전 값으로 센다. CLI가 없어 대체한 칸은 이번 실행이 스크립트를 쓰지 않는다."""
+    no_script = {r["role"].removesuffix(assignment.FALLBACK_SUFFIX) for r in substituted
+                 if r["reason"] == assignment.NO_SCRIPT_REASON}
+    return {key: chosen[key] if key in no_script and key in chosen else cell for key, cell in shown.items()}
+
+
+def _setup_notes(roles: dict) -> list[str]:
+    try:
+        used = {skill_scripts.RUNNER_SKILLS[runner] for runner, path in setup.check_paths(roles) if path == setup.REVIEW}
+        return setup.notices(record=setup.read_record(_state_dir() / SETUP_RECORD), table=recommend.load_table(),
+                             default_profile=_default_profile(), roles=roles, scripts=_script_states(used))
+    except (ConfigError, OSError) as e:
+        return [f"설정 알림을 건너뛴다: {e}"]
+
+
+def _setup_target() -> toml_edit.Target:
+    return toml_edit.locate(os.environ, s.USER_REPOS_TOML, s.LEGACY_REPOS_TOML)
+
+
+def _target_source(target: toml_edit.Target) -> Path | None:
+    return target.path if target.path.is_file() else target.copy_from
+
+
+def _known_profiles(source: Path | None) -> dict[str, dict]:
+    return profiles.load_profiles(source)[0]
+
+
+def _require_known(name: str, known: dict[str, dict]) -> None:
+    if name not in known:
+        raise s.CliError(f"모르는 프로필이다: {name!r}. 알려진 이름: {', '.join(known)}", ExitCodes.PARSE_ERROR)
+
+
+def _backup_stamp() -> str:
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def _plugin_version() -> str | None:
+    manifest = setup.read_record(s.SKILL_ROOT / ".claude-plugin" / "plugin.json")
+    return manifest.get("version") if manifest else None
+
+
+def _dump(data: dict) -> None:
+    print(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def _print_next_commands(*commands: str) -> None:
+    print("다음:")
+    for command in commands:
+        print(f"  {command}")
+
+
+def _setup_inspect(table: dict, target: toml_edit.Target | None, target_error: str | None) -> dict:
+    return setup.inspect(table=table, availability=setup.availability(), codex_model=codex_model(Path.home() / ".codex"),
+                         target=target, target_error=target_error, scripts=_script_states(),
+                         script_dirs={name: str(skill_scripts.skill_dir(script)) for name, script in _skill_scripts().items()},
+                         record=setup.read_record(_state_dir() / SETUP_RECORD))
+
+
+def _render_setup_detect(info: dict) -> str:
+    availability = info["availability"]
+    lines = [f"환경: {info['env']} ({RUNNER_CODEX} {availability[RUNNER_CODEX]}, {RUNNER_CURSOR} {availability[RUNNER_CURSOR]})"]
+    lines.extend(f"안내: {runner}는 로그인이 필요하다 — {LOGIN_HINTS[runner]}"
+                 for runner in (RUNNER_CODEX, RUNNER_CURSOR) if availability[runner] == setup.NEEDS_LOGIN)
+    if availability[RUNNER_CODEX] != setup.ABSENT:
+        lines.append(f"Codex 모델: {info['codex_model'] or '없음(~/.codex/config.toml에 model이 없다)'}")
+    toml = info["repos_toml"]
+    if toml["path"]:
+        copied = f" (예전 위치 {toml['copy_from']}를 복사해 쓴다)" if toml["copy_from"] else ""
+        lines.append(f"repos.toml: {toml['path']}{copied}")
+    if toml["error"]:
+        lines.append(f"repos.toml 문제: {toml['error']}")
+    lines.append(f"현재 default_profile: {toml['default_profile'] or '없음'}")
+    if toml["overridden_builtins"]:
+        lines.append(f"덮은 내장 프로필: {', '.join(toml['overridden_builtins'])} — 추천 이름은 같아도 칸 값은 덮은 값이 쓰인다")
+    saved, fast = (info["options"][priority] for priority in recommend.PRIORITIES)
+    lines.append(f"추천(Claude 한도 아끼기): {saved[0]['profile']} [{STATUS_LABELS[saved[0]['status']]}]")
+    lines.append(f"추천(빨리 끝내기): {fast[0]['profile']}")
+    lines.extend(f"  대안: {o['profile']} [{STATUS_LABELS[o['status']]}] {o['note']}".rstrip() for o in saved[1:])
+    for name, (state, details) in info["scripts"].items():
+        lines.append(f"스크립트 {name}: {state} ({info['script_dirs'][name]})" + (f" — {'; '.join(details)}" if details else ""))
+    record = info["record"]
+    if record:
+        lines.append(f"지난 설정: {record.get('setup_at')} {record.get('profile')} (표 v{record.get('table_version')})")
+        backups = record.get("backups")
+        lines.extend(f"  백업: {b}" for b in (backups if isinstance(backups, list) else []))
+    return "\n".join(lines)
+
+
+def _setup_detect(args) -> int:
+    try:
+        target, error = _setup_target(), None
+    except toml_edit.EditError as e:
+        target, error = None, str(e)
+    info = _setup_inspect(recommend.load_table(), target, error)
+    print(json.dumps(info, ensure_ascii=False, indent=2) if args.json else _render_setup_detect(info))
+    return 0
+
+
+def _acp_check(model: str) -> dict:
+    run = _execute([sys.executable, "-m", "cascade.cursor_acp_check", "--model", model], "", s.SKILL_ROOT,
+                   {**os.environ, "PYTHONPATH": str(s.SKILL_ROOT)}, ACP_CHECK_TIMEOUT, grace=ACP_STOP_GRACE)
+    if run.timed_out or run.missing:
+        return {"status": setup.ACP_UNKNOWN, "detail": "시간 초과" if run.timed_out else run.stderr}
+    output = f"{run.stdout}\n{run.stderr}".strip()
+    return {"status": setup.acp_result(output, run.returncode), "detail": output[-DETAIL_TAIL:]}
+
+
+def _check_passed(result: dict) -> bool:
+    return result["status"] in (setup.CHECK_OK, setup.ACP_CLEAN)
+
+
+def _merge_check_into_record(profile: str, results: dict) -> bool:
+    path = _state_dir() / SETUP_RECORD
+    record = setup.read_record(path)
+    if record is None or record.get("profile") != profile:
+        return False
+    old = record.get("checks")
+    checks = {**(old if isinstance(old, dict) else {}), **{name: result["status"] for name, result in results.items()}}
+    setup.write_record(path, {**record, "checks": checks})
+    return True
+
+
+def _check_roles(name: str, roles: dict) -> dict:
+    """검토 칸의 auto를 Claude가 아닌 입력일 때처럼 푼다. codex는 스크립트와 CLI가 다 있을 때만 고른다."""
+    available: dict[str, bool] = {}
+    codex_ok = s.RUN_REVIEW.is_file() and _probe(available, (RUNNER_CODEX,))[RUNNER_CODEX]
+    try:
+        return assignment.resolve_auto(roles, f"{RUNNER_CODEX}-code", s.RUN_REVIEW if codex_ok else Path(os.devnull),
+                                       _cursor_reviewer_ok(available), name=name)
+    except profiles.ProfileError as e:
+        raise s.CliError(str(e), ExitCodes.PARSE_ERROR) from None
+
+
+def _setup_check(args) -> int:
+    if not args.profile:
+        raise s.CliError("--check 는 --profile <이름>이 필요하다")
+    if args.dry_run:
+        raise s.CliError("--check 는 --dry-run 을 받지 않는다(시험 문장을 실제로 보낸다)")
+    known = _known_profiles(s.repos_toml())
+    _require_known(args.profile, known)
+    roles = _check_roles(args.profile, known[args.profile]["roles"])
+    scripts = {runner: _skill_scripts()[skill] for runner, skill in skill_scripts.RUNNER_SKILLS.items()}
+    results = {}
+    for runner, path in setup.check_paths(roles):
+        model, effort = setup.cell_model(roles, runner, path)
+        results[f"{runner}-{path}"] = setup.run_check(runner, path, model, effort, scripts)
+    models = setup.acp_models(roles)
+    for model in models:
+        results["cursor_acp" if len(models) == 1 else f"cursor_acp:{model}"] = _acp_check(model)
+    check = {"profile": args.profile, "checked_at": s.now(), "results": results}
+    if _merge_check_into_record(args.profile, results):
+        (_state_dir() / SETUP_CHECK).unlink(missing_ok=True)
+    else:
+        setup.write_record(_state_dir() / SETUP_CHECK, check)
+    passed = all(_check_passed(result) for result in results.values())
+    if args.json:
+        _dump(check)
+    else:
+        if not results:
+            print("외부 runner를 쓰지 않아 시험할 것이 없다")
+        for name, result in results.items():
+            detail = " ".join(result["detail"].split())[:CHECK_DETAIL_CHARS]
+            print(f"시험 {name}: {result['status']}" + (f" — {detail}" if detail and not _check_passed(result) else ""))
+        if passed:
+            _print_next_commands(f"{s.CLI} setup --apply --profile {shlex.quote(args.profile)} --priority <save-claude|fast> --dry-run")
+        else:
+            _print_next_commands("실패한 runner를 빼고 추천을 다시 고르거나, 고친 뒤 "
+                                 f"{s.CLI} setup --check --profile {shlex.quote(args.profile)} 로 다시 시험한다")
+    return 0 if passed else ExitCodes.NEEDS_USER
+
+
+def _replace_skills(raw: str | None) -> list[str]:
+    runners = [x.strip() for x in (raw or "").split(",") if x.strip()]
+    unknown = [x for x in runners if x not in skill_scripts.RUNNER_SKILLS]
+    if unknown:
+        raise s.CliError(f"--replace-scripts 는 {', '.join(skill_scripts.RUNNER_SKILLS)} 중에서 쉼표로 고른다: {', '.join(unknown)}")
+    return [skill_scripts.RUNNER_SKILLS[x] for x in dict.fromkeys(runners)]
+
+
+def _plan_diff(target: toml_edit.Target, base: str, new_text: str) -> str:
+    return toml_edit.diff(base if target.path.is_file() else "", new_text, target.path)
+
+
+def _plan_lines(target: toml_edit.Target, diff: str) -> list[str]:
+    lines = []
+    if target.copy_from:
+        lines.append(f"예전 위치 {target.copy_from}를 {target.path}로 복사한다(예전 파일은 고치지 않는다)")
+    lines.append(f"repos.toml: {target.path} ({'바꿀 내용이 없다' if not diff else '새로 만든다' if not target.path.is_file() else '고친다'})")
+    if diff:
+        lines.append(diff.rstrip("\n"))
+    return lines
+
+
+def _apply_command(args, replace_raw: str | None) -> str:
+    choice = "--keep" if args.keep else f"--profile {shlex.quote(args.profile)}"
+    replace = f" --replace-scripts {shlex.quote(replace_raw)}" if replace_raw else ""
+    return f"{s.CLI} setup --apply {choice} --priority {args.priority}{replace}"
+
+
+def _setup_apply(args) -> int:
+    if bool(args.profile) == bool(args.keep):
+        raise s.CliError("--apply 는 --profile <이름> 또는 --keep 중 하나만 받는다")
+    if not args.priority:
+        raise s.CliError(f"--apply 는 --priority ({'|'.join(recommend.PRIORITIES)})가 필요하다")
+    replace = _replace_skills(args.replace_scripts)
+    redirected = [name for name in ENV_SCRIPT_REDIRECTS if replace and os.environ.get(name)]
+    if redirected:
+        raise s.CliError(f"{', '.join(redirected)}이 잡혀 있어 검토 스크립트를 바꾸지 않는다. 변수를 지우고 다시 하라", ExitCodes.PARSE_ERROR)
+    target = _setup_target()
+    known = _known_profiles(_target_source(target))
+    if args.profile:
+        _require_known(args.profile, known)
+    table = recommend.load_table()
+    info = _setup_inspect(table, target, None)
+    base = toml_edit.base_text(target, s.LEGACY_REPOS_TOML)
+    new_text = base if args.keep else toml_edit.set_default_profile(base, args.profile)
+    diff = "" if args.keep else _plan_diff(target, base, new_text)
+    replacing = [name for name in replace if info["scripts"][name][0] != skill_scripts.SAME]
+    if args.dry_run:
+        lines = ["repos.toml: 건드리지 않는다(지금 값 유지)"] if args.keep else _plan_lines(target, diff)
+        for name in replace:
+            state, details = info["scripts"][name]
+            note = f"{state}({'; '.join(details)})" + ("; 원래 파일은 .bak으로 남긴다" if state == skill_scripts.DIFFERENT else "")
+            lines.append(f"스크립트 교체 {name}: {skill_scripts.skill_dir(_skill_scripts()[name])} — " + (note if name in replacing else "이미 같다"))
+        if args.json:
+            _dump({"dry_run": True, "path": str(target.path), "copy_from": str(target.copy_from) if target.copy_from else None,
+                   "diff": diff, "replace_scripts": {name: info["scripts"][name] for name in replace}})
+        else:
+            print("\n".join(lines))
+            _print_next_commands(_apply_command(args, args.replace_scripts))
+        return 0
+    stamp = _backup_stamp()
+    repos_backup = toml_edit.write_checked(target.path, new_text, stamp) if diff else None
+    backups: list[Path] = [repos_backup] if repos_backup else []
+    try:
+        for name in replacing:
+            backups.extend(skill_scripts.install(name, skill_scripts.skill_dir(_skill_scripts()[name]), stamp))
+    except OSError as e:
+        if repos_backup:
+            written = f"repos.toml {target.path}는 이미 고쳤다(백업: {', '.join(map(str, backups))}). 되돌리려면 {s.CLI} setup --restore"
+        else:
+            written = f"repos.toml {target.path}를 새로 만들었다(백업 없음)" if diff else "repos.toml은 바꾸지 않았다"
+        raise s.CliError(f"스크립트 설치에 실패했다: {e}. {written}. 설정 기록은 쓰지 않았다") from None
+    profile = info["repos_toml"]["default_profile"] if args.keep else args.profile
+    check_path = _state_dir() / SETUP_CHECK
+    check = setup.read_record(check_path)
+    matched = check is not None and check.get("profile") == profile and isinstance(check.get("results"), dict)
+    checks = {name: result.get("status") if isinstance(result, dict) else result
+              for name, result in check["results"].items()} if matched else {}
+    record = {
+        "setup_at": s.now(), "plugin_version": _plugin_version(), "table_version": table["version"], "env": info["env"],
+        "priority": args.priority, "recommended": recommend.recommended(table, info["env"], args.priority),
+        "profile": profile, "kept_existing": args.keep, "checks": checks,
+        "scripts": {name: SCRIPTS_REPLACED if name in replacing else state for name, (state, _) in info["scripts"].items()},
+        "backups": [str(b) for b in backups],
+    }
+    setup.write_record(_state_dir() / SETUP_RECORD, record)
+    if matched:
+        check_path.unlink(missing_ok=True)
+    if args.json:
+        _dump({"dry_run": False, "path": str(target.path), "record": record})
+        return 0
+    if args.keep:
+        print("repos.toml: 건드리지 않았다(지금 값 유지)")
+    else:
+        print(f'repos.toml: {target.path}에 default_profile = "{profile}"를 썼다' if diff else f"repos.toml: {target.path} 바꿀 내용이 없다")
+    print(f"설정 기록: {_state_dir() / SETUP_RECORD}")
+    print("\n".join(f"백업: {b}" for b in backups) or "백업: 없음")
+    for name in replacing:
+        print(f"스크립트 교체함: {name}")
+    _print_next_commands(f"{s.CLI} setup --restore --dry-run  # repos.toml을 되돌리려면" if repos_backup else f"{s.CLI} setup --detect")
+    return 0
+
+
+def _setup_repo_profile(args) -> int:
+    root = Path(args.root).resolve() if args.root else s.git_toplevel(Path.cwd())
+    target = _setup_target()
+    _require_known(args.repo_profile, _known_profiles(_target_source(target)))
+    base = toml_edit.base_text(target, s.LEGACY_REPOS_TOML)
+    new_text = toml_edit.set_repo_profile(base, root, args.repo_profile)
+    diff = _plan_diff(target, base, new_text)
+    if args.dry_run:
+        if args.json:
+            _dump({"dry_run": True, "path": str(target.path), "copy_from": str(target.copy_from) if target.copy_from else None,
+                   "root": str(root), "diff": diff})
+        else:
+            print("\n".join(_plan_lines(target, diff)))
+            _print_next_commands(f"{s.CLI} setup --repo-profile {shlex.quote(args.repo_profile)} --root {shlex.quote(str(root))}")
+        return 0
+    backup = toml_edit.write_checked(target.path, new_text, _backup_stamp()) if diff else None
+    if args.json:
+        _dump({"dry_run": False, "path": str(target.path), "root": str(root), "backup": str(backup) if backup else None})
+        return 0
+    if not diff:
+        print(f"repos.toml: {target.path} 바꿀 내용이 없다")
+        return 0
+    print(f'repos.toml: {target.path}에 {root}의 profile = "{args.repo_profile}"를 썼다')
+    print(f"백업: {backup or '없음'}")
+    _print_next_commands(f"{s.CLI} setup --restore --dry-run  # repos.toml을 되돌리려면")
+    return 0
+
+
+def _setup_restore(args) -> int:
+    target = _setup_target()
+    path = target.path
+    if args.dry_run:
+        found = toml_edit.backups(path)
+        if not found:
+            raise toml_edit.EditError(f"되돌릴 백업이 없다: {path}")
+        if not path.is_file():
+            raise toml_edit.EditError(f"현재 파일이 없어 되돌리지 못한다: {path}")
+        diff = toml_edit.diff(path.read_text(encoding="utf-8"), found[0].read_text(encoding="utf-8"), path)
+        if args.json:
+            _dump({"dry_run": True, "path": str(path), "backup": str(found[0]), "diff": diff})
+        else:
+            print(f"되돌릴 백업: {found[0]}")
+            print(diff.rstrip("\n") or "현재 파일과 백업이 같다")
+            _print_next_commands(f"{s.CLI} setup --restore")
+        return 0
+    used, kept = toml_edit.restore_latest(path, _backup_stamp())
+    if args.json:
+        _dump({"dry_run": False, "path": str(path), "restored_from": str(used), "backup": str(kept)})
+    else:
+        print(f"되돌렸다: {used} → {path}")
+        print(f"되돌리기 전 파일은 {kept}에 남겼다")
+        _print_next_commands(f"{s.CLI} setup --detect")
+    return 0
+
+
+SETUP_HANDLERS = {"detect": _setup_detect, "check": _setup_check, "apply": _setup_apply,
+                  "repo_profile": _setup_repo_profile, "restore": _setup_restore}
+
+
+def cmd_setup(args) -> int:
+    action = next(name for name in SETUP_HANDLERS if getattr(args, name))
+    try:
+        return SETUP_HANDLERS[action](args)
+    except ConfigError as e:
+        raise s.CliError(str(e), ExitCodes.PARSE_ERROR) from None
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="cascade.cli", description="리뷰 지적 캐스케이드 처리")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1754,6 +2129,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reviewer", choices=REVIEWER_CHOICES)
     p.add_argument("--profile", help="역할 프로필 이름(기본: 환경 변수 CASCADE_PROFILE, repos.toml, 없으면 내장 default)")
     add_workers_args(p)
+    p = add("setup", cmd_setup, run_dir=False, force=False)
+    action = p.add_mutually_exclusive_group(required=True)
+    action.add_argument("--detect", action="store_true", help="이 기기의 환경·현재 설정·추천을 보인다(파일을 쓰지 않는다)")
+    action.add_argument("--check", action="store_true", help="--profile 이 쓰는 외부 runner 경로마다 시험 문장을 보내 동작을 확인한다")
+    action.add_argument("--apply", action="store_true", help="--profile <이름>(또는 --keep)을 repos.toml default_profile과 설정 기록에 쓴다")
+    action.add_argument("--repo-profile", metavar="이름", help="--root 저장소 항목의 profile을 정한다(항상 Claude만 등)")
+    action.add_argument("--restore", action="store_true", help="repos.toml을 가장 최근 백업으로 되돌린다")
+    p.add_argument("--profile", help="--check·--apply 가 다룰 프로필 이름")
+    p.add_argument("--priority", choices=recommend.PRIORITIES, help="--apply 의 우선순위(save-claude: Claude 한도 아끼기, fast: 빨리 끝내기)")
+    p.add_argument("--keep", action="store_true", help="--apply 에서 repos.toml은 건드리지 않고 기록만 쓴다(지금 값 유지)")
+    p.add_argument("--replace-scripts", help="--apply 에서 플러그인 판으로 바꿀 검토 스크립트의 runner(codex,cursor 중 쉼표 구분)")
+    p.add_argument("--root", help="--repo-profile 의 저장소 루트(기본: 현재 디렉터리의 git 루트)")
+    p.add_argument("--dry-run", action="store_true", help="--apply·--repo-profile·--restore 가 바꿀 내용만 보이고 쓰지 않는다")
+    p.add_argument("--json", action="store_true")
     p = add("review", cmd_review, run_dir=False, force=False)
     p.add_argument("--kind", choices=("code", "doc"))
     p.add_argument("--base")

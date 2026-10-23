@@ -1,11 +1,12 @@
 # codex-review 스킬 변경 기록
 
-cascade-fix의 Codex 검토자는 `codex-review` 스킬의 `scripts/run-review.sh`를 부른다. 원래 `codex-review`에는 cascade-fix가 쓰는 모드가 없어서 스크립트를 고쳐 쓴다. 그 스킬은 git 밖에 있어 고친 결과를 여기 보관한다.
+cascade-fix의 Codex 검토자는 `codex-review` 스킬의 `scripts/run-review.sh`를 부른다. 원래 `codex-review`에는 cascade-fix가 쓰는 모드가 없어서 스크립트를 고쳐 쓴다. 정본은 이 디렉터리의 플러그인 사본이고, `CF setup`이 개인 스킬(`~/.claude/skills/codex-review/`)과 비교해 승인을 받고 설치한다.
 
 | 파일 | 내용 |
 | --- | --- |
-| [run-review.sh](run-review.sh) | 지금 쓰는 `run-review.sh` 전체(2026-10-21). `~/.claude/skills/codex-review/scripts/run-review.sh`를 이 파일로 바꾸거나, 지금 파일과 비교해 아래 변경을 옮긴다 |
-| [SKILL.md.diff](SKILL.md.diff) | `codex-review`의 SKILL.md에 재검토·의견 모드 설명을 더한 diff(2026-10-17) |
+| [SKILL.md](SKILL.md) | `codex-review`의 SKILL.md 전체(2026-10-23). 재검토·의견 모드 설명을 포함한다. `CF setup`이 `~/.claude/skills/codex-review/SKILL.md`로 설치한다 |
+| [run-review.sh](run-review.sh) | 지금 쓰는 `run-review.sh` 전체(2026-10-21). `CF setup`이 `~/.claude/skills/codex-review/scripts/run-review.sh`로 설치한다 |
+| [SKILL.md.diff](SKILL.md.diff) | `codex-review`의 SKILL.md에 재검토·의견 모드 설명을 더한 diff(2026-10-17). 이력으로만 남긴다 |
 
 예전에는 `run-review.sh`도 diff로 보관했다. 그 뒤 다른 변경(`--known` 등)이 쌓여 diff가 지금 스크립트와 맞지 않게 되어, 전체 파일로 바꿨다.
 
