@@ -29,6 +29,7 @@ from cascade.toml_edit import Target
 SMOKE_PROMPT = "cascade-fix 설정 시험 호출이다. 다른 말 없이 OK라고만 답하라."
 LOGGED_IN, NEEDS_LOGIN, ABSENT = "로그인됨", "로그인 필요", "없음"
 CHECK_OK, CHECK_NEEDS_LOGIN, CHECK_LIMIT, CHECK_FAILED = "성공", "로그인 필요", "한도", "실패"
+ACP_CLEAN, ACP_LEAK, ACP_UNKNOWN = "누출 0건", "누출 있음", "확인 못 함"
 WORKER, REVIEW = "worker", "review"
 RECORD_SCHEMA = 1
 EXIT_NEEDS_LOGIN, EXIT_LIMIT = 77, 75
@@ -162,8 +163,8 @@ def run_check(runner: str, path: str, model: str, effort: str, scripts: dict[str
 def acp_result(output: str, code: int) -> str:
     found = _LEAKS.search(output)
     if found is None:
-        return "확인 못 함"
-    return "누출 0건" if int(found.group(1)) == 0 else "누출 있음"
+        return ACP_UNKNOWN
+    return ACP_CLEAN if int(found.group(1)) == 0 else ACP_LEAK
 
 
 def read_record(path: Path) -> dict | None:
