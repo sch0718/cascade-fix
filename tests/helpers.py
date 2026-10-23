@@ -1,9 +1,16 @@
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 SKILL_ROOT = Path(__file__).resolve().parent.parent
+
+
+def cursor_read_denied(deny, path):
+    """Cursor처럼 Read(...) 패턴을 다듬어 `*`만 아무 문자열로 보고 요청 경로 전체와 대소문자 구분해 맞춘다."""
+    patterns = [rule.strip()[len("Read("):-1].strip() for rule in deny if rule.strip().startswith("Read(")]
+    return any(re.fullmatch(re.escape(p).replace(r"\*", ".*"), str(path)) for p in patterns)
 
 
 def git(repo, *args):

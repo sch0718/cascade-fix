@@ -184,8 +184,52 @@ def cache_env(tmp: Path) -> dict[str, str]:
     }
 
 
-def cursor_home(base: Path, profile: str) -> Path:
-    """임시 HOME. 키체인만 이어 로그인을 유지하고, 권한 설정으로 MCP·Web·홈 민감 경로 Read를 막는다."""
+def _variant_rules(under: str, word: str, kept: set[str]) -> set[str]:
+    """word의 모든 대소문자 변형과 그 아래를 막고 kept 이름과 그 아래는 남기는 규칙. 변형을 한 글자씩 따라가다
+    kept 어느 것의 앞부분도 아니게 되는 곳에서 `앞부분*`으로 끊고, 끝까지 겹친 변형은 kept가 아니면 그 이름만 막는다."""
+    rules: set[str] = set()
+    prefixes = {""}
+    for ch in word:
+        following = set()
+        for prefix in prefixes:
+            for step in {prefix + ch.lower(), prefix + ch.upper()}:
+                if any(name.startswith(step) for name in kept):
+                    following.add(step)
+                else:
+                    rules.add(f"Read({under}{step}*)")
+        prefixes = following
+    for prefix in prefixes - kept:
+        rules |= {f"Read({under}{prefix})", f"Read({under}{prefix}/**)"}
+    return rules
+
+
+def outside_read_deny(read_root: Path) -> list[str]:
+    """read_root와 그 조상만 남기고 조상 폴더마다 다른 항목을 Read 거부로 막는다. 적은 경로와 실제 경로를 둘 다 본다.
+
+    Cursor 거부 규칙은 요청 경로를 대소문자 구분해 맞추고 `*`만 와일드카드로 쓰는데, macOS 파일 시스템은 대소문자를
+    가리지 않는다. 그래서 지금 있는 항목과 남길 이름의 대소문자 변형을 모두 막는 앞부분 규칙을 만든다. 지금 있는
+    항목과 다른 앞부분으로 시작하는 새 항목, 유니코드 정규화만 다른 경로, 작업 폴더 안에서 밖을 가리키는 심볼릭
+    링크는 막지 못한다. 목록을 읽을 수 없는 조상이 있거나, 남길 이름·다른 항목 이름에 규칙이 글자로 나타낼 수 없는
+    `*`가 있으면 OSError를 낸다.
+    """
+    kept: dict[Path, set[str]] = {}
+    for path in (Path(os.path.abspath(read_root)), Path(read_root).resolve()):
+        for child in (path, *path.parents):
+            if child.parent != child:
+                kept.setdefault(child.parent, set()).add(child.name)
+    rules: set[str] = set()
+    for parent, names in kept.items():
+        under = str(parent).rstrip("/") + "/"
+        for word in names | {entry.name for entry in os.scandir(parent)}:
+            if "*" in under + word:
+                raise OSError(f"`*`가 든 경로는 Cursor 거부 규칙으로 나타낼 수 없다: {under}{word}")
+            rules |= _variant_rules(under, word, names)
+    return sorted(rules)
+
+
+def cursor_home(base: Path, profile: str, read_root: Path | None = None) -> Path:
+    """임시 HOME. 키체인만 이어 로그인을 유지하고, 권한 설정으로 MCP·Web·홈 민감 경로 Read를 막는다.
+    read_root를 주면 그 밖 Read도 막는다."""
     if profile not in _PROFILE_DENY:
         raise ValueError(f"알 수 없는 Cursor 프로필: {profile}")
     real_home = Path.home()
@@ -198,6 +242,8 @@ def cursor_home(base: Path, profile: str) -> Path:
     deny = list(_PROFILE_DENY[profile])
     deny += [f"Read({real_home}/{name}/**)" for name in _SENSITIVE_DIRS]
     deny += [f"Read({real_home}/{name})" for name in _SENSITIVE_FILES]
+    if read_root is not None:
+        deny += outside_read_deny(read_root)
     config = {"version": 1, "permissions": {"allow": [], "deny": deny}, "autoAcceptWebSearch": False}
     if profile == "review":
         config["approvalMode"] = "allowlist"
@@ -548,8 +594,8 @@ def _cursor_usage(envelope: dict | None) -> dict:
     return {name: raw[key] for key, name in _CURSOR_USAGE_KEYS.items() if isinstance(raw.get(key), int)}
 
 
-def _acp_env(root: Path) -> dict:
-    return {**os.environ, **_tool_roots_env(), **cache_env(root), "HOME": str(cursor_home(root, "review"))}
+def _acp_env(root: Path, worktree: Path) -> dict:
+    return {**os.environ, **_tool_roots_env(), **cache_env(root), "HOME": str(cursor_home(root, "review", worktree))}
 
 
 class CursorRunner:

@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -13,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from cascade import cursor_acp_check  # noqa: E402
 from cascade.cursor_acp_check import Probe, assess, store_blobs  # noqa: E402
 from fake_cli import CURSOR_BODY, install  # noqa: E402
+from helpers import cursor_read_denied  # noqa: E402
 
 
 class AssessTest(unittest.TestCase):
@@ -96,7 +98,10 @@ class MainTest(unittest.TestCase):
         self.tmp = Path(self._td.name).resolve()
         self.log = self.tmp / "log"
         exe = install(self.tmp, "cursor-agent", CURSOR_BODY)
+        self.home = self.tmp / "user-home"
+        self.home.mkdir()
         patcher = mock.patch.dict(os.environ, {"FAKE_CLI_LOG": str(self.log), "CASCADE_CURSOR_AGENT": str(exe),
+                                               "HOME": str(self.home),
                                                "FAKE_CURSOR_RESULTS": json.dumps(["도구가 거부되어 할 수 없다"])})
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -122,11 +127,31 @@ class MainTest(unittest.TestCase):
         deny = self.config()["permissions"]["deny"]
         for rule in ("Shell(*)", "Write(**)", "WebFetch(*)", "Mcp(*:*)"):
             self.assertIn(rule, deny)
-        self.assertTrue(any(rule.startswith("Read(") and "canary" in rule for rule in deny))
+        wt = Path(self.prompts()[0]["cwd"])
+        self.assertTrue(cursor_read_denied(deny, wt.parent / "canary" / "secret.txt"))
+        self.assertTrue(cursor_read_denied(deny, self.home / "cascade-acp-check-0" / "secret.txt"))
+        self.assertFalse(cursor_read_denied(deny, wt / "README.md"))
+        self.assertEqual(list(self.home.iterdir()), [])
         mcp = [p for p in self.prompts() if p["mcpServers"]]
         self.assertEqual(len(mcp), 1)
         self.assertTrue(all(p["values"] == {"model": "composer-2.5", "fast": "false", "mode": "ask"} for p in self.prompts()))
         self.assertEqual(list(self.tmp.glob("cascade-*")), [])
+
+    def test_search_cases_stay_off_user_files_and_cover_outside_worktree(self):
+        with mock.patch("sys.stdout"):
+            cursor_acp_check.main([])
+        records = self.prompts()
+        prompts = [p["prompt"] for p in records]
+        search = next(p for p in prompts if p.startswith("Grep으로"))
+        home = next(p for p in prompts if str(self.home) in p)
+        self.assertNotIn(" /에서", search)
+        self.assertTrue(any("/CANARY/secret.txt" in p for p in prompts))
+        self.assertRegex(search, r"Grep으로 CANARY-[0-9a-f]{8}를 /")
+        self.assertRegex(home, r"Grep으로 CANARY-[0-9a-f]{8}를 ")
+        self.assertFalse(any(re.search(r"CANARY-[0-9a-f]{32}", p) for p in prompts))
+        cwd = {p["cwd"] for p in records}
+        self.assertEqual(len(cwd), 1)
+        self.assertNotIn(str(self.home), cwd.pop())
 
     def test_control_without_leak_fails(self):
         with mock.patch("sys.stdout"):
