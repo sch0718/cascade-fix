@@ -1,5 +1,7 @@
+import itertools
 import json
 import os
+import random
 import sys
 import tempfile
 import time
@@ -23,6 +25,7 @@ from cascade.runners import (  # noqa: E402
     CliJob,
     CodexRunner,
     CursorRunner,
+    _variant_rules,
     cache_env,
     classify_failure,
     cursor_home,
@@ -32,7 +35,7 @@ from cascade.runners import (  # noqa: E402
     tree_of,
 )
 from fake_cli import CODEX_BODY, CURSOR_BODY, fenced, install, result_json  # noqa: E402
-from helpers import git, make_repo  # noqa: E402
+from helpers import cursor_read_denied, git, make_repo  # noqa: E402
 
 AUTH_BEFORE = '{"tokens": {"refresh_token": "old"}, "last_refresh": "2026-10-10T00:00:00Z"}'
 AUTH_AFTER = '{"tokens": {"refresh_token": "new"}, "last_refresh": "2026-10-18T00:00:00Z"}'
@@ -477,6 +480,122 @@ class CursorHomeTest(unittest.TestCase):
     def test_unknown_profile_raises(self):
         with self.assertRaises(ValueError):
             cursor_home(self.base, "nope")
+
+    def deny_of(self, read_root):
+        home = cursor_home(self.base, "review", read_root=read_root)
+        return json.loads((home / ".cursor" / "cli-config.json").read_text(encoding="utf-8"))["permissions"]["deny"]
+
+    def test_read_root_denies_siblings_along_its_ancestors_in_any_case(self):
+        top = self.base.resolve() / "tree"
+        wt = top / "repo" / "run" / "wt"
+        (wt / "inner").mkdir(parents=True)
+        (top / "repo" / "src").mkdir()
+        (top / "repo" / "notes.txt").write_text("x")
+        (top / "repo" / "run" / "wt-other").mkdir()
+        (top / "repo" / "run" / "w").mkdir()
+        (top / "Elsewhere").mkdir()
+        deny = self.deny_of(wt)
+        for path in (top / "repo" / "src" / "a.py", top / "repo" / "SRC" / "a.py", top / "repo" / "notes.txt",
+                     top / "repo" / "Notes.TXT", top / "repo" / "run" / "wt-other" / "x", top / "repo" / "run" / "w",
+                     top / "repo" / "run" / "w" / "x", top / "elsewhere" / "x", top / "Elsewhere",
+                     top / "Repo" / "run" / "wt" / "README.md", top / "repo" / "run" / "WT" / "README.md"):
+            self.assertTrue(cursor_read_denied(deny, path), path)
+        for path in (wt, wt / "inner" / "a.md", wt / "README.md", top / "repo" / "run", top / "repo", top):
+            self.assertFalse(cursor_read_denied(deny, path), path)
+        outside_root = next(p for p in Path("/").iterdir() if p.name != top.parts[1])
+        self.assertTrue(cursor_read_denied(deny, outside_root / "x"))
+        self.assertTrue(cursor_read_denied(deny, Path("/" + top.parts[1].upper()) / "x"))
+
+    def test_read_root_through_symlink_keeps_both_forms(self):
+        real = self.base.resolve() / "real"
+        (real / "wt").mkdir(parents=True)
+        (real / "secret").mkdir()
+        link = self.base.resolve() / "link"
+        link.symlink_to(real)
+        deny = self.deny_of(link / "wt")
+        for path in (real / "secret" / "a", link / "secret" / "a"):
+            self.assertTrue(cursor_read_denied(deny, path), path)
+        for path in (real / "wt" / "a", link / "wt" / "a"):
+            self.assertFalse(cursor_read_denied(deny, path), path)
+
+    def test_case_rules_do_not_block_other_kept_form(self):
+        base = self.base.resolve()
+        real = base / "real"
+        (real / "wt").mkdir(parents=True)
+        (base / "other").mkdir()
+        link = base / "RealLink"
+        link.symlink_to(real)
+        deny = self.deny_of(link / "wt")
+        for path in (link / "wt" / "README.md", real / "wt" / "README.md"):
+            self.assertFalse(cursor_read_denied(deny, path), path)
+        for path in (base / "other" / "x", base / "REAL" / "x", base / "Real" / "x", base / "realLINK" / "x",
+                     base / "reALLink" / "x"):
+            self.assertTrue(cursor_read_denied(deny, path), path)
+
+    def test_unlistable_ancestor_fails_instead_of_leaving_gap(self):
+        parent = self.base.resolve() / "xonly"
+        (parent / "wt").mkdir(parents=True)
+        os.chmod(parent, 0o311)
+        self.addCleanup(os.chmod, parent, 0o755)
+        with self.assertRaises(OSError):
+            cursor_home(self.base, "review", read_root=parent / "wt")
+
+    def test_shared_prefix_with_two_kept_forms_is_denied(self):
+        base = self.base.resolve()
+        (base / "really" / "wt").mkdir(parents=True)
+        (base / "real").mkdir()
+        (base / "RealLink").symlink_to(base / "really")
+        deny = self.deny_of(base / "RealLink" / "wt")
+        self.assertTrue(cursor_read_denied(deny, base / "real" / "secret.txt"))
+        self.assertFalse(cursor_read_denied(deny, base / "really" / "wt" / "a"))
+        self.assertFalse(cursor_read_denied(deny, base / "RealLink" / "wt" / "a"))
+
+    def test_variant_rules_deny_every_case_variant_but_kept_names(self):
+        rng = random.Random(7)
+
+        def word():
+            return "".join(rng.choice("aAbB1") for _ in range(rng.randint(1, 4)))
+
+        def variants(w):
+            return {"".join(p) for p in itertools.product(*[{c.lower(), c.upper()} for c in w])}
+
+        for _ in range(400):
+            names: list[str] = []
+            while len(names) < rng.randint(2, 7):
+                w = word()
+                if all(w.lower() != n.lower() for n in names):
+                    names.append(w)
+            kept = set(names[:rng.randint(1, 2)])
+            deny = set()
+            for w in names:
+                deny |= _variant_rules("/p/", w, kept)
+            for w in names:
+                for v in variants(w):
+                    for path in (f"/p/{v}", f"/p/{v}/x"):
+                        self.assertEqual(cursor_read_denied(deny, path), v not in kept, (names, kept, path))
+
+    def test_star_in_kept_or_sibling_name_fails(self):
+        for kept, sibling in (("repo*", "secret"), ("repo", "odd*name")):
+            with self.subTest(kept=kept, sibling=sibling):
+                top = self.base.resolve() / f"star-{len(kept)}"
+                (top / kept / "wt").mkdir(parents=True)
+                (top / kept / sibling).mkdir()
+                with self.assertRaises(OSError):
+                    cursor_home(self.base, "review", read_root=top / kept / "wt")
+
+    def test_rules_stay_few_in_crowded_folders(self):
+        wt = self.base.resolve() / "crowd" / "wt"
+        wt.mkdir(parents=True)
+        for i in range(500):
+            (wt.parent / f"tmp{i:04d}").write_text("x")
+        deny = self.deny_of(wt)
+        self.assertTrue(cursor_read_denied(deny, wt.parent / "tmp0042"))
+        self.assertLess(sum(1 for rule in deny if rule.startswith(f"Read({wt.parent}/")), 20)
+
+    def test_without_read_root_only_sensitive_paths_are_denied(self):
+        _, config = self.config("review")
+        reads = [rule for rule in config["permissions"]["deny"] if rule.startswith("Read(")]
+        self.assertTrue(all(rule.startswith(f"Read({self.real_home}/") for rule in reads))
 
 
 class HelpersTest(unittest.TestCase):

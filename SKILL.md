@@ -278,7 +278,7 @@ Claude·Cursor·`codex-doc` 결과는 형식이 같아 형식으로는 가릴 �
 - `jobs --force`는 그 회차의 CLI 결과와 대체 실행 결과(`stage1-cli.json`·`stage1-fallback*.json`, 점검자 쪽 포함)를 무효로 하고, 작업 워크트리를 회차의 첫 입력 상태로 되돌리며, 이전 판정·의견·판가름 상태를 지운다. `apply`까지 한 회차는 다시 열지 않는다. 다시 하면 `workers`부터 한다. `workers`도 이미 한 단계는 다시 하지 않는다(`--force`).
 - CF workers는 한 번에 하나만 돌린다. 다른 회차나 실행의 `workers`와 나란히 띄우지 않는다. 같은 Codex 로그인을 쓰는 프로세스가 겹쳐 토큰을 갱신하면 로그인이 풀릴 수 있다.
 - 작업 하나의 시간 제한은 900초고 CLI별 동시 실행은 최대 4개다.
-- Cursor 실행 방식은 역할에 따라 다르다. 쓰기 역할(코드 작업자 A·B, 문서 작성자)은 작업마다 `cursor-agent -p --sandbox enabled`를 띄운다. 읽기 역할(문서 판정자 a·b, 점검자)은 `workers` 한 번 동안 `cursor-agent acp` 상주 서버를 최대 4개 띄워 돌려 쓰고, 작업마다 그 워크트리를 cwd로 새 세션을 연다(50세션마다 서버 교체, `workers`가 끝나면 닫음). ACP 세션은 `model=<칸의 Cursor 모델>`·`fast=false`·`mode=ask`로 맞추고 실제 값이 다르면 프롬프트를 보내지 않는다. Auto 모델은 거절한다. 읽기 역할은 셸·쓰기·WebFetch·MCP가 막혀 Read·Grep·Glob만 쓴다. ACP에서는 셸이 샌드박스 없이 돌기 때문이다(아래 2026-10-21 실측).
+- Cursor 실행 방식은 역할에 따라 다르다. 쓰기 역할(코드 작업자 A·B, 문서 작성자)은 작업마다 `cursor-agent -p --sandbox enabled`를 띄운다. 읽기 역할(문서 판정자 a·b, 점검자)은 `workers` 한 번 동안 `cursor-agent acp` 상주 서버를 워크트리마다 하나씩 최대 4개 띄워 돌려 쓰고, 작업마다 그 워크트리를 cwd로 새 세션을 연다(50세션마다 서버 교체, 다 차면 다른 워크트리의 쉬는 서버를 닫고 새로 띄움, `workers`가 끝나면 닫음). 서버 프로필은 워크트리의 각 상위 폴더에 있는 다른 항목을 Read 거부해 워크트리 밖 Read·Grep·Glob을 막는다. Cursor 규칙은 대소문자를 구분하고 `*`만 와일드카드라, 남길 이름과 처음 갈리는 글자를 대·소문자로 적은 `Read(<상위>/<공통 앞부분><글자>*)`와 남길 이름의 대소문자 변형 규칙으로 만든다(적은 경로와 실제 경로 둘 다). ACP 세션은 `model=<칸의 Cursor 모델>`·`fast=false`·`mode=ask`로 맞추고 실제 값이 다르면 프롬프트를 보내지 않는다. Auto 모델은 거절한다. 읽기 역할은 셸·쓰기·WebFetch·MCP가 막혀 Read·Grep·Glob만 쓴다. ACP에서는 셸이 샌드박스 없이 돌기 때문이다(아래 2026-10-21 실측).
 
 ### 실패와 대체 실행
 
@@ -307,7 +307,7 @@ Claude·Cursor·`codex-doc` 결과는 형식이 같아 형식으로는 가릴 �
 - `-p`가 느린 원인: 모델 응답은 3~5초인데 시작 단계가 75~185초다(처음 HOME 166~175초, 같은 HOME 재사용 72~79초). 시작 단계에서 Cursor 팀 마켓플레이스 플러그인의 MCP 서버(`uvx … serena`, `npx typescript-language-server`)를 띄운다. 샌드박스를 꺼도 같았다. `typescript-language-server`는 `-p`가 끝난 뒤에도 남는다.
 - ACP는 팀 플러그인을 싣지 않는다. 읽기 작업 8건을 동시 4로 돌리면 26초에 끝났다(서버마다 첫 작업 16~18초, 이후 5~7초). 끝난 뒤 남은 프로세스·임시 폴더는 없었다.
 - ACP에서 셸은 `session/request_permission`으로 오고, 허락하면 샌드박스 없이 돈다. cli-config `sandbox.mode=enabled`나 전역 `--sandbox enabled`를 줘도 워크트리 밖 쓰기, 다른 워크트리 쓰기, `curl https://example.com`, 워크트리 밖 파일 `cat`이 모두 됐다. Write 도구도 권한 요청 없이 작업 폴더 밖에 썼다. 그래서 쓰기 역할은 `-p`(네트워크 차단, 프록시 403)로 둔다.
-- 격리 점검 `PYTHONPATH="${CLAUDE_SKILL_DIR}" python3 -m cascade.cursor_acp_check [--control]`(읽기 역할 프로필): Read(워크트리 밖 카나리아), 셸 `cat`, 워크트리 안·밖 쓰기, Grep·Glob, WebFetch, MCP(시험용 MCP 서버를 세션에 붙임) 6건이 모두 막혔다. 판정은 진행 알림이 아니라 답 텍스트·세션 저장소(`acp-sessions/*/store.db`)·파일 생성·MCP `tools/call` 수신으로 한다. `--control`(거부 설정을 비우고 Read만)은 카나리아를 읽어 시험이 누출을 잡는 것을 확인했다. **Cursor CLI가 바뀌면 두 명령을 다시 돌린다**(누출 0건이면 종료 코드 0, `--control`은 누출을 잡으면 0).
+- 격리 점검 `PYTHONPATH="${CLAUDE_SKILL_DIR}" python3 -m cascade.cursor_acp_check [--control]`(읽기 역할 프로필): Read(워크트리 밖 카나리아), 셸 `cat`, 워크트리 안·밖 쓰기, Grep·Glob(카나리아 앞부분 패턴, 카나리아 폴더 범위), 홈 아래 Read·Grep, 대소문자를 바꾼 경로 Read, WebFetch, MCP(시험용 MCP 서버를 세션에 붙임) 8건이 모두 막혔다(2026-10-23). 거부 규칙은 실제 프로필 그대로 쓴다. 판정은 진행 알림이 아니라 답 텍스트·세션 저장소(`acp-sessions/*/store.db`)·파일 생성·MCP `tools/call` 수신으로 한다. `--control`(거부 설정을 비우고 Read만)은 카나리아를 읽어 시험이 누출을 잡는 것을 확인했다. **Cursor CLI가 바뀌면 두 명령을 다시 돌린다**(누출 0건이면 종료 코드 0, `--control`은 누출을 잡으면 0).
 - 읽기 역할은 홈 민감 경로가 아닌 워크트리 밖 파일은 읽을 수 있다(`/`를 Grep하면 다른 폴더 파일이 나온다). `-p` 읽기 역할도 샌드박스 읽기 경계가 시스템 전체라 같다.
 
 ### 아직 실측하지 않은 것

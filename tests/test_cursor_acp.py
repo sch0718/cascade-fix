@@ -23,7 +23,7 @@ from cascade.runners import (  # noqa: E402
 )
 from cascade.workers import usage_totals  # noqa: E402
 from fake_cli import fenced, result_json  # noqa: E402
-from helpers import make_repo  # noqa: E402
+from helpers import cursor_read_denied, make_repo  # noqa: E402
 from test_runners import RunnerTestBase  # noqa: E402
 
 LIMIT_ENTRY = {"is_error": True, "result": "You've hit your usage limit"}
@@ -94,17 +94,46 @@ class CursorAcpTest(RunnerTestBase):
         self.assertEqual(self.calls("cursor-acp"), 0)
         self.assertIn("-p", self.log_args("cursor-agent"))
 
-    def test_server_is_reused_with_new_session_per_job(self):
+    def test_server_is_reused_with_new_session_per_job_in_same_worktree(self):
+        runner = self.runner()
+        self.assertEqual(runner.run(self.readonly_job()).status, STATUS_OK)
+        self.assertEqual(runner.run(self.readonly_job()).status, STATUS_OK)
+        self.assertEqual(self.calls("cursor-acp"), 1)
+        first, second = self.prompt_record(1), self.prompt_record(2)
+        self.assertEqual(first["pid"], second["pid"])
+        self.assertNotEqual(first["sessionId"], second["sessionId"])
+
+    def test_profile_denies_reads_outside_worktree(self):
+        (self.tmp / "outside.txt").write_text("x")
+        self.assertEqual(self.runner().run(self.readonly_job()).status, STATUS_OK)
+        deny = json.loads(self.server_file("config.json"))["permissions"]["deny"]
+        self.assertTrue(cursor_read_denied(deny, self.tmp / "outside.txt"))
+        self.assertTrue(cursor_read_denied(deny, self.tmp / "bin" / "cursor-agent"))
+        self.assertFalse(cursor_read_denied(deny, self.wt / "a.txt"))
+
+    def test_other_worktree_gets_its_own_server(self):
         runner = self.runner()
         other = self.tmp / "other-wt"
         other.mkdir()
         self.assertEqual(runner.run(self.readonly_job()).status, STATUS_OK)
         self.assertEqual(runner.run(self.readonly_job(worktree=other)).status, STATUS_OK)
-        self.assertEqual(self.calls("cursor-acp"), 1)
-        first, second = self.prompt_record(1), self.prompt_record(2)
-        self.assertEqual(first["pid"], second["pid"])
-        self.assertNotEqual(first["sessionId"], second["sessionId"])
-        self.assertEqual(second["cwd"], str(other))
+        self.assertEqual(self.calls("cursor-acp"), 2)
+        self.assertNotEqual(self.prompt_record(1)["pid"], self.prompt_record(2)["pid"])
+        self.assertEqual(self.prompt_record(2)["cwd"], str(other))
+        deny = json.loads(self.server_file("config.json", 2))["permissions"]["deny"]
+        self.assertTrue(cursor_read_denied(deny, self.wt / "a.txt"))
+        self.assertFalse(cursor_read_denied(deny, other / "a.txt"))
+
+    def test_full_pool_replaces_idle_server_of_other_worktree(self):
+        runner = self.runner(max_servers=1)
+        other = self.tmp / "other-wt"
+        other.mkdir()
+        self.assertEqual(runner.run(self.readonly_job()).status, STATUS_OK)
+        old_home = Path(json.loads(self.server_file("env.json"))["HOME"])
+        self.assertEqual(runner.run(self.readonly_job(worktree=other)).status, STATUS_OK)
+        self.assertEqual(self.calls("cursor-acp"), 2)
+        self.assertFalse(old_home.exists())
+        self.assertFalse(_alive(int(self.server_file("pid"))))
 
     def test_server_is_replaced_after_session_limit_and_old_home_removed(self):
         runner = self.runner(sessions_per_server=1)
@@ -228,6 +257,17 @@ class CursorAcpTest(RunnerTestBase):
         out = self.runner().run(self.readonly_job())
         self.assertEqual(out.status, STATUS_AUTH)
         self.assertEqual(self.calls("acp-prompt"), 0)
+
+    def test_unlistable_worktree_ancestor_is_error_without_starting_server(self):
+        parent = self.tmp / "xonly"
+        wt = parent / "wt"
+        wt.mkdir(parents=True)
+        os.chmod(parent, 0o311)
+        self.addCleanup(os.chmod, parent, 0o755)
+        out = self.runner().run(self.readonly_job(worktree=wt))
+        self.assertEqual(out.status, STATUS_ERROR)
+        self.assertIn("프로필", out.detail)
+        self.assertEqual(self.calls("cursor-acp"), 0)
 
     def test_missing_executable_is_error(self):
         runner = CursorRunner(str(self.tmp / "nope"))

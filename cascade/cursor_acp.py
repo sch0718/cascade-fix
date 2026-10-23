@@ -1,6 +1,8 @@
 """cursor-agent acp(Agent Client Protocol) 상주 서버 풀. 읽기 역할 작업만 보낸다.
 
 ACP에서는 셸이 샌드박스 없이 돌기 때문에(2026-10-21 실측) 셸·쓰기를 막은 프로필로만 띄운다.
+ACP는 읽기 경계(sandbox.readBoundary)를 쓰지 않아(2026-10-23 실측) 작업 폴더 밖 Read 거부 규칙을 서버마다 만들므로,
+서버 하나는 작업 폴더 하나만 맡는다.
 """
 import atexit
 import codecs
@@ -52,11 +54,12 @@ def _scrub(text: str, secrets: list[str]) -> str:
 
 
 class _Server:
-    """임시 폴더(HOME·캐시)를 가진 cursor-agent acp 프로세스 하나."""
+    """임시 폴더(HOME·캐시)를 가진 cursor-agent acp 프로세스 하나. env_factory(임시 폴더, 작업 폴더)로 환경을 만든다."""
 
-    def __init__(self, exe: str, env_factory: Callable[[Path], dict]):
+    def __init__(self, exe: str, env_factory: Callable[[Path, Path], dict], worktree: Path):
         self.exe = exe
         self.env_factory = env_factory
+        self.worktree = worktree
         self.root: Path | None = None
         self.proc: subprocess.Popen | None = None
         self.sessions = 0
@@ -79,8 +82,12 @@ class _Server:
                 return
             self.root = Path(tempfile.mkdtemp(prefix="cascade-cursor-acp-"))
             try:
+                env = self.env_factory(self.root, self.worktree)
+            except OSError as e:
+                raise AcpError(f"Cursor 프로필을 만들지 못했다: {e}") from e
+            try:
                 self.proc = subprocess.Popen(
-                    [self.exe, "acp"], cwd=self.root, env=self.env_factory(self.root),
+                    [self.exe, "acp"], cwd=self.root, env=env,
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     text=True, encoding="utf-8", errors="replace", start_new_session=True)
             except OSError as e:
@@ -275,9 +282,10 @@ def _remove(root: Path) -> None:
 
 
 class CursorAcpPool:
-    """서버를 max_servers개까지 띄워 돌려 쓴다. 작업마다 새 세션을 열고, 서버는 sessions_per_server마다 바꾼다."""
+    """서버를 max_servers개까지 띄워 같은 작업 폴더의 작업에 돌려 쓴다. 작업마다 새 세션을 열고, 서버는
+    sessions_per_server마다 바꾼다. 다 차면 다른 작업 폴더의 쉬는 서버를 닫고 새로 띄운다."""
 
-    def __init__(self, exe: str, env_factory: Callable[[Path], dict], max_servers: int, timeout: float,
+    def __init__(self, exe: str, env_factory: Callable[[Path, Path], dict], max_servers: int, timeout: float,
                  sessions_per_server: int = SESSIONS_PER_SERVER, start_timeout: float = START_TIMEOUT):
         self.exe = exe
         self.env_factory = env_factory
@@ -290,18 +298,27 @@ class CursorAcpPool:
         self._idle: list[_Server] = []
         self._closed = False
 
-    def _acquire(self) -> _Server:
+    def _acquire(self, worktree: Path) -> _Server:
+        stale = None
         with self._condition:
             while True:
                 if self._closed:
                     raise AcpError("Cursor ACP 실행기를 닫았다")
-                if self._idle:
-                    return self._idle.pop()
+                same = next((s for s in self._idle if s.worktree == worktree), None)
+                if same is not None:
+                    self._idle.remove(same)
+                    return same
+                if len(self._servers) >= self.max_servers and self._idle:
+                    stale = self._idle.pop(0)
+                    self._servers.discard(stale)
                 if len(self._servers) < self.max_servers:
-                    server = _Server(self.exe, self.env_factory)
+                    server = _Server(self.exe, self.env_factory, worktree)
                     self._servers.add(server)
-                    return server
+                    break
                 self._condition.wait()
+        if stale is not None:
+            stale.close()
+        return server
 
     def _release(self, server: _Server, reusable: bool) -> None:
         with self._condition:
@@ -348,14 +365,15 @@ class CursorAcpPool:
         """prompt를 보내 parse가 받아들이면 그 결과를, 아니면 같은 세션에 retry_prompt를 한 번 더 보낸 결과를 돌려 준다."""
         if model.lower().startswith("auto"):
             raise AcpError(f"Cursor ACP에서 Auto 모델은 쓰지 않는다: {model}")
-        server = self._acquire()
+        worktree = Path(worktree)
+        server = self._acquire(worktree)
         reusable = False
         sent = [prompt, retry_prompt]
         try:
             server.clear_stderr()
             server.start(self.start_timeout)
             deadline = time.monotonic() + self.timeout
-            session = self._open(server, Path(worktree), model, deadline)
+            session = self._open(server, worktree, model, deadline)
             output = parse(self._prompt(server, session, prompt, deadline))
             if output is None:
                 output = parse(self._prompt(server, session, retry_prompt, deadline))
