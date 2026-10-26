@@ -1,5 +1,6 @@
 import json
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 PRICES_AS_OF = "2026-10-06"
@@ -37,6 +38,7 @@ class AgentUsage:
     cache_read: int
     cache_write: int
     cost: float | None
+    messages: int = 0
 
 
 def cost(model: str, input: int, output: int, cache_read: int, cache_write: int,
@@ -121,6 +123,21 @@ def _one_hour_writes(raw: dict) -> int:
     return max(0, min(tokens, raw["cache_creation_input_tokens"]))
 
 
+def _usage_values(message: dict, raw: dict, name: str) -> tuple[str, dict[str, int]]:
+    message_id = message.get("id")
+    if not isinstance(message_id, str):
+        raise UsageFormatError(f"{name}의 usage 줄에 message.id가 없다")
+    for key in _USAGE_KEYS:
+        if not isinstance(raw.get(key), int):
+            raise UsageFormatError(f"{name}의 usage에 {key}가 없다")
+    return message_id, {**{key: raw[key] for key in _USAGE_KEYS}, "cache_write_1h": _one_hour_writes(raw)}
+
+
+def _message_cost(model: str, m: dict[str, int]) -> float | None:
+    return cost(model, m["input_tokens"], m["output_tokens"], m["cache_read_input_tokens"],
+                m["cache_creation_input_tokens"] - m["cache_write_1h"], m["cache_write_1h"])
+
+
 def _last_usage_per_message(workflow_dir: Path, agent_id: str) -> list[dict[str, int]]:
     name = f"agent-{agent_id}.jsonl"
     last: dict[str, dict[str, int]] = {}
@@ -129,16 +146,25 @@ def _last_usage_per_message(workflow_dir: Path, agent_id: str) -> list[dict[str,
         raw = message.get("usage") if isinstance(message, dict) else None
         if not isinstance(raw, dict):
             continue
-        message_id = message.get("id")
-        if not isinstance(message_id, str):
-            raise UsageFormatError(f"{name}의 usage 줄에 message.id가 없다")
-        for key in _USAGE_KEYS:
-            if not isinstance(raw.get(key), int):
-                raise UsageFormatError(f"{name}의 usage에 {key}가 없다")
-        last[message_id] = {**{key: raw[key] for key in _USAGE_KEYS}, "cache_write_1h": _one_hour_writes(raw)}
+        message_id, values = _usage_values(message, raw, name)
+        last[message_id] = values
     if not last:
         raise UsageFormatError(f"{name}에 토큰 사용량 줄이 없다")
     return list(last.values())
+
+
+def _agent_usage(label: str, model: str, messages: list[dict[str, int]]) -> AgentUsage:
+    costs = [_message_cost(model, m) for m in messages]
+    return AgentUsage(
+        label=label,
+        model=model,
+        input=sum(m["input_tokens"] for m in messages),
+        output=sum(m["output_tokens"] for m in messages),
+        cache_read=sum(m["cache_read_input_tokens"] for m in messages),
+        cache_write=sum(m["cache_creation_input_tokens"] for m in messages),
+        cost=None if any(c is None for c in costs) else sum(costs),
+        messages=len(messages),
+    )
 
 
 def read_workflow(dir: Path) -> list[AgentUsage]:
@@ -147,18 +173,56 @@ def read_workflow(dir: Path) -> list[AgentUsage]:
     for agent_id, label in _journal_agents(workflow_dir):
         model = _agent_model(workflow_dir, agent_id)
         messages = _last_usage_per_message(workflow_dir, agent_id)
-        costs = [
-            cost(model, m["input_tokens"], m["output_tokens"], m["cache_read_input_tokens"],
-                 m["cache_creation_input_tokens"] - m["cache_write_1h"], m["cache_write_1h"])
-            for m in messages
-        ]
-        result.append(AgentUsage(
-            label=label,
-            model=model,
-            input=sum(m["input_tokens"] for m in messages),
-            output=sum(m["output_tokens"] for m in messages),
-            cache_read=sum(m["cache_read_input_tokens"] for m in messages),
-            cache_write=sum(m["cache_creation_input_tokens"] for m in messages),
-            cost=None if any(c is None for c in costs) else sum(costs),
-        ))
+        result.append(_agent_usage(label, model, messages))
+    return result
+
+
+def _parse_time(value, name: str) -> datetime:
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (AttributeError, ValueError) as e:
+        raise UsageFormatError(f"{name}의 시각을 읽지 못했다: {value!r}") from e
+
+
+def _session_files(path: Path, subagents: bool) -> list[tuple[str, Path]]:
+    files = [("main", path)]
+    if subagents:
+        files += [("subagent", p) for p in sorted(path.with_suffix("").glob("subagents/**/*.jsonl")) if p.name != "journal.jsonl"]
+    return files
+
+
+def read_session(path: Path, *, subagents: bool = False, since: str | None = None,
+                 until: str | None = None) -> list[AgentUsage]:
+    """세션 기록 JSONL의 토큰 사용량을 (main|subagent, 모델)별로 센다. 메시지 id마다 마지막 줄만 센다.
+
+    subagents면 세션 폴더(`<세션>/subagents/` 아래 Workflow 포함)의 하위 에이전트 기록도 센다. since·until(ISO 시각)을
+    주면 그 사이(양 끝 포함) 메시지만 센다. 사용량이 모두 0인 메시지(`<synthetic>` 등)는 건너뛴다.
+    """
+    path = Path(path)
+    start = _parse_time(since, "since") if since else None
+    end = _parse_time(until, "until") if until else None
+    last: dict[tuple[str, str], tuple[str, str, dict[str, int]]] = {}
+    for label, file in _session_files(path, subagents):
+        for row in _read_jsonl(file):
+            message = row.get("message")
+            raw = message.get("usage") if isinstance(message, dict) else None
+            if not isinstance(raw, dict):
+                continue
+            message_id, values = _usage_values(message, raw, file.name)
+            if not any(values[key] for key in _USAGE_KEYS):
+                continue
+            if start or end:
+                at = _parse_time(row.get("timestamp"), file.name)
+                if (start and at < start) or (end and at > end):
+                    continue
+            model = message.get("model")
+            if not isinstance(model, str) or not model:
+                raise UsageFormatError(f"{file.name}의 usage 줄에 message.model이 없다")
+            last[(str(file), message_id)] = (label, model, values)
+    groups: dict[tuple[str, str], list[dict[str, int]]] = {}
+    for label, model, values in last.values():
+        groups.setdefault((label, model), []).append(values)
+    result = []
+    for (label, model), messages in groups.items():
+        result.append(_agent_usage(label, model, messages))
     return result

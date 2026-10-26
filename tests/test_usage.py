@@ -122,6 +122,74 @@ class UsageTest(unittest.TestCase):
                "cache_creation_input_tokens": 300_000}
         self.assertAlmostEqual(usage.read_workflow(self.make_run(row))[0].cost, 300_000 * 2.5 / 1e6)
 
+    def session_row(self, message_id, model, ts, output, cache_write_1h=0):
+        return {"type": "assistant", "timestamp": ts,
+                "message": {"id": message_id, "model": model,
+                            "usage": {"input_tokens": 1, "output_tokens": output, "cache_read_input_tokens": 100,
+                                      "cache_creation_input_tokens": 10 + cache_write_1h,
+                                      "cache_creation": {"ephemeral_5m_input_tokens": 10,
+                                                         "ephemeral_1h_input_tokens": cache_write_1h}}}}
+
+    def make_session(self):
+        main = self.tmp / "s1.jsonl"
+        write_jsonl(main, [
+            {"type": "user", "timestamp": "2026-10-26T01:00:00.000Z", "message": {"role": "user", "content": "x"}},
+            self.session_row("m1", "claude-opus-5-5", "2026-10-26T01:00:01.000Z", 5),
+            self.session_row("m1", "claude-opus-5-5", "2026-10-26T01:00:02.000Z", 7),
+            self.session_row("m2", "claude-haiku-5-5", "2026-10-26T01:10:00.000Z", 3),
+            self.session_row("m3", "claude-opus-5-5", "2026-10-26T02:00:00.000Z", 11, cache_write_1h=1000),
+        ])
+        sub = self.tmp / "s1" / "subagents"
+        (sub / "workflows" / "wf_x").mkdir(parents=True)
+        write_jsonl(sub / "agent-a1.jsonl", [self.session_row("s1", "claude-sonnet-5-5", "2026-10-26T01:05:00.000Z", 13)])
+        write_jsonl(sub / "workflows" / "wf_x" / "journal.jsonl", [{"type": "started", "agentId": "a2", "label": "y"}])
+        write_jsonl(sub / "workflows" / "wf_x" / "agent-a2.jsonl",
+                    [self.session_row("s2", "claude-haiku-5-5", "2026-10-26T01:06:00.000Z", 17)])
+        return main
+
+    def test_session_counts_each_message_once_per_model(self):
+        got = {(u.label, u.model): u for u in usage.read_session(self.make_session())}
+        self.assertEqual(set(got), {("main", "claude-opus-5-5"), ("main", "claude-haiku-5-5")})
+        opus = got[("main", "claude-opus-5-5")]
+        self.assertEqual((opus.input, opus.output, opus.cache_read, opus.cache_write), (2, 18, 200, 1020))
+        self.assertEqual(opus.messages, 2)
+        want = (usage.cost("claude-opus-5-5", 1, 7, 100, 10)
+                + usage.cost("claude-opus-5-5", 1, 11, 100, 10, cache_write_1h=1000))
+        self.assertAlmostEqual(opus.cost, want)
+
+    def test_session_subagents_only_when_asked(self):
+        main = self.make_session()
+        self.assertNotIn("subagent", {u.label for u in usage.read_session(main)})
+        got = {(u.label, u.model): u.output for u in usage.read_session(main, subagents=True)}
+        self.assertEqual(got[("subagent", "claude-sonnet-5-5")], 13)
+        self.assertEqual(got[("subagent", "claude-haiku-5-5")], 17)
+
+    def test_session_window_keeps_messages_between_since_and_until(self):
+        got = usage.read_session(self.make_session(), since="2026-10-26T01:00:02Z", until="2026-10-26T01:10:00Z")
+        self.assertEqual({(u.model, u.output) for u in got}, {("claude-opus-5-5", 7), ("claude-haiku-5-5", 3)})
+
+    def test_session_window_applies_to_subagents(self):
+        got = usage.read_session(self.make_session(), subagents=True, until="2026-10-26T01:05:30Z")
+        self.assertEqual({(u.label, u.model) for u in got}, {("main", "claude-opus-5-5"), ("subagent", "claude-sonnet-5-5")})
+
+    def test_session_skips_zero_usage_messages(self):
+        path = self.tmp / "s.jsonl"
+        zero = {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
+        write_jsonl(path, [{"timestamp": "2026-10-26T01:00:00Z", "message": {"id": "z", "model": "<synthetic>", "usage": zero}}])
+        self.assertEqual(usage.read_session(path), [])
+
+    def test_session_without_timestamp_in_window_raises(self):
+        path = self.tmp / "s.jsonl"
+        row = self.session_row("m1", "claude-opus-5-5", "x", 1)
+        del row["timestamp"]
+        write_jsonl(path, [row])
+        with self.assertRaises(usage.UsageFormatError):
+            usage.read_session(path, since="2026-10-26T00:00:00Z")
+
+    def test_session_missing_file_raises(self):
+        with self.assertRaises(usage.UsageFormatError):
+            usage.read_session(self.tmp / "none.jsonl")
+
     def test_unconfirmed_price_key_gives_none(self):
         saved = usage.PRICES["claude-sonnet-5-5"].pop("cache_write")
         self.addCleanup(usage.PRICES["claude-sonnet-5-5"].__setitem__, "cache_write", saved)
