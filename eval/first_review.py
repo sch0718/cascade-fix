@@ -303,6 +303,7 @@ def reviewer_score(runner: str, groups: list[dict], findings: dict, truth: dict[
     mine = [(g, f) for g in groups for f in member_findings(g, findings) if f["runner"] == runner]
     facts = [g for g in groups if truth.get(g["id"]) == VERDICT_FACT]
     found = [g for g in facts if runner in found_by_of(member_findings(g, findings))]
+    unique = [g for g in found if found_by_of(member_findings(g, findings)) == [runner]]
     severity_of = {g["id"]: group_severity(member_findings(g, findings)) for g in groups}
     by_severity = {}
     for severity in SEVERITIES:
@@ -312,7 +313,7 @@ def reviewer_score(runner: str, groups: list[dict], findings: dict, truth: dict[
                           sum(f["severity"] == severity for g, f in mine)),
             "recall": (sum(g in found for g in all_facts), len(all_facts))}
     return {"findings": len(mine), "precision": (sum(truth[g["id"]] == VERDICT_FACT for g, f in mine), len(mine)),
-            "recall": (len(found), len(facts)), "by_severity": by_severity}
+            "recall": (len(found), len(facts)), "unique": len(unique), "by_severity": by_severity}
 
 
 def sum_tokens(rows: list[dict]) -> dict:
@@ -376,8 +377,9 @@ def table(header: tuple[str, ...], rows: list[tuple[str, ...]]) -> list[str]:
 
 def render(result: dict) -> str:
     lines = ["## 검토자별 정밀도·재현율", "",
-             *table(("검토자", "지적 수", "정밀도", "재현율"),
-                    [(label(r), str(v["findings"]), pct(v["precision"]), pct(v["recall"])) for r, v in result.items()]),
+             *table(("검토자", "지적 수", "정밀도", "재현율", "단독 사실"),
+                    [(label(r), str(v["findings"]), pct(v["precision"]), pct(v["recall"]), str(v["unique"]))
+                     for r, v in result.items()]),
              "", "## 등급별(정밀도는 검토자가 붙인 등급, 재현율은 묶음의 가장 높은 등급)", "",
              *table(("검토자", "등급", "정밀도", "재현율"),
                     [(label(r), severity, pct(s["precision"]), pct(s["recall"])) for r, v in result.items()
