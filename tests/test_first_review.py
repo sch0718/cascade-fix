@@ -393,6 +393,25 @@ class MainTest(unittest.TestCase):
         path.write_text(text, encoding="utf-8")
         return path
 
+    def test_merge_does_not_overwrite_confirmed_merged_json(self):
+        out = self.tmp / "out"
+        codex = self.write("codex.final", CODEX_TEXT)
+        self.assertEqual(self.call(["merge", "--codex", codex, "--doc", "plan.md", "--out", out])[0], 0)
+        merged = json.loads((out / "merged.json").read_text(encoding="utf-8"))
+        merged["confirmed"] = True
+        (out / "merged.json").write_text(json.dumps(merged, ensure_ascii=False), encoding="utf-8")
+        code, _, err = self.call(["merge", "--codex", codex, "--doc", "plan.md", "--out", out])
+        self.assertEqual(code, 1)
+        self.assertIn("덮어쓰지 않는다", err)
+        self.assertTrue(json.loads((out / "merged.json").read_text(encoding="utf-8"))["confirmed"])
+
+    def test_merge_warns_about_unparsed_codex_code_items(self):
+        out = self.tmp / "out"
+        codex = self.write("codex.final", "- [P2] 위치가 빠진 항목\n본문\n")
+        code, _, err = self.call(["merge", "--codex", codex, "--out", out])
+        self.assertEqual(code, 0)
+        self.assertIn("형식을 읽지 못한 Codex 항목 1건", err)
+
     def test_merge_confirm_score_round_trip(self):
         out = self.tmp / "out"
         code, stdout, _ = self.call(["merge", "--codex", self.write("codex.final", CODEX_TEXT), "--cursor",
