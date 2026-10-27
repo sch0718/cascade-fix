@@ -284,6 +284,12 @@ class ScoreTest(unittest.TestCase):
         self.assertEqual(s["codex"]["by_severity"]["Warning"]["recall"], (1, 2))
         self.assertEqual(s["codex"]["by_severity"]["Suggestion"]["recall"], (0, 0))
 
+    def test_unique_counts_fact_groups_only_that_reviewer_found(self):
+        s = first_review.score(self.merged, TRUTH)
+        self.assertEqual({r: v["unique"] for r, v in s.items()}, {"claude": 1, "codex": 0, "cursor": 0})
+        s = first_review.score(self.merged, {**TRUTH, "g04": "사실"})
+        self.assertEqual(s["codex"]["unique"], 1)
+
     def test_reviewer_not_given_is_left_out(self):
         merged = confirmed_of(first_review.merge(None, CODEX_TEXT, CURSOR_TEXT, mode="doc"))
         s = first_review.score(merged, {"g01": "사실", "g02": "아님", "g03": "사실"})
@@ -364,6 +370,7 @@ class ScoreTest(unittest.TestCase):
         text = first_review.render(first_review.score(self.merged, TRUTH))
         self.assertIn("1/2", text)
         self.assertIn("기록 없음", text)
+        self.assertIn("| 단독 사실 |", text)
 
 
 class MainTest(unittest.TestCase):
