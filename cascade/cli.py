@@ -451,6 +451,8 @@ def cmd_init(args) -> int:
     )
     write_findings(s.round_dir(snap.run_dir, 1) / "findings.json", findings)
     s.save_ledger(snap.run_dir, ledger)
+    if first_review:
+        s.write_json(Path(args.input).parent / REVIEW_USED, {"run_dir": str(snap.run_dir)})
     counts = Counter(f.severity for f in findings)
     print(f"run_dir={snap.run_dir}")
     print(f"status={STATUS_RUNNING}")
@@ -1691,6 +1693,9 @@ def cmd_usage(args) -> int:
         print(f"Claude 토큰 미측정: {result['error']}")
     else:
         print(f"Claude 토큰: Workflow {result['workflow']} 작업 {result['jobs']}건 기록, 일치하지 않음 {result['unmatched']}건 → {out}")
+    if args.review_dir and (used := _read_optional_json(rd / REVIEW_USED)):
+        print(f"경고: 이 첫 검토 폴더는 이미 init에 쓰였다({used.get('run_dir')}). 지금 기록한 토큰은 그 실행의 보고서에 들어가지 않는다. "
+              "첫 검토 토큰은 init 전에 CF usage --review-dir로 기록한다")
     return 0
 
 
@@ -1706,6 +1711,7 @@ def cmd_status(args) -> int:
     return 0
 
 
+REVIEW_USED = "review-used.json"
 SETUP_RECORD = "setup.json"
 SETUP_CHECK = "setup-check.json"
 STATUS_LABELS = {recommend.MEASURED: "측정됨", recommend.PROVISIONAL: "잠정"}

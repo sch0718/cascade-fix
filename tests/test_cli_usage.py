@@ -291,6 +291,19 @@ class FirstReviewUsageTest(CliTestBase):
     def test_init_without_review_usage_has_no_usage_key(self):
         self.assertNotIn("usage", self.init_from(self.review_dir()))
 
+    def test_usage_after_init_warns_that_the_report_will_not_get_it(self):
+        review_dir = self.review_dir()
+        wf = write_workflow(self.tmp / "wf_review", [("code review", SONNET)])
+        self.init_from(review_dir)
+        p = self.cli("usage", "--review-dir", str(review_dir), "--workflow", str(wf))
+        self.assertIn("이미 init에 쓰였다", p.stdout)
+
+    def test_usage_before_init_has_no_warning(self):
+        review_dir = self.review_dir()
+        wf = write_workflow(self.tmp / "wf_review", [("code review", SONNET)])
+        p = self.cli("usage", "--review-dir", str(review_dir), "--workflow", str(wf))
+        self.assertNotIn("이미 init에 쓰였다", p.stdout)
+
 
 class WorkflowStepTest(unittest.TestCase):
     def test_workflow_step_mentions_usage(self):
