@@ -185,14 +185,14 @@ def cache_env(tmp: Path) -> dict[str, str]:
 
 
 def _variant_rules(under: str, word: str, kept: set[str]) -> set[str]:
-    """word의 모든 대소문자 변형과 그 아래를 막고 kept 이름과 그 아래는 남기는 규칙. 변형을 한 글자씩 따라가다
+    """word의 모든 대소문자(타이틀케이스 포함) 변형과 그 아래를 막고 kept 이름과 그 아래는 남기는 규칙. 변형을 한 글자씩 따라가다
     kept 어느 것의 앞부분도 아니게 되는 곳에서 `앞부분*`으로 끊고, 끝까지 겹친 변형은 kept가 아니면 그 이름만 막는다."""
     rules: set[str] = set()
     prefixes = {""}
     for ch in word:
         following = set()
         for prefix in prefixes:
-            for step in {prefix + ch.lower(), prefix + ch.upper()}:
+            for step in {prefix + ch.lower(), prefix + ch.upper(), prefix + ch.title()}:
                 if any(name.startswith(step) for name in kept):
                     following.add(step)
                 else:
