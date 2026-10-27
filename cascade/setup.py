@@ -115,6 +115,16 @@ def cell_model(roles: dict, runner: str, path: str) -> tuple[str, str]:
     return model, effort
 
 
+def check_cells(roles: dict) -> list[tuple[str, str, str, str]]:
+    cells = set()
+    for runner, path, target in _external_uses(roles):
+        model = target["model"]
+        if runner == RUNNER_CODEX and not model:
+            model = codex_model(Path.home() / ".codex")
+        cells.add((runner, path, model, target["effort"]))
+    return sorted(cells)
+
+
 def acp_models(roles: dict) -> list[str]:
     cells = [cell for key in _ACP_READ_KEYS if key in roles for cell in (roles[key], roles[key]["fallback"])]
     return sorted({cell["model"] or DEFAULT_CURSOR_MODEL for cell in cells if cell["runner"] == RUNNER_CURSOR})

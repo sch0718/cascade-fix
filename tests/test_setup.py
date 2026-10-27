@@ -73,6 +73,19 @@ class CheckPathsTest(unittest.TestCase):
         self.assertEqual(setup.acp_models(with_cursor(CLAUDE_ONLY, "doc.checker", fallback_only=True)), ["composer-2.5"])
 
 
+class CheckCellsTest(unittest.TestCase):
+    def test_same_runner_and_path_with_different_models_are_checked_separately(self):
+        roles = copy.deepcopy(LOCAL)
+        roles["code.review"].update(model="gpt-a", effort="high")
+        roles["code.opinion"].update(model="gpt-b", effort="high")
+        models = {model for runner, path, model, _ in setup.check_cells(roles) if (runner, path) == ("codex", "review")}
+        self.assertTrue({"gpt-a", "gpt-b"} <= models)
+
+    def test_same_cell_used_by_many_roles_is_checked_once(self):
+        cells = setup.check_cells(with_cursor(CLAUDE_ONLY, "code.a"))
+        self.assertEqual(len(cells), len(set(cells)))
+
+
 class CellModelTest(unittest.TestCase):
     def test_codex_worker_cell(self):
         roles = copy.deepcopy(LOCAL)

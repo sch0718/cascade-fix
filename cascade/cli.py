@@ -1879,9 +1879,11 @@ def _setup_check(args) -> int:
     roles = _check_roles(args.profile, known[args.profile]["roles"])
     scripts = {runner: _skill_scripts()[skill] for runner, skill in skill_scripts.RUNNER_SKILLS.items()}
     results = {}
-    for runner, path in setup.check_paths(roles):
-        model, effort = setup.cell_model(roles, runner, path)
-        results[f"{runner}-{path}"] = setup.run_check(runner, path, model, effort, scripts)
+    cells = setup.check_cells(roles)
+    for runner, path, model, effort in cells:
+        same_path = sum(1 for cell in cells if cell[:2] == (runner, path))
+        name = f"{runner}-{path}" if same_path == 1 else f"{runner}-{path}:{model or 'default'}/{effort or 'default'}"
+        results[name] = setup.run_check(runner, path, model, effort, scripts)
     models = setup.acp_models(roles)
     for model in models:
         results["cursor_acp" if len(models) == 1 else f"cursor_acp:{model}"] = _acp_check(model)
@@ -2070,7 +2072,7 @@ SETUP_HANDLERS = {"detect": _setup_detect, "check": _setup_check, "apply": _setu
 
 
 def cmd_setup(args) -> int:
-    action = next(name for name in SETUP_HANDLERS if getattr(args, name))
+    action = next(name for name in SETUP_HANDLERS if getattr(args, name) not in (None, False))
     try:
         return SETUP_HANDLERS[action](args)
     except ConfigError as e:
