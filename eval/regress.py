@@ -47,10 +47,14 @@ def profile_name(ledger: dict) -> str:
 def check_apply(run_id: str, apply) -> dict:
     if not isinstance(apply, dict) or not isinstance(apply.get("applied", []), list):
         raise RegressError(f"{run_id}: apply.json 형식이 맞지 않는다(applied는 목록이어야 한다)")
+    history = apply.get("final_history")
+    if history is not None and (not isinstance(history, list) or not all(isinstance(h, dict) for h in history)):
+        raise RegressError(f"{run_id}: apply.json 형식이 맞지 않는다(final_history는 객체 목록이어야 한다)")
     return apply
 
 
 def load_folder(folder: Path) -> dict:
+    folder = folder.resolve()
     ledger = read_json(folder / "ledger.json", folder.name)
     if not isinstance(ledger, dict):
         raise RegressError(f"{folder.name}: ledger.json이 객체가 아니다")
@@ -126,7 +130,7 @@ def apply_reverts(r: Result, reverts: list, ids: dict[str, str], skipped: dict[s
 
 
 def entry_id(entry) -> str:
-    return str(entry.get("id", "?")) if isinstance(entry, dict) else Path(entry).name
+    return str(entry.get("id", "?")) if isinstance(entry, dict) else Path(entry).resolve().name
 
 
 def compute(runs: list, reverts=None, *, stop_runs: int = STOP_RUNS, stop_patches: int = STOP_PATCHES) -> Result:
@@ -189,8 +193,8 @@ def render(r: dict) -> str:
     header = [table_row(name for name, _ in TABLE_COLUMNS), table_row(align for _, align in TABLE_COLUMNS)]
     rows = [table_row(stats_cells(name, r[name])) for name in names]
     progress = [progress_line(name, r[name], r.stop) for name in names if "stop" in r[name]]
-    notes = ["회귀 = 전체 검사 회귀가 있었던 실행 ∪ 되돌림이 있었던 실행(합집합 크기, 기준선도 실패한 실행은 제외)"]
-    return "\n".join([*header, *rows, "", "종료 조건 진행(먼저 닿은 쪽에서 멈춘다)", "", *progress, "", *notes, ""])
+    notes = ["회귀 = 전체 검사 회귀가 있었던 실행 ∪ 되돌림이 있었던 실행(합집합 크기). 전체 검사 회귀는 기준선도 실패한 회차를 빼고 세고, 되돌림은 그런 실행도 센다"]
+    return "\n".join([*header, *rows, "", "종료 조건 진행(먼저 닿은 쪽에서 측정을 끝낸다. 위 표는 --runs의 실행을 모두 센다)", "", *progress, "", *notes, ""])
 
 
 def load_reverts(path: str) -> tuple[list, list[str]]:

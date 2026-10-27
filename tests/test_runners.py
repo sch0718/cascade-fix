@@ -574,6 +574,11 @@ class CursorHomeTest(unittest.TestCase):
                     for path in (f"/p/{v}", f"/p/{v}/x"):
                         self.assertEqual(cursor_read_denied(deny, path), v not in kept, (names, kept, path))
 
+    def test_variant_rules_deny_titlecase_letter_sibling(self):
+        deny = _variant_rules("/p/", "ǅx", {"p"})
+        for name in ("ǅx", "ǆx", "Ǆx"):
+            self.assertTrue(cursor_read_denied(deny, f"/p/{name}"), name)
+
     def test_star_in_kept_or_sibling_name_fails(self):
         for kept, sibling in (("repo*", "secret"), ("repo", "odd*name")):
             with self.subTest(kept=kept, sibling=sibling):

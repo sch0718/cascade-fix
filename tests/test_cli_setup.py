@@ -138,7 +138,7 @@ class SetupApplyTest(CliSetupBase):
         self.apply()
         data = tomllib.loads(self.repos.read_text(encoding="utf-8"))
         self.assertEqual(data["default_profile"], "claude-only")
-        self.assertIn("형식 견본이다", self.repos.read_text(encoding="utf-8"))
+        self.assertNotIn("형식 견본이다", self.repos.read_text(encoding="utf-8"))
         rec = self.record()
         self.assertEqual((rec["schema"], rec["table_version"], rec["recommended"], rec["profile"]),
                          (1, 1, "claude-only", "claude-only"))
@@ -392,6 +392,13 @@ class SetupRepoProfileTest(CliSetupBase):
         repo = self.make_repo()
         p = self.run_setup("--repo-profile", "no-such", "--root", str(repo))
         self.assertEqual(p.returncode, 5, p.stdout + p.stderr)
+        self.assertFalse(self.repos.exists())
+
+    def test_repo_profile_empty_name_exit_5_without_traceback(self):
+        repo = self.make_repo()
+        p = self.run_setup("--repo-profile", "", "--root", str(repo))
+        self.assertEqual(p.returncode, 5, p.stdout + p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
         self.assertFalse(self.repos.exists())
 
     def test_repo_profile_refuses_with_env_var(self):

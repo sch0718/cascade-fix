@@ -13,6 +13,7 @@ from cascade.config import ConfigError, has_repos
 ENV_VAR = "CASCADE_REPOS_TOML"
 TABLE_HEADER = re.compile(r"^\s*\[")
 STRING_VALUE = r'(?:"(?:[^"\\\n]|\\.)*"|\'[^\'\n]*\')'
+SAMPLE_ONLY_MARKERS = ("형식 견본이다", "예전처럼 이 파일에")
 BACKUP_STAMP = re.compile(r"\.bak-\d{8}-\d{6}(?:-\d{2})?")
 
 
@@ -45,7 +46,8 @@ def base_text(target: Target, sample: Path) -> str:
     for line in sample.read_text(encoding="utf-8").splitlines(keepends=True):
         if line.strip() and not line.lstrip().startswith("#"):
             break
-        header.append(line)
+        if not any(marker in line for marker in SAMPLE_ONLY_MARKERS):
+            header.append(line)
     return "".join(header)
 
 

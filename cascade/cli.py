@@ -451,6 +451,8 @@ def cmd_init(args) -> int:
     )
     write_findings(s.round_dir(snap.run_dir, 1) / "findings.json", findings)
     s.save_ledger(snap.run_dir, ledger)
+    if first_review:
+        s.write_json(Path(args.input).parent / REVIEW_USED, {"run_dir": str(snap.run_dir)})
     counts = Counter(f.severity for f in findings)
     print(f"run_dir={snap.run_dir}")
     print(f"status={STATUS_RUNNING}")
@@ -1691,6 +1693,9 @@ def cmd_usage(args) -> int:
         print(f"Claude 토큰 미측정: {result['error']}")
     else:
         print(f"Claude 토큰: Workflow {result['workflow']} 작업 {result['jobs']}건 기록, 일치하지 않음 {result['unmatched']}건 → {out}")
+    if args.review_dir and (used := _read_optional_json(rd / REVIEW_USED)):
+        print(f"경고: 이 첫 검토 폴더는 이미 init에 쓰였다({used.get('run_dir')}). 지금 기록한 토큰은 그 실행의 보고서에 들어가지 않는다. "
+              "첫 검토 토큰은 init 전에 CF usage --review-dir로 기록한다")
     return 0
 
 
@@ -1706,6 +1711,7 @@ def cmd_status(args) -> int:
     return 0
 
 
+REVIEW_USED = "review-used.json"
 SETUP_RECORD = "setup.json"
 SETUP_CHECK = "setup-check.json"
 STATUS_LABELS = {recommend.MEASURED: "측정됨", recommend.PROVISIONAL: "잠정"}
@@ -1879,9 +1885,11 @@ def _setup_check(args) -> int:
     roles = _check_roles(args.profile, known[args.profile]["roles"])
     scripts = {runner: _skill_scripts()[skill] for runner, skill in skill_scripts.RUNNER_SKILLS.items()}
     results = {}
-    for runner, path in setup.check_paths(roles):
-        model, effort = setup.cell_model(roles, runner, path)
-        results[f"{runner}-{path}"] = setup.run_check(runner, path, model, effort, scripts)
+    cells = setup.check_cells(roles)
+    for runner, path, model, effort in cells:
+        same_path = sum(1 for cell in cells if cell[:2] == (runner, path))
+        name = f"{runner}-{path}" if same_path == 1 else f"{runner}-{path}:{model or 'default'}/{effort or 'default'}"
+        results[name] = setup.run_check(runner, path, model, effort, scripts)
     models = setup.acp_models(roles)
     for model in models:
         results["cursor_acp" if len(models) == 1 else f"cursor_acp:{model}"] = _acp_check(model)
@@ -2070,7 +2078,7 @@ SETUP_HANDLERS = {"detect": _setup_detect, "check": _setup_check, "apply": _setu
 
 
 def cmd_setup(args) -> int:
-    action = next(name for name in SETUP_HANDLERS if getattr(args, name))
+    action = next(name for name in SETUP_HANDLERS if getattr(args, name) not in (None, False))
     try:
         return SETUP_HANDLERS[action](args)
     except ConfigError as e:

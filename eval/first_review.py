@@ -8,7 +8,8 @@ SKILL_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SKILL_ROOT))
 from cascade.cli import FIRST_REVIEW_KEYS  # noqa: E402
 from cascade.cli_steps import USAGE_FILE  # noqa: E402
-from cascade.findings import _LOCATION, SEVERITIES, ParseError, parse_codex_code, parse_codex_doc  # noqa: E402
+from cascade.findings import (_LOCATION, SEVERITIES, ParseError, parse_codex_code, parse_codex_doc,  # noqa: E402
+                              unparsed_code_items)
 from cascade.review import (REVIEW_JOB, REVIEW_META, REVIEWER_CLAUDE, REVIEWER_CODEX, REVIEWER_CURSOR,  # noqa: E402
                             label, load_text)
 from score import (NO_RECORD, TOKEN_KEYS, UNMEASURED_COST, VERDICT_FACT, VERDICT_NO, VERDICT_UNREPRODUCIBLE,  # noqa: E402
@@ -422,8 +423,12 @@ def init_command(mode: str, out: Path, docs: list[str]) -> str:
 
 def run_merge(args) -> int:
     mode = MODE_DOC if args.doc else MODE_CODE
-    merged = merge_files(args.claude, args.codex, args.cursor, mode, args.doc)
     out = Path(args.out)
+    if isinstance(previous := read_optional(out / MERGED_FILE), dict) and previous.get("confirmed") is True:
+        raise FirstReviewError(f"확정된 {out / MERGED_FILE}가 이미 있어 덮어쓰지 않는다. 다시 합치려면 그 파일을 옮기거나 지운다")
+    merged = merge_files(args.claude, args.codex, args.cursor, mode, args.doc)
+    if mode == MODE_CODE and args.codex and (skipped := unparsed_code_items(read_result_text(REVIEWER_CODEX, Path(args.codex)))):
+        print(f"경고: 형식을 읽지 못한 Codex 항목 {len(skipped)}건: {' / '.join(skipped)}", file=sys.stderr)
     write_json(out / MERGED_FILE, merged)
     command = init_command(mode, out, args.doc or [])
     (out / REVIEW_FILE).write_text(review_markdown(merged, out, command), encoding="utf-8")

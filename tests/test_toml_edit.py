@@ -168,6 +168,8 @@ class TomlEditTest(unittest.TestCase):
         self.assertTrue(all(not line.strip() or line.lstrip().startswith("#") for line in text.splitlines()))
         self.assertEqual(tomllib.loads(text), {})
         self.assertNotIn("\n[profiles.", text)
+        self.assertNotIn("형식 견본이다", text)
+        self.assertNotIn("예전처럼 이 파일에", text)
         self.assertLess(len(text), len(sample))
 
     def test_base_text_prefers_existing_then_legacy(self):
