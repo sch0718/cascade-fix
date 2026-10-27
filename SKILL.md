@@ -305,7 +305,7 @@ Claude·Cursor·`codex-doc` 결과는 형식이 같아 형식으로는 가릴 �
 진짜 `cursor-agent`(2026.10.16-e3cb207), 모델 `composer-2.5`(fast=false), 짧은 시험 문장과 카나리아만 썼다.
 
 - `-p`가 느린 원인: 모델 응답은 3~5초인데 시작 단계가 75~185초다(처음 HOME 166~175초, 같은 HOME 재사용 72~79초). 시작 단계에서 Cursor 팀 마켓플레이스 플러그인의 MCP 서버(`uvx … serena`, `npx typescript-language-server`)를 띄운다. 샌드박스를 꺼도 같았다. `typescript-language-server`는 `-p`가 끝난 뒤에도 남는다.
-- ACP는 팀 플러그인을 싣지 않는다. 읽기 작업 8건을 동시 4로 돌리면 26초에 끝났다(서버마다 첫 작업 16~18초, 이후 5~7초). 끝난 뒤 남은 프로세스·임시 폴더는 없었다.
+- ACP는 팀 플러그인을 싣지 않는다. 읽기 작업 8건을 동시 4로 돌리면 26초에 끝났다(서버마다 첫 작업 16~18초, 이후 5~7초). 끝난 뒤 남은 프로세스·임시 폴더는 없었다. 이 수치는 서버를 다시 쓴 경우다. 읽기 역할 작업은 작업마다 작업 폴더가 달라 서버를 매번 새로 띄우는 일이 많으므로 첫 작업 값(16~18초)이 더 자주 나온다.
 - ACP에서 셸은 `session/request_permission`으로 오고, 허락하면 샌드박스 없이 돈다. cli-config `sandbox.mode=enabled`나 전역 `--sandbox enabled`를 줘도 워크트리 밖 쓰기, 다른 워크트리 쓰기, `curl https://example.com`, 워크트리 밖 파일 `cat`이 모두 됐다. Write 도구도 권한 요청 없이 작업 폴더 밖에 썼다. 그래서 쓰기 역할은 `-p`(네트워크 차단, 프록시 403)로 둔다.
 - 격리 점검 `PYTHONPATH="${CLAUDE_SKILL_DIR}" python3 -m cascade.cursor_acp_check [--control]`(읽기 역할 프로필): Read(워크트리 밖 카나리아), 셸 `cat`, 워크트리 안·밖 쓰기, Grep·Glob(카나리아 앞부분 패턴, 카나리아 폴더 범위), 홈 아래 Read·Grep, 대소문자를 바꾼 경로 Read, WebFetch, MCP(시험용 MCP 서버를 세션에 붙임) 8건이 모두 막혔다(2026-10-23). 거부 규칙은 실제 프로필 그대로 쓴다. 판정은 진행 알림이 아니라 답 텍스트·세션 저장소(`acp-sessions/*/store.db`)·파일 생성·MCP `tools/call` 수신으로 한다. `--control`(거부 설정을 비우고 Read만)은 카나리아를 읽어 시험이 누출을 잡는 것을 확인했다. **Cursor CLI가 바뀌면 두 명령을 다시 돌린다**(누출 0건이면 종료 코드 0, `--control`은 누출을 잡으면 0).
 - 읽기 역할은 홈 민감 경로가 아닌 워크트리 밖 파일은 읽을 수 있다(`/`를 Grep하면 다른 폴더 파일이 나온다). `-p` 읽기 역할도 샌드박스 읽기 경계가 시스템 전체라 같다.
