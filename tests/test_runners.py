@@ -462,6 +462,13 @@ class CursorHomeTest(unittest.TestCase):
         self.assertEqual(config["version"], 1)
         self.assertEqual(config["permissions"]["allow"], [])
 
+    def test_serena_dashboard_is_disabled(self):
+        for profile in ("review", "worker", "readonly"):
+            home, _ = self.config(profile)
+            text = (home / ".serena" / "serena_config.yml").read_text(encoding="utf-8")
+            self.assertIn("web_dashboard: false", text)
+            self.assertIn("web_dashboard_open_on_launch: false", text)
+
     def test_worker_profile_allows_shell_and_write(self):
         _, config = self.config("worker")
         deny = config["permissions"]["deny"]

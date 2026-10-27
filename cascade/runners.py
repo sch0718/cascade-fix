@@ -49,6 +49,7 @@ _PROFILE_DENY = {
     "worker": ["WebFetch(*)", "Mcp(*:*)"],
     "readonly": ["Write(**)", "WebFetch(*)", "Mcp(*:*)"],
 }
+_SERENA_CONFIG = "web_dashboard: false\nweb_dashboard_open_on_launch: false\n"
 _TOOL_ROOTS = {"PYENV_ROOT": ".pyenv", "UV_PYTHON_INSTALL_DIR": ".local/share/uv/python"}
 
 _OUTPUT_INSTRUCTION = (
@@ -229,13 +230,15 @@ def outside_read_deny(read_root: Path) -> list[str]:
 
 def cursor_home(base: Path, profile: str, read_root: Path | None = None) -> Path:
     """임시 HOME. 키체인만 이어 로그인을 유지하고, 권한 설정으로 MCP·Web·홈 민감 경로 Read를 막는다.
-    read_root를 주면 그 밖 Read도 막는다."""
+    Serena 웹 대시보드가 작업마다 브라우저를 열지 않게 설정을 둔다. read_root를 주면 그 밖 Read도 막는다."""
     if profile not in _PROFILE_DENY:
         raise ValueError(f"알 수 없는 Cursor 프로필: {profile}")
     real_home = Path.home()
     home = base / f"home-{profile}"
     (home / "Library").mkdir(parents=True, exist_ok=True)
     (home / ".cursor").mkdir(exist_ok=True)
+    (home / ".serena").mkdir(exist_ok=True)
+    (home / ".serena" / "serena_config.yml").write_text(_SERENA_CONFIG, encoding="utf-8")
     keychains = home / "Library" / "Keychains"
     if not keychains.is_symlink():
         keychains.symlink_to(real_home / "Library" / "Keychains")
