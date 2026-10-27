@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -98,6 +99,29 @@ class ComputeTest(RegressTestBase):
         run = self.make("run-x", round_of(1, OK))
         r = regress.compute([run], reverts=[{"run": "run-x", "finding": "r1-01", "reason": "버그"}])
         self.assertEqual(r["local"]["regressions"], 1)
+
+    def test_run_id_of_current_folder_is_its_resolved_name(self):
+        run = self.make("run-dot", round_of(1, OK))
+        cwd = Path.cwd()
+        try:
+            os.chdir(run)
+            r = regress.compute(["."], reverts=[{"run": "run-dot", "finding": "r1-01", "reason": "버그"}])
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(r["local"]["regressions"], 1)
+        self.assertEqual(r.warnings, [])
+
+    def test_null_final_history_entry_is_an_error_item(self):
+        run = self.make("odd", round_of(1, {**OK, "final_history": [None]}))
+        r = regress.compute([run])
+        [error] = r.errors
+        self.assertIn("final_history", error)
+        self.assertNotIn("local", r)
+
+    def test_render_notes_say_reverts_count_baseline_failed_runs(self):
+        text = regress.render(regress.compute([self.make("a", round_of(1, BASELINE_FAILED))]))
+        self.assertIn("되돌림은 그런 실행도 센다", text)
+        self.assertIn("위 표는 --runs의 실행을 모두 센다", text)
 
     def test_revert_for_unknown_run_goes_to_unknown_profile_bucket(self):
         run = self.make("ok", round_of(1, OK))
