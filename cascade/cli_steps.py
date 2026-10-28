@@ -1,4 +1,5 @@
 import copy
+import fcntl
 import json
 import os
 import re
@@ -6,7 +7,8 @@ import shlex
 import subprocess
 import tomllib
 from collections.abc import Callable
-from dataclasses import replace
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -789,93 +791,169 @@ def review_cmd(ledger: Ledger, role: str, prompt: Path, root: str, out: Path) ->
     return run_review_cmd(role, prompt, root, out, review_script(ledger, role), model)
 
 
+WORKERS_LOCK = "workers.lock"
+GO_LOCK = "go.lock"
+
+
+@contextmanager
+def _run_lock(run_dir: Path, name: str, message: str):
+    if not (Path(run_dir) / "ledger.json").is_file():
+        raise CliError(f"원장이 없다: {Path(run_dir) / 'ledger.json'}")
+    handle = open(Path(run_dir) / name, "a")
+    try:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise CliError(message) from None
+        yield
+    finally:
+        handle.close()
+
+
+def workers_lock(run_dir: Path):
+    """실행 폴더당 workers 하나만 돈다. 같은 Codex 로그인을 쓰는 프로세스가 겹치면 로그인이 풀릴 수 있다."""
+    return _run_lock(run_dir, WORKERS_LOCK, "workers가 이미 돈다. 하나가 끝난 뒤 다시 한다")
+
+
+def go_lock(run_dir: Path):
+    """실행 폴더당 go 하나만 돈다. 둘이 같은 단계를 동시에 하면 원장과 작업 트리가 엇갈린다."""
+    return _run_lock(run_dir, GO_LOCK, "go가 이미 돈다")
+
+
+def workers_running(run_dir: Path) -> bool:
+    try:
+        with workers_lock(run_dir):
+            return False
+    except CliError:
+        return True
+
+
 def _cmd(name: str, run_dir: Path, *rest: str) -> str:
     return " ".join([CLI, name, "--run-dir", _q(run_dir), *rest])
 
 
-def _judge_cmd(run_dir: Path, rd: Path, no: int, stage: str) -> str:
+@dataclass(frozen=True)
+class Action:
+    """next_steps의 한 줄. kind: cmd(CF 명령) | workflow(Workflow 도구) | shell(검토 스크립트) | note(안내만)."""
+    kind: str
+    text: str
+    argv: tuple[str, ...] = ()
+    args_path: Path | None = None
+    out_path: Path | None = None
+    background: bool = False
+    hidden: bool = False
+
+
+def _note(text: str) -> Action:
+    return Action("note", text)
+
+
+def _cmd_action(name: str, run_dir: Path, *rest: str, background: bool = False) -> Action:
+    text = _cmd(name, run_dir, *rest)
+    argv = tuple(shlex.split(" ".join([name, "--run-dir", _q(run_dir), *rest])))
+    return Action("cmd", f"(백그라운드로) {text}" if background else text, argv, background=background)
+
+
+def _workflow_action(args: Path, out: Path) -> Action:
+    return Action("workflow", workflow_step(args, out), args_path=Path(args), out_path=Path(out))
+
+
+def _shell_action(ledger: Ledger, role: str, prompt: Path, root: str, out: Path) -> Action:
+    return Action("shell", review_cmd(ledger, role, prompt, root, out))
+
+
+def _judge_action(run_dir: Path, rd: Path, no: int, stage: str) -> Action:
     rest = [f"--results {_q(rd / STAGE_OUTPUTS[STAGE1])}"] if has_jobs(rd / STAGE_ARGS[STAGE1]) else []
     if stage == STAGE_CHECKER and has_jobs(rd / STAGE_ARGS[STAGE_CHECKER]):
         rest.append(f"--checker-results {_q(rd / STAGE_OUTPUTS[STAGE_CHECKER])}")
-    return _cmd("judge", run_dir, f"--round {no}", *rest)
+    return _cmd_action("judge", run_dir, f"--round {no}", *rest)
 
 
 def _judge_ready(rnd: RoundRecord, rd: Path, stage: str) -> bool:
     return not (Path(rd) / f"{stage}-cli-args.json").is_file() or workers_done(rnd, stage)
 
 
-def _stage_steps(rnd: RoundRecord, run_dir: Path, rd: Path, stage: str) -> list[str]:
-    claude = [workflow_step(rd / STAGE_ARGS[stage], rd / STAGE_OUTPUTS[stage])] if has_jobs(rd / STAGE_ARGS[stage]) else []
+def _stage_actions(rnd: RoundRecord, run_dir: Path, rd: Path, stage: str) -> list[Action]:
+    claude = [_workflow_action(rd / STAGE_ARGS[stage], rd / STAGE_OUTPUTS[stage])] if has_jobs(rd / STAGE_ARGS[stage]) else []
     if not (rd / f"{stage}-cli-args.json").is_file():
-        return [*claude, _judge_cmd(run_dir, rd, rnd.no, stage)]
+        return [*claude, _judge_action(run_dir, rd, rnd.no, stage)]
     if not workers_done(rnd, stage):
-        workers = f"(백그라운드로) {_cmd('workers', run_dir, f'--round {rnd.no}', f'--stage {stage}')}"
-        return [workers, *claude, *(["Workflow와 workers는 서로 기다리지 않으므로 두 단계를 동시에 띄운다"] if claude else [])]
+        workers = _cmd_action("workers", run_dir, f"--round {rnd.no}", f"--stage {stage}", background=True)
+        return [workers, *claude, *([_note("Workflow와 workers는 서로 기다리지 않으므로 두 단계를 동시에 띄운다")] if claude else [])]
     fallback_args, fallback_out = rd / f"{stage}-fallback-args.json", rd / f"{stage}-fallback.json"
-    fallback = [workflow_step(fallback_args, fallback_out)] if fallback_args.is_file() and not fallback_out.is_file() else []
-    pending = claude if not (rd / STAGE_OUTPUTS[stage]).is_file() else []
-    return [*pending, *fallback, _judge_cmd(run_dir, rd, rnd.no, stage)]
+    fallback = [_workflow_action(fallback_args, fallback_out)] if fallback_args.is_file() else []
+    saved = [replace(a, hidden=a.out_path.is_file()) for a in [*claude, *fallback]]
+    return [*saved, _judge_action(run_dir, rd, rnd.no, stage)]
 
 
-def next_steps(ledger: Ledger, run_dir: Path) -> list[str]:
+def _stage_steps(rnd: RoundRecord, run_dir: Path, rd: Path, stage: str) -> list[str]:
+    return [action.text for action in _stage_actions(rnd, run_dir, rd, stage) if not action.hidden]
+
+
+def next_actions(ledger: Ledger, run_dir: Path) -> list[Action]:
     rnd = ledger.current_round()
     if rnd is None:
-        return ["회차가 없다"]
+        return [_note("회차가 없다")]
     if ledger.status == STATUS_DONE:
         steps = []
         latest = next((e for e in reversed(rnd.events) if e.get("step") not in NON_PROGRESS_STEPS), {})
         reported = latest.get("step") == "report" and latest.get("round") == rnd.no
         if not reported or not (Path(run_dir) / "report.md").is_file():
-            steps.append(_cmd("report", run_dir))
+            steps.append(_cmd_action("report", run_dir))
         elif not any(step_done(r, "cleanup") for r in ledger.rounds):
-            steps.append(_cmd("cleanup", run_dir))
+            steps.append(_cmd_action("cleanup", run_dir))
         holds = [d["finding_id"] for r in ledger.rounds for d in r.decisions
                  if d["outcome"] == "보류후보" and d["finding_id"] not in ledger.hold_choices]
         if holds:
-            steps.append(f"(선택, cleanup 전에) 보류 후보 {', '.join(holds)}의 선택을 받으면: " + _cmd("resume", run_dir, "--choices <JSON>"))
-        return steps or ["할 일 없음"]
+            steps.append(_note(f"(선택, cleanup 전에) 보류 후보 {', '.join(holds)}의 선택을 받으면: "
+                               + _cmd("resume", run_dir, "--choices <JSON>")))
+        return steps or [_note("할 일 없음")]
     rd = Path(run_dir) / f"round-{rnd.no}"
     n = f"--round {rnd.no}"
     if not step_done(rnd, "jobs"):
-        return [_cmd("jobs", run_dir, n)]
+        return [_cmd_action("jobs", run_dir, n)]
     if not step_done(rnd, "judge"):
         if checker_pending(rnd) and (rd / STAGE_ARGS[STAGE_CHECKER]).is_file():
-            return _stage_steps(rnd, run_dir, rd, STAGE_CHECKER)
-        steps = _stage_steps(rnd, run_dir, rd, STAGE1)
+            return _stage_actions(rnd, run_dir, rd, STAGE_CHECKER)
+        steps = _stage_actions(rnd, run_dir, rd, STAGE1)
         if _judge_ready(rnd, rd, STAGE1) and any(repro_listed(rd).values()):
-            steps.append(f"(재현 명령 {rd / REPRO_FILE} 을 사용자에게 보이고 승인받았으면 judge에 --allow-repro {_q(rd / REPRO_FILE)} 를 붙인다)")
+            steps.append(_note(f"(재현 명령 {rd / REPRO_FILE} 을 사용자에게 보이고 승인받았으면 judge에 --allow-repro {_q(rd / REPRO_FILE)} 를 붙인다)"))
         return steps
     if (rd / "adj-args.json").is_file() and not step_done(rnd, "adjudicate"):
         return [
-            workflow_step(rd / "adj-args.json", rd / "adj.json"),
-            _cmd("adjudicate", run_dir, n, f"--results {_q(rd / 'adj.json')}"),
+            _workflow_action(rd / "adj-args.json", rd / "adj.json"),
+            _cmd_action("adjudicate", run_dir, n, f"--results {_q(rd / 'adj.json')}"),
         ]
     pending = pending_opinions(ledger, rd)
     if pending and is_claude(ledger, "opinion"):
         return [
-            workflow_step(rd / OPINION_ARGS, rd / OPINION_RESULTS),
-            _cmd("opinion", run_dir, n, f"--results {_q(rd / OPINION_RESULTS)}"),
+            _workflow_action(rd / OPINION_ARGS, rd / OPINION_RESULTS),
+            _cmd_action("opinion", run_dir, n, f"--results {_q(rd / OPINION_RESULTS)}"),
         ]
     if pending:
         fid = pending[0]
         out = rd / f"opinion-{fid}.out"
         return [
-            review_cmd(ledger, "opinion", rd / f"opinion-{fid}.md", ledger.root, out),
-            _cmd("opinion", run_dir, n, f"--id {fid}", f"--result {_q(str(out) + '.final')}"),
+            _shell_action(ledger, "opinion", rd / f"opinion-{fid}.md", ledger.root, out),
+            _cmd_action("opinion", run_dir, n, f"--id {fid}", f"--result {_q(str(out) + '.final')}"),
         ]
     if not step_done(rnd, "apply"):
-        return [_cmd("apply", run_dir, n)]
+        return [_cmd_action("apply", run_dir, n)]
     if rnd.recheck_opened and not step_done(rnd, "recheck") and is_claude(ledger, "recheck"):
         return [
-            workflow_step(rd / RECHECK_ARGS, rd / RECHECK_RESULTS),
-            _cmd("recheck", run_dir, n, f"--result {_q(rd / RECHECK_RESULTS)}"),
+            _workflow_action(rd / RECHECK_ARGS, rd / RECHECK_RESULTS),
+            _cmd_action("recheck", run_dir, n, f"--result {_q(rd / RECHECK_RESULTS)}"),
         ]
     if rnd.recheck_opened and not step_done(rnd, "recheck"):
         out = rd / "recheck.out"
         repo_file = rd / RECHECK_REPO_FILE
         repo = repo_file.read_text(encoding="utf-8").strip() if repo_file.is_file() else ledger.root
         return [
-            review_cmd(ledger, "recheck", rd / "recheck-prompt.md", repo, out),
-            _cmd("recheck", run_dir, n, f"--result {_q(str(out) + '.final')}"),
+            _shell_action(ledger, "recheck", rd / "recheck-prompt.md", repo, out),
+            _cmd_action("recheck", run_dir, n, f"--result {_q(str(out) + '.final')}"),
         ]
-    return [_cmd("report", run_dir)]
+    return [_cmd_action("report", run_dir)]
+
+
+def next_steps(ledger: Ledger, run_dir: Path) -> list[str]:
+    return [action.text for action in next_actions(ledger, run_dir) if not action.hidden]

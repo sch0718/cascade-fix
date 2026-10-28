@@ -72,6 +72,70 @@ class OrchestrationCostTest(unittest.TestCase):
             assistant("2026-10-25T00:12:10Z", "a8", 300, text="끝"),
         ])
 
+    def test_finds_start_go_run_from_background_outputs(self):
+        path = self.session([
+            human("2026-10-28T00:00:00Z", "리뷰하고 고쳐줘"),
+            assistant("2026-10-28T00:01:00Z", "a1", 10, tool=("t1", f"{CF} start --source codex-code --input r.json --dry-run")),
+            result("2026-10-28T00:01:01Z", "t1", "Command running in background"),
+            assistant("2026-10-28T00:02:00Z", "a2", 10, tool=("t2", "cat /tmp/tasks/b1.output")),
+            result("2026-10-28T00:02:01Z", "t2", init_out("/r/.cascade-fix/cf-3", 3) + "멈춤: Workflow 결과가 필요하다\n"),
+            assistant("2026-10-28T00:03:00Z", "a3", 10, tool=("t3", f"{CF} go --run-dir /r/.cascade-fix/cf-3 --workflow-output /tmp/o")),
+            result("2026-10-28T00:03:01Z", "t3", "Command running in background"),
+            assistant("2026-10-28T00:04:00Z", "a4", 10, tool=("t4", "cat /tmp/tasks/b2.output")),
+            result("2026-10-28T00:04:01Z", "t4", "멈춤: report까지 끝났다. 보고 뒤 보류 후보 선택을 받고 cleanup 한다"),
+            assistant("2026-10-28T00:04:10Z", "a5", 10, text="정리했습니다"),
+            human("2026-10-28T00:10:00Z", "다음 것도"),
+            assistant("2026-10-28T00:10:01Z", "a6", 5000, text="네"),
+        ])
+        [run] = oc.find_runs(path)
+        self.assertEqual((run.run_dir, run.findings, run.dry_run), ("/r/.cascade-fix/cf-3", 3, True))
+        self.assertEqual((run.start, run.end), ("2026-10-28T00:01:00Z", "2026-10-28T00:04:10Z"))
+
+    def test_start_output_with_run_dir_and_report_marker_together_is_one_finished_run(self):
+        path = self.session([
+            human("2026-10-28T00:00:00Z", "리뷰하고 고쳐줘"),
+            assistant("2026-10-28T00:01:00Z", "a1", 10, tool=("t1", f"{CF} start --source codex-code --input r.json")),
+            result("2026-10-28T00:01:05Z", "t1", init_out("/r/.cascade-fix/cf-5", 1) + "멈춤: report까지 끝났다. 보고 뒤 cleanup 한다"),
+            assistant("2026-10-28T00:01:10Z", "a2", 10, text="정리했습니다"),
+            human("2026-10-28T00:10:00Z", "다음 것도"),
+        ])
+        [run] = oc.find_runs(path)
+        self.assertEqual((run.run_dir, run.end), ("/r/.cascade-fix/cf-5", "2026-10-28T00:01:10Z"))
+
+    def test_restart_after_scale_question_replaces_the_abandoned_run(self):
+        path = self.session([
+            human("2026-10-28T00:00:00Z", "리뷰하고 고쳐줘"),
+            assistant("2026-10-28T00:01:00Z", "a1", 10, tool=("t1", f"{CF} start --source codex-code --input r.json")),
+            result("2026-10-28T00:01:01Z", "t1", "Command running in background"),
+            assistant("2026-10-28T00:02:00Z", "a2", 10, tool=("t2", "cat /tmp/tasks/b1.output")),
+            result("2026-10-28T00:02:01Z", "t2", init_out("/r/.cascade-fix/cf-A", 12) + "멈춤: 1단계 작업이 24개로 10개를 넘는다\n"),
+            human("2026-10-28T00:03:00Z", "Critical·Warning만"),
+            assistant("2026-10-28T00:04:00Z", "a3", 10, tool=("t3", f"{CF} cleanup --run-dir /r/.cascade-fix/cf-A")),
+            result("2026-10-28T00:04:01Z", "t3", "정리했다"),
+            assistant("2026-10-28T00:05:00Z", "a4", 10, tool=("t4", f"{CF} start --source codex-code --input r.json --severity Critical,Warning")),
+            result("2026-10-28T00:05:01Z", "t4", "Command running in background"),
+            assistant("2026-10-28T00:06:00Z", "a5", 10, tool=("t5", "cat /tmp/tasks/b2.output")),
+            result("2026-10-28T00:06:01Z", "t5", init_out("/r/.cascade-fix/cf-B", 2)),
+            assistant("2026-10-28T00:07:00Z", "a6", 10, tool=("t6", f"{CF} go --run-dir /r/.cascade-fix/cf-B")),
+            result("2026-10-28T00:07:01Z", "t6", "Command running in background"),
+            assistant("2026-10-28T00:08:00Z", "a7", 10, tool=("t7", "cat /tmp/tasks/b3.output")),
+            result("2026-10-28T00:08:01Z", "t7", "멈춤: report까지 끝났다. 보고 뒤 cleanup 한다"),
+            assistant("2026-10-28T00:08:10Z", "a8", 10, text="정리했습니다"),
+            human("2026-10-28T00:20:00Z", "다음 것도"),
+        ])
+        [run] = oc.find_runs(path)
+        self.assertEqual((run.run_dir, run.findings), ("/r/.cascade-fix/cf-B", 2))
+        self.assertEqual((run.start, run.end), ("2026-10-28T00:01:00Z", "2026-10-28T00:08:10Z"))
+
+    def test_start_run_without_report_marker_is_dropped(self):
+        path = self.session([
+            human("2026-10-28T00:00:00Z", "리뷰하고 고쳐줘"),
+            assistant("2026-10-28T00:01:00Z", "a1", 10, tool=("t1", f"{CF} start --source codex-code --input r.json")),
+            result("2026-10-28T00:01:05Z", "t1", init_out("/r/.cascade-fix/cf-4", 1)),
+            human("2026-10-28T00:10:00Z", "그만"),
+        ])
+        self.assertEqual(oc.find_runs(path), [])
+
     def test_finds_runs_and_windows(self):
         runs = oc.find_runs(self.two_runs())
         self.assertEqual([(r.run_dir, r.findings, r.profile, r.dry_run) for r in runs],

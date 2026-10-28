@@ -9,11 +9,12 @@ SKILL_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SKILL_ROOT))
 from cascade.usage import PRICE_SOURCE, PRICES_AS_OF, read_session  # noqa: E402
 
-STEP = re.compile(r"(?:cascade\.cli\"?|\bCF)\s+(init|report)\b")
+STEP = re.compile(r"(?:cascade\.cli\"?|\bCF)\s+(init|start|go|report)\b")
+GO_REPORTED = "멈춤: report까지 끝났다"
 RUN_DIR = re.compile(r"^run_dir=(\S+)", re.M)
 FINDINGS = re.compile(r"^지적 (\d+)건", re.M)
 PROFILE = re.compile(r"^프로필: (\S+)", re.M)
-SCOPE = "init를 부른 메시지부터 report 뒤 사람의 다음 입력 직전까지의 메인 세션 메시지(하위 에이전트·detect·첫 검토 제외)"
+SCOPE = "init(또는 start)를 부른 메시지부터 report 뒤 사람의 다음 입력 직전까지의 메인 세션 메시지(하위 에이전트·detect·첫 검토 제외)"
 
 
 @dataclass
@@ -66,13 +67,27 @@ def find_runs(path: Path) -> list[Run]:
     calls: dict[str, tuple[str, str, str]] = {}
     current: Run | None = None
     pending_start: str | None = None
+    pending_command = ""
     reported = False
+
+    def open_run(text: str, timestamp: str) -> Run:
+        findings = FINDINGS.search(text)
+        profile = PROFILE.search(text)
+        return Run(session=Path(path).stem, run_dir=RUN_DIR.search(text).group(1),
+                   findings=int(findings.group(1)) if findings else 0,
+                   profile=profile.group(1) if profile else "", dry_run="--dry-run" in pending_command,
+                   start=current.start if current else pending_start or timestamp)
+
     for row in _rows(path):
         if current is not None and reported and _is_human(row):
             runs.append(current)
             current, reported = None, False
         content = _content(row)
+        if current is not None and GO_REPORTED in json.dumps(content, ensure_ascii=False):
+            reported = True
         if not isinstance(content, list):
+            if pending_start is not None and isinstance(content, str) and RUN_DIR.search(content):
+                current, pending_start, reported = open_run(content, row["timestamp"]), None, GO_REPORTED in content
             if current is not None and reported:
                 current.end = row["timestamp"]
             continue
@@ -83,21 +98,22 @@ def find_runs(path: Path) -> list[Run]:
                 command = c.get("input", {}).get("command", "")
                 for step in STEP.findall(command):
                     calls[c["id"]] = (step, row["timestamp"], command)
-                    if step == "init" and current is None and pending_start is None:
-                        pending_start = row["timestamp"]
-            elif c.get("type") == "tool_result" and c.get("tool_use_id") in calls:
-                step, _, command = calls[c["tool_use_id"]]
+                    if step in ("init", "start"):
+                        if current is not None and reported:
+                            runs.append(current)
+                            current, reported = None, False
+                        pending_command = command
+                        pending_start = pending_start or row["timestamp"]
+            elif c.get("type") == "tool_result":
                 text = _result_text(c)
-                if step == "init" and RUN_DIR.search(text):
-                    findings = FINDINGS.search(text)
-                    profile = PROFILE.search(text)
-                    run = Run(session=Path(path).stem, run_dir=RUN_DIR.search(text).group(1),
-                              findings=int(findings.group(1)) if findings else 0,
-                              profile=profile.group(1) if profile else "", dry_run="--dry-run" in command,
-                              start=current.start if current else pending_start or row["timestamp"])
-                    current, pending_start, reported = run, None, False
+                step, _, command = calls.get(c.get("tool_use_id"), ("", "", ""))
+                if step in ("init", "start") and RUN_DIR.search(text):
+                    pending_command = command
+                    current, pending_start, reported = open_run(text, row["timestamp"]), None, GO_REPORTED in text
                 elif step == "report" and current is not None:
                     reported = True
+                elif pending_start is not None and RUN_DIR.search(text):
+                    current, pending_start, reported = open_run(text, row["timestamp"]), None, GO_REPORTED in text
         if current is not None and reported:
             current.end = row["timestamp"]
     if current is not None and reported:
