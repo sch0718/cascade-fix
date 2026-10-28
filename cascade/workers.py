@@ -21,6 +21,8 @@ from cascade.runners import (
 
 WORKERS_CLAUDE, WORKERS_EXTERNAL = "claude", "external"
 WORKERS_CHOICES = (WORKERS_CLAUDE, WORKERS_EXTERNAL)
+CLAUDE_VIA_WORKFLOW, CLAUDE_VIA_CLI = "workflow", "cli"
+CLAUDE_VIA_CHOICES = (CLAUDE_VIA_WORKFLOW, CLAUDE_VIA_CLI)
 DEFAULT_CURSOR_MODEL = "composer-2.5"
 WORKER_ROLES = ("a", "b", "writer", "checker")
 

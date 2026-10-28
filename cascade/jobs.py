@@ -249,18 +249,21 @@ _CLI_JOB_KEYS = ("id", "role", "kind", "runner", "model", "effort")
 _CLAUDE_JOB_HIDDEN = ("runner", "role", "worktree", "writable")
 
 
-def split_job_args(args: dict, prompts_dir: Path) -> tuple[dict, dict]:
-    claude = [{k: v for k, v in j.items() if k not in _CLAUDE_JOB_HIDDEN}
-              for j in args["jobs"] if j.get("runner", RUNNER_CLAUDE) == RUNNER_CLAUDE]
-    cli = [j for j in args["jobs"] if j.get("runner", RUNNER_CLAUDE) != RUNNER_CLAUDE]
+def split_job_args(args: dict, prompts_dir: Path, claude_cli: bool = False) -> tuple[dict, dict]:
+    """claude_cli면 Claude 작업도 CLI 작업 파일로 보낸다(`claude -p` 러너가 워크트리·쓰기 여부를 읽어야 해서 메타데이터를 남긴다)."""
+    def on_workflow(j: dict) -> bool:
+        return j.get("runner", RUNNER_CLAUDE) == RUNNER_CLAUDE and not (claude_cli and "worktree" in j)
+
+    claude = [{k: v for k, v in j.items() if k not in _CLAUDE_JOB_HIDDEN} for j in args["jobs"] if on_workflow(j)]
+    cli = [j for j in args["jobs"] if not on_workflow(j)]
     written_cli = write_job_args({"jobs": cli}, prompts_dir)["jobs"]
     cli_jobs = [{**{k: j[k] for k in _CLI_JOB_KEYS}, "promptPath": w["promptPath"], "worktree": j["worktree"],
                  "writable": j["writable"]} for j, w in zip(cli, written_cli)]
     return write_job_args({"jobs": claude}, prompts_dir), {"jobs": cli_jobs}
 
 
-def _write_values(workers: dict | None, role: str) -> dict[str, str]:
-    if ((workers or {}).get(role) or {}).get("runner", RUNNER_CLAUDE) == RUNNER_CLAUDE:
+def _write_values(workers: dict | None, role: str, claude_cli: bool = False) -> dict[str, str]:
+    if ((workers or {}).get(role) or {}).get("runner", RUNNER_CLAUDE) == RUNNER_CLAUDE and not claude_cli:
         return {"rules": RULES, "commit_step": _COMMIT_STEP}
     return {"rules": RULES_CLI, "commit_step": _CLI_COMMIT_STEP}
 
@@ -271,6 +274,7 @@ def build_stage1_jobs(
     wts: dict[str, dict[str, Path]],
     mode: Literal["code", "doc"],
     workers: dict | None = None,
+    claude_cli: bool = False,
 ) -> dict:
     if mode not in _MODE_NAMES:
         raise ValueError(f"알 수 없는 모드: {mode!r}")
@@ -280,7 +284,7 @@ def build_stage1_jobs(
             for role in ("a", "b"):
                 wt = wts[f.id][role]
                 values = {**_finding_values(f, role, wt), "verify_cmds": _code_verify_cmds(cfg, wt, f.location),
-                          **_write_values(workers, role)}
+                          **_write_values(workers, role, claude_cli)}
                 jobs.append(_job(f.id, role, _render("worker-code.md", values), workers, wt, writable=True))
             continue
         for role in ("a", "b"):
@@ -291,7 +295,7 @@ def build_stage1_jobs(
         values = {
             **_finding_values(f, "writer", wt),
             "verify_cmds": _doc_verify_cmds(cfg),
-            **_write_values(workers, "writer"),
+            **_write_values(workers, "writer", claude_cli),
         }
         jobs.append(_job(f.id, "writer", _render("worker-doc-writer.md", values), workers, wt, writable=True))
     return {"jobs": jobs}

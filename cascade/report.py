@@ -4,7 +4,7 @@ from pathlib import Path
 
 from cascade import assignment
 from cascade import usage as price_table
-from cascade.cli_steps import CLAUDE_JOB_FILES, USAGE_FILE, exhausted_runners, review_cell
+from cascade.cli_steps import CLAUDE_JOB_FILES, USAGE_FILE, claude_job_entries, exhausted_runners, review_cell
 from cascade.consensus import (
     OUTCOME_ADJUDICATE,
     OUTCOME_AGREED_FACT,
@@ -661,9 +661,8 @@ class _ClaudeUsage:
                 if isinstance(row.get("cell"), str):
                     self.rows.setdefault(row["cell"], []).append({**row, "round": rnd.no})
             for name in CLAUDE_JOB_FILES:
-                listed = _read_json(rd / name)
-                for entry in listed.get("jobs", []) if isinstance(listed, dict) and isinstance(listed.get("jobs"), list) else []:
-                    cell = _cell_of(ledger, entry["id"]) if isinstance(entry, dict) and isinstance(entry.get("id"), str) else None
+                for entry in claude_job_entries(_read_json(rd / name)):
+                    cell = _cell_of(ledger, entry["id"]) if isinstance(entry.get("id"), str) else None
                     if cell:
                         self.jobs.setdefault(cell, set()).add((rnd.no, entry["id"]))
 

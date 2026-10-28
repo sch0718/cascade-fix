@@ -96,6 +96,8 @@ from cascade.runners import (
     RUNNER_CODEX,
     RUNNER_CURSOR,
     STATUS_OK,
+    UNRECORDED,
+    ClaudeRunner,
     CliJob,
     CodexRunner,
     CursorRunner,
@@ -103,6 +105,7 @@ from cascade.runners import (
     codex_available,
     codex_model,
     cursor_available,
+    find_claude,
     find_codex,
     find_cursor_agent,
     head_of,
@@ -125,6 +128,9 @@ from cascade.snapshot import (
 )
 from cascade.verify import repro_cmds, run_repro, run_verifiers
 from cascade.workers import (
+    CLAUDE_VIA_CHOICES,
+    CLAUDE_VIA_CLI,
+    CLAUDE_VIA_WORKFLOW,
     DEFAULT_CURSOR_MODEL,
     WORKERS_CHOICES,
     WORKERS_CLAUDE,
@@ -454,6 +460,7 @@ def _init(args, print_next: bool = True) -> tuple[int, Path | None]:
         workers=workers,
         adopt_on_both_pass=legacy["adopt_on_both_pass"],
         profile=record,
+        claude_via=getattr(args, "claude_via", None) or CLAUDE_VIA_WORKFLOW,
     )
     write_findings(s.round_dir(snap.run_dir, 1) / "findings.json", findings)
     s.save_ledger(snap.run_dir, ledger)
@@ -781,10 +788,17 @@ def _reopen_round(ledger, rnd, rd: Path) -> None:
 
 
 def cmd_jobs(args) -> int:
+    with s.workers_lock(Path(args.run_dir)):
+        return _jobs(args)
+
+
+def _jobs(args) -> int:
     run_dir = Path(args.run_dir)
     ledger = s.load_ledger(run_dir)
     rnd = s.get_round(ledger, args.round)
     s.guard(rnd, "jobs", args.force)
+    if getattr(args, "claude_via", None):
+        ledger.claude_via = args.claude_via
     if s.step_done(rnd, "jobs"):
         _reopen_round(ledger, rnd, s.round_dir(run_dir, rnd.no))
     cfg = s.cfg_for(ledger.source, Path(ledger.root))
@@ -826,8 +840,9 @@ def cmd_jobs(args) -> int:
                 for cmd in cmds:
                     print(f"  {fid}: {cmd}")
     out = rd / "stage1-args.json"
+    claude_cli = ledger.claude_via == CLAUDE_VIA_CLI
     claude_args, cli_args = split_job_args(
-        build_stage1_jobs(findings, cfg, wts, ledger.mode, job_workers), rd / "prompts")
+        build_stage1_jobs(findings, cfg, wts, ledger.mode, assignment.build_workers(ledger), claude_cli), rd / "prompts", claude_cli)
     s.write_json(out, claude_args)
     cli_out = rd / "stage1-cli-args.json"
     if cli_args["jobs"]:
@@ -854,7 +869,8 @@ def _cli_job(entry: dict) -> CliJob:
                   Path(entry["promptPath"]), Path(entry["worktree"]), entry["writable"])
 
 
-_CLI_MAKERS = {RUNNER_CODEX: (find_codex, CodexRunner), RUNNER_CURSOR: (find_cursor_agent, CursorRunner)}
+_CLI_MAKERS = {RUNNER_CODEX: (find_codex, CodexRunner), RUNNER_CURSOR: (find_cursor_agent, CursorRunner),
+               RUNNER_CLAUDE: (find_claude, ClaudeRunner)}
 
 
 def _cli_runners(jobs: list[CliJob]) -> dict[str, object]:
@@ -920,6 +936,26 @@ def cmd_workers(args) -> int:
         return _workers(args)
 
 
+def _record_claude_usage(rd: Path, mode: str, entries: list[dict], outcomes: list, stage: str) -> None:
+    """Claude 러너의 호출(대체 전 실패 포함)마다 봉투의 토큰·비용을 claude-usage.json에 시도별로 남긴다. 다시 돌려도 앞 시도를 덮지 않는다."""
+    by_id = {e["id"]: e for e in entries}
+    rows = [{"job_id": o.id, "label": o.id, "cell": assignment.job_cell_key(mode, by_id[o.id]["role"]), "model": by_id[o.id]["model"],
+             "input": o.usage.get("input_tokens", 0), "output": o.usage.get("output_tokens", 0),
+             "cache_read": o.usage.get("cached_input_tokens", 0), "cache_write": o.usage.get("cache_write_tokens", 0),
+             "cost": o.usage.get("cost_usd")}
+            for o in outcomes if o.runner == RUNNER_CLAUDE and not o.usage.get(UNRECORDED) and o.id in by_id]
+    if not rows:
+        return
+    out = rd / s.USAGE_FILE
+    data = _read_optional_json(out)
+    data = data if isinstance(data, dict) else {}
+    workflows = data["workflows"] if isinstance(data.get("workflows"), dict) else {}
+    key = next(f"cli-{stage}-{n}" for n in itertools.count(1) if f"cli-{stage}-{n}" not in workflows)
+    s.write_json(out, {**data, "prices_as_of": data.get("prices_as_of") or workflow_usage.PRICES_AS_OF,
+                       "price_source": data.get("price_source") or workflow_usage.PRICE_SOURCE,
+                       "workflows": {**workflows, key: rows}})
+
+
 def _workers(args) -> int:
     run_dir = Path(args.run_dir)
     ledger = s.load_ledger(run_dir)
@@ -964,6 +1000,7 @@ def _workers(args) -> int:
     else:
         fallback_args.unlink(missing_ok=True)
     counts = dict(Counter(o.status for o in first))
+    _record_claude_usage(rd, ledger.mode, entries, [*first, *second.values()], args.stage)
     ledger = s.load_ledger(run_dir)
     rnd = s.get_round(ledger, args.round)
     s.mark(rnd, step, counts=counts, usage=usage_totals([*first, *second.values()]), fallback=failed,
@@ -1072,8 +1109,8 @@ def cmd_judge(args) -> int:
         if pending and checker_results is None:
             out = rd / "checker-args.json"
             wts = {f.id: {"writer": s.worktree(snap, f.id, "writer")} for f in pending}
-            jobs = build_checker_jobs(s.prompt_findings(ledger, pending), wts, writer_patches, assignment.job_workers(ledger))
-            claude_args, cli_args = split_job_args(jobs, rd / "prompts")
+            jobs = build_checker_jobs(s.prompt_findings(ledger, pending), wts, writer_patches, assignment.build_workers(ledger))
+            claude_args, cli_args = split_job_args(jobs, rd / "prompts", ledger.claude_via == CLAUDE_VIA_CLI)
             s.write_json(out, claude_args)
             if cli_args["jobs"]:
                 s.write_json(rd / "checker-cli-args.json", cli_args)
@@ -2367,6 +2404,8 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--review-model", help=f"Claude 검토자 모델(기본 {DEFAULT_MODEL})")
         p.add_argument("--review-effort", choices=EFFORTS, help=f"Claude 검토자 effort(기본 {DEFAULT_EFFORT})")
         p.add_argument("--profile", help="역할 프로필 이름(기본: 환경 변수 CASCADE_PROFILE, repos.toml, 없으면 내장 default)")
+        p.add_argument("--claude-via", choices=CLAUDE_VIA_CHOICES,
+                       help="1단계 Claude 작업을 돌리는 방식(기본 workflow). cli: CF workers가 `claude -p`로 돌린다(Workflow 없이 go가 이어 간다)")
         p.add_argument("--severity", help="이번 실행에서 처리할 등급(쉼표 구분, 예: Critical,Warning). 나머지는 보류 후보")
         add_workers_args(p)
     p = add("init", cmd_init, run_dir=False, force=False)
@@ -2417,7 +2456,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--review-dir", help="--fallback-from으로 이력을 고칠 처음 첫 검토 폴더(review_dir=로 찍힌 곳)")
     p.add_argument("--fallback-from", help="실패한 첫 검토 runner(codex·cursor). 마지막으로 시도한 runner와 같아야 한다")
     p.add_argument("--reason", help=f"--fallback-from의 사유(기본 {REVIEW_DEFAULT_REASON})")
-    add("jobs", cmd_jobs, round_no=True)
+    p = add("jobs", cmd_jobs, round_no=True)
+    p.add_argument("--claude-via", choices=CLAUDE_VIA_CHOICES,
+                   help="Claude 작업을 돌리는 방식을 이 값으로 바꿔 작업 파일을 다시 만든다(--force로 회차를 다시 열 때)")
     p = add("usage", cmd_usage, run_dir=False, force=False)
     p.add_argument("--run-dir")
     p.add_argument("--round", type=int)

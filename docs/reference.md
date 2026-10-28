@@ -320,6 +320,16 @@ tests = ["pytest {files}"]
 - 작업자 프로필은 Shell을 허용하므로 홈 민감 경로의 Read 거부는 Shell(`cat`)로 우회될 수 있습니다. 민감 경로 보호는 cursor-review(검토자, Shell 거부)에서만 실질적입니다.
 - 통과 기준(판정 일치율, Opus 호출 수, 대체 실행 비율, 회귀)과 측정 절차는 [docs/2026-10-18-workers-measurement-plan.md](2026-10-18-workers-measurement-plan.md)에 있습니다. 프로필 구성별 측정은 [docs/2026-10-21-role-profiles-measurement-plan.md](2026-10-21-role-profiles-measurement-plan.md)에 있습니다.
 
+### Claude 작업을 `claude -p`로
+
+`--claude-via cli`(`init`·`start`, 또는 판정·적용 전의 `jobs --force --claude-via …`)면 1단계 작업자·점검자(코드 `a`·`b`, 문서 `judge_a`·`judge_b`·`writer`·`checker`)를 Workflow 대신 `CF workers`가 호출마다 `claude -p`로 돌립니다. `stage1-args.json`은 비고 Claude 작업도 `stage1-cli-args.json`(`runner: claude`)에 들어가므로 `go`가 메인 세션 없이 `workers`를 돌려 판정까지 이어 갑니다. 기본은 `workflow`이고 그 경로는 그대로 남습니다.
+
+- 판가름·의견·재검토·첫 검토와, Claude 작업이 실패했을 때의 Claude 대체 실행(`*-fallback-args.json`)은 이번 범위가 아니라 계속 Workflow입니다. `go`는 그 단계에서 Workflow 결과를 기다리며 멈춥니다.
+- 도구: 쓰기 역할은 `acceptEdits`로 `Bash·Read·Edit·Write·Grep·Glob`, 읽기 역할은 `default`로 `Bash·Read·Grep·Glob`만 열고 `Edit·Write·NotebookEdit`을 막습니다(읽기 역할이 Bash로 파일을 바꾸면 기존 검사가 되돌리고 결과를 버립니다). 모든 호출에서 `WebFetch·WebSearch·Agent·Task`와 사용자 MCP·설정(`--setting-sources project --strict-mcp-config`)을 끕니다. 작업 폴더 밖 쓰기를 막는 샌드박스는 아니라서 Workflow 서브에이전트와 같은 수준인지는 측정 전이고, 그래서 기본값으로 쓰지 않습니다.
+- 사용량: 호출마다 `claude -p` JSON 봉투의 `usage`·`total_cost_usd`를 `round-N/claude-usage.json`의 `workflows.cli-<stage>-<n>`에 작업별로 씁니다. 다시 돌려도 앞 시도의 행이 남고 실패한 호출의 비용도 들어갑니다. 봉투가 없으면 행이 없어 보고서가 「미측정」으로 셉니다. 이 경로는 `CF usage`가 필요 없습니다.
+- 모델 ID: 결과의 `model_id`는 요청 모델 그대로(`claude-sonnet-5-5`)입니다. 봉투의 `modelUsage`가 요청 모델을 하나도 담지 않으면 그 결과를 채택하지 않고 `무효`로 대체 실행합니다.
+- 아직 실측하지 않은 것: 실제 `claude -p`의 한도·로그인 실패 문구와 `modelUsage` 키 형식, 격리 수준.
+
 ### 보고서의 역할 절
 
 - 「역할 배정」: 프로필 이름·출처, 이 모드의 칸별 runner·모델·effort·fallback 표, 덮은 칸, 배정 때 바꾼 칸(init·jobs), 첫 검토 이력, 실행 중 대체(칸·사유·회차)와 로그인이 풀린 CLI의 안내. 항상 들어갑니다.
@@ -387,11 +397,11 @@ PYTHONPATH=<스킬 경로> python3 -m cascade.cli <명령> [옵션]
 | `detect [--input F] [--doc F…] [--pr N] [--no-gh] [--profile P] [--reviewer R] [--workers W] [--cursor-model M] [--json]` | 상황을 판정하고 추천·프로필·규모·전송 동의·멈춤 사유를 보여 줍니다. 읽기만 하므로 `--consent`가 없습니다. 첫 검토는 늘 `CF review …`로 권합니다. `--doc`은 커밋한 문서도 검토 대상으로 지정합니다. `--no-gh`면 PR을 조회하지 않습니다. |
 | `review --kind code\|doc (--base B \| --uncommitted \| --commit SHA \| --doc F…) [--focus 관점] [--profile P] [--review-model M] [--review-effort E] [--consent C] [--workers W] [--cursor-model M]` | `<모드>.review` 칸을 따라 첫 검토를 준비합니다. claude 칸이면 Workflow 입력을, codex·cursor 칸이면 `RR`·`CR` 명령을 출력합니다. 외부 칸에는 `--review-model`·`--review-effort`를 줄 수 없습니다. `--workers`·`--cursor-model`은 출력하는 init 줄에 붙습니다. |
 | `review --review-dir D --fallback-from codex\|cursor [--reason 사유]` | 외부 첫 검토가 한도·오류로 실패했을 때 처음 폴더 `D`의 이력을 고치고 fallback 칸 작업을 만듭니다. 실패한 runner는 마지막으로 시도한 runner와 같아야 합니다. |
-| `init --source S --input X [--doc F…] [--severity …] [--dry-run] [--adopt-on-both-pass] [--max-rechecks N] [--profile P] [--consent C] [--reviewer R] [--workers W] [--cursor-model M] [--review-model M] [--review-effort E]` | 실행을 시작하고 지적을 읽습니다. 프로필을 골라 역할을 배정하고 `프로필:`·`역할:`·`전송 동의:` 줄을 찍습니다. `--consent`는 전송에 동의한 수신처(`codex`·`cursor` 쉼표 구분, 또는 `none`)입니다. PR이면 `--input`에 PR 번호를 주고 `--pr-repo owner/name`·`--me <내 로그인>`을 붙일 수 있습니다. `--input` 대신 `--findings-json F`로 정규화한 지적 목록(`id`·`severity`·`location`·`body`)을 바로 줄 수도 있습니다. |
+| `init --source S --input X [--doc F…] [--severity …] [--dry-run] [--adopt-on-both-pass] [--max-rechecks N] [--profile P] [--consent C] [--reviewer R] [--workers W] [--cursor-model M] [--review-model M] [--review-effort E] [--claude-via workflow\|cli]` | 실행을 시작하고 지적을 읽습니다. `--claude-via cli`는 1단계 Claude 작업을 Workflow 대신 `CF workers`가 `claude -p`로 돌리게 원장에 기록합니다(기본 `workflow`, [Claude 작업을 `claude -p`로](#claude-작업을-claude--p로)). 프로필을 골라 역할을 배정하고 `프로필:`·`역할:`·`전송 동의:` 줄을 찍습니다. `--consent`는 전송에 동의한 수신처(`codex`·`cursor` 쉼표 구분, 또는 `none`)입니다. PR이면 `--input`에 PR 번호를 주고 `--pr-repo owner/name`·`--me <내 로그인>`을 붙일 수 있습니다. `--input` 대신 `--findings-json F`로 정규화한 지적 목록(`id`·`severity`·`location`·`body`)을 바로 줄 수도 있습니다. |
 | `start` (`init`과 같은 옵션) | `init` 뒤 `jobs`까지 이어서 합니다. 1단계 작업이 10개를 넘고 `--severity`가 없으면 `init`에서 멈추고 규모를 사용자에게 묻도록 안내합니다. |
 | `go --run-dir D [--workflow-output F] [--workflow W] [--allow-repro F]` | 원장이 가리키는 다음 단계부터 멈출 곳까지 단계 명령(`jobs`·`judge`·`adjudicate`·`opinion`·`apply`·`recheck`·`report`)을 이어 부릅니다. `--workflow-output`은 Workflow 완료 알림의 output-file로, 기다리는 Workflow 결과를 `round-N/`에 저장합니다(기다리는 작업과 다르면 종료 코드 5). `--workflow`를 주면 `usage`도 합니다. Workflow가 필요할 때, `workers`와 Workflow를 동시에 띄워야 할 때, `workers`가 이미 돌 때, 모델 ID 경고가 났을 때, PR 재현 명령 승인이 필요할 때, `report`까지 끝났을 때(`cleanup`은 하지 않음) `멈춤: <이유>`와 `다음:`을 출력하고 멈춥니다. 단계 명령이 0이 아닌 종료 코드로 끝나면 그 코드로 끝납니다. |
-| `jobs` / `judge` / `adjudicate` / `opinion` / `apply` / `recheck` | 회차 단계(`--run-dir`·`--round`) |
-| `workers --stage stage1\|checker` | 외부 runner 칸이 있는 회차에서 CLI 작업(Codex·Cursor)을 돌리고 결과를 `stage1-cli.json`(점검자는 `checker-cli.json`)에 씁니다. 실패한 작업은 그 칸의 fallback으로 같은 호출에서 다시 돌리고(외부 fallback), Claude로 대체할 작업이 있으면 `*-fallback-args.json`을 만듭니다. 한 번에 하나만 돌립니다(실행 폴더의 `workers.lock`으로 막고, 돌고 있으면 오류로 끝납니다). |
+| `jobs [--claude-via workflow\|cli]` / `judge` / `adjudicate` / `opinion` / `apply` / `recheck` | 회차 단계(`--run-dir`·`--round`). `jobs --force --claude-via …`는 판정·적용 전에 Claude 작업의 실행 경로를 바꿔 작업 파일을 다시 만듭니다. |
+| `workers --stage stage1\|checker` | CLI 작업(Codex·Cursor, `--claude-via cli`면 Claude)을 돌리고 결과를 `stage1-cli.json`(점검자는 `checker-cli.json`)에 씁니다. 실패한 작업은 그 칸의 fallback으로 같은 호출에서 다시 돌리고(외부 fallback), Claude로 대체할 작업이 있으면 `*-fallback-args.json`을 만듭니다. 한 번에 하나만 돌립니다(실행 폴더의 `workers.lock`으로 막고, 돌고 있으면 오류로 끝납니다). |
 | `resume --choices F` | 보류 후보마다 「지금 반영 / 구현 때 테스트로 / 보류」를 받습니다. 「지금 반영」이 있으면 회차를 엽니다. |
 | `usage (--run-dir D --round N \| --review-dir D) --workflow W` | Workflow 기록을 읽어 작업별 Claude 토큰과 추정 비용을 `round-N/claude-usage.json`(첫 검토는 `<review_dir>/claude-usage.json`)에 씁니다. `W`는 Workflow 실행 id 또는 그 기록 폴더 경로입니다. 같은 Workflow를 다시 넣으면 그 몫만 바뀌고 두 번 더해지지 않습니다. 이름표가 작업과 맞지 않는 에이전트는 어느 칸에도 넣지 않고 경고합니다. 기록 폴더를 읽지 못하면 `Claude 토큰 미측정: <이유>`를 출력하고 종료 코드 0으로 끝납니다. 첫 검토는 `init`보다 먼저 돌립니다. |
 | `report` / `status` / `cleanup` | 보고서, 다음 할 일, 정리 |

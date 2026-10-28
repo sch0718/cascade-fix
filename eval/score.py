@@ -8,7 +8,7 @@ sys.path.insert(0, str(SKILL_ROOT))
 from cascade.assignment import first_review_runner, job_cell_key  # noqa: E402
 from cascade.cli import PRE_FINAL_DECISIONS  # noqa: E402
 from cascade.cli_steps import CLAUDE_JOB_FILES as ALL_CLAUDE_JOB_FILES  # noqa: E402
-from cascade.cli_steps import OPINION_ARGS, RECHECK_ARGS, USAGE_FILE  # noqa: E402
+from cascade.cli_steps import OPINION_ARGS, RECHECK_ARGS, USAGE_FILE, claude_job_entries  # noqa: E402
 from cascade.consensus import REASON_BOTH_PASS  # noqa: E402
 from cascade.jobs import RUNNER_CLAUDE  # noqa: E402
 from cascade.report import JOB_FILES  # noqa: E402
@@ -137,7 +137,7 @@ def claude_calls(run_dir: Path, round_no: int | None = None) -> dict[str, int]:
     calls = dict.fromkeys(CLAUDE_FAMILIES, 0)
     for name in CLAUDE_JOB_FILES:
         for data in round_files(run_dir, name, round_no):
-            for job in data.get("jobs", []):
+            for job in claude_job_entries(data):
                 for family in CLAUDE_FAMILIES:
                     calls[family] += str(job.get("model", "")).startswith(f"claude-{family}-")
     return calls
@@ -319,7 +319,9 @@ def claude_job_names(scope: str) -> tuple[str, ...]:
 
 
 def claude_jobs(round_dir: Path, mode: str, scope: str) -> set[str]:
-    return {job_id for job_id in job_ids(round_dir, claude_job_names(scope)) if scoped_cells([job_id], mode, scope)}
+    ids = {job["id"] for name in claude_job_names(scope) for job in claude_job_entries(read_optional(round_dir / name))
+           if isinstance(job.get("id"), str)}
+    return {job_id for job_id in ids if scoped_cells([job_id], mode, scope)}
 
 
 def first_review_of(ledger: dict) -> dict:
