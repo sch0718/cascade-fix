@@ -46,13 +46,26 @@ def write_json(path: Path, data) -> None:
     Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def parse_reviewer(runner: str, text: str, mode: str) -> list[dict]:
+def relative_location(location: str, root: str | None) -> str:
+    if not root:
+        return location
+    text = normalize_location(location)
+    if not text.startswith("/"):
+        return location
+    for prefix in {root, str(Path(root).resolve())}:
+        prefix = prefix.rstrip("/") + "/"
+        if text.startswith(prefix):
+            return text[len(prefix):]
+    return location
+
+
+def parse_reviewer(runner: str, text: str, mode: str, root: str | None = None) -> list[dict]:
     parser = parse_codex_code if runner == REVIEWER_CODEX and mode == MODE_CODE else parse_codex_doc
     try:
         parsed = parser(text, 1)
     except ParseError as exc:
         raise FirstReviewError(f"{label(runner)} 결과를 해석하지 못했다: {exc}") from None
-    return [{"runner": runner, "id": f.id, "severity": f.severity, "location": f.location, "body": f.body,
+    return [{"runner": runner, "id": f.id, "severity": f.severity, "location": relative_location(f.location, root), "body": f.body,
              "evidence": f.evidence, "found_by": [runner]} for f in parsed]
 
 
@@ -103,11 +116,11 @@ def group_record(number: int, members: list[dict]) -> dict:
             "members": [{"runner": m["runner"], "id": m["id"]} for m in members]}
 
 
-def merge(claude_text: str | None, codex_text: str | None, cursor_text: str | None, mode: str) -> dict:
+def merge(claude_text: str | None, codex_text: str | None, cursor_text: str | None, mode: str, root: str | None = None) -> dict:
     texts = {REVIEWER_CLAUDE: claude_text, REVIEWER_CODEX: codex_text, REVIEWER_CURSOR: cursor_text}
     if all(text is None for text in texts.values()):
         raise FirstReviewError("검토 결과를 하나 이상 준다(--claude, --codex, --cursor)")
-    findings = [f for runner in RUNNERS if texts[runner] is not None for f in parse_reviewer(runner, texts[runner], mode)]
+    findings = [f for runner in RUNNERS if texts[runner] is not None for f in parse_reviewer(runner, texts[runner], mode, root)]
     groups = [group_record(number, members) for number, members in enumerate(propose_groups(findings), 1)]
     return {"mode": mode, "confirmed": False, "reviewers": {runner: {"given": texts[runner] is not None, "meta": None, "usage": None}
                                                               for runner in RUNNERS},
@@ -162,10 +175,11 @@ def cursor_log_of(final: Path) -> Path | None:
     return final.with_name(final.name.removesuffix(FINAL_SUFFIX)) if final.name.endswith(FINAL_SUFFIX) else None
 
 
-def merge_files(claude: Path | None, codex: Path | None, cursor: Path | None, mode: str, docs: list[str] | None = None) -> dict:
+def merge_files(claude: Path | None, codex: Path | None, cursor: Path | None, mode: str, docs: list[str] | None = None,
+                root: str | None = None) -> dict:
     paths = {REVIEWER_CLAUDE: claude, REVIEWER_CODEX: codex, REVIEWER_CURSOR: cursor}
     texts = {runner: read_result_text(runner, Path(path)) if path else None for runner, path in paths.items()}
-    merged = merge(texts[REVIEWER_CLAUDE], texts[REVIEWER_CODEX], texts[REVIEWER_CURSOR], mode)
+    merged = merge(texts[REVIEWER_CLAUDE], texts[REVIEWER_CODEX], texts[REVIEWER_CURSOR], mode, root)
     for runner, path in paths.items():
         if path is None:
             continue
@@ -426,7 +440,7 @@ def run_merge(args) -> int:
     out = Path(args.out)
     if isinstance(previous := read_optional(out / MERGED_FILE), dict) and previous.get("confirmed") is True:
         raise FirstReviewError(f"확정된 {out / MERGED_FILE}가 이미 있어 덮어쓰지 않는다. 다시 합치려면 그 파일을 옮기거나 지운다")
-    merged = merge_files(args.claude, args.codex, args.cursor, mode, args.doc)
+    merged = merge_files(args.claude, args.codex, args.cursor, mode, args.doc, args.root)
     if mode == MODE_CODE and args.codex and (skipped := unparsed_code_items(read_result_text(REVIEWER_CODEX, Path(args.codex)))):
         print(f"경고: 형식을 읽지 못한 Codex 항목 {len(skipped)}건: {' / '.join(skipped)}", file=sys.stderr)
     write_json(out / MERGED_FILE, merged)
@@ -478,6 +492,7 @@ def build_parser() -> argparse.ArgumentParser:
     merge_parser.add_argument("--codex", help="Codex 검토 결과(.final)")
     merge_parser.add_argument("--cursor", help="Cursor 검토 결과(.final). 같은 폴더의 원본 로그에서 토큰을 읽는다")
     merge_parser.add_argument("--doc", action="append", help="검토한 문서(문서 모드). 여러 번 줄 수 있다. 없으면 코드 모드")
+    merge_parser.add_argument("--root", help="검토한 저장소(워크트리) 루트. 이 아래를 가리키는 절대 경로 위치를 상대 경로로 맞춘다")
     merge_parser.add_argument("--confirm", help="사람이 고쳐 확정한 merged.json. 주면 findings-input.json과 found-by.json을 쓴다")
     merge_parser.add_argument("--out", required=True, help="결과를 쓸 폴더")
     score_parser = sub.add_parser("score", help="확정한 merged.json과 정답으로 검토자별 정밀도·재현율·비용을 낸다")
@@ -495,8 +510,8 @@ def main(argv=None) -> int:
         if args.command == "score":
             return run_score(args)
         if args.confirm:
-            if any((args.claude, args.codex, args.cursor, args.doc)):
-                raise FirstReviewError("--confirm은 --claude·--codex·--cursor·--doc과 함께 쓰지 않는다")
+            if any((args.claude, args.codex, args.cursor, args.doc, args.root)):
+                raise FirstReviewError("--confirm은 --claude·--codex·--cursor·--doc·--root와 함께 쓰지 않는다")
             return run_confirm(args)
         return run_merge(args)
     except (FirstReviewError, OSError) as exc:

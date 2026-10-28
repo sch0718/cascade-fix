@@ -107,6 +107,24 @@ class MergeTest(unittest.TestCase):
         self.assertEqual(len(first_review.merge(None, one, same, mode="doc")["groups"]), 1)
         self.assertEqual(len(first_review.merge(None, one, other, mode="doc")["groups"]), 2)
 
+    def test_absolute_location_under_root_groups_with_relative_one(self):
+        claude = "Warning\n1. 상대 경로\n   위치: cascade/report.py:610\n   근거: x\n"
+        codex = "Warning\n1. 절대 경로\n   위치: /private/tmp/wt/T1/cascade/report.py:612\n   근거: y\n"
+        self.assertEqual(len(first_review.merge(claude, codex, None, mode="doc")["groups"]), 2)
+        merged = first_review.merge(claude, codex, None, mode="doc", root="/private/tmp/wt/T1/")
+        self.assertEqual(len(merged["groups"]), 1)
+        self.assertEqual({f["location"] for f in merged["findings"]}, {"cascade/report.py:610", "cascade/report.py:612"})
+
+    def test_location_outside_root_is_kept(self):
+        codex = "Warning\n1. 밖\n   위치: /other/T1x/a.py:3\n   근거: y\n2. 접두만 같음\n   위치: /private/tmp/wt/T1x/a.py:4\n   근거: y\n"
+        merged = first_review.merge(None, codex, None, mode="doc", root="/private/tmp/wt/T1")
+        self.assertEqual([f["location"] for f in merged["findings"]], ["/other/T1x/a.py:3", "/private/tmp/wt/T1x/a.py:4"])
+
+    def test_relative_location_is_kept_even_when_root_is_relative(self):
+        claude = "Warning\n1. 상대\n   위치: project/a.py:10\n   근거: x\n"
+        merged = first_review.merge(claude, None, None, mode="doc", root="project")
+        self.assertEqual([f["location"] for f in merged["findings"]], ["project/a.py:10"])
+
     def test_code_mode_reads_codex_code_format(self):
         codex = (FIXTURES / "codex-code.final").read_text(encoding="utf-8")
         merged = first_review.merge(None, codex, None, mode="code")
