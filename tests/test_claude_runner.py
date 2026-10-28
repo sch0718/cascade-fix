@@ -124,6 +124,13 @@ class ClaudeRunnerTest(unittest.TestCase):
                 os.environ["FAKE_CLAUDE_ENVELOPE"] = json.dumps({"is_error": True, "result": text})
                 self.assertEqual(self.run_job().status, status)
 
+    def test_errors_array_of_error_envelope_is_classified(self):
+        os.environ["FAKE_CLAUDE_ENVELOPE"] = json.dumps(
+            {"is_error": True, "subtype": "error_during_execution", "result": None, "errors": ["Rate limit exceeded"]})
+        out = self.run_job()
+        self.assertEqual(out.status, STATUS_LIMIT)
+        self.assertIn("Rate limit", out.detail)
+
     def test_non_json_stdout_is_error_with_unrecorded_usage(self):
         os.environ["FAKE_CLAUDE_STDOUT"] = "not json"
         os.environ["FAKE_CLAUDE_EXIT"] = "1"

@@ -96,7 +96,6 @@ from cascade.runners import (
     RUNNER_CODEX,
     RUNNER_CURSOR,
     STATUS_OK,
-    UNRECORDED,
     ClaudeRunner,
     CliJob,
     CodexRunner,
@@ -937,13 +936,13 @@ def cmd_workers(args) -> int:
 
 
 def _record_claude_usage(rd: Path, mode: str, entries: list[dict], outcomes: list, stage: str) -> None:
-    """Claude 러너의 호출(대체 전 실패 포함)마다 봉투의 토큰·비용을 claude-usage.json에 시도별로 남긴다. 다시 돌려도 앞 시도를 덮지 않는다."""
+    """Claude 러너의 호출(대체 전 실패 포함)마다 봉투의 토큰·비용을 claude-usage.json에 시도별로 남긴다. 봉투가 없던 시도는 비용 없는 행(미측정)으로 남긴다. 다시 돌려도 앞 시도를 덮지 않는다."""
     by_id = {e["id"]: e for e in entries}
     rows = [{"job_id": o.id, "label": o.id, "cell": assignment.job_cell_key(mode, by_id[o.id]["role"]), "model": by_id[o.id]["model"],
              "input": o.usage.get("input_tokens", 0), "output": o.usage.get("output_tokens", 0),
              "cache_read": o.usage.get("cached_input_tokens", 0), "cache_write": o.usage.get("cache_write_tokens", 0),
              "cost": o.usage.get("cost_usd")}
-            for o in outcomes if o.runner == RUNNER_CLAUDE and not o.usage.get(UNRECORDED) and o.id in by_id]
+            for o in outcomes if o.runner == RUNNER_CLAUDE and o.usage and o.id in by_id]
     if not rows:
         return
     out = rd / s.USAGE_FILE

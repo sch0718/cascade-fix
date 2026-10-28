@@ -788,7 +788,8 @@ class ClaudeRunner:
             return Outcome(job.id, job.runner, classify_failure(text), None, usage,
                            f"JSON 봉투가 아니다(종료 코드 {run.returncode}): {_tail(_without_prompt(run.stderr, prompt) or run.stdout)}")
         if run.returncode != 0 or envelope.get("is_error"):
-            message = str(envelope.get("result", "")) if envelope.get("is_error") else ""
+            errors = envelope.get("errors")
+            message = "\n".join([str(envelope.get("result") or ""), *map(str, errors if isinstance(errors, list) else [])])
             text = _without_prompt(f"{message}\n{run.stderr}", prompt)
             return Outcome(job.id, job.runner, classify_failure(text), None, usage,
                            f"종료 코드 {run.returncode}: {_tail(message) or _tail(run.stderr)}")

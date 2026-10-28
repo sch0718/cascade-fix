@@ -113,6 +113,15 @@ class ClaudeViaGoTest(ClaudeViaTestBase):
         self.assertEqual(sorted(workflows), ["cli-stage1-1", "cli-stage1-2"])
         self.assertEqual(len(workflows["cli-stage1-1"]), 4)
 
+    def test_attempt_without_envelope_is_recorded_as_unmeasured_row(self):
+        self.start("--claude-via", "cli")
+        entries = self.read("stage1-cli-args.json")["jobs"]
+        lost = Outcome("r1-01:a", "claude", "timeout", None, {"unrecorded": 1}, "")
+        skipped = Outcome("r1-01:b", "claude", "skipped", None, {}, "")
+        cli._record_claude_usage(self.rd(), "code", entries, [lost, skipped], "stage1")
+        rows = self.read(cli_steps.USAGE_FILE)["workflows"]["cli-stage1-2"]
+        self.assertEqual([(r["job_id"], r["cost"]) for r in rows], [("r1-01:a", None)])
+
     def test_report_expects_claude_cli_jobs_so_missing_usage_is_unmeasured(self):
         self.start("--claude-via", "cli")
         (self.rd() / cli_steps.USAGE_FILE).unlink()
