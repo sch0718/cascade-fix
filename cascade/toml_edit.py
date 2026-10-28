@@ -77,6 +77,17 @@ def _next_table(lines: list[str], start: int) -> int:
     return next((i for i in range(start, len(lines)) if TABLE_HEADER.match(lines[i])), len(lines))
 
 
+def _table_comment_start(lines: list[str], table: int) -> int:
+    start = table
+    while start > 0 and lines[start - 1].lstrip().startswith("#"):
+        start -= 1
+    try:
+        tomllib.loads("".join(lines[:start]))
+    except tomllib.TOMLDecodeError:
+        return table
+    return start
+
+
 def _parse(text: str) -> dict:
     try:
         return tomllib.loads(text)
@@ -108,7 +119,8 @@ def _default_profile_text(text: str, name: str) -> str:
         return "".join(lines)
     entry = f"default_profile = {_quote(name)}\n"
     if first_table < len(lines):
-        lines[first_table:first_table] = [entry, "\n"]
+        at = _table_comment_start(lines, first_table)
+        lines[at:at] = [entry, "\n"]
         return "".join(lines)
     head = _with_newline(text)
     if head and head.splitlines()[-1].strip():

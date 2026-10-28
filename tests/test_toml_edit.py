@@ -28,6 +28,16 @@ class TomlEditTest(unittest.TestCase):
         self.assertIn("# 둘째 줄", out)
         self.assertIn("# 주석", out)
 
+    def test_set_default_profile_stays_above_comment_block_of_first_table(self):
+        text = '# 머리\n\n# 이 저장소는 로컬\n[repos."/x"]\nprofile = "local"\n'
+        out = toml_edit.set_default_profile(text, "local")
+        self.assertEqual(out, '# 머리\n\ndefault_profile = "local"\n\n# 이 저장소는 로컬\n[repos."/x"]\nprofile = "local"\n')
+
+    def test_set_default_profile_keeps_multiline_string_ending_with_hash_line(self):
+        text = 'repos."/x".tests = ["""echo ok\n# test script"""]\n[profiles.mix]\nbase = "claude-only"\n'
+        out = toml_edit.set_default_profile(text, "local")
+        self.assertEqual(out, 'repos."/x".tests = [\"\"\"echo ok\n# test script\"\"\"]\ndefault_profile = "local"\n\n[profiles.mix]\nbase = "claude-only"\n')
+
     def test_set_default_profile_replaces_existing_line(self):
         once = toml_edit.set_default_profile(SAMPLE, "local")
         twice = toml_edit.set_default_profile(once, "claude-only")
