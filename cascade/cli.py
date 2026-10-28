@@ -1,4 +1,6 @@
 import argparse
+import contextlib
+import io
 import itertools
 import json
 import os
@@ -28,7 +30,7 @@ from cascade.consensus import (
     decide,
     decide_doc,
 )
-from cascade.detect import detect, estimate_line
+from cascade.detect import detect, estimate, estimate_line
 from cascade.detect import render as render_detect
 from cascade.findings import (
     GH_TIMEOUT,
@@ -388,6 +390,10 @@ def _expected_review_model(args, resolved: profiles.Resolved, mode: str, first_r
 
 
 def cmd_init(args) -> int:
+    return _init(args)[0]
+
+
+def _init(args, print_next: bool = True) -> tuple[int, Path | None]:
     root = Path(args.root).resolve() if args.root else s.git_toplevel(Path.cwd())
     s.cfg_for(args.source, root)
     consent = _consent_option(args.consent)
@@ -407,7 +413,7 @@ def cmd_init(args) -> int:
         print(f"경고: 형식을 읽지 못한 항목 {len(skipped)}건: {' / '.join(skipped)}")
     if not findings:
         print(f"status={STATUS_DONE}")
-        return 0
+        return 0, None
     keep = _severity_filter(args.severity)
     deferred = [f for f in findings if f.severity not in keep]
     findings = [f for f in findings if f.severity in keep]
@@ -471,8 +477,9 @@ def cmd_init(args) -> int:
     if ledger.adopt_on_both_pass:
         print("한쪽 채택: 같은 판정에 패치가 달라도 둘 다 검증을 통과하면 작은 패치를 채택한다(판가름 안 함)")
     _print_review_cells(ledger)
-    _print_next(ledger, snap.run_dir)
-    return 0
+    if print_next:
+        _print_next(ledger, snap.run_dir)
+    return 0, snap.run_dir
 
 
 def _print_review_cells(ledger: Ledger) -> None:
@@ -823,15 +830,13 @@ def cmd_jobs(args) -> int:
         build_stage1_jobs(findings, cfg, wts, ledger.mode, job_workers), rd / "prompts")
     s.write_json(out, claude_args)
     cli_out = rd / "stage1-cli-args.json"
-    had_cli = cli_out.is_file()
     if cli_args["jobs"]:
         s.write_json(cli_out, cli_args)
     else:
         cli_out.unlink(missing_ok=True)
     s.clear_cli_outputs(rd, s.STAGE1, s.STAGE_CHECKER)
-    if cli_args["jobs"] or had_cli:
-        for stage in (s.STAGE1, s.STAGE_CHECKER):
-            (rd / s.STAGE_OUTPUTS[stage]).unlink(missing_ok=True)
+    for stage in (s.STAGE1, s.STAGE_CHECKER):
+        (rd / s.STAGE_OUTPUTS[stage]).unlink(missing_ok=True)
     ledger.snapshot = snap.to_dict()
     fingerprint = user_tree_fingerprint(snap.root, snap.run_dir)
     s.mark(rnd, "jobs", worktrees={fid: {r: str(p) for r, p in m.items()} for fid, m in wts.items()},
@@ -911,6 +916,11 @@ def _rerun_with_fallbacks(entries: list[dict], first: list, cells: dict[str, dic
 
 
 def cmd_workers(args) -> int:
+    with s.workers_lock(Path(args.run_dir)):
+        return _workers(args)
+
+
+def _workers(args) -> int:
     run_dir = Path(args.run_dir)
     ledger = s.load_ledger(run_dir)
     rnd = s.get_round(ledger, args.round)
@@ -1658,6 +1668,238 @@ def _usage_record(workflow: str, labels: dict[str, str], cell_of, out: Path) -> 
     return {"workflow": name, "jobs": len(rows), "unmatched": len(unmatched), "error": None}
 
 
+START_JOBS_LIMIT = 10
+MODEL_WARNING = re.compile(r"^경고: .*모델 ID", re.M)
+REVIEW_WARNING_STOP = ("모델 ID 경고가 났다. 이 단계는 아직 기록하지 않았다. 사용자에게 알린다. 결과를 쓰지 않으려면 Workflow를 다시 돌려 "
+                       "go --workflow-output 으로 바꾸고, 그대로 쓰려면 아래 명령을 직접 부른다")
+MODEL_WARNING_STOP = ("모델 ID 경고가 났다. 사용자에게 알린다. 이 결과를 쓰지 않으려면 jobs --force 로 회차를 다시 열고, "
+                      "그대로 쓰려면 go 를 다시 부른다")
+GO_MAX_STEPS = 200
+REVIEW_SCRIPT_TAIL_LINES = 20
+
+
+def _stage1_jobs(ledger: Ledger) -> int:
+    rnd = ledger.current_round()
+    return estimate(len(s.findings_of(rnd)), ledger.mode, ledger.reviewer, ledger.workers)["stage1"]
+
+
+def cmd_start(args) -> int:
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        code, run_dir = _init(args, print_next=False)
+    print(buffer.getvalue(), end="")
+    if run_dir is None:
+        return code
+    if _model_warnings(buffer.getvalue()):
+        return _go_stop(run_dir, MODEL_WARNING_STOP, [])
+    ledger = s.load_ledger(run_dir)
+    jobs = _stage1_jobs(ledger)
+    if jobs > START_JOBS_LIMIT and not args.severity:
+        print(f"멈춤: 1단계 작업이 {jobs}개로 {START_JOBS_LIMIT}개를 넘는다. 「전부 / Critical·Warning만」을 사용자에게 묻는다")
+        print("다음:")
+        print(f"  전부: {s._cmd('go', run_dir)}")
+        print(f"  Critical·Warning만: {s._cmd('cleanup', run_dir)} 뒤 같은 인자에 --severity Critical,Warning 을 붙여 CF start")
+        return 0
+    return _advance(run_dir, None, None, None)
+
+
+def cmd_go(args) -> int:
+    return _advance(Path(args.run_dir), args.workflow_output, args.workflow, args.allow_repro)
+
+
+def _model_warnings(text: str) -> list[str]:
+    return MODEL_WARNING.findall(text)
+
+
+def _run_review_script(command: str) -> tuple[str | None, tuple[str, int] | None]:
+    """검토 스크립트(RR·CR)를 돌린다. 반환: (참고 줄, 멈춤(이유, 종료 코드)).
+
+    실행 전에 옛 로그·결과를 치워 이번 시도가 쓴 것만 남긴다. 스크립트가 로그를 쓰고 끝난 실패는 다음 단계(opinion·recheck)가
+    로그로 가른다. 로그 없이 끝났으면 종료 코드 77(로그인 필요)은 로그인 안내로, 그 밖은 이번 stderr와 함께 오류로 멈춘다(대체하지 않는다)."""
+    argv = shlex.split(command)
+    out = Path(argv[argv.index("--out") + 1]) if "--out" in argv and argv.index("--out") + 1 < len(argv) else None
+    if out:
+        out.unlink(missing_ok=True)
+        Path(f"{out}.final").unlink(missing_ok=True)
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True)
+    except OSError as e:
+        return None, (f"검토 스크립트를 실행하지 못했다: {e}", 1)
+    if not result.returncode:
+        return None, None
+    note = f"참고: 검토 스크립트가 종료 코드 {result.returncode}로 끝났다. 결과가 없으면 다음 단계가 대체 실행으로 처리한다"
+    if out and out.is_file():
+        return note, None
+    detail = "\n".join(result.stderr.strip().splitlines()[-REVIEW_SCRIPT_TAIL_LINES:]
+                       + result.stdout.strip().splitlines()[-REVIEW_SCRIPT_TAIL_LINES:])
+    if result.returncode == 77:
+        runner = RUNNER_CURSOR if argv[0] == str(s.CURSOR_REVIEW) else RUNNER_CODEX
+        return None, (f"로그인이 필요하다 — {LOGIN_HINTS[runner]}\n{detail}", 0)
+    return None, (f"검토 스크립트가 로그 없이 종료 코드 {result.returncode}로 끝났다. 대체하지 않는다\n{detail}", 1)
+
+
+def _review_model_warnings(ledger: Ledger, argv: list[str]) -> list[str]:
+    """Claude 검토자 Workflow 결과(opinion·recheck)는 단계를 기록하기 전에 모델 ID를 본다. 기록한 뒤에는 되돌릴 수 없다."""
+    if argv[0] not in ("opinion", "recheck"):
+        return []
+    option = "--results" if "--results" in argv else "--result"
+    result = argv[argv.index(option) + 1] if option in argv and argv.index(option) + 1 < len(argv) else ""
+    if not result.endswith(".json") or not Path(result).is_file():
+        return []
+    try:
+        items = s.read_json(Path(result)).get("results", [])
+    except (OSError, ValueError, AttributeError):
+        return []
+    expected = s.review_cell(ledger, argv[0])["model"]
+    warnings = [model_warning(item["id"], item["output"].get("model_id"), expected) for item in items
+                if isinstance(item, dict) and isinstance(item.get("output"), dict) and isinstance(item.get("id"), str)]
+    return [w for w in warnings if w]
+
+
+def _run_step(argv: list[str]) -> tuple[int, str]:
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        code = main(argv)
+    lines = buffer.getvalue().rstrip("\n").splitlines()
+    for index in range(len(lines) - 1, -1, -1):
+        if lines[index] == "다음:":
+            if all(line.startswith("  ") for line in lines[index + 1:]):
+                lines = lines[:index]
+            break
+    return code, "\n".join(lines)
+
+
+def _save_workflow_result(action: s.Action, output: Path) -> None:
+    try:
+        result = json.loads(Path(output).read_text(encoding="utf-8"))["result"]
+        got = {item["id"] for item in result["results"]}
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise s.CliError(f"Workflow 완료 알림의 output-file에서 결과를 읽지 못했다: {output} ({e})", ExitCodes.PARSE_ERROR) from None
+    expected = {job["id"] for job in s.read_json(action.args_path)["jobs"]}
+    if got != expected:
+        raise s.CliError(f"이 Workflow 결과의 작업이 기다리는 작업과 다르다(받은 {len(got)}건, 기다리는 {len(expected)}건): {action.args_path.name}",
+                         ExitCodes.PARSE_ERROR)
+    action.out_path.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+
+
+def _usage_argv(action: s.Action, run_dir: Path, workflow: str) -> list[str]:
+    folder = action.args_path.parent
+    round_no = re.fullmatch(r"round-(\d+)", folder.name)
+    return ["usage", "--run-dir", str(run_dir), "--round", round_no.group(1), "--workflow", workflow]
+
+
+def _pick_workflow(pending: list[s.Action], saved: list[s.Action], output: str | None) -> s.Action | None:
+    """결과를 줄 Workflow 단계. 기다리는 것을 먼저 보고, 없으면 저장했지만 끝나지 않은 단계(뒤 명령이 실패한 단계)를 본다.
+    둘 이상이면 작업 id가 맞는 쪽을 고른다."""
+    candidates = [*pending, *saved]
+    if not output or len(candidates) < 2:
+        return candidates[0] if candidates else None
+    try:
+        got = {item["id"] for item in json.loads(Path(output).read_text(encoding="utf-8"))["result"]["results"]}
+    except (OSError, ValueError, KeyError, TypeError):
+        return candidates[0]
+    return next((a for a in candidates if {job["id"] for job in s.read_json(a.args_path)["jobs"]} == got), candidates[0])
+
+
+def _go_stop(run_dir: Path, reason: str, actions: list[s.Action], then: str | None = None) -> int:
+    shown = [action for action in actions if not action.hidden]
+    print(f"멈춤: {reason}")
+    print("다음:")
+    for action in shown:
+        print(f"  {action.text}")
+    if then:
+        print(f"  {then}")
+    elif any(action.kind == "workflow" for action in shown):
+        print(f"  (Workflow가 끝나면) {s._cmd('go', run_dir, '--workflow-output <완료 알림의 output-file>', '--workflow <Workflow 실행 id>')}")
+    return 0
+
+
+def _advance(run_dir: Path, output: str | None, workflow: str | None, allow_repro: str | None) -> int:
+    used = []
+    try:
+        with s.go_lock(run_dir):
+            code = _advance_steps(run_dir, output, workflow, allow_repro, used)
+    except s.CliError as e:
+        if e.message != "go가 이미 돈다":
+            raise
+        print("멈춤: go가 이미 돈다. 그 go가 끝난 뒤 알림을 읽고 필요하면 다시 부른다")
+        return 0
+    if output and not used:
+        print(f"참고: 기다리는 Workflow가 없어 --workflow-output {output} 은 쓰지 않았다")
+    return code
+
+
+def _advance_steps(run_dir: Path, output: str | None, workflow: str | None, allow_repro: str | None, used: list) -> int:
+    seen = None
+    for _ in range(GO_MAX_STEPS):
+        ledger = s.load_ledger(run_dir)
+        actions = s.next_actions(ledger, run_dir)
+        steps = [a for a in actions if a.kind != "note" and not (a.kind == "workflow" and a.out_path.is_file())]
+        if not steps:
+            return _go_stop(run_dir, "할 일이 없다", actions)
+        flows = [a for a in steps if a.kind == "workflow"]
+        target = _pick_workflow(flows, [a for a in actions if a.kind == "workflow" and a not in flows], output)
+        if output and target:
+            _save_workflow_result(target, Path(output))
+            print(f"Workflow 결과를 저장했다: {target.out_path}")
+            if workflow:
+                code, text = _run_step(_usage_argv(target, run_dir, workflow))
+                print(text)
+            else:
+                print("Claude 토큰 미측정: --workflow 를 주지 않았다")
+            output = None
+            used.append(True)
+            continue
+        first = steps[0]
+        if first.kind == "cmd" and first.background:
+            if s.workers_running(run_dir):
+                if flows:
+                    return _go_stop(run_dir, "workers가 돌고 있다. 같은 단계를 다시 띄우지 않고 남은 Workflow만 띄운다", flows)
+                return _go_stop(run_dir, "workers가 돌고 있다. 같은 단계를 다시 띄우지 않는다", [], then=f"(workers가 끝나면) {s._cmd('go', run_dir)}")
+            if [a.text for a in s.next_actions(s.load_ledger(run_dir), run_dir)] != [a.text for a in actions]:
+                continue
+        if first.kind == "workflow":
+            return _go_stop(run_dir, "Workflow 결과가 필요하다", actions)
+        if first.kind == "cmd" and first.background and flows:
+            return _go_stop(run_dir, "workers와 Workflow를 동시에 띄운다", actions)
+        if first.kind == "cmd" and first.argv[0] == "cleanup":
+            return _go_stop(run_dir, "report까지 끝났다. 보고 뒤 보류 후보 선택을 받고 cleanup 한다", actions)
+        signature = [a.text for a in steps]
+        if signature == seen:
+            print("오류: 같은 단계를 다시 해도 진행되지 않는다. CF status 로 상태를 본다")
+            return 1
+        seen = signature
+        if first.kind == "shell":
+            note, stop = _run_review_script(first.text)
+            if note:
+                print(note)
+            if stop:
+                reason, code = stop
+                if code:
+                    print(f"오류: {reason}")
+                    return code
+                return _go_stop(run_dir, reason, [], then=f"(로그인한 뒤) {s._cmd('go', run_dir)}")
+            first = steps[1]
+        argv = list(first.argv)
+        if first.argv[0] == "judge":
+            if any("--allow-repro" in a.text for a in actions if a.kind == "note"):
+                if not allow_repro:
+                    return _go_stop(run_dir, "PR 재현 명령 승인이 필요하다. 명령 목록을 사용자에게 보이고 승인받으면 go에 --allow-repro <파일>을 준다", actions)
+                argv += ["--allow-repro", allow_repro]
+        warnings = _review_model_warnings(ledger, argv)
+        if warnings:
+            print("\n".join(warnings))
+            return _go_stop(run_dir, REVIEW_WARNING_STOP, actions)
+        code, text = _run_step(argv)
+        print(text)
+        if code:
+            return code
+        if _model_warnings(text):
+            return _go_stop(run_dir, MODEL_WARNING_STOP, [])
+    print(f"오류: {GO_MAX_STEPS}단계를 넘겨도 끝나지 않았다. CF status 로 상태를 본다")
+    return 1
+
+
 def cmd_usage(args) -> int:
     if bool(args.run_dir) == bool(args.review_dir):
         raise s.CliError("--run-dir(과 --round)와 --review-dir 중 하나만 준다", ExitCodes.PARSE_ERROR)
@@ -2106,27 +2348,35 @@ def build_parser() -> argparse.ArgumentParser:
                             "external: 쓸 수 있는 Codex·Cursor CLI에 A·writer, B·checker 자리를 배정")
         p.add_argument("--cursor-model", help=f"Cursor 작업자 모델(기본 {DEFAULT_CURSOR_MODEL})")
 
+    def add_init_args(p):
+        p.add_argument("--source", choices=SOURCES, required=True)
+        p.add_argument("--input")
+        p.add_argument("--findings-json")
+        p.add_argument("--doc", action="append")
+        p.add_argument("--pr-repo")
+        p.add_argument("--me")
+        p.add_argument("--dry-run", action="store_true")
+        p.add_argument("--adopt-on-both-pass", action="store_true",
+                       help="코드 모드에서 같은 판정에 패치가 달라도 둘 다 검증을 통과하면 판가름 없이 작은 패치를 채택")
+        p.add_argument("--max-rechecks", type=int, default=2)
+        p.add_argument("--root")
+        p.add_argument("--consent", help="전송에 동의한 외부 수신처(codex,cursor 중 쉼표 구분, 또는 none). 기본: 이 프로필이 쓰는 수신처 전부")
+        p.add_argument("--reviewer", choices=REVIEWER_CHOICES,
+                       help="판가름 뒤 의견·재검토를 맡을 검토자(기본: 환경 변수 CASCADE_REVIEWER, 없으면 auto). "
+                            "auto: claude-* 입력이면 claude, 아니면 codex-review 스킬이 있으면 codex, 없으면 cursor를 쓸 수 있을 때 cursor, 아니면 claude")
+        p.add_argument("--review-model", help=f"Claude 검토자 모델(기본 {DEFAULT_MODEL})")
+        p.add_argument("--review-effort", choices=EFFORTS, help=f"Claude 검토자 effort(기본 {DEFAULT_EFFORT})")
+        p.add_argument("--profile", help="역할 프로필 이름(기본: 환경 변수 CASCADE_PROFILE, repos.toml, 없으면 내장 default)")
+        p.add_argument("--severity", help="이번 실행에서 처리할 등급(쉼표 구분, 예: Critical,Warning). 나머지는 보류 후보")
+        add_workers_args(p)
     p = add("init", cmd_init, run_dir=False, force=False)
-    p.add_argument("--source", choices=SOURCES, required=True)
-    p.add_argument("--input")
-    p.add_argument("--findings-json")
-    p.add_argument("--doc", action="append")
-    p.add_argument("--pr-repo")
-    p.add_argument("--me")
-    p.add_argument("--dry-run", action="store_true")
-    p.add_argument("--adopt-on-both-pass", action="store_true",
-                   help="코드 모드에서 같은 판정에 패치가 달라도 둘 다 검증을 통과하면 판가름 없이 작은 패치를 채택")
-    p.add_argument("--max-rechecks", type=int, default=2)
-    p.add_argument("--root")
-    p.add_argument("--consent", help="전송에 동의한 외부 수신처(codex,cursor 중 쉼표 구분, 또는 none). 기본: 이 프로필이 쓰는 수신처 전부")
-    p.add_argument("--reviewer", choices=REVIEWER_CHOICES,
-                   help="판가름 뒤 의견·재검토를 맡을 검토자(기본: 환경 변수 CASCADE_REVIEWER, 없으면 auto). "
-                        "auto: claude-* 입력이면 claude, 아니면 codex-review 스킬이 있으면 codex, 없으면 cursor를 쓸 수 있을 때 cursor, 아니면 claude")
-    p.add_argument("--review-model", help=f"Claude 검토자 모델(기본 {DEFAULT_MODEL})")
-    p.add_argument("--review-effort", choices=EFFORTS, help=f"Claude 검토자 effort(기본 {DEFAULT_EFFORT})")
-    p.add_argument("--profile", help="역할 프로필 이름(기본: 환경 변수 CASCADE_PROFILE, repos.toml, 없으면 내장 default)")
-    p.add_argument("--severity", help="이번 실행에서 처리할 등급(쉼표 구분, 예: Critical,Warning). 나머지는 보류 후보")
-    add_workers_args(p)
+    add_init_args(p)
+    p = add("start", cmd_start, run_dir=False, force=False)
+    add_init_args(p)
+    p = add("go", cmd_go, force=False)
+    p.add_argument("--workflow-output", help="Workflow 완료 알림의 output-file. 기다리는 Workflow 결과를 저장하고 이어 간다")
+    p.add_argument("--workflow", help="그 Workflow 실행 id(wf_…). 주면 CF usage도 한다")
+    p.add_argument("--allow-repro", help="사용자가 승인한 재현 명령 목록(judge에 넘긴다)")
     p = add("detect", cmd_detect, run_dir=False, force=False)
     p.add_argument("--input")
     p.add_argument("--doc", action="append", help="검토할 문서(설계·계획 문서). 변경으로 잡히지 않는 커밋한 문서도 지정한다")

@@ -57,7 +57,7 @@ PYTHONPATH="${CLAUDE_SKILL_DIR}" python3 -m cascade.cli
    - `detect`에 `참고: 이 기기 설정 전이다…` 줄이 있으면 선택지에 「먼저 설정」을 더한다. 고르면 「설정」 절을 마친 뒤 `detect`부터 다시 한다.
    - 사용자가 처음부터 `/cascade-fix`로 부르며 옵션까지 정했거나 「묻지 말고 진행」이라고 했으면 이 질문을 건너뛴다.
    - 이 확인(또는 사용자의 명시적 호출)이 이번 실행에서 Workflow 도구를 쓰라는 사용자의 요청이다. 사용자가 이 스킬을 직접 요청하지 않았고 확인도 받지 않았으면 Workflow를 돌리지 않는다.
-3. **끝까지 진행** — 아래 「절차」를 각 명령의 「다음:」 출력을 따라 이어 간다. 단계 사이에 사용자에게 묻지 않고, 진행 상황은 한 줄씩만 알린다. 첫 검토가 필요하면 「첫 검토」(`CF review`)부터 한다. 첫 검토 칸이 claude면 「Claude 단독 첫 검토」, codex·cursor면 「외부 첫 검토와 대체」를 따른다.
+3. **끝까지 진행** — 아래 「절차」의 「기본 경로: start와 go」를 따른다(멈춤 출력의 「다음:」이 다음 할 일이다). 단계 사이에 사용자에게 묻지도 알리지도 않는다(작업 목록 표시만 갱신한다). 첫 검토가 필요하면 「첫 검토」(`CF review`)부터 한다. 첫 검토 칸이 claude면 「Claude 단독 첫 검토」, codex·cursor면 「외부 첫 검토와 대체」를 따른다.
    - `init`이 출력한 「규모:」의 최대가 확인 때 말한 범위를 크게 넘으면(1단계 작업 10개 초과이고 등급을 고르지 않았으면) 한 번 더 묻는다: 「전부 / Critical·Warning만」. Critical·Warning만이면 `init`을 `--severity Critical,Warning`으로 다시 한다(앞 실행은 `cleanup`).
 4. **보고** — 「결과 보고 형식」대로 보고하고 사람이 고를 것을 묻는다.
 
@@ -200,6 +200,19 @@ Claude·Cursor·`codex-doc` 결과는 형식이 같아 형식으로는 가릴 �
 대상 저장소 루트에서 실행한다. 각 명령은 끝에 다음 할 일을 출력한다. 막히면 `CF status --run-dir <run_dir>`를 본다.
 
 `jobs`·`judge`·`adjudicate`·`apply`는 검증 명령과 테스트를 돌려 Bash 시간 제한을 넘길 수 있다. Bash 도구의 `run_in_background`로 돌리고 완료 알림을 기다린 뒤 출력을 읽는다.
+
+### 기본 경로: start와 go
+
+메인 세션은 두 명령과 Workflow 도구만 쓴다. 단계 명령(`jobs`·`judge`·`adjudicate`·`opinion`·`apply`·`recheck`·`report`)은 스크립트가 이어 부른다. 둘 다 `run_in_background`로 돌리고 완료 알림을 기다린 뒤 출력을 읽는다.
+
+1. `CF start <init 인자>` — `init` 뒤 `jobs`까지 한다. 출력의 `run_dir=`을 이후 명령에 준다. 1단계 작업이 10개를 넘고 `--severity`가 없으면 `init`에서 멈추고 「전부 / Critical·Warning만」을 묻는다(전부면 `CF go`, Critical·Warning만이면 `cleanup` 뒤 같은 인자에 `--severity Critical,Warning`을 붙여 `CF start`).
+2. `CF go --run-dir <run_dir> [--workflow-output <완료 알림의 output-file> --workflow <Workflow 실행 id>]` — 원장이 가리키는 다음 단계부터 멈출 곳까지 잇는다.
+   - Workflow 결과를 주면 `.result`를 `round-N/`의 해당 파일에 저장하고(`python3 -c` 옮기기가 필요 없다), `--workflow`를 줬으면 `CF usage`도 한 뒤 이어 간다. 기다리는 작업과 다른 결과면 종료 코드 5로 거절한다. 결과를 저장했지만 뒤 명령이 실패해 끝나지 않은 단계에 새 결과를 주면 그 결과로 바꾼다.
+   - 멈추면 `멈춤: <이유>`와 `다음:`을 출력한다. 멈추는 곳: Workflow가 필요할 때(그 줄대로 Workflow를 돌리고 끝나면 `CF go`를 다시 부른다), `workers`와 Workflow를 동시에 띄워야 할 때(「외부 작업자 칸」), PR 재현 명령 승인이 필요할 때(승인받으면 `--allow-repro <파일>`), `workers`가 이미 돌고 있을 때(끝나면 `CF go`를 다시 부른다), 단계 명령이 모델 ID 경고를 냈을 때(사용자에게 알린다. 쓰지 않으려면 `jobs --force`, 그대로 쓰려면 `CF go`), `report`까지 끝났을 때(`cleanup`은 하지 않는다), 단계 명령이 0이 아닌 종료 코드로 끝났을 때(그 코드로 끝난다. 4·5·6은 「멈추는 곳」).
+   - Codex·Cursor 의견·재검토 스크립트도 `go`가 순서대로 돌린다. 이미 한 단계는 다시 하지 않으므로 같은 `go`를 다시 불러도 된다.
+3. 보고하고 보류 후보 선택을 받으면 아래 13·14(`resume`·`cleanup`)를 한다.
+
+아래 1~14는 `start`·`go`가 부르는 개별 명령이다. 한 단계만 다시 하거나 직접 진행할 때 쓴다.
 
 1. **init** — `CF init --source <종류> --input <결과 파일|PR 번호> [--doc <문서>…] [--dry-run] [--adopt-on-both-pass] [--max-rechecks N] [--severity Critical,Warning] [--profile <이름>] [--consent <codex,cursor|none>] [--reviewer auto|codex|cursor|claude] [--workers claude|external] [--cursor-model M] [--review-model M] [--review-effort E]`
    - 출력의 `run_dir=<경로>`를 이후 모든 명령에 `--run-dir`로 준다. 「규모:」 줄에 회차당 에이전트 수가 나온다(외부 runner를 쓰면 Claude·Codex·Cursor 호출 수로 나뉘고, 프로필을 명시했으면 끝에 runner별 합계가 붙는다). `프로필:`·`참고:`·`덮음:`·`대체:`·`역할:`·`전송 동의:` 줄이 먼저 나온다(「역할 배정」). `--profile`·`--consent`는 「첫 검토」의 `CF review`에 준 것과 같은 값을 준다.
