@@ -99,6 +99,51 @@ class AdoptRecalcTest(unittest.TestCase):
                 self.assertFalse((out_rd / name).exists())
         self.assertTrue((rd / "adj-cli-args.json").is_file())
 
+    def test_recalc_recomputes_remaining_adjudication_event_when_only_some_are_dropped(self):
+        rd = self.round_dir()
+        ledger_path = self.runs / "x" / "ledger.json"
+        ledger = read(ledger_path)
+        rnd = ledger["rounds"][0]
+        rnd["findings"].append({**rnd["findings"][0], "id": "r1-02"})
+        rnd["decisions"].append({**rnd["decisions"][0], "finding_id": "r1-02"})
+        results = read(rd / "results.json")
+        results["r1-02:a"] = {**results["r1-01:a"], "finding_id": "r1-02"}
+        results["r1-02:b"] = {**results["r1-01:b"], "finding_id": "r1-02", "verdict": "아님"}
+        results["r1-02:adjudicator"] = {**results["r1-01:adjudicator"], "finding_id": "r1-02"}
+        write(rd / "results.json", results)
+        verify = read(rd / "verify.json")
+        verify["r1-02"] = verify["r1-01"]
+        write(rd / "verify.json", verify)
+        write(rd / "lossy.json", {**read(rd / "lossy.json"), "r1-02": {"a": False, "b": False}})
+        write(rd / "decisions.json", rnd["decisions"])
+        jobs = [{**read(rd / "adj-args.json")["jobs"][0], "id": f"{fid}:adjudicator"} for fid in ("r1-01", "r1-02")]
+        usage = {"r1-01:adjudicator": {"input_tokens": 100, "output_tokens": 10, "cached_input_tokens": 1000},
+                 "r1-02:adjudicator": {"input_tokens": 200, "output_tokens": 20, "cached_input_tokens": 2000}}
+        outcomes = [{"id": job["id"], "runner": "codex", "status": "limit" if job["id"].startswith("r1-01") else "ok",
+                     "output": {}, "usage": usage[job["id"]], "detail": ""} for job in jobs]
+        write(rd / "adj-args.json", {"jobs": []})
+        write(rd / "adj-cli-args.json", {"jobs": jobs})
+        write(rd / "adj-cli.json", {"results": [{"id": j["id"], "output": {}} for j in jobs], "outcomes": outcomes,
+                                    "fallback_runs": {"r1-01:adjudicator": {"runner": "cursor", "model": "m", "effort": "high"}},
+                                    "replaced": []})
+        (rd / "adj.json").unlink()
+        rnd["events"].append({
+            "step": "workers-adj", "at": "2026-10-29T00:00:00+09:00", "counts": {"limit": 1, "ok": 1},
+            "usage": {"codex": {"input": 300, "output": 30, "cache_read": 3000}},
+            "fallback": ["r1-01:adjudicator"], "fallback_runs": {"r1-01:adjudicator": "cursor"}})
+        write(ledger_path, ledger)
+        write(self.runs / "x" / "run" / "ledger.json", ledger)
+        code, _ = self.recalc()
+        self.assertEqual(code, 0)
+        self.assertTrue(read(self.out / "check.json")["ok"])
+        for path in (self.out / "x" / "ledger.json", self.out / "x" / "run" / "ledger.json"):
+            with self.subTest(path=path.parent.name):
+                event = next(e for e in read(path)["rounds"][0]["events"] if e["step"] == "workers-adj")
+                self.assertEqual(event["counts"], {"ok": 1})
+                self.assertEqual(event["usage"], {"codex": {"input": 200, "output": 20, "cache_read": 2000}})
+                self.assertEqual(event["fallback"], [])
+                self.assertEqual(event["fallback_runs"], {})
+
     def test_recalc_applies_lossy_like_judge(self):
         write(self.round_dir() / "lossy.json", {"r1-01": {"a": True, "b": False}})
         code, _ = self.recalc()

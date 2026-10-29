@@ -3,6 +3,7 @@ import json
 import shutil
 import sys
 import tomllib
+from collections import Counter
 from pathlib import Path
 
 SKILL_ROOT = Path(__file__).resolve().parent.parent
@@ -12,12 +13,16 @@ from cascade.cli import LOSSY_FILE, PRE_FINAL_DECISIONS  # noqa: E402
 from cascade.config import ConfigError, RepoConfig, load_repo_config  # noqa: E402
 from cascade.consensus import OUTCOME_ADJUDICATE, OUTCOME_UNDECIDABLE, Decision, WorkerResult, decide  # noqa: E402
 from cascade.patches import changed_files  # noqa: E402
+from cascade.runners import STATUS_OK, Outcome  # noqa: E402
 from cascade.verify import VerifyResult  # noqa: E402
+from cascade.workers import usage_totals  # noqa: E402
 from score import COST_CORE, COUNTERFACTUAL_FILE, TOKEN_KEYS, read_json, read_optional, stored_number  # noqa: E402
 
 ROUND_DIR = "round-1"
 ADJ_ARGS, ADJ_RESULTS = "adj-args.json", "adj.json"
-ADJ_ARTIFACTS = ((ADJ_ARGS, ADJ_RESULTS), ("adj-cli-args.json", "adj-cli.json"),
+ADJ_CLI_RESULTS = "adj-cli.json"
+STEP_WORKERS_ADJ = "workers-adj"
+ADJ_ARTIFACTS = ((ADJ_ARGS, ADJ_RESULTS), ("adj-cli-args.json", ADJ_CLI_RESULTS),
                  ("adj-fallback-args.json", "adj-fallback.json"))
 STEP_ADJUDICATE = "adjudicate"
 ADJUDICATOR = "adjudicator"
@@ -154,7 +159,21 @@ def replace_decision(decisions: list, new: dict) -> list:
     return [{**new, "adopted_as": None} if d.get("finding_id") == new["finding_id"] else d for d in decisions]
 
 
-def rewrite_ledger(path: Path, flipped: list[dict], drop_event: bool) -> None:
+def remaining_workers_event(event: dict, results: dict) -> dict:
+    """남은 판가름 결과로 workers-adj 이벤트의 건수·토큰·대체 실행 집계를 다시 계산한다."""
+    replaced = {o["id"]: o for o in results.get("replaced", [])}
+    second = [o for o in results.get("outcomes", []) if o["id"] in replaced]
+    first = [replaced.get(o["id"], o) for o in results.get("outcomes", [])]
+    fresh = {
+        "counts": dict(Counter(o["status"] for o in first)),
+        "usage": usage_totals([Outcome(**o) for o in [*first, *second]]),
+        "fallback": [o["id"] for o in first if o["status"] != STATUS_OK],
+        "fallback_runs": {job_id: spec["runner"] for job_id, spec in results.get("fallback_runs", {}).items()},
+    }
+    return {**event, **{key: value for key, value in fresh.items() if key in event}}
+
+
+def rewrite_ledger(path: Path, flipped: list[dict], drop_event: bool, rd: Path) -> None:
     if not path.is_file():
         return
     ledger = read_json(path)
@@ -162,8 +181,13 @@ def rewrite_ledger(path: Path, flipped: list[dict], drop_event: bool) -> None:
     for row in flipped:
         rnd["decisions"] = replace_decision(rnd["decisions"], row["on"])
     if drop_event:
-        dropped = {STEP_ADJUDICATE, "workers-adj"}
+        dropped = {STEP_ADJUDICATE, STEP_WORKERS_ADJ}
         rnd["events"] = [e for e in rnd.get("events", []) if e.get("step") not in dropped]
+    else:
+        results = read_optional(rd / ADJ_CLI_RESULTS)
+        if isinstance(results, dict):
+            rnd["events"] = [remaining_workers_event(e, results) if e.get("step") == STEP_WORKERS_ADJ else e
+                             for e in rnd.get("events", [])]
     write_json(path, ledger)
 
 
@@ -219,7 +243,7 @@ def flip_item(out_base: Path, flipped: list[dict]) -> None:
     drop_usage(rd, dropped)
     drop_event = drop_adjudications(rd, dropped)
     for ledger_path in (out_base / "ledger.json", out_base / "run" / "ledger.json"):
-        rewrite_ledger(ledger_path, flipped, drop_event)
+        rewrite_ledger(ledger_path, flipped, drop_event, rd)
     for name in ("decisions.json", PRE_FINAL_DECISIONS):
         rewrite_decisions(rd / name, flipped)
 
