@@ -93,9 +93,11 @@ from cascade.rounds import (
 )
 from cascade.runners import (
     DETAIL_TAIL,
+    MAX_PARALLEL,
     RUNNER_CODEX,
     RUNNER_CURSOR,
     STATUS_OK,
+    STATUS_SKIPPED,
     ClaudeRunner,
     CliJob,
     CodexRunner,
@@ -782,6 +784,8 @@ def _reopen_round(ledger, rnd, rd: Path) -> None:
     if (rd / s.USAGE_FILE).is_file():
         k = next(n for n in itertools.count(1) if not (rd / f"claude-usage.superseded-{n}.json").exists())
         (rd / s.USAGE_FILE).rename(rd / f"claude-usage.superseded-{k}.json")
+    s.clear_cli_outputs(rd, s.STAGE_ADJ, s.STAGE_OPINION)
+    (rd / "adj-cli-args.json").unlink(missing_ok=True)
     for path in rd.glob("opinion-*"):
         path.unlink()
 
@@ -882,11 +886,11 @@ def _cli_runners(jobs: list[CliJob]) -> dict[str, object]:
     return runners
 
 
-def _run_cli_jobs(jobs: list[CliJob], exhausted: dict[str, dict]) -> list:
+def _run_cli_jobs(jobs: list[CliJob], exhausted: dict[str, dict], max_parallel: int = MAX_PARALLEL) -> list:
     """실행기를 만들어 돌리고, 상주 서버(Cursor ACP)를 둔 실행기는 끝나면 닫는다."""
     runners = _cli_runners(jobs)
     try:
-        return run_all(jobs, runners, exhausted=exhausted)
+        return run_all(jobs, runners, max_parallel=max_parallel, exhausted=exhausted)
     finally:
         for runner in runners.values():
             close = getattr(runner, "close", None)
@@ -963,11 +967,14 @@ def _workers(args) -> int:
     if not s.step_done(rnd, "jobs"):
         raise s.CliError(f"회차 {rnd.no}의 jobs 단계를 먼저 한다")
     if s.judged_after_workers_input(rnd, args.stage):
-        raise s.CliError(f"회차 {rnd.no}의 judge를 이미 했다. 작업자 결과를 다시 만들려면 jobs --force로 회차를 다시 연다")
+        consumer = {s.STAGE_ADJ: "adjudicate", s.STAGE_OPINION: "opinion/apply"}.get(args.stage, "judge")
+        raise s.CliError(f"회차 {rnd.no}의 {consumer}를 이미 했다. 작업자 결과를 다시 만들려면 jobs --force로 회차를 다시 연다")
     if s.workers_done(rnd, args.stage) and not args.force:
         raise s.CliError(f"회차 {rnd.no}의 {step} 단계는 이미 했다. 다시 하려면 --force 를 붙인다")
     if args.stage == s.STAGE_CHECKER and not s.checker_pending(rnd):
         raise s.CliError(f"회차 {rnd.no}의 judge 단계를 먼저 한다(1차 호출이 점검자 작업을 만든다)")
+    if args.stage in (s.STAGE_ADJ, s.STAGE_OPINION) and not s.step_done(rnd, s.STAGE_INPUTS[args.stage]):
+        raise s.CliError(f"회차 {rnd.no}의 {s.STAGE_INPUTS[args.stage]} 단계를 먼저 한다")
     rd = s.round_dir(run_dir, rnd.no)
     cli_args = rd / f"{args.stage}-cli-args.json"
     if not cli_args.is_file():
@@ -977,9 +984,13 @@ def _workers(args) -> int:
     _pin_worktrees(rd / WORKTREE_INPUTS, [job.worktree for job in jobs if job.writable])
     profile = assignment.ledger_profile(ledger)
     cells = assignment.mode_workers(profile["roles"], ledger.mode)
-    exhausted = s.exhausted_runners(rnd)
-    first = _run_cli_jobs(jobs, exhausted)
-    reruns, second = _rerun_with_fallbacks(entries, first, cells, set(profile["consented"]), exhausted)
+    exhausted = {} if args.stage == s.STAGE_OPINION and args.force else s.exhausted_runners(
+        rnd, args.stage if args.stage == s.STAGE_OPINION else None)
+    if args.stage == s.STAGE_ADJ:
+        cells["adjudicator"] = assignment.adjudicator_cell(ledger)
+    first = _run_cli_jobs(jobs, exhausted, max_parallel=1) if args.stage == s.STAGE_OPINION else _run_cli_jobs(jobs, exhausted)
+    reruns, second = ({}, {}) if args.stage in (s.STAGE_ADJ, s.STAGE_OPINION) else _rerun_with_fallbacks(
+        entries, first, cells, set(profile["consented"]), exhausted)
     outcomes = [second.get(o.id, o) for o in first]
     out = rd / f"{args.stage}-cli.json"
     s.write_json(out, {"results": [{"id": o.id, "output": o.output} for o in outcomes],
@@ -993,7 +1004,7 @@ def _workers(args) -> int:
     (rd / f"{args.stage}-fallback.json").unlink(missing_ok=True)
     if args.stage == s.STAGE1:
         s.clear_cli_outputs(rd, s.STAGE_CHECKER)
-    if unresolved:
+    if unresolved and args.stage != s.STAGE_OPINION:
         s.write_json(fallback_args, {"jobs": [s.fallback_job(e, cells.get(e["role"], {}))
                                               for e in entries if e["id"] in unresolved]})
     else:
@@ -1002,16 +1013,24 @@ def _workers(args) -> int:
     _record_claude_usage(rd, ledger.mode, entries, [*first, *second.values()], args.stage)
     ledger = s.load_ledger(run_dir)
     rnd = s.get_round(ledger, args.round)
-    s.mark(rnd, step, counts=counts, usage=usage_totals([*first, *second.values()]), fallback=failed,
+    s.mark(rnd, step, counts=counts, usage=usage_totals([*first, *second.values()]),
+           fallback=[] if args.stage == s.STAGE_OPINION else failed,
+           **({"failed": failed} if args.stage == s.STAGE_OPINION else {}),
            fallback_runs={job_id: spec["runner"] for job_id, spec in reruns.items()},
            **({"exhausted": exhausted} if exhausted else {}))
     s.save_ledger(run_dir, ledger)
     n, reasons = fallback_counts(counts)
     rerun_ok = sum(1 for o in second.values() if o.status == STATUS_OK)
-    print(f"CLI 작업 {len(outcomes)}건: 성공 {counts.get(STATUS_OK, 0)}, 대체 실행 {n}" + (f"({reasons})" if n else "")
-          + (f" → 외부 재실행 성공 {rerun_ok}, Claude 대체 {len(unresolved)}" if n else ""))
+    if args.stage == s.STAGE_OPINION:
+        print(f"CLI 작업 {len(outcomes)}건: 성공 {counts.get(STATUS_OK, 0)}, 의견 없음 {len(unresolved)}")
+    else:
+        print(f"CLI 작업 {len(outcomes)}건: 성공 {counts.get(STATUS_OK, 0)}, 대체 실행 {n}" + (f"({reasons})" if n else "")
+              + (f" → 외부 재실행 성공 {rerun_ok}, Claude 대체 {len(unresolved)}" if n else ""))
     if reruns:
         print(f"외부 CLI로 다시 돌린 작업 {len(reruns)}건: " + ", ".join(f"{i}→{spec['runner']}" for i, spec in reruns.items()))
+    skipped = [o for o in [*first, *second.values()] if o.status == STATUS_SKIPPED]
+    if skipped:
+        print("건너뛴 작업: " + "; ".join(dict.fromkeys(o.detail.replace("\n", " ") for o in skipped)))
     print(f"결과: {out}")
     _print_next(ledger, run_dir)
     return 0
@@ -1139,8 +1158,18 @@ def cmd_judge(args) -> int:
             _pin_worktrees(rd / WORKTREE_INPUTS, [wt])
             adj_items.append(s.adj_input(ledger, by_id[d.finding_id], merged, verify, wt, cfg, d.reasons))
     if adj_items:
-        adj_jobs = build_adjudicator_jobs(adj_items, assignment.adjudicator_cell(ledger))
-        s.write_json(rd / "adj-args.json", write_job_args(adj_jobs, rd / "prompts"))
+        claude_cli = ledger.claude_via == CLAUDE_VIA_CLI
+        adj_jobs = build_adjudicator_jobs(adj_items, assignment.adjudicator_cell(ledger), claude_cli)
+        if claude_cli:
+            claude_args, cli_args = split_job_args(adj_jobs, rd / "prompts", claude_cli=True)
+            s.write_json(rd / "adj-args.json", claude_args)
+            s.write_json(rd / "adj-cli-args.json", cli_args)
+        else:
+            s.write_json(rd / "adj-args.json", write_job_args(adj_jobs, rd / "prompts"))
+    elif ledger.claude_via == CLAUDE_VIA_CLI:
+        s.clear_cli_outputs(rd, s.STAGE_ADJ)
+        for name in ("adj-args.json", "adj-cli-args.json"):
+            (rd / name).unlink(missing_ok=True)
     held = {f["id"] for f in rnd.hold_findings}
     rnd.decisions = [d for d in rnd.decisions if d["finding_id"] in held] + [d.to_dict() for d in decisions]
     s.write_json(rd / "decisions.json", rnd.decisions)
@@ -1178,9 +1207,16 @@ def cmd_adjudicate(args) -> int:
     cfg = s.cfg_for(ledger.source, Path(ledger.root))
     snap = s.snapshot_of(ledger)
     rd = s.round_dir(run_dir, rnd.no)
-    results = read_results(s.read_json(args.results))
+    loaded_ids = {}
+    if args.results:
+        data = s.read_json(args.results)
+    elif (rd / "adj-cli-args.json").is_file():
+        data, loaded_ids = s.stage_inputs(run_dir, rnd, rd, s.STAGE_ADJ, None, "--results")
+    else:
+        raise s.CliError("--results 가 필요하다: adj-args.json 의 Workflow 결과를 준다")
+    results = read_results(data)
     expected = assignment.adjudicator_cell(ledger)["model"]
-    for warning in s.model_warnings(results, {key: expected for key, r in results.items() if r.role == "adjudicator"}):
+    for warning in s.model_warnings(results, {**{key: expected for key, r in results.items() if r.role == "adjudicator"}, **loaded_ids}):
         print(warning)
     merged = s.read_json(rd / "results.json")
     verify = s.read_json(rd / "verify.json")
@@ -1218,7 +1254,9 @@ def cmd_adjudicate(args) -> int:
         new_decisions.append(new.to_dict())
     rnd.decisions = new_decisions
     if opinion_jobs and s.is_claude(ledger, "opinion"):
-        s.write_review_args(rd, s.OPINION_ARGS, ledger, opinion_jobs, "opinion")
+        claude_cli = ledger.claude_via == CLAUDE_VIA_CLI and s.base_name(rnd) in snap.worktrees
+        name = "opinion-cli-args.json" if claude_cli else s.OPINION_ARGS
+        s.write_review_args(rd, name, ledger, opinion_jobs, "opinion", claude_cli)
     s.write_json(rd / "results.json", merged)
     s.write_json(rd / "verify.json", verify)
     s.write_json(rd / "decisions.json", rnd.decisions)
@@ -2464,13 +2502,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--review-dir", help="CF review가 만든 첫 검토 폴더(review_dir=로 찍힌 곳)")
     p.add_argument("--workflow", required=True, help="Workflow 실행 id 또는 그 기록 폴더 경로")
     p = add("workers", cmd_workers, round_no=True)
-    p.add_argument("--stage", choices=(s.STAGE1, s.STAGE_CHECKER), required=True)
+    p.add_argument("--stage", choices=(s.STAGE1, s.STAGE_CHECKER, s.STAGE_ADJ, s.STAGE_OPINION), required=True)
     p = add("judge", cmd_judge, round_no=True)
     p.add_argument("--results")
     p.add_argument("--checker-results")
     p.add_argument("--allow-repro")
     p = add("adjudicate", cmd_adjudicate, round_no=True)
-    p.add_argument("--results", required=True)
+    p.add_argument("--results")
     p = add("opinion", cmd_opinion, round_no=True)
     p.add_argument("--id")
     p.add_argument("--result")

@@ -75,6 +75,30 @@ class AdoptRecalcTest(unittest.TestCase):
         self.assertEqual((self.round_dir() / "results.json").read_text(encoding="utf-8"), before)
         self.assertTrue((self.round_dir() / "adj-args.json").is_file())
 
+    def test_recalc_handles_cli_adjudication_files(self):
+        rd = self.round_dir()
+        jobs = read(rd / "adj-args.json")["jobs"]
+        write(rd / "adj-args.json", {"jobs": []})
+        write(rd / "adj-cli-args.json", {"jobs": jobs})
+        write(rd / "adj-cli.json", {"results": [{"id": j["id"], "output": {}} for j in jobs],
+                                    "outcomes": [{"id": j["id"], "status": "ok"} for j in jobs],
+                                    "fallback_runs": {}, "replaced": []})
+        (rd / "adj.json").unlink()
+        ledger_path = self.runs / "x" / "ledger.json"
+        ledger = read(ledger_path)
+        ledger["rounds"][0]["events"].append({"step": "workers-adj", "at": "2026-10-29T00:00:00+09:00"})
+        write(ledger_path, ledger)
+        code, _ = self.recalc()
+        self.assertEqual(code, 0)
+        self.assertTrue(read(self.out / "check.json")["ok"])
+        steps = [e["step"] for e in read(self.out / "x" / "ledger.json")["rounds"][0]["events"]]
+        self.assertNotIn("workers-adj", steps)
+        out_rd = self.round_dir(self.out)
+        for name in ("adj-args.json", "adj-cli-args.json", "adj-cli.json"):
+            with self.subTest(name=name):
+                self.assertFalse((out_rd / name).exists())
+        self.assertTrue((rd / "adj-cli-args.json").is_file())
+
     def test_recalc_applies_lossy_like_judge(self):
         write(self.round_dir() / "lossy.json", {"r1-01": {"a": True, "b": False}})
         code, _ = self.recalc()

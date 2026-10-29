@@ -17,6 +17,8 @@ from score import COST_CORE, COUNTERFACTUAL_FILE, TOKEN_KEYS, read_json, read_op
 
 ROUND_DIR = "round-1"
 ADJ_ARGS, ADJ_RESULTS = "adj-args.json", "adj.json"
+ADJ_ARTIFACTS = ((ADJ_ARGS, ADJ_RESULTS), ("adj-cli-args.json", "adj-cli.json"),
+                 ("adj-fallback-args.json", "adj-fallback.json"))
 STEP_ADJUDICATE = "adjudicate"
 ADJUDICATOR = "adjudicator"
 MODE_CODE = "code"
@@ -61,9 +63,12 @@ def finding_ids(rnd: dict) -> list[str]:
 
 
 def adjudication_ids(rd: Path) -> set[str]:
-    data = read_optional(rd / ADJ_ARGS)
-    jobs = data.get("jobs") if isinstance(data, dict) else None
-    return {job["id"] for job in jobs or [] if isinstance(job, dict) and isinstance(job.get("id"), str)}
+    ids = set()
+    for args_name, _ in ADJ_ARTIFACTS:
+        data = read_optional(rd / args_name)
+        jobs = data.get("jobs") if isinstance(data, dict) else None
+        ids.update(job["id"] for job in jobs or [] if isinstance(job, dict) and isinstance(job.get("id"), str))
+    return ids
 
 
 def adjudicator_id(fid: str) -> str:
@@ -157,7 +162,8 @@ def rewrite_ledger(path: Path, flipped: list[dict], drop_event: bool) -> None:
     for row in flipped:
         rnd["decisions"] = replace_decision(rnd["decisions"], row["on"])
     if drop_event:
-        rnd["events"] = [e for e in rnd.get("events", []) if e.get("step") != STEP_ADJUDICATE]
+        dropped = {STEP_ADJUDICATE, "workers-adj"}
+        rnd["events"] = [e for e in rnd.get("events", []) if e.get("step") not in dropped]
     write_json(path, ledger)
 
 
@@ -171,19 +177,28 @@ def rewrite_decisions(path: Path, flipped: list[dict]) -> None:
 
 def drop_adjudications(rd: Path, dropped: set[str]) -> bool:
     """판가름 작업과 결과를 지운다. 이 회차에 판가름이 하나도 안 남으면 True."""
-    args = read_optional(rd / ADJ_ARGS)
-    if isinstance(args, dict):
+    had_args = False
+    for args_name, results_name in ADJ_ARTIFACTS:
+        args = read_optional(rd / args_name)
+        if not isinstance(args, dict):
+            continue
+        had_args = True
         jobs = [job for job in args.get("jobs", []) if job.get("id") not in dropped]
-        results = read_optional(rd / ADJ_RESULTS)
+        results = read_optional(rd / results_name)
         if jobs:
-            write_json(rd / ADJ_ARGS, {**args, "jobs": jobs})
+            write_json(rd / args_name, {**args, "jobs": jobs})
             if isinstance(results, dict):
-                write_json(rd / ADJ_RESULTS, {**results, "results": [r for r in results.get("results", []) if r.get("id") not in dropped]})
+                results = {**results, "results": [r for r in results.get("results", []) if r.get("id") not in dropped]}
+                for key in ("outcomes", "replaced"):
+                    if key in results:
+                        results[key] = [r for r in results[key] if r.get("id") not in dropped]
+                if "fallback_runs" in results:
+                    results["fallback_runs"] = {k: v for k, v in results["fallback_runs"].items() if k not in dropped}
+                write_json(rd / results_name, results)
         else:
-            (rd / ADJ_ARGS).unlink()
-            (rd / ADJ_RESULTS).unlink(missing_ok=True)
-        return not jobs
-    return False
+            (rd / args_name).unlink()
+            (rd / results_name).unlink(missing_ok=True)
+    return had_args and not adjudication_ids(rd)
 
 
 def drop_usage(rd: Path, dropped: set[str]) -> None:
@@ -220,7 +235,7 @@ def check_item(base: Path, out_base: Path, rows: list[dict]) -> tuple[list[dict]
         off_adjudicates = row["off"]["outcome"] == OUTCOME_ADJUDICATE
         if off_adjudicates != row["adjudication_in_ledger"]:
             found.append(mismatch(item, "branch", f"{row['finding_id']}: 끈 재계산은 {row['off']['outcome']}인데 원장의 "
-                                  f"{ADJ_ARGS}는 {'있다' if row['adjudication_in_ledger'] else '없다'}"))
+                                  f"판가름 작업은 {'있다' if row['adjudication_in_ledger'] else '없다'}"))
         if row["flipped"] and row["lossy_unknown"]:
             found.append(mismatch(item, "lossy", f"{row['finding_id']}: 손실 여부 미확인({LOSSY_FILE}에 기록이 없다)"))
     flipped = [row for row in rows if row["flipped"]]

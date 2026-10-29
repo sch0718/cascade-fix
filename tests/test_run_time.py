@@ -56,6 +56,16 @@ class RunTimeTest(unittest.TestCase):
         got = run_time.cascade_item(d, self.projects)
         self.assertEqual((got["claude_s"], got["cli_s"], got["missing"]), (270.0, 70.0, []))
 
+    def test_cli_seconds_measures_each_stage_from_its_own_input(self):
+        ledger = {"rounds": [{"events": [
+            {"step": "jobs", "at": "2026-10-26T10:00:00+09:00"},
+            {"step": "workers-stage1", "at": "2026-10-26T10:01:00+09:00"},
+            {"step": "judge", "at": "2026-10-26T10:05:00+09:00"},
+            {"step": "workers-adj", "at": "2026-10-26T10:06:00+09:00"},
+            {"step": "workers-opinion", "at": "2026-10-26T10:09:00+09:00"},
+        ]}]}
+        self.assertEqual(run_time.cli_seconds(ledger), 120.0)
+
     def test_counterfactual_rows_drop_adjudicator_time(self):
         d = self.item("i2", [{"label": "f1 b"}], [])
         self.assertEqual(run_time.cascade_item(d, self.projects)["claude_s"], 90.0)

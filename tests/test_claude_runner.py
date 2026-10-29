@@ -20,6 +20,7 @@ from cascade.runners import (  # noqa: E402
     ClaudeRunner,
     CliJob,
     find_claude,
+    _check_output,
 )
 from fake_cli import CLAUDE_BODY, install, result_json  # noqa: E402
 
@@ -102,6 +103,18 @@ class ClaudeRunnerTest(unittest.TestCase):
         out = self.run_job()
         self.assertEqual(out.status, STATUS_INVALID)
         self.assertEqual(out.usage["cost_usd"], 0.25)
+
+    def test_review_kind_validates_text_and_uses_requested_model(self):
+        job = self.job(id="F1:opinion", role="opinion", kind="review", writable=False)
+        self.assertEqual(_check_output(job, {"text": "review", "model_id": "reported"}),
+                         {"text": "review", "model_id": MODEL})
+        for output in ({}, {"text": ""}, {"text": "  "}, {"text": 1}, {"text": "review", "extra": True}):
+            with self.subTest(output=output):
+                self.assertIsNone(_check_output(job, output))
+        os.environ["FAKE_CLAUDE_RESULT"] = json.dumps({"text": "review", "model_id": "reported"})
+        out = self.run_job(job)
+        self.assertEqual((out.status, out.output), (STATUS_OK, {"text": "review", "model_id": MODEL}))
+        self.assertEqual(set(json.loads(self.option("--json-schema"))["properties"]), {"text", "model_id"})
 
     def test_model_mismatch_is_not_adopted(self):
         os.environ["FAKE_CLAUDE_ENVELOPE"] = json.dumps({"modelUsage": {"claude-haiku-5-5": {}}})

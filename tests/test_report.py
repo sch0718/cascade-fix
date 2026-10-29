@@ -609,6 +609,21 @@ class RoleSectionTest(unittest.TestCase):
         self.assertIn("codex login", section(text, "## 역할 배정"))
         self.assertNotIn("cursor-agent login", text)
 
+    def test_opinion_failure_count_requires_failed_key_and_is_not_a_fallback(self):
+        for failed in (None, [], ["F1:opinion"]):
+            with self.subTest(failed=failed):
+                event = {"step": "workers-opinion", "counts": {"error": 1}, "fallback": ["F1:opinion"]}
+                if failed is not None:
+                    event["failed"] = failed
+                ledger = profile_ledger(profile_record(), events=[event])
+                line = next(line for line in self.render(ledger).splitlines() if "회차 1 opinion:" in line)
+                self.assertNotIn("대체 실행", line)
+                if failed is None:
+                    self.assertNotIn("의견 없음", line)
+                else:
+                    self.assertIn(f"의견 없음 {len(failed)}건", line)
+                self.assertNotIn("code.opinion", report._worker_fallbacks(ledger, None)[0])
+
 
 class RoleUsageTest(unittest.TestCase):
     def render(self, ledger, run_dir):

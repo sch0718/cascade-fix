@@ -339,7 +339,7 @@ def _check_output(job: CliJob, output: dict | None) -> dict | None:
         return None
     model_id = job.model if job.runner == RUNNER_CLAUDE else f"{job.runner}:{job.model or DEFAULT_MODEL_NAME}"
     candidate = {**output, "model_id": model_id}
-    return candidate if valid_output(candidate, job.role) else None
+    return candidate if valid_output(candidate, job.role, job.kind) else None
 
 
 def _add_usage(total: dict, extra: dict) -> dict:

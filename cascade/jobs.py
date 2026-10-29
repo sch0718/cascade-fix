@@ -361,7 +361,7 @@ def _adj_verify_cmds(cfg: RepoConfig | None, item: "AdjInput") -> str:
     return _code_verify_cmds(cfg, item.worktree, item.finding.location)
 
 
-def build_adjudicator_jobs(items: list[AdjInput], cell: dict | None = None) -> dict:
+def build_adjudicator_jobs(items: list[AdjInput], cell: dict | None = None, claude_cli: bool = False) -> dict:
     jobs = []
     for item in items:
         f = item.finding
@@ -379,9 +379,12 @@ def build_adjudicator_jobs(items: list[AdjInput], cell: dict | None = None) -> d
             "verify_cmds": _adj_verify_cmds(item.cfg, item),
             "verify_a": _format_verify(item.verify_a),
             "verify_b": _format_verify(item.verify_b),
-            "rules": RULES,
+            **_write_values(None, "adjudicator", claude_cli),
         }
-        job = _job(f.id, "adjudicator", _render("adjudicator.md", values))
+        values["commit_step"] = values["commit_step"].removeprefix("검증을 마친 뒤 ")
+        workers = {"adjudicator": cell} if cell else {}
+        job = _job(f.id, "adjudicator", _render("adjudicator.md", values),
+                   workers if claude_cli else None, item.worktree, writable=True)
         jobs.append(job | {"model": cell["model"], "effort": cell["effort"]} if cell else job)
     return {"jobs": jobs}
 
@@ -392,9 +395,12 @@ def _valid_verify(value) -> bool:
     )
 
 
-def valid_output(output, role: str) -> bool:
+def valid_output(output, role: str, kind: str | None = None) -> bool:
     if not isinstance(output, dict):
         return False
+    if kind == KIND_REVIEW:
+        return (set(output) == set(REVIEW_SCHEMA["required"]) and isinstance(output.get("text"), str)
+                and bool(output["text"].strip()) and isinstance(output.get("model_id"), str))
     schema = CHECKER_SCHEMA if role == "checker" else WORKER_SCHEMA
     if any(k not in output for k in schema["required"]):
         return False
