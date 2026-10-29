@@ -38,7 +38,7 @@ REASON_ADJUDICATED_NO = "판가름: 아님"
 UNMEASURED = "측정 불가(dry-run은 전체 테스트를 돌리지 않음)"
 PATH_KEYS = ("합의", "규칙 채택", "판가름", "Codex 검토", "사람")
 CLAUDE_FAMILIES = ("sonnet", "haiku", "opus")
-CLAUDE_JOB_FILES = tuple(name for name in ALL_CLAUDE_JOB_FILES if name not in (OPINION_ARGS, RECHECK_ARGS))
+CLAUDE_JOB_FILES = tuple(name for name in ALL_CLAUDE_JOB_FILES if name not in (OPINION_ARGS, "opinion-cli-args.json", RECHECK_ARGS))
 USAGE_KEYS = ("input", "output", "cache_read")
 TRUTH_KEYS = (VERDICT_FACT, VERDICT_NO, VERDICT_UNREPRODUCIBLE)
 STEP_APPLY = "apply"
@@ -161,13 +161,16 @@ def add_counts(total: dict, part: dict) -> None:
 
 def workers_stats(ledger: dict) -> tuple[int, dict[str, int], int, dict[str, dict[str, int]]]:
     counts: dict[str, int] = {}
+    fallback_counts: dict[str, int] = {}
     usage: dict[str, dict[str, int]] = {}
     for event in workers_events(ledger):
         add_counts(counts, event.get("counts") or {})
+        if event["step"] != "workers-opinion":
+            add_counts(fallback_counts, event.get("counts") or {})
         for runner, tokens in (event.get("usage") or {}).items():
             add_counts(usage.setdefault(runner, dict.fromkeys(USAGE_KEYS, 0)), {k: tokens.get(k, 0) for k in USAGE_KEYS})
-    fallback = {label: counts[status] for status, label in FALLBACK_LABELS.items() if counts.get(status)}
-    return sum(counts.values()), fallback, counts.get(STATUS_INVALID, 0), usage
+    fallback = {label: fallback_counts[status] for status, label in FALLBACK_LABELS.items() if fallback_counts.get(status)}
+    return sum(fallback_counts.values()), fallback, fallback_counts.get(STATUS_INVALID, 0), usage
 
 
 def measured_checks(apply: dict) -> list[dict]:
@@ -317,7 +320,7 @@ def fallback_job_ids(ledger: dict) -> list[str]:
 
 
 def claude_job_names(scope: str) -> tuple[str, ...]:
-    return (*CLAUDE_JOB_FILES, *((OPINION_ARGS, RECHECK_ARGS) if scope == COST_ALL else ()))
+    return (*CLAUDE_JOB_FILES, *((OPINION_ARGS, "opinion-cli-args.json", RECHECK_ARGS) if scope == COST_ALL else ()))
 
 
 def claude_jobs(round_dir: Path, mode: str, scope: str) -> set[str]:
@@ -344,7 +347,7 @@ def first_review_is_claude(ledger: dict, review: dict) -> bool:
 
 def add_cell_calls(cells: dict[str, dict], ledger: dict, rounds: list[Path], scope: str) -> None:
     mode = ledger.get("mode")
-    names = (*JOB_FILES, *((OPINION_ARGS, RECHECK_ARGS) if scope == COST_ALL else ()))
+    names = (*JOB_FILES, *((OPINION_ARGS, "opinion-cli-args.json", RECHECK_ARGS) if scope == COST_ALL else ()))
     for round_dir in rounds:
         results = read_optional(round_dir / "results.json")
         ids = job_ids(round_dir, names) | set(results if isinstance(results, dict) else ())

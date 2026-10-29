@@ -288,6 +288,9 @@ envelope = {
 }
 if "FAKE_CLAUDE_RESULT" in os.environ:
     envelope["structured_output"] = json.loads(os.environ["FAKE_CLAUDE_RESULT"])
+model_result = json.loads(os.environ.get("FAKE_CLAUDE_RESULTS_MODELS", "{}")).get(model)
+if model_result is not None:
+    envelope["structured_output"] = model_result
 envelope.update(json.loads(os.environ.get("FAKE_CLAUDE_ENVELOPE", "{}")))
 if os.environ.get("FAKE_CLAUDE_STDOUT"):
     sys.stdout.write(os.environ["FAKE_CLAUDE_STDOUT"])

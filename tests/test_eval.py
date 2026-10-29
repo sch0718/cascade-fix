@@ -267,6 +267,40 @@ class ScoreTest(unittest.TestCase):
         self.assertNotIn("대체 실행", text)
         self.assertNotIn("Claude 호출", text)
 
+    def test_opinion_failures_are_not_fallback_executions(self):
+        usage = {"claude": {"input": 100, "output": 20, "cache_read": 5}}
+        event = workers_event("opinion", {"auth": 1, "skipped": 1, "invalid": 1}, usage)
+        event["failed"] = ["r1-01:opinion", "r1-02:opinion", "r1-03:opinion"]
+        ledger = {"rounds": [{"no": 1, "events": [
+            workers_event("adj", {"error": 1}, fallback=["r1-01:adjudicator"]), event]}]}
+        self.assertEqual(score.workers_stats(ledger), (1, {"오류": 1}, 0, usage))
+        self.assertEqual(score.fallback_job_ids(ledger), ["r1-01:adjudicator"])
+
+    def test_opinion_invalid_results_are_excluded_from_invalid_ratio(self):
+        make_run(self.runs, "s1", [decision("합의-사실", "a")], events=[
+            workers_event("stage1", {"ok": 2}), workers_event("opinion", {"invalid": 3})])
+        m = score.compute(self.runs, score.load_sample(self.sample))
+        self.assertEqual((m["cli_jobs"], m["invalid"]), (2, 0))
+        self.assertIn("| 무효 결과 | 0/2 (0.0%) |", score.render(m))
+        self.assertIn("| 무효 결과 | 0/2 (0.0%) | 0/2 (0.0%) |", score.render_compare(m, m))
+
+    def test_opinion_jobs_do_not_change_fallback_ratio_or_selection(self):
+        for adj in ([], [workers_event("adj", {"ok": 2})]):
+            with self.subTest(adj=adj):
+                events = [workers_event("stage1", {"ok": 3, "error": 1}, fallback=["r1-01:b"]), *adj]
+                make_run(self.runs, "s1", [decision("합의-사실", "a")], events=events)
+                sample = sample_of(sample_line("s1"))
+                before = score.compute(self.runs, sample)
+                events.append(workers_event("opinion", {"ok": 4}))
+                make_run(self.runs, "s1", [decision("합의-사실", "a")], events=events)
+                after = score.compute(self.runs, sample)
+                self.assertEqual(before["cli_jobs"], 4 + 2 * bool(adj))
+                self.assertEqual(after["cli_jobs"], before["cli_jobs"])
+                self.assertEqual(score.fallback_ratio(after), score.fallback_ratio(before))
+                self.assertEqual(score.fallback_check(after), score.fallback_check(before))
+                self.assertFalse(score.fallback_check(after)["ok"])
+                self.assertIn("대체 실행", score.compare_causes(after, before))
+
     def test_render_with_cli_jobs_adds_workers_rows(self):
         make_run(self.runs, "s1", [decision("합의-사실", "a")],
                  events=[workers_event("stage1", {"ok": 3, "invalid": 1}, {"codex": {"input": 1, "output": 2, "cache_read": 3}})],

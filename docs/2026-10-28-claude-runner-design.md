@@ -8,7 +8,8 @@
 | --- | --- | --- |
 | (a-lite) | `CF start`(init→jobs까지)·`CF go`(Workflow 결과 저장·`usage`·`judge`~`report`를 멈출 곳까지)·`next_actions`(다음 단계를 구조화해 `next_steps`가 문자열로 그림)·`workers.lock`(실행 폴더당 `workers` 하나)·모델 ID 경고 멈춤·끝나지 않은 단계의 Workflow 결과 교체·`eval/orchestration_cost.py`의 `start`/`go` 인식·SKILL.md 「기본 경로」·`tests/test_cli_go.py`·`go.lock`·검토 스크립트 실패 처리(로그 없이 종료 코드 77이면 로그인 안내로 멈춤, 그 밖의 비정상 종료는 stderr와 함께 오류로 멈춤)·Claude 검토자 Workflow 결과의 모델 ID 사전 검사 | 구현됨, main에 병합(PR #31). 내용은 전체 테스트 1,597개 통과 시점의 작업 트리 기준이다 |
 | (a-full) 1차 | `ClaudeRunner`, `--claude-via cli`(1단계 작업자·점검자), CLI 사용량 기록, 예상 Claude 작업 수집 | 구현됨(11절). 유료 측정 전이라 기본값은 `workflow` |
-| (a-full) 나머지 | 판가름(`workers --stage adj`)·Claude 대체 실행·검토 역할의 CLI 경로, 재개·`--retry-failed`·중단 경계, 격리 점검 | 설계 단계 |
+| (a-full) 2차 | 판가름(`workers --stage adj`)·Claude 의견(`workers --stage opinion`)의 CLI 경로 | 구현됨(11.2.1). 재검토는 격리 경로 검증 전까지 Workflow 유지 |
+| (a-full) 나머지 | 재검토·첫 검토의 CLI 경로(읽기 전용 전용 경로), 재개·`--retry-failed`·중단 경계, 격리 점검 | 설계 단계 |
 
 (a-lite)에서 이 설계가 이어 쓰는 것: `go`의 단계 이음 루프, `Action` 구조, `workers.lock`, 모델 ID 경고 멈춤(출력 줄 검사 방식), Workflow 결과 검증(작업 id 일치).
 
@@ -286,6 +287,15 @@ SUMMARY: critical=0 warning=6 suggestion=2
 - **모델 ID**(10번): 러너 안에서 막는다. Claude 결과의 `model_id`는 접두사 없는 요청 모델이고, 봉투의 `modelUsage`에 요청 모델이 하나도 없으면 `무효`다. 전용 종료 코드·`--strict-model`은 두지 않았다.
 - **사용자 설정**(5.3): `--setting-sources project --strict-mcp-config`로 사용자 MCP·설정을 끄고 `CLAUDECODE`는 자식 환경에서 지운다. `--bare`는 평가하지 않았다.
 - **계획 확인 문구**(5.4): SKILL.md에 한 줄을 더했다. 그 줄이 있을 때만 `--claude-via cli`를 쓴다.
+
+### 11.2.1 판가름·의견 이전 (2차 구현, 2026-10-29)
+
+- **범위**: 판가름(`workers --stage adj`)과 Claude 의견(`workers --stage opinion`)을 `--claude-via cli`로 옮겼다. `adj-cli-args.json`(`role=adjudicator`·`kind=adjudicator`·`writable=true`·판가름 워크트리)과 `opinion-cli-args.json`(`role=opinion`·`kind=review`·`writable=false`·base 워크트리)이 3.1의 규칙대로 메타데이터를 싣는다. `adjudicate`는 `--results`가 선택이고, 없으면 `adj-cli.json`+`adj-fallback.json`을 `load_stage_results` 규칙으로 읽는다. `opinion --results opinion-cli.json`은 기존 Workflow 결과 모양 그대로다. 기본값 `workflow`의 파일·출력은 바뀌지 않는다(HEAD와 파일 단위로 비교해 확인).
+- **의견은 base 워크트리에서 도는 것으로 충분하다고 판단했다**: `jobs`가 항상 base 워크트리를 만든다(`cli.py` `_jobs`). 그래서 `_run_isolated`를 써도 사용자 저장소가 건드려지지 않는다. snapshot에 base 워크트리가 없으면 CLI 파일을 만들지 않고 Workflow 경로로 둔다. 의견들이 base 하나를 공유하므로 읽기 역할 검사와 복구가 겹치지 않게 순차로 돌린다(의견 N건이 최대 N×900초).
+- **재검토(와 첫 검토, 그 칸의 Claude 대체 실행)는 격리 경로 검증 전까지 Workflow를 유지한다.** 근거: 재검토는 사용자 저장소 루트(`recheck-repo.txt`)를 읽는데, `_run_isolated`가 쓰는 `tree_of`·`restore_tree`는 그 폴더에 `git add -A`·`git clean`을 실행해 모델이 아무것도 쓰지 않아도 사용자의 스테이징 상태를 바꾼다. 5.1이 제안한 전용 경로(인덱스를 쓰지 않는 `git status --porcelain`·diff 해시 비교, 복구 없이 무효 처리)는 실제 `claude -p`로 검증하지 못해 만들지 않았다. 따라서 재검토가 Claude 칸인 프로필(`claude-only` 등)은 여전히 `report`까지 Workflow가 필요하고, 재검토 칸이 Codex·Cursor이면 Workflow 없이 `report`까지 간다. 후속 과제.
+- **판가름 프롬프트**: cli 모드에서는 「커밋하지 않는다」 규칙과 충돌하지 않도록 `{commit_step}` 자리표시자로 커밋 지시를 바꾼다(workflow 모드 출력은 바이트 동일).
+- **상태 규칙**: 소진(한도·인증) 상태는 의견 단계에서 같은 단계(`workers-opinion`) 기록에서만 물려받고, `--force`면 무시한다(의견에는 Workflow 대체 실행이 없어 다시 돌릴 길이 이것뿐이다). 의견 단계 이벤트는 `fallback=[]`와 `failed` 키를 쓰며, 보고서·평가기는 의견을 대체 실행 비율·무효 결과 비율의 분자·분모에서 뺀다. `judge --force`가 판가름 대상을 없애면 cli 모드에서 낡은 `adj-cli*.json`을 지운다(workflow 모드의 낡은 `adj-args.json`이 남는 기존 동작은 그대로).
+- **미구현·후속**: `eval/run_time.py`의 `cli_seconds`가 모든 `workers-*` 이벤트를 마지막 `jobs` 시각부터 재서 새 단계에서 시간을 중복으로 센다(점검자에도 있던 방식). 각 단계의 입력 이벤트부터 재도록 바꾸는 일이 남았다. 판가름·의견은 가짜 실행 파일로만 검증했고 실제 `claude -p` 호출·한도·로그인 문구·`modelUsage` 형식은 미실측이다. 검토는 3회차까지 했고 마지막 반영분(무효 결과 분모, `judge --force` 정리)은 재검토 없이 테스트로만 확인했다.
 
 ### 11.3 구현하지 않은 것(미확인·미해결)
 

@@ -25,7 +25,7 @@ from cascade.consensus import (
     WorkerResult,
 )
 from cascade.findings import Finding
-from cascade.jobs import ROLES, RUNNER_CLAUDE, AdjInput, location_file, split_location, write_job_args
+from cascade.jobs import ROLES, RUNNER_CLAUDE, AdjInput, location_file, split_job_args, split_location, write_job_args
 from cascade.patches import DIFF_FLAGS, changed_files, is_lossy, record_setup_paths
 from cascade.review import REVIEWER_CLAUDE, REVIEWER_CURSOR, claude_prompt, review_job
 from cascade.rounds import STATUS_DONE, Ledger, RoundRecord, ledger_path, needs_recheck
@@ -93,7 +93,8 @@ RECHECK_ARGS = "recheck-args.json"
 RECHECK_RESULTS = "recheck.json"
 USAGE_FILE = "claude-usage.json"
 CLAUDE_JOB_FILES = ("stage1-args.json", "stage1-cli-args.json", "stage1-fallback-args.json", "checker-args.json",
-                    "checker-cli-args.json", "checker-fallback-args.json", "adj-args.json", OPINION_ARGS, RECHECK_ARGS)
+                    "checker-cli-args.json", "checker-fallback-args.json", "adj-args.json", "adj-cli-args.json",
+                    "adj-fallback-args.json", OPINION_ARGS, "opinion-cli-args.json", RECHECK_ARGS)
 
 
 def claude_job_entries(data) -> list[dict]:
@@ -103,9 +104,10 @@ def claude_job_entries(data) -> list[dict]:
 
 
 NON_PROGRESS_STEPS = ("cleanup", "usage")
-STAGE1, STAGE_CHECKER = "stage1", "checker"
-STAGE_ARGS = {STAGE1: "stage1-args.json", STAGE_CHECKER: "checker-args.json"}
-STAGE_OUTPUTS = {STAGE1: "stage1.json", STAGE_CHECKER: "checker.json"}
+STAGE1, STAGE_CHECKER, STAGE_ADJ, STAGE_OPINION = "stage1", "checker", "adj", "opinion"
+STAGE_ARGS = {STAGE1: "stage1-args.json", STAGE_CHECKER: "checker-args.json", STAGE_ADJ: "adj-args.json"}
+STAGE_OUTPUTS = {STAGE1: "stage1.json", STAGE_CHECKER: "checker.json", STAGE_ADJ: "adj.json"}
+STAGE_INPUTS = {STAGE1: "jobs", STAGE_CHECKER: "judge-checker", STAGE_ADJ: "judge", STAGE_OPINION: "adjudicate"}
 STOP_PARTS = {"tree": "작업 트리", "head": "HEAD", "head_ref": "현재 브랜치", "stash": "stash",
               "attached": "작업자 워크트리 브랜치"}
 
@@ -285,25 +287,28 @@ def _last(rnd: RoundRecord, step: str) -> int:
 
 
 def workers_done(rnd: RoundRecord, stage: str) -> bool:
-    """workers 단계는 입력(stage1은 jobs, checker는 judge 1차)이 마지막으로 바뀐 뒤에 돌았을 때만 끝난 것으로 본다."""
-    source = "jobs" if stage == STAGE1 else "judge-checker"
-    return _last(rnd, f"workers-{stage}") > _last(rnd, source)
+    """마지막 입력 갱신 뒤에 실행한 workers만 완료로 본다."""
+    return _last(rnd, f"workers-{stage}") > _last(rnd, STAGE_INPUTS[stage])
 
 
-def exhausted_runners(rnd: RoundRecord) -> dict[str, dict]:
+def exhausted_runners(rnd: RoundRecord, stage: str | None = None) -> dict[str, dict]:
     """회차(마지막 jobs 이후)의 workers 단계에서 한도·인증으로 멈춘 runner와 그 상태·사유."""
     found: dict[str, dict] = {}
     for e in rnd.events[_last(rnd, "jobs") + 1:]:
-        if str(e.get("step", "")).startswith("workers-"):
+        if str(e.get("step", "")).startswith("workers-") and (stage is None or e["step"] == f"workers-{stage}"):
             for runner, entry in (e.get("exhausted") or {}).items():
                 found.setdefault(runner, entry)
     return found
 
 
 def judged_after_workers_input(rnd: RoundRecord, stage: str) -> bool:
-    """workers 단계의 입력(stage1은 jobs, checker는 judge 1차)이 마지막으로 바뀐 뒤에 judge가 이미 끝났다."""
-    source = "jobs" if stage == STAGE1 else "judge-checker"
-    return _last(rnd, "judge") > _last(rnd, source)
+    """마지막 입력 갱신 뒤에 결과를 소비한 단계가 있으면 재실행을 막는다."""
+    source = _last(rnd, STAGE_INPUTS[stage])
+    if stage == STAGE_OPINION:
+        return any(e.get("step") == "apply" or str(e.get("step", "")).startswith("opinion:")
+                   for e in rnd.events[source + 1:])
+    consumer = "adjudicate" if stage == STAGE_ADJ else "judge"
+    return _last(rnd, consumer) > source
 
 
 def checker_pending(rnd: RoundRecord) -> bool:
@@ -359,7 +364,8 @@ def load_stage_results(rd: Path, stage: str, claude: Path | None) -> tuple[dict,
 
 def stage_inputs(run_dir: Path, rnd: RoundRecord, rd: Path, stage: str, claude: str | None, option: str) -> tuple[dict, dict[str, str]]:
     rd = Path(rd)
-    if (rd / f"{stage}-cli-args.json").is_file() and not workers_done(rnd, stage):
+    if (rd / f"{stage}-cli-args.json").is_file() and (
+            not workers_done(rnd, stage) or (stage == STAGE_ADJ and not (rd / f"{stage}-cli.json").is_file())):
         raise CliError(f"회차 {rnd.no}의 {stage} CLI 작업이 남았다. workers 단계를 먼저 한다: "
                        + _cmd("workers", run_dir, f"--round {rnd.no}", f"--stage {stage}"))
     fallback_args, fallback_out = rd / f"{stage}-fallback-args.json", rd / f"{stage}-fallback.json"
@@ -748,13 +754,20 @@ def recheck_job_id(no: int) -> str:
     return f"round-{no}:recheck"
 
 
-def write_review_args(rd: Path, name: str, ledger: Ledger, items: list[tuple[str, str, str, str]], role: str) -> Path:
-    """items: (job id, 표시 이름, 프롬프트, 참고 저장소). role 칸의 모델·effort로 Claude 검토자 Workflow 입력을 rd/name 에 쓴다."""
+def write_review_args(rd: Path, name: str, ledger: Ledger, items: list[tuple[str, str, str, str]], role: str,
+                      claude_cli: bool = False) -> Path:
+    """items: (job id, 표시 이름, 프롬프트, 참고 저장소). role 칸의 모델·effort로 Claude 검토자 입력을 rd/name 에 쓴다."""
     cell = review_cell(ledger, role)
     jobs = [review_job(job_id, text, claude_prompt(prompt, repo), cell["model"], cell["effort"])
             for job_id, text, prompt, repo in items]
     out = Path(rd) / name
-    write_json(out, write_job_args({"jobs": jobs}, Path(rd) / "prompts"))
+    if claude_cli:
+        jobs = [j | {"role": role, "runner": RUNNER_CLAUDE, "worktree": str(repo), "writable": False}
+                for j, (_, _, _, repo) in zip(jobs, items)]
+        _, args = split_job_args({"jobs": jobs}, Path(rd) / "prompts", claude_cli=True)
+    else:
+        args = write_job_args({"jobs": jobs}, Path(rd) / "prompts")
+    write_json(out, args)
     return out
 
 
@@ -927,12 +940,22 @@ def next_actions(ledger: Ledger, run_dir: Path) -> list[Action]:
         if _judge_ready(rnd, rd, STAGE1) and any(repro_listed(rd).values()):
             steps.append(_note(f"(재현 명령 {rd / REPRO_FILE} 을 사용자에게 보이고 승인받았으면 judge에 --allow-repro {_q(rd / REPRO_FILE)} 를 붙인다)"))
         return steps
+    if (rd / "adj-cli-args.json").is_file() and not step_done(rnd, "adjudicate"):
+        if not workers_done(rnd, STAGE_ADJ):
+            return [_cmd_action("workers", run_dir, n, "--stage adj", background=True)]
+        fallback_args, fallback_out = rd / "adj-fallback-args.json", rd / "adj-fallback.json"
+        fallback = [replace(_workflow_action(fallback_args, fallback_out), hidden=fallback_out.is_file())] if has_jobs(fallback_args) else []
+        return [*fallback, _cmd_action("adjudicate", run_dir, n)]
     if (rd / "adj-args.json").is_file() and not step_done(rnd, "adjudicate"):
         return [
             _workflow_action(rd / "adj-args.json", rd / "adj.json"),
             _cmd_action("adjudicate", run_dir, n, f"--results {_q(rd / 'adj.json')}"),
         ]
     pending = pending_opinions(ledger, rd)
+    if pending and is_claude(ledger, "opinion") and (rd / "opinion-cli-args.json").is_file():
+        if not workers_done(rnd, STAGE_OPINION):
+            return [_cmd_action("workers", run_dir, n, "--stage opinion", background=True)]
+        return [_cmd_action("opinion", run_dir, n, f"--results {_q(rd / 'opinion-cli.json')}")]
     if pending and is_claude(ledger, "opinion"):
         return [
             _workflow_action(rd / OPINION_ARGS, rd / OPINION_RESULTS),

@@ -30,7 +30,7 @@ BUCKET_HOLD = "보류 후보"
 BUCKETS = (BUCKET_REBUTTAL, BUCKET_DESIGN, BUCKET_UNDECIDABLE, BUCKET_HOLD)
 ADJUDICATED_NO = "판가름: 아님"
 ADJUDICATION_MARK = "판가름"
-JOB_FILES = ("stage1-args.json", "stage1-cli-args.json", "checker-args.json", "checker-cli-args.json", "adj-args.json")
+JOB_FILES = ("stage1-args.json", "stage1-cli-args.json", "checker-args.json", "checker-cli-args.json", "adj-args.json", "adj-cli-args.json")
 CLI_TOKEN_KEYS = (("input", "input_tokens"), ("output", "output_tokens"))
 OPINION_MAX_LINES = 20
 COMMIT_SUBJECT_MAX = 60
@@ -555,7 +555,7 @@ def _worker_fallbacks(ledger: Ledger, run_dir: Path | None) -> tuple[dict[str, d
         data = _stage_cli_data(run_dir, no, stage) if run_dir is not None else None
         outcomes = data.get("outcomes") if data else None
         if not isinstance(outcomes, list):
-            for job_id in event.get("fallback") or []:
+            for job_id in (event.get("fallback") or []) if stage != "opinion" else []:
                 if key := _cell_of(ledger, job_id):
                     _add_reason(reasons, key, "")
             continue
@@ -567,7 +567,7 @@ def _worker_fallbacks(ledger: Ledger, run_dir: Path | None) -> tuple[dict[str, d
             if key is None:
                 continue
             status = first.get(outcome["id"], outcome).get("status")
-            if status != STATUS_OK:
+            if status != STATUS_OK and stage != "opinion":
                 _add_reason(reasons, key, FALLBACK_LABELS.get(status, str(status)))
             total = tokens.setdefault(key, {"input": 0, "output": 0, UNRECORDED: 0})
             for run in (outcome, first.get(outcome["id"])):
@@ -819,8 +819,12 @@ def _runtime_lines(ledger: Ledger, profile: dict) -> list[str]:
              for r in profile.get("runtime_substitutions", []) if r["role"].startswith(f"{ledger.mode}.")]
     for no, stage, event in _worker_events(ledger):
         total = sum((event.get("counts") or {}).values())
-        n, reasons = fallback_counts(event.get("counts") or {})
-        lines.append(f"- 회차 {no} {stage}: CLI 작업 {total}건, 대체 실행 {n}건" + (f"({reasons})" if n else ""))
+        if stage == "opinion":
+            lines.append(f"- 회차 {no} {stage}: CLI 작업 {total}건"
+                         + (f", 의견 없음 {len(event['failed'])}건" if "failed" in event else ""))
+        else:
+            n, reasons = fallback_counts(event.get("counts") or {})
+            lines.append(f"- 회차 {no} {stage}: CLI 작업 {total}건, 대체 실행 {n}건" + (f"({reasons})" if n else ""))
         if event.get("fallback_runs"):
             lines.append(f"- 회차 {no} {stage} 외부 CLI로 다시 돌림: "
                          + ", ".join(f"{job_id} → {runner}" for job_id, runner in event["fallback_runs"].items()))
