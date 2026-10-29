@@ -138,7 +138,7 @@ def measure(path: Path) -> list[dict]:
 
 
 def project(row: dict, removed_requests: int) -> dict:
-    """지적당 비용 범위. 캐시 쓰기는 비용 비중이 가장 큰 모델의 1시간 TTL 단가(입력 단가의 2배)로 추정한다."""
+    """지적당 비용 범위. 캐시 쓰기는 비용 비중이 가장 큰 모델의 1시간 TTL 단가(입력 단가의 2배)로 추정한다. Haiku 장문 단가는 반영하지 않는다."""
     requests = row["requests"]
     if removed_requests < 0 or removed_requests > requests:
         raise ValueError("줄일 요청 수는 0 이상 전체 요청 수 이하여야 한다")
