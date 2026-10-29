@@ -31,6 +31,12 @@ def result(ts, tool_id, text):
             "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tool_id, "content": text}]}}
 
 
+def read(ts, mid, output, tool):
+    row = assistant(ts, mid, output, tool=tool)
+    row["message"]["content"][0].update(name="Read", input={"file_path": tool[1]})
+    return row
+
+
 def human(ts, text):
     return {"type": "user", "timestamp": ts, "message": {"role": "user", "content": text}}
 
@@ -90,6 +96,57 @@ class OrchestrationCostTest(unittest.TestCase):
         [run] = oc.find_runs(path)
         self.assertEqual((run.run_dir, run.findings, run.dry_run), ("/r/.cascade-fix/cf-3", 3, True))
         self.assertEqual((run.start, run.end), ("2026-10-28T00:01:00Z", "2026-10-28T00:04:10Z"))
+
+    def test_finds_start_go_run_from_background_read_outputs(self):
+        for content_type in ("string", "list"):
+            for separator in ("→", "\t"):
+                with self.subTest(content_type=content_type, separator=separator):
+                    init_text = "\n".join(f"{i:6}{separator}{line}" for i, line in enumerate(
+                        init_out("/r/.cascade-fix/cf-3", 3, "local-sonnet-b").splitlines(), 1))
+                    go_text = f"     1{separator}멈춤: report까지 끝났다. 보고 뒤 보류 후보 선택을 받고 cleanup 한다"
+                    if content_type == "list":
+                        init_text = [{"type": "text", "text": init_text}]
+                        go_text = [{"type": "text", "text": go_text}]
+                    path = self.session([
+                        human("2026-10-28T00:00:00Z", "리뷰하고 고쳐줘"),
+                        assistant("2026-10-28T00:01:00Z", "a1", 10, tool=("t1", f"{CF} start --source codex-code --input r.json --dry-run")),
+                        result("2026-10-28T00:01:01Z", "t1", "Command running in background"),
+                        read("2026-10-28T00:02:00Z", "a2", 10, ("t2", "/tmp/tasks/b1.output")),
+                        result("2026-10-28T00:02:01Z", "t2", init_text),
+                        assistant("2026-10-28T00:03:00Z", "a3", 10, tool=("t3", f"{CF} go --run-dir /r/.cascade-fix/cf-3 --workflow-output /tmp/o")),
+                        result("2026-10-28T00:03:01Z", "t3", "Command running in background"),
+                        read("2026-10-28T00:04:00Z", "a4", 10, ("t4", "/tmp/tasks/b2.output")),
+                        result("2026-10-28T00:04:01Z", "t4", go_text),
+                        assistant("2026-10-28T00:04:10Z", "a5", 10, text="정리했습니다"),
+                        human("2026-10-28T00:10:00Z", "다음 것도"),
+                        assistant("2026-10-28T00:10:01Z", "a6", 5000, text="네"),
+                    ])
+                    runs = oc.find_runs(path)
+                    self.assertEqual(len(runs), 1)
+                    [run] = runs
+                    self.assertEqual((run.run_dir, run.findings, run.profile, run.dry_run),
+                                     ("/r/.cascade-fix/cf-3", 3, "local-sonnet-b", True))
+                    self.assertEqual((run.start, run.end), ("2026-10-28T00:01:00Z", "2026-10-28T00:04:10Z"))
+
+    def test_ignores_indented_source_run_dir_in_read_output(self):
+        init_text = "\n".join(f"{i:6}→{line}" for i, line in enumerate(
+            init_out("/r/.cascade-fix/cf-3", 3, "local-sonnet-b").splitlines(), 1))
+        path = self.session([
+            human("2026-10-28T00:00:00Z", "리뷰하고 고쳐줘"),
+            assistant("2026-10-28T00:01:00Z", "a1", 10, tool=("t1", f"{CF} start --source codex-code --input r.json --dry-run")),
+            result("2026-10-28T00:01:01Z", "t1", "Command running in background"),
+            read("2026-10-28T00:02:00Z", "a2", 10, ("t2", "/r/cascade/state.py")),
+            result("2026-10-28T00:02:01Z", "t2", '   123→            run_dir=Path(data["run_dir"]),'),
+            read("2026-10-28T00:03:00Z", "a3", 10, ("t3", "/tmp/tasks/b1.output")),
+            result("2026-10-28T00:03:01Z", "t3", init_text),
+            assistant("2026-10-28T00:04:00Z", "a4", 10, tool=("t4", f"{CF} go --run-dir /r/.cascade-fix/cf-3 --workflow-output /tmp/o")),
+            result("2026-10-28T00:04:01Z", "t4", "멈춤: report까지 끝났다. 보고 뒤 cleanup 한다"),
+            human("2026-10-28T00:10:00Z", "다음 것도"),
+        ])
+        [run] = oc.find_runs(path)
+        self.assertEqual((run.run_dir, run.findings, run.profile, run.dry_run),
+                         ("/r/.cascade-fix/cf-3", 3, "local-sonnet-b", True))
+        self.assertEqual((run.start, run.end), ("2026-10-28T00:01:00Z", "2026-10-28T00:04:01Z"))
 
     def test_start_output_with_run_dir_and_report_marker_together_is_one_finished_run(self):
         path = self.session([
