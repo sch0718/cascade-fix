@@ -11,9 +11,9 @@ from cascade.usage import PRICE_SOURCE, PRICES_AS_OF, read_session  # noqa: E402
 
 STEP = re.compile(r"(?:cascade\.cli\"?|\bCF)\s+(init|start|go|report)\b")
 GO_REPORTED = "멈춤: report까지 끝났다"
-RUN_DIR = re.compile(r"^run_dir=(\S+)", re.M)
-FINDINGS = re.compile(r"^지적 (\d+)건", re.M)
-PROFILE = re.compile(r"^프로필: (\S+)", re.M)
+RUN_DIR = re.compile(r"^(?:[ \t]*\d+[→\t])?run_dir=(\S+)", re.M)
+FINDINGS = re.compile(r"^(?:[ \t]*\d+[→\t])?지적 (\d+)건", re.M)
+PROFILE = re.compile(r"^(?:[ \t]*\d+[→\t])?프로필: (\S+)", re.M)
 SCOPE = "init(또는 start)를 부른 메시지부터 report 뒤 사람의 다음 입력 직전까지의 메인 세션 메시지(하위 에이전트·detect·첫 검토 제외)"
 
 
