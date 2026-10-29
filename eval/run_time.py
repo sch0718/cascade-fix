@@ -9,8 +9,9 @@ sys.path.insert(0, str(SKILL_ROOT))
 from cascade.usage import UsageFormatError, find_workflow_dir  # noqa: E402
 
 PROJECTS_ROOT = Path.home() / ".claude" / "projects"
-CLI_STEP_PREFIX = "workers-"
-SCOPE = ("항목당 처리 시간 합: Claude 에이전트 기록의 처음~끝 시각 + Codex·Cursor 작업자(원장 jobs→workers-* 간격). "
+# cascade.cli_steps.STAGE_INPUTS의 작업 단계만 잰다. CLI 의견은 측정에서 제외한다.
+CLI_STAGE_INPUTS = {"workers-stage1": "jobs", "workers-checker": "judge-checker", "workers-adj": "judge"}
+SCOPE = ("항목당 처리 시간 합: Claude 에이전트 기록의 처음~끝 시각 + CLI 작업자(원장 단계별 입력→workers-* 간격). "
          "단일 Claude는 세션 시간(duration_ms). 동시 실행으로 겹친 시간도 각각 더한다. 하네스 검증·CLI 의견 시간은 빼고 잰다")
 
 
@@ -42,12 +43,17 @@ def agent_seconds(workflow_dir: Path, label: str) -> float | None:
 def cli_seconds(ledger: dict) -> float:
     total = 0.0
     for rnd in ledger.get("rounds", []):
-        last_jobs = None
+        inputs = {}
         for event in rnd.get("events", []):
-            if event.get("step") == "jobs" and event.get("at"):
-                last_jobs = _time(event["at"])
-            elif str(event.get("step", "")).startswith(CLI_STEP_PREFIX) and event.get("at") and last_jobs:
-                total += (_time(event["at"]) - last_jobs).total_seconds()
+            step = event.get("step")
+            if not event.get("at"):
+                continue
+            if step in CLI_STAGE_INPUTS.values():
+                inputs[step] = _time(event["at"])
+            elif step in CLI_STAGE_INPUTS:
+                start = inputs.get(CLI_STAGE_INPUTS[step])
+                if start is not None:
+                    total += (_time(event["at"]) - start).total_seconds()
     return total
 
 
