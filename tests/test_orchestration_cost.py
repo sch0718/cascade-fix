@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import sys
 import tempfile
@@ -252,6 +254,58 @@ class OrchestrationCostTest(unittest.TestCase):
         data = json.loads(out.read_text(encoding="utf-8"))
         self.assertEqual(len(data["runs"]), 2)
         self.assertIn("fit", data)
+
+    def test_project_removes_eight_of_twenty_four_requests(self):
+        row = {"requests": 24, "cost": 1.55, "findings": 4, "cache_write": 100_000,
+               "input": 100, "output": 1000, "cache_read": 200_000,
+               "by_model": {"claude-sonnet-5-5": 0.15, "claude-opus-5-5": 1.40}}
+        estimate = oc.project(row, 8)
+        self.assertAlmostEqual(estimate["lower"], 0.25833333333333336)
+        self.assertAlmostEqual(estimate["upper"], 0.325)
+        self.assertEqual(row["requests"], 24)
+        self.assertEqual(row["cost"], 1.55)
+        self.assertEqual(oc.project(row, 0), {"lower": 0.3875, "upper": 0.3875})
+
+    def test_project_matches_the_measurement_document_bounds(self):
+        row = {"requests": 24, "cost": 1.55, "findings": 4, "cache_write": 106_250,
+               "by_model": {"claude-opus-5-5": 1.55}}
+        estimate = oc.project(row, 8)
+        self.assertAlmostEqual(estimate["lower"], 0.2583, places=4)
+        self.assertAlmostEqual(estimate["upper"], 0.3292, places=4)
+
+    def test_project_without_cache_writes_has_the_same_bounds(self):
+        row = {"requests": 24, "cost": 1.55, "findings": 4, "cache_write": 0, "by_model": {}}
+        estimate = oc.project(row, 8)
+        self.assertAlmostEqual(estimate["lower"], 0.25833333333333336)
+        self.assertAlmostEqual(estimate["upper"], estimate["lower"])
+
+    def test_project_unmeasured_values_and_invalid_request_counts(self):
+        row = {"requests": 24, "cost": 1.55, "findings": 4, "cache_write": 100_000,
+               "by_model": {"claude-opus-5-5": 1.55}}
+        for field, value in (("cost", None), ("findings", 0), ("requests", 0)):
+            with self.subTest(field=field):
+                self.assertEqual(oc.project(dict(row, **{field: value}), 0), {"lower": None, "upper": None})
+        for removed in (-1, 25):
+            with self.subTest(removed=removed), self.assertRaises(ValueError):
+                oc.project(row, removed)
+        estimate = oc.project(dict(row, by_model={"unknown": 1.55}), 8)
+        self.assertAlmostEqual(estimate["lower"], 0.25833333333333336)
+        self.assertIsNone(estimate["upper"])
+
+    def test_main_prints_projection_only_when_requested(self):
+        session = str(self.two_runs())
+        for options, count in (([], 0), (["--remove-requests", "1"], 2)):
+            with self.subTest(options=options):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(oc.main(["--session", session, *options]), 0)
+                lines = out.getvalue().splitlines()
+                projections = [i for i, line in enumerate(lines) if line.startswith("추정:")]
+                self.assertEqual(len(projections), count)
+                for i in projections:
+                    self.assertTrue(lines[i - 1].startswith("| s1 |"))
+                    self.assertIn("~", lines[i])
+                    self.assertIn("지적당", lines[i])
 
 
 if __name__ == "__main__":
