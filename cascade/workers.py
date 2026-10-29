@@ -33,7 +33,7 @@ FALLBACK_LABELS = {
     STATUS_LIMIT: "한도", STATUS_INVALID: "무효", STATUS_AUTH: "로그인",
     STATUS_TIMEOUT: "시간 초과", STATUS_ERROR: "오류", STATUS_SKIPPED: "건너뜀",
 }
-LOGIN_COMMANDS = {RUNNER_CODEX: "codex login", RUNNER_CURSOR: "cursor-agent login"}
+LOGIN_COMMANDS = {RUNNER_CODEX: "codex login", RUNNER_CURSOR: "cursor-agent login", RUNNER_CLAUDE: "claude /login"}
 _USAGE_KEYS = {"input": "input_tokens", "output": "output_tokens", "cache_read": "cached_input_tokens"}
 
 

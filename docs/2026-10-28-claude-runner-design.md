@@ -52,7 +52,7 @@
 | 모드 | 역할 | 대상 | 쓰기 | 이전 |
 | --- | --- | --- | --- | --- |
 | 코드 | `code.a`·`code.b`(작업자 A·B) | 작업 워크트리 | 둘 다 쓴다 | 1차 |
-| 코드·문서 | 판가름(`adjudicator`) | 판가름 워크트리(패치를 커밋) | 쓴다 | 1차 |
+| 코드·문서 | 판가름(`adjudicator`) | 판가름 워크트리(패치를 커밋) | 쓴다 | 1차 → **11.2로 대체됨**(1차 구현에서 제외, Workflow 유지) |
 | 문서 | `judge_a`·`judge_b` | 작업 워크트리 | 읽기 | 1차 |
 | 문서 | `writer` | 작업 워크트리 | 쓴다 | 1차 |
 | 문서 | `checker` | 작업 워크트리 | 읽기 | 1차 |
@@ -73,7 +73,7 @@
 | `go`에 `--claude-via cli`를 더한다(권장) | 이음 루프·멈춤 규칙·테스트를 재사용, 진행 로직이 한 곳 | `next_actions`가 Claude 작업을 Workflow 대신 `workers` 단계로 내도록 바뀐다 |
 | 별도 `run` 명령 | 기존 `go`를 건드리지 않는다 | 이음 루프·멈춤 규칙을 복제해 두 벌을 유지 |
 
-설계: `--claude-via cli`(원장에 기록)일 때 `next_actions`가 Claude 작업 단계를 `Action(kind="workflow")` 대신 `workers` 단계(1차 범위: `stage1`·`checker`·`adj`)의 `cmd` 행동으로 낸다. 의견·재검토·첫 검토는 2차 범위라 검토 칸이 Claude이면 Workflow 행동이 그대로 남는다. 1차 범위만 Claude인 프로필에서는 `go`의 기존 「workers와 Workflow를 동시에 띄운다」 멈춤이 사라지고, `go`가 `workers`를 직접 돌려(`workers.lock` 아래) `report`까지 한 번에 이어 간다. 멈추는 곳은 (a-lite)와 같다(종료 코드 4·5·6, PR 재현 명령 승인, 모델 ID 경고, 로그인 만료, 보류 후보 선택, `report` 뒤).
+설계: `--claude-via cli`(원장에 기록)일 때 `next_actions`가 Claude 작업 단계를 `Action(kind="workflow")` 대신 `workers` 단계(1차 범위: `stage1`·`checker`·`adj`. **`adj`는 11.2로 대체됨** — 구현된 1차는 `stage1`·`checker`만이다)의 `cmd` 행동으로 낸다. 의견·재검토·첫 검토는 2차 범위라 검토 칸이 Claude이면 Workflow 행동이 그대로 남는다. 1차 범위만 Claude인 프로필에서는 `go`의 기존 「workers와 Workflow를 동시에 띄운다」 멈춤이 사라지고, `go`가 `workers`를 직접 돌려(`workers.lock` 아래) `report`까지 한 번에 이어 간다. 멈추는 곳은 (a-lite)와 같다(종료 코드 4·5·6, PR 재현 명령 승인, 모델 ID 경고, 로그인 만료, 보류 후보 선택, `report` 뒤).
 
 ## 5. 설계 쟁점과 제안
 
@@ -290,6 +290,8 @@ SUMMARY: critical=0 warning=6 suggestion=2
 ### 11.3 구현하지 않은 것(미확인·미해결)
 
 - 격리 점검(5.1)과 유료 측정(6절 1~3단계): 하지 않았다. 도구 허용 목록과 사후 검사(`_run_isolated`)까지만 있고 작업 폴더 밖 쓰기를 막지 못한다. 격리가 Workflow 수준임을 보이기 전에는 기본값을 `cli`로 바꾸지 않는다.
-- `claude -p`의 한도·로그인 문구, `modelUsage` 키 형식: 미실측. 가짜 실행 파일로만 검증했다. `classify_failure`에 `/login`·`invalid api key`를 더했다.
+- `claude -p`의 한도·로그인 문구, `modelUsage` 키 형식: 미실측. 가짜 실행 파일로만 검증했다. `classify_failure`에 `run /login`·`invalid api key`를 더했다(일반 `/login`은 Codex·Cursor의 경로 문구 `app/login/views.py`와 겹쳐 좁혔다). 로그인 안내(`LOGIN_COMMANDS`)에 claude를 넣었다.
+- 한도 정지(5.5): 미구현. 러너의 `_Exhaustion`이 같은 `workers` 실행 안의 나머지 Claude 호출을 건너뛰게 할 뿐, 한도에 걸린 뒤 `go`가 멈추거나 재개 시점을 알려 주지 않는다. 한도 문구는 미실측이다.
+- 대체 실행 사용량: 실패한 CLI 시도의 행과 Workflow 대체 실행의 행은 같은 작업 id라, CLI 기록 행에 `via: cli`를 달고 보고서(`_ClaudeUsage`)·평가기(`collect_usage`)가 (작업 id, 실행 경로)별로 센다. `workers --force`로 CLI 시도가 여러 번 쌓여도 Workflow 대체 실행분의 기록을 대신하지 못한다.
 - 재개·`--retry-failed`·부모 강제 종료 뒤 자식 정리(5.5): 하지 않았다. 한도·로그인 실패 뒤에는 기존처럼 `jobs --force`로 회차를 다시 연다. Claude 작업이 실패하면 그 작업은 Claude 대체 실행 Workflow(`*-fallback-args.json`)로 간다.
 - W2의 입력 세대 ID, W4의 분모 통일.

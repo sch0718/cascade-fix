@@ -139,9 +139,29 @@ class ClaudeRunnerTest(unittest.TestCase):
         self.assertEqual(out.usage, {UNRECORDED: 1})
 
     def test_not_logged_in_stderr_without_envelope_is_auth(self):
-        os.environ.update({"FAKE_CLAUDE_STDOUT": "", "FAKE_CLAUDE_STDERR": "Not logged in · Please run /login",
+        os.environ.update({"FAKE_CLAUDE_STDOUT": "\n", "FAKE_CLAUDE_STDERR": "Not logged in · Please run /login",
                            "FAKE_CLAUDE_EXIT": "1"})
         self.assertEqual(self.run_job().status, STATUS_AUTH)
+
+    def test_login_path_in_stderr_without_envelope_is_error(self):
+        os.environ.update({"FAKE_CLAUDE_STDOUT": "\n", "FAKE_CLAUDE_STDERR": "cannot read /repo/app/login/views.py",
+                           "FAKE_CLAUDE_EXIT": "1"})
+        self.assertEqual(self.run_job().status, STATUS_ERROR)
+
+    def test_read_only_checker_and_doc_judge_jobs_run_with_read_tools(self):
+        checker = json.dumps({"verdict": "사실", "needs_design_decision": False, "reason": "맞다", "checker_ok": True,
+                              "model_id": "x"})
+        os.environ["FAKE_CLAUDE_RESULT"] = checker
+        out = self.run_job(self.job(id="F1:checker", role="checker", kind="checker", writable=False))
+        self.assertEqual(out.status, STATUS_OK)
+        self.assertIs(out.output["checker_ok"], True)
+        os.environ["FAKE_CLAUDE_RESULT"] = result_json()
+        out = self.run_job(self.job(id="F1:judge_a", role="judge_a", writable=False))
+        self.assertEqual(out.status, STATUS_OK)
+        for n in (1, 2):
+            args = json.loads((self.log / f"claude-{n}.args.json").read_text(encoding="utf-8"))
+            self.assertEqual(args[args.index("--permission-mode") + 1], "default")
+            self.assertNotIn("Write", args[args.index("--allowedTools") + 1].split(","))
 
     def test_timeout_is_reported(self):
         os.environ["FAKE_CLAUDE_SLEEP"] = "5"

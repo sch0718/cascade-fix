@@ -326,7 +326,7 @@ tests = ["pytest {files}"]
 
 - 판가름·의견·재검토·첫 검토와, Claude 작업이 실패했을 때의 Claude 대체 실행(`*-fallback-args.json`)은 이번 범위가 아니라 계속 Workflow입니다. `go`는 그 단계에서 Workflow 결과를 기다리며 멈춥니다.
 - 도구: 쓰기 역할은 `acceptEdits`로 `Bash·Read·Edit·Write·Grep·Glob`, 읽기 역할은 `default`로 `Bash·Read·Grep·Glob`만 열고 `Edit·Write·NotebookEdit`을 막습니다(읽기 역할이 Bash로 파일을 바꾸면 기존 검사가 되돌리고 결과를 버립니다). 모든 호출에서 `WebFetch·WebSearch·Agent·Task`와 사용자 MCP·설정(`--setting-sources project --strict-mcp-config`)을 끕니다. 작업 폴더 밖 쓰기를 막는 샌드박스는 아니라서 Workflow 서브에이전트와 같은 수준인지는 측정 전이고, 그래서 기본값으로 쓰지 않습니다.
-- 사용량: 호출마다 `claude -p` JSON 봉투의 `usage`·`total_cost_usd`를 `round-N/claude-usage.json`의 `workflows.cli-<stage>-<n>`에 작업별로 씁니다. 다시 돌려도 앞 시도의 행이 남고 실패한 호출의 비용도 들어갑니다. 봉투가 없으면 행이 없어 보고서가 「미측정」으로 셉니다. 이 경로는 `CF usage`가 필요 없습니다.
+- 사용량: 호출마다 `claude -p` JSON 봉투의 `usage`·`total_cost_usd`를 `round-N/claude-usage.json`의 `workflows.cli-<stage>-<n>`에 작업별로 씁니다. 다시 돌려도 앞 시도의 행이 남고 실패한 호출의 비용도 들어갑니다. 봉투가 없던 시도는 토큰·비용이 비어 있는 행으로 남아 보고서가 두 칸 모두 「미측정」으로 셉니다. CLI 호출이 실패해 Workflow로 대체 실행한 작업은 호출 횟수만큼 기록이 있어야 측정으로 세므로, 대체 실행분은 `CF usage`로 기록하기 전까지 「외 미측정 N건」으로 드러납니다. 실패한 Claude CLI의 로그인 안내는 `claude /login`입니다. 이 경로는 `CF usage`가 필요 없습니다.
 - 모델 ID: 결과의 `model_id`는 요청 모델 그대로(`claude-sonnet-5-5`)입니다. 봉투의 `modelUsage`가 요청 모델을 하나도 담지 않으면 그 결과를 채택하지 않고 `무효`로 대체 실행합니다.
 - 아직 실측하지 않은 것: 실제 `claude -p`의 한도·로그인 실패 문구와 `modelUsage` 키 형식, 격리 수준.
 

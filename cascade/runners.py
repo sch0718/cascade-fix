@@ -38,7 +38,7 @@ _CODEX_APP_PATHS = (
 _CODEX_EXTENSION_GLOB = ".cursor/extensions/openai.chatgpt-*/bin/macos-aarch64/codex"
 _LIMIT_PATTERN = re.compile(r"usage limit|rate limit|quota|too many requests|\b429\b|hit your .{0,30}limit", re.IGNORECASE)
 _AUTH_PATTERN = re.compile(
-    r"authentication required|not logged in|unauthorized|\b401\b|refresh token|login required|codex login|cursor-agent login|/login|invalid api key",
+    r"authentication required|not logged in|unauthorized|\b401\b|refresh token|login required|codex login|cursor-agent login|run /login|invalid api key",
     re.IGNORECASE)
 _FENCED_JSON = re.compile(r"```json[ \t]*\r?\n(.*?)```", re.DOTALL)
 

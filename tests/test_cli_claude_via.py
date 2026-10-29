@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import unittest
+from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -126,7 +127,7 @@ class ClaudeViaGoTest(ClaudeViaTestBase):
         self.start("--claude-via", "cli")
         (self.rd() / cli_steps.USAGE_FILE).unlink()
         usage = report._ClaudeUsage(self.ledger(), self.run_dir)
-        self.assertEqual(usage.jobs["code.a"], {(1, "r1-01:a"), (1, "r1-02:a")})
+        self.assertEqual(dict(usage.jobs["code.a"]), {(1, "r1-01:a", "cli"): 1, (1, "r1-02:a", "cli"): 1})
         self.assertEqual(usage.columns([], usage.jobs["code.a"], True)[0], "미측정")
 
     def test_failed_claude_job_goes_to_workflow_fallback_and_keeps_failed_cost(self):
@@ -139,6 +140,34 @@ class ClaudeViaGoTest(ClaudeViaTestBase):
         rows = next(iter(self.read(cli_steps.USAGE_FILE)["workflows"].values()))
         self.assertEqual(len(rows), 4)
 
+    def test_workflow_fallback_run_of_failed_cli_job_shows_as_unmeasured(self):
+        self.env["FAKE_CLAUDE_ENVELOPE"] = json.dumps({"is_error": True, "result": "boom"})
+        self.init("--claude-via", "cli")
+        self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1")
+        self.cli("workers", "--run-dir", str(self.run_dir), "--round", "1", "--stage", "stage1")
+        usage = report._ClaudeUsage(self.ledger(), self.run_dir)
+        tokens, cost = usage.columns(usage.rows["code.a"], usage.jobs["code.a"], True)
+        self.assertEqual(tokens, "200/40/10 외 미측정 2건")
+        self.assertEqual(cost, "$0.5000 외 미측정 2건")
+        self.assertEqual(usage.unmeasured, 2)
+
+    def test_attempt_without_envelope_shows_tokens_as_unmeasured(self):
+        self.start("--claude-via", "cli")
+        entries = self.read("stage1-cli-args.json")["jobs"]
+        lost = Outcome("r1-01:a", "claude", "timeout", None, {"unrecorded": 1}, "")
+        cli._record_claude_usage(self.rd(), "code", entries, [lost], "stage1")
+        usage = report._ClaudeUsage(self.ledger(), self.run_dir)
+        rows = [r for r in usage.rows["code.a"] if r["job_id"] == "r1-01:a"][-1:]
+        self.assertEqual(usage.columns(rows, Counter(), True), ("미측정", "미측정"))
+
+    def test_report_points_to_login_when_claude_cli_auth_fails(self):
+        self.env["FAKE_CLAUDE_ENVELOPE"] = json.dumps({"is_error": True, "result": "Invalid API key · Please run /login"})
+        self.init("--claude-via", "cli")
+        self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1")
+        self.cli("workers", "--run-dir", str(self.run_dir), "--round", "1", "--stage", "stage1")
+        text = self.cli("report", "--run-dir", str(self.run_dir)).stdout
+        self.assertIn("claude: 로그인이 풀렸다. `claude /login`", text)
+
     def test_eval_scorer_expects_claude_cli_jobs_but_not_external_ones(self):
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "eval"))
         import score
@@ -149,6 +178,18 @@ class ClaudeViaGoTest(ClaudeViaTestBase):
         cli_args["jobs"][0]["runner"] = "codex"
         (self.rd() / "stage1-cli-args.json").write_text(json.dumps(cli_args), encoding="utf-8")
         self.assertEqual(score.claude_jobs(self.rd(), "code", score.COST_CORE), expected - {"r1-01:a"})
+
+    def test_eval_scorer_counts_missing_workflow_fallback_usage_as_gap(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "eval"))
+        import score
+        self.env["FAKE_CLAUDE_ENVELOPE"] = json.dumps({"is_error": True, "result": "boom"})
+        self.init("--claude-via", "cli")
+        self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1")
+        for _ in range(2):
+            self.cli("workers", "--run-dir", str(self.run_dir), "--round", "1", "--stage", "stage1", "--force")
+        _, _, tags, gaps = score.collect_usage(json.loads((self.run_dir / "ledger.json").read_text(encoding="utf-8")), [self.rd()], score.COST_CORE)
+        self.assertEqual(tags, [""])
+        self.assertEqual(gaps, {"code.a", "code.b"})
 
     def test_claude_job_entries_counts_claude_cli_and_workflow_jobs_only(self):
         data = {"jobs": [{"id": "a", "runner": "claude"}, {"id": "b", "runner": "codex"}, {"id": "c"}]}
