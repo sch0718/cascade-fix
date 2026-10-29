@@ -25,7 +25,7 @@ from cascade.consensus import (
     WorkerResult,
 )
 from cascade.findings import Finding
-from cascade.jobs import ROLES, AdjInput, location_file, split_location, write_job_args
+from cascade.jobs import ROLES, RUNNER_CLAUDE, AdjInput, location_file, split_location, write_job_args
 from cascade.patches import DIFF_FLAGS, changed_files, is_lossy, record_setup_paths
 from cascade.review import REVIEWER_CLAUDE, REVIEWER_CURSOR, claude_prompt, review_job
 from cascade.rounds import STATUS_DONE, Ledger, RoundRecord, ledger_path, needs_recheck
@@ -92,8 +92,16 @@ OPINION_RESULTS = "opinion.json"
 RECHECK_ARGS = "recheck-args.json"
 RECHECK_RESULTS = "recheck.json"
 USAGE_FILE = "claude-usage.json"
-CLAUDE_JOB_FILES = ("stage1-args.json", "stage1-fallback-args.json", "checker-args.json", "checker-fallback-args.json",
-                    "adj-args.json", OPINION_ARGS, RECHECK_ARGS)
+CLAUDE_JOB_FILES = ("stage1-args.json", "stage1-cli-args.json", "stage1-fallback-args.json", "checker-args.json",
+                    "checker-cli-args.json", "checker-fallback-args.json", "adj-args.json", OPINION_ARGS, RECHECK_ARGS)
+
+
+def claude_job_entries(data) -> list[dict]:
+    """작업 파일 내용에서 Claude가 돌릴 작업. runner가 없는 Workflow 입력은 모두 Claude이고, CLI 입력은 runner가 claude인 것만 센다."""
+    jobs = data.get("jobs") if isinstance(data, dict) else None
+    return [j for j in jobs or [] if isinstance(j, dict) and j.get("runner", RUNNER_CLAUDE) == RUNNER_CLAUDE]
+
+
 NON_PROGRESS_STEPS = ("cleanup", "usage")
 STAGE1, STAGE_CHECKER = "stage1", "checker"
 STAGE_ARGS = {STAGE1: "stage1-args.json", STAGE_CHECKER: "checker-args.json"}

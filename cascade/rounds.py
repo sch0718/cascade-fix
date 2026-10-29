@@ -72,6 +72,7 @@ class Ledger:
     workers: dict = field(default_factory=dict)
     adopt_on_both_pass: bool = False
     profile: dict = field(default_factory=dict)
+    claude_via: str = "workflow"
 
     def current_round(self) -> RoundRecord | None:
         return self.rounds[-1] if self.rounds else None

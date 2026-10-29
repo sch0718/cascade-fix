@@ -1,13 +1,14 @@
 # (a-full) 설계: Claude 작업을 `claude -p` 러너로 (2026-10-28, 초안)
 
-`docs/2026-10-28-orchestration-cost-design.md`의 (a-full) 후보를 구체화한 설계 초안이다. 이 문서의 「구현됨」은 (a-lite)뿐이고, `ClaudeRunner`·`--claude-via` 등 (a-full)은 모두 설계 단계다((a-full) 코드 없음, 유료 측정 없음). (a-lite)는 PR #31로 main에 병합됐다(병합 커밋 c918ff4, 이 브랜치의 구현 커밋 20688b9. 병합 사실은 세션 메시지 기준이고 이 작업 트리의 로컬 `main`에는 아직 없다). 읽은 것은 `cascade/runners.py`·`cascade/workers.py`·`cascade/jobs.py`·`cascade/cli.py`·`cascade/cli_steps.py`·`cascade/report.py`·`scripts/run-jobs.js`·`eval/solo.py`와 `claude --help`(2.1.311, 모델 호출 없음)다.
+`docs/2026-10-28-orchestration-cost-design.md`의 (a-full) 후보를 구체화한 설계 초안이다. 이 문서의 「구현됨」은 (a-lite)와 (a-full) 1차(11절)다. 11절에 적은 범위 밖의 (a-full)은 설계 단계이고 유료 측정은 하지 않았다. (a-lite)는 PR #31로 main에 병합됐다(병합 커밋 c918ff4, 이 브랜치의 구현 커밋 20688b9. 병합 사실은 세션 메시지 기준이고 이 작업 트리의 로컬 `main`에는 아직 없다). 읽은 것은 `cascade/runners.py`·`cascade/workers.py`·`cascade/jobs.py`·`cascade/cli.py`·`cascade/cli_steps.py`·`cascade/report.py`·`scripts/run-jobs.js`·`eval/solo.py`와 `claude --help`(2.1.311, 모델 호출 없음)다.
 
 ## 0. 구현 상태
 
 | 구분 | 내용 | 상태 |
 | --- | --- | --- |
 | (a-lite) | `CF start`(init→jobs까지)·`CF go`(Workflow 결과 저장·`usage`·`judge`~`report`를 멈출 곳까지)·`next_actions`(다음 단계를 구조화해 `next_steps`가 문자열로 그림)·`workers.lock`(실행 폴더당 `workers` 하나)·모델 ID 경고 멈춤·끝나지 않은 단계의 Workflow 결과 교체·`eval/orchestration_cost.py`의 `start`/`go` 인식·SKILL.md 「기본 경로」·`tests/test_cli_go.py`·`go.lock`·검토 스크립트 실패 처리(로그 없이 종료 코드 77이면 로그인 안내로 멈춤, 그 밖의 비정상 종료는 stderr와 함께 오류로 멈춤)·Claude 검토자 Workflow 결과의 모델 ID 사전 검사 | 구현됨, main에 병합(PR #31). 내용은 전체 테스트 1,597개 통과 시점의 작업 트리 기준이다 |
-| (a-full) | Claude 작업을 `claude -p`로 돌리는 `ClaudeRunner`, `--claude-via cli`, 판가름·대체 실행·검토 역할의 CLI 경로 | 설계 단계(아래 전부) |
+| (a-full) 1차 | `ClaudeRunner`, `--claude-via cli`(1단계 작업자·점검자), CLI 사용량 기록, 예상 Claude 작업 수집 | 구현됨(11절). 유료 측정 전이라 기본값은 `workflow` |
+| (a-full) 나머지 | 판가름(`workers --stage adj`)·Claude 대체 실행·검토 역할의 CLI 경로, 재개·`--retry-failed`·중단 경계, 격리 점검 | 설계 단계 |
 
 (a-lite)에서 이 설계가 이어 쓰는 것: `go`의 단계 이음 루프, `Action` 구조, `workers.lock`, 모델 ID 경고 멈춤(출력 줄 검사 방식), Workflow 결과 검증(작업 id 일치).
 
@@ -51,7 +52,7 @@
 | 모드 | 역할 | 대상 | 쓰기 | 이전 |
 | --- | --- | --- | --- | --- |
 | 코드 | `code.a`·`code.b`(작업자 A·B) | 작업 워크트리 | 둘 다 쓴다 | 1차 |
-| 코드·문서 | 판가름(`adjudicator`) | 판가름 워크트리(패치를 커밋) | 쓴다 | 1차 |
+| 코드·문서 | 판가름(`adjudicator`) | 판가름 워크트리(패치를 커밋) | 쓴다 | 1차 → **11.2로 대체됨**(1차 구현에서 제외, Workflow 유지) |
 | 문서 | `judge_a`·`judge_b` | 작업 워크트리 | 읽기 | 1차 |
 | 문서 | `writer` | 작업 워크트리 | 쓴다 | 1차 |
 | 문서 | `checker` | 작업 워크트리 | 읽기 | 1차 |
@@ -72,7 +73,7 @@
 | `go`에 `--claude-via cli`를 더한다(권장) | 이음 루프·멈춤 규칙·테스트를 재사용, 진행 로직이 한 곳 | `next_actions`가 Claude 작업을 Workflow 대신 `workers` 단계로 내도록 바뀐다 |
 | 별도 `run` 명령 | 기존 `go`를 건드리지 않는다 | 이음 루프·멈춤 규칙을 복제해 두 벌을 유지 |
 
-설계: `--claude-via cli`(원장에 기록)일 때 `next_actions`가 Claude 작업 단계를 `Action(kind="workflow")` 대신 `workers` 단계(1차 범위: `stage1`·`checker`·`adj`)의 `cmd` 행동으로 낸다. 의견·재검토·첫 검토는 2차 범위라 검토 칸이 Claude이면 Workflow 행동이 그대로 남는다. 1차 범위만 Claude인 프로필에서는 `go`의 기존 「workers와 Workflow를 동시에 띄운다」 멈춤이 사라지고, `go`가 `workers`를 직접 돌려(`workers.lock` 아래) `report`까지 한 번에 이어 간다. 멈추는 곳은 (a-lite)와 같다(종료 코드 4·5·6, PR 재현 명령 승인, 모델 ID 경고, 로그인 만료, 보류 후보 선택, `report` 뒤).
+설계: `--claude-via cli`(원장에 기록)일 때 `next_actions`가 Claude 작업 단계를 `Action(kind="workflow")` 대신 `workers` 단계(1차 범위: `stage1`·`checker`·`adj`. **`adj`는 11.2로 대체됨** — 구현된 1차는 `stage1`·`checker`만이다)의 `cmd` 행동으로 낸다. 의견·재검토·첫 검토는 2차 범위라 검토 칸이 Claude이면 Workflow 행동이 그대로 남는다. 1차 범위만 Claude인 프로필에서는 `go`의 기존 「workers와 Workflow를 동시에 띄운다」 멈춤이 사라지고, `go`가 `workers`를 직접 돌려(`workers.lock` 아래) `report`까지 한 번에 이어 간다. 멈추는 곳은 (a-lite)와 같다(종료 코드 4·5·6, PR 재현 명령 승인, 모델 ID 경고, 로그인 만료, 보류 후보 선택, `report` 뒤).
 
 ## 5. 설계 쟁점과 제안
 
@@ -258,3 +259,39 @@ Suggestion
    제안: 현재 결정은 한곳에서 관리하고, 과거 결정은 변경 이력으로 분리한다. 미결 목록에는 실제로 남은 선택만 둔다.
 
 SUMMARY: critical=0 warning=6 suggestion=2
+## 11. 구현 결과와 지적 판정 (2026-10-28)
+
+위 「검토에서 남은 지적」을 코드와 대조해 판정하고 (a-full) 1차를 구현했다. 판정은 코드를 읽어 확인한 것이고, 실제 동시 실행·유료 호출로 재현한 것은 없다.
+
+### 11.1 지적 판정
+
+| 지적 | 판정 | 처리 |
+| --- | --- | --- |
+| W1 작업 id 중복 제거가 재시도 비용과 충돌 | 사실(최초·대체 실행이 같은 작업 id를 쓴다) | CLI 호출 기록은 작업 id로 합치지 않고 시도별 키(`workflows.cli-<stage>-<n>`)에 행을 쌓는다. 다시 돌려도 앞 시도와 실패 호출의 비용이 남는다. 같은 시도 재수집 중복 제거는 필요 없다(러너가 한 번만 쓴다) |
+| W2 `jobs --force`가 `workers`와 직렬화되지 않음 | 사실(`cmd_jobs`는 `workers.lock`을 잡지 않았다) | `jobs`가 `workers.lock`을 잡아 `workers`가 도는 동안은 거절한다. 입력 세대 ID로 전환 전 결과를 거부하는 것은 하지 않았다(미해결) |
+| W3 평가기가 Workflow 입력 목록만 본다 | 사실(`eval/score.py`의 `claude_jobs`) | `cli_steps.claude_job_entries`를 만들어 `CLAUDE_JOB_FILES`에 `stage1-cli-args.json`·`checker-cli-args.json`을 더하고 보고서·평가기가 같은 함수로 `runner == claude`인 작업을 센다(외부 runner 작업은 세지 않는다). 사용량이 전부 빠진 CLI 실행은 「미측정」으로 나오는 것을 테스트로 확인했다. 판가름 입력(`adj-cli-args.json`)은 이번 범위 밖이라 없다 |
+| W4 대체 실행 비율 분모가 경로마다 다름 | 사실로 읽힘(`workers-*` 이벤트 작업 수 합산, 재현 안 함) | 측정 단계(6절) 몫이다. 구현은 바꾸지 않았다. 측정 때 외부 작업과 Claude 작업의 대체 비율을 따로 보고한다 |
+| W5 CLI 모드에서 `CF usage` 생략 규칙이 혼합 실행과 모순 | 사실 | 모드가 아니라 호출 경로로 정한다. CLI 호출은 `workers`가 기록하고 Workflow 호출은 `CF usage`가 같은 `claude-usage.json`에 각자의 키로 쓴다(`CF usage`는 자기 Workflow 키만 바꾼다). 두 경로가 섞인 실행의 합산을 통합 테스트로 검증하지는 못했다(미확인) |
+| W6 실행 경로 설정·변경 명령 계약 불일치 | 사실 | 확정: 최초 설정은 `start`·`init`의 `--claude-via`, 변경은 `jobs --force --claude-via …`(판정·적용 전), `go`는 원장 값을 쓴다 |
+| S1 기본값 전환 범위 | 타당 | 기본값 전환은 측정한 범위(코드 모드 `local-sonnet-b` 표본)로 한정한다. 문서 모드·Haiku 단독은 따로 검증한다 |
+| S2 확정·미결 동기화 | 타당 | 9절을 갱신하지 않고 아래 11.2에 현재 결정을 모았다. 9절은 당시 목록으로 둔다 |
+
+### 11.2 이번에 정한 설계 결정
+
+- **진행 명령**(9절 6번): `go` 확장. 별도 `run`은 만들지 않았다. `next_actions`는 바꾸지 않았다: Claude 작업을 `stage1-cli-args.json`으로 보내면 기존 `workers` 행동이 그대로 나온다.
+- **경로 확정 시점**(13번): 원장 `claude_via`(`workflow`|`cli`, 옛 원장은 `workflow`). `jobs`가 읽는다.
+- **1차 범위**(14번): 1단계 작업자·점검자만 옮긴다. 판가름은 `workers --stage adj` 계약(3절 1번)이 필요해 PR 크기와 검토 범위를 위해 뒤로 미룬다. 따라서 `claude_via cli`여도 판가름·의견·재검토와 Claude 대체 실행은 Workflow가 남고, 이 PR만으로 「Workflow 없이 `report`까지」는 되지 않는다(합의로 끝나는 지적만 있으면 재검토에서 멈춘다).
+- **Agent 도구**(8번): 허용하지 않는다(`--disallowedTools`). 비용은 봉투의 `total_cost_usd`를 쓴다(세션 기록을 읽지 않는다). 하위 에이전트가 없으므로 5.2의 누락 위험이 없다.
+- **사용량 기록**(15번): 작업별 파일 대신 `workers`가 끝난 뒤 한 곳(`_workers`, `workers.lock` 아래)에서 시도별 키로 쓴다. `workers`가 하나만 돌므로 잠금은 필요 없다.
+- **모델 ID**(10번): 러너 안에서 막는다. Claude 결과의 `model_id`는 접두사 없는 요청 모델이고, 봉투의 `modelUsage`에 요청 모델이 하나도 없으면 `무효`다. 전용 종료 코드·`--strict-model`은 두지 않았다.
+- **사용자 설정**(5.3): `--setting-sources project --strict-mcp-config`로 사용자 MCP·설정을 끄고 `CLAUDECODE`는 자식 환경에서 지운다. `--bare`는 평가하지 않았다.
+- **계획 확인 문구**(5.4): SKILL.md에 한 줄을 더했다. 그 줄이 있을 때만 `--claude-via cli`를 쓴다.
+
+### 11.3 구현하지 않은 것(미확인·미해결)
+
+- 격리 점검(5.1)과 유료 측정(6절 1~3단계): 하지 않았다. 도구 허용 목록과 사후 검사(`_run_isolated`)까지만 있고 작업 폴더 밖 쓰기를 막지 못한다. 격리가 Workflow 수준임을 보이기 전에는 기본값을 `cli`로 바꾸지 않는다.
+- `claude -p`의 한도·로그인 문구, `modelUsage` 키 형식: 미실측. 가짜 실행 파일로만 검증했다. `classify_failure`에 `run /login`·`invalid api key`를 더했다(일반 `/login`은 Codex·Cursor의 경로 문구 `app/login/views.py`와 겹쳐 좁혔다). 로그인 안내(`LOGIN_COMMANDS`)에 claude를 넣었다.
+- 한도 정지(5.5): 미구현. 러너의 `_Exhaustion`이 같은 `workers` 실행 안의 나머지 Claude 호출을 건너뛰게 할 뿐, 한도에 걸린 뒤 `go`가 멈추거나 재개 시점을 알려 주지 않는다. 한도 문구는 미실측이다.
+- 대체 실행 사용량: 실패한 CLI 시도의 행과 Workflow 대체 실행의 행은 같은 작업 id라, CLI 기록 행에 `via: cli`를 달고 보고서(`_ClaudeUsage`)·평가기(`collect_usage`)가 (작업 id, 실행 경로)별로 센다. `workers --force`로 CLI 시도가 여러 번 쌓여도 Workflow 대체 실행분의 기록을 대신하지 못한다.
+- 재개·`--retry-failed`·부모 강제 종료 뒤 자식 정리(5.5): 하지 않았다. 한도·로그인 실패 뒤에는 기존처럼 `jobs --force`로 회차를 다시 연다. Claude 작업이 실패하면 그 작업은 Claude 대체 실행 Workflow(`*-fallback-args.json`)로 간다.
+- W2의 입력 세대 ID, W4의 분모 통일.

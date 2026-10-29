@@ -268,6 +268,36 @@ stamp("cursor-agent", n, "end")
 sys.exit(entry.get("exit", 0))
 '''
 
+CLAUDE_BODY = _COMMON + r'''
+n = claim("claude")
+stamp("claude", n, "start")
+args = sys.argv[1:]
+(log / f"claude-{n}.stdin").write_text(sys.stdin.read())
+(log / f"claude-{n}.env.json").write_text(json.dumps({"CLAUDECODE": os.environ.get("CLAUDECODE")}))
+(log / f"claude-{n}.cwd").write_text(os.getcwd())
+sleep = float(os.environ.get("FAKE_CLAUDE_SLEEP", "0"))
+if sleep:
+    time.sleep(sleep)
+mutate(os.getcwd())
+model = args[args.index("--model") + 1]
+envelope = {
+    "type": "result", "subtype": "success", "is_error": False, "result": "", "session_id": "s",
+    "total_cost_usd": 0.25, "num_turns": 2,
+    "usage": {"input_tokens": 100, "output_tokens": 20, "cache_read_input_tokens": 5, "cache_creation_input_tokens": 1},
+    "modelUsage": {model: {"inputTokens": 100}},
+}
+if "FAKE_CLAUDE_RESULT" in os.environ:
+    envelope["structured_output"] = json.loads(os.environ["FAKE_CLAUDE_RESULT"])
+envelope.update(json.loads(os.environ.get("FAKE_CLAUDE_ENVELOPE", "{}")))
+if os.environ.get("FAKE_CLAUDE_STDOUT"):
+    sys.stdout.write(os.environ["FAKE_CLAUDE_STDOUT"])
+else:
+    print(json.dumps(envelope, ensure_ascii=False))
+sys.stderr.write(os.environ.get("FAKE_CLAUDE_STDERR", ""))
+stamp("claude", n, "end")
+sys.exit(int(os.environ.get("FAKE_CLAUDE_EXIT", "0")))
+'''
+
 
 def install(directory, name, body):
     path = Path(directory) / name

@@ -1,6 +1,7 @@
 import argparse
 import json
 import sys
+from collections import Counter
 from pathlib import Path
 
 SKILL_ROOT = Path(__file__).resolve().parent.parent
@@ -8,14 +9,15 @@ sys.path.insert(0, str(SKILL_ROOT))
 from cascade.assignment import first_review_runner, job_cell_key  # noqa: E402
 from cascade.cli import PRE_FINAL_DECISIONS  # noqa: E402
 from cascade.cli_steps import CLAUDE_JOB_FILES as ALL_CLAUDE_JOB_FILES  # noqa: E402
-from cascade.cli_steps import OPINION_ARGS, RECHECK_ARGS, USAGE_FILE  # noqa: E402
+from cascade.cli_steps import OPINION_ARGS, RECHECK_ARGS, USAGE_FILE, claude_job_entries  # noqa: E402
 from cascade.consensus import REASON_BOTH_PASS  # noqa: E402
 from cascade.jobs import RUNNER_CLAUDE  # noqa: E402
 from cascade.report import JOB_FILES  # noqa: E402
 from cascade.report import _money as money  # noqa: E402
+from cascade.report import _via_of_file  # noqa: E402
 from cascade.runners import STATUS_INVALID  # noqa: E402
 from cascade.usage import PRICE_SOURCE, PRICES_AS_OF  # noqa: E402
-from cascade.workers import FALLBACK_LABELS  # noqa: E402
+from cascade.workers import CLAUDE_VIA_WORKFLOW, FALLBACK_LABELS  # noqa: E402
 
 TARGET_AGREEMENT = 0.95
 TARGET_OPUS = 0.40
@@ -137,7 +139,7 @@ def claude_calls(run_dir: Path, round_no: int | None = None) -> dict[str, int]:
     calls = dict.fromkeys(CLAUDE_FAMILIES, 0)
     for name in CLAUDE_JOB_FILES:
         for data in round_files(run_dir, name, round_no):
-            for job in data.get("jobs", []):
+            for job in claude_job_entries(data):
                 for family in CLAUDE_FAMILIES:
                     calls[family] += str(job.get("model", "")).startswith(f"claude-{family}-")
     return calls
@@ -319,7 +321,16 @@ def claude_job_names(scope: str) -> tuple[str, ...]:
 
 
 def claude_jobs(round_dir: Path, mode: str, scope: str) -> set[str]:
-    return {job_id for job_id in job_ids(round_dir, claude_job_names(scope)) if scoped_cells([job_id], mode, scope)}
+    ids = {job["id"] for name in claude_job_names(scope) for job in claude_job_entries(read_optional(round_dir / name))
+           if isinstance(job.get("id"), str)}
+    return {job_id for job_id in ids if scoped_cells([job_id], mode, scope)}
+
+
+def claude_expected(round_dir: Path, mode: str, scope: str) -> Counter:
+    """기록이 있어야 하는 Claude 호출을 (작업 id, 실행 경로)별 횟수로 센다. CLI 호출과 그 대체 Workflow 호출은 따로 센다."""
+    return Counter((job["id"], _via_of_file(name)) for name in claude_job_names(scope)
+                   for job in claude_job_entries(read_optional(round_dir / name))
+                   if isinstance(job.get("id"), str) and scoped_cells([job["id"]], mode, scope))
 
 
 def first_review_of(ledger: dict) -> dict:
@@ -371,7 +382,8 @@ def collect_usage(ledger: dict, rounds: list[Path], scope: str) -> tuple[list[di
         if found and isinstance(data.get("prices_as_of"), str):
             dates.append(data["prices_as_of"])
         rows += found
-        unrecorded = claude_jobs(round_dir, mode, scope) - {row.get("job_id") for row in found}
+        have = Counter((row.get("job_id"), row.get("via", CLAUDE_VIA_WORKFLOW)) for row in found)
+        unrecorded = [job_id for (job_id, via), n in claude_expected(round_dir, mode, scope).items() if n > have[(job_id, via)]]
         if unrecorded:
             tags.append("")
             gaps.update(scoped_cells(unrecorded, mode, scope))

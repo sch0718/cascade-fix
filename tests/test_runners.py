@@ -192,6 +192,13 @@ class CodexRunnerTest(RunnerTestBase):
                     os.environ, {"FAKE_CODEX_EXIT": "1", "FAKE_CODEX_EVENTS": json.dumps([event])}):
                 self.assertEqual(self.run_codex().status, status)
 
+    def test_login_path_in_stderr_is_not_auth_failure(self):
+        stderr = "Error: failed to read /repo/app/login/views.py: permission denied"
+        with mock.patch.dict(os.environ, {"FAKE_CODEX_EXIT": "1", "FAKE_CODEX_STDERR": stderr}):
+            self.assertEqual(self.run_codex().status, STATUS_ERROR)
+        self.assertEqual(classify_failure(stderr), STATUS_ERROR)
+        self.assertEqual(classify_failure("Please run /login to continue"), STATUS_AUTH)
+
     def test_truncated_auth_copy_is_not_written_back(self):
         with mock.patch.dict(os.environ, {"FAKE_CODEX_REFRESH": '{"tokens": {"refre'}):
             out = self.run_codex()

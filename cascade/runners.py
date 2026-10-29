@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from cascade.cursor_acp import SESSIONS_PER_SERVER, AcpError, AcpTimeout, CursorAcpPool
-from cascade.jobs import SCHEMAS, valid_output
+from cascade.jobs import RUNNER_CLAUDE, SCHEMAS, valid_output
 from cascade.patches import NO_HOOKS, _git_checked
 
 STATUS_OK, STATUS_INVALID, STATUS_LIMIT, STATUS_AUTH, STATUS_TIMEOUT, STATUS_ERROR, STATUS_SKIPPED = (
@@ -38,7 +38,7 @@ _CODEX_APP_PATHS = (
 _CODEX_EXTENSION_GLOB = ".cursor/extensions/openai.chatgpt-*/bin/macos-aarch64/codex"
 _LIMIT_PATTERN = re.compile(r"usage limit|rate limit|quota|too many requests|\b429\b|hit your .{0,30}limit", re.IGNORECASE)
 _AUTH_PATTERN = re.compile(
-    r"authentication required|not logged in|unauthorized|\b401\b|refresh token|login required|codex login|cursor-agent login",
+    r"authentication required|not logged in|unauthorized|\b401\b|refresh token|login required|codex login|cursor-agent login|run /login|invalid api key",
     re.IGNORECASE)
 _FENCED_JSON = re.compile(r"```json[ \t]*\r?\n(.*?)```", re.DOTALL)
 
@@ -122,6 +122,14 @@ def find_cursor_agent() -> str | None:
     if on_path:
         return os.path.abspath(on_path)
     return _executable(Path.home() / ".local" / "bin" / "cursor-agent")
+
+
+def find_claude() -> str | None:
+    """claude 실행 파일. 환경 변수 CASCADE_CLAUDE를 주면 그것만 본다."""
+    if os.environ.get("CASCADE_CLAUDE"):
+        return _executable(Path(os.environ["CASCADE_CLAUDE"]))
+    on_path = shutil.which("claude")
+    return os.path.abspath(on_path) if on_path else None
 
 
 def codex_available() -> bool:
@@ -329,7 +337,8 @@ def _failure(job: CliJob, run: _Run, usage: dict, timeout: float) -> Outcome | N
 def _check_output(job: CliJob, output: dict | None) -> dict | None:
     if output is None:
         return None
-    candidate = {**output, "model_id": f"{job.runner}:{job.model or DEFAULT_MODEL_NAME}"}
+    model_id = job.model if job.runner == RUNNER_CLAUDE else f"{job.runner}:{job.model or DEFAULT_MODEL_NAME}"
+    candidate = {**output, "model_id": model_id}
     return candidate if valid_output(candidate, job.role) else None
 
 
@@ -717,6 +726,83 @@ class CursorRunner:
             output = _check_output(job, extract_json_block(str(envelope.get("result", ""))))
             if output is None:
                 return Outcome(job.id, job.runner, STATUS_INVALID, None, usage, "재요청 뒤에도 스키마를 따르지 않는 결과")
+        return Outcome(job.id, job.runner, STATUS_OK, output, usage, "")
+
+
+_CLAUDE_DENIED = ("WebFetch", "WebSearch", "Agent", "Task")
+_CLAUDE_READ_TOOLS = ("Bash", "Read", "Grep", "Glob")
+_CLAUDE_WRITE_TOOLS = ("Edit", "Write", "NotebookEdit")
+_CLAUDE_USAGE_KEYS = {"input_tokens": "input_tokens", "output_tokens": "output_tokens",
+                      "cache_read_input_tokens": "cached_input_tokens", "cache_creation_input_tokens": "cache_write_tokens"}
+
+
+def _claude_usage(envelope: dict | None) -> dict:
+    if envelope is None:
+        return {UNRECORDED: 1}
+    raw = envelope.get("usage") if isinstance(envelope.get("usage"), dict) else {}
+    usage = {name: raw[key] for key, name in _CLAUDE_USAGE_KEYS.items() if isinstance(raw.get(key), int)}
+    cost = envelope.get("total_cost_usd")
+    if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+        usage["cost_usd"] = cost
+    return usage or {UNRECORDED: 1}
+
+
+def _claude_model_mismatch(job: CliJob, envelope: dict) -> str | None:
+    """봉투의 modelUsage가 요청 모델을 하나도 담지 않으면 실제 모델 ID를 돌려준다. modelUsage가 없으면 확인하지 못한 것이라 통과시킨다."""
+    used = envelope.get("modelUsage")
+    if not isinstance(used, dict) or not used or any(job.model in str(name) for name in used):
+        return None
+    return ", ".join(map(str, used))
+
+
+class ClaudeRunner:
+    """호출마다 `claude -p`로 돌린다. 작업 워크트리 안에서 도는 역할만 맡는다(쓰기 역할은 도구로 쓰기를 열고, 읽기 역할은 막는다)."""
+
+    def __init__(self, exe: str, timeout: int = JOB_TIMEOUT):
+        self.exe = exe
+        self.timeout = timeout
+
+    def run(self, job: CliJob) -> Outcome:
+        try:
+            return self._run_job(job)
+        except Exception as e:
+            return _unexpected(job, e)
+
+    def _command(self, job: CliJob) -> list[str]:
+        schema = json.dumps(SCHEMAS[job.kind], ensure_ascii=False)
+        tools = _CLAUDE_READ_TOOLS + (("Edit", "Write") if job.writable else ())
+        denied = _CLAUDE_DENIED + (() if job.writable else _CLAUDE_WRITE_TOOLS)
+        return [self.exe, "-p", "--model", job.model, "--effort", job.effort, "--output-format", "json",
+                "--json-schema", schema, "--setting-sources", "project", "--strict-mcp-config",
+                "--permission-mode", "acceptEdits" if job.writable else "default",
+                "--allowedTools", ",".join(tools), "--disallowedTools", ",".join(denied)]
+
+    def _run_job(self, job: CliJob) -> Outcome:
+        prompt = job.prompt_path.read_text(encoding="utf-8")
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+        run = _execute(self._command(job), prompt, job.worktree, env, self.timeout)
+        envelope = _cursor_envelope(run.stdout)
+        usage = _claude_usage(envelope)
+        failed = _failure(job, run, usage, self.timeout)
+        if failed:
+            return failed
+        if envelope is None:
+            text = _without_prompt(f"{run.stdout}\n{run.stderr}", prompt)
+            return Outcome(job.id, job.runner, classify_failure(text), None, usage,
+                           f"JSON 봉투가 아니다(종료 코드 {run.returncode}): {_tail(_without_prompt(run.stderr, prompt) or run.stdout)}")
+        if run.returncode != 0 or envelope.get("is_error"):
+            errors = envelope.get("errors")
+            message = "\n".join([str(envelope.get("result") or ""), *map(str, errors if isinstance(errors, list) else [])])
+            text = _without_prompt(f"{message}\n{run.stderr}", prompt)
+            return Outcome(job.id, job.runner, classify_failure(text), None, usage,
+                           f"종료 코드 {run.returncode}: {_tail(message) or _tail(run.stderr)}")
+        mismatch = _claude_model_mismatch(job, envelope)
+        if mismatch:
+            return Outcome(job.id, job.runner, STATUS_INVALID, None, usage, f"실제 모델이 요청({job.model})과 다르다: {mismatch}")
+        output = envelope.get("structured_output")
+        output = _check_output(job, output if isinstance(output, dict) else extract_json_block(str(envelope.get("result") or "")))
+        if output is None:
+            return Outcome(job.id, job.runner, STATUS_INVALID, None, usage, "결과가 스키마를 따르지 않는다")
         return Outcome(job.id, job.runner, STATUS_OK, output, usage, "")
 
 

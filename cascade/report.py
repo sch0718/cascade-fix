@@ -1,10 +1,11 @@
 import json
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
 from cascade import assignment
 from cascade import usage as price_table
-from cascade.cli_steps import CLAUDE_JOB_FILES, USAGE_FILE, exhausted_runners, review_cell
+from cascade.cli_steps import CLAUDE_JOB_FILES, USAGE_FILE, claude_job_entries, exhausted_runners, review_cell
 from cascade.consensus import (
     OUTCOME_ADJUDICATE,
     OUTCOME_AGREED_FACT,
@@ -19,7 +20,7 @@ from cascade.profiles import ROLE_KEYS
 from cascade.review import label as reviewer_label
 from cascade.rounds import Ledger
 from cascade.runners import STATUS_AUTH, STATUS_OK
-from cascade.workers import FALLBACK_LABELS, LOGIN_COMMANDS, UNRECORDED, WORKERS_CLAUDE, describe, fallback_counts
+from cascade.workers import CLAUDE_VIA_CLI, CLAUDE_VIA_WORKFLOW, FALLBACK_LABELS, LOGIN_COMMANDS, UNRECORDED, WORKERS_CLAUDE, describe, fallback_counts
 
 SOURCE_PR_COMMENT = "pr-comment"
 BUCKET_REBUTTAL = "반박"
@@ -606,7 +607,7 @@ def _review_rows(runners: list[str], events: list[dict | None], fallback: str, w
     rows = []
     for r, n in counts.items():
         if r == RUNNER_CLAUDE:
-            tokens, cost = claude.columns(claude.rows.get(cell, []), claude.jobs.get(cell, set()), True)
+            tokens, cost = claude.columns(claude.rows.get(cell, []), claude.jobs.get(cell, Counter()), True)
         else:
             tokens, cost = "-", "-"
         rows.append(f"| {reviewer_label(r)} {what} | {n} | {_reason_text(reasons.get(r, {}))} | {tokens} | {cost} | - |")
@@ -638,13 +639,17 @@ def _read_usage_rows(data) -> list[dict]:
     return rows
 
 
+def _via_of_file(name: str) -> str:
+    return CLAUDE_VIA_CLI if name.endswith("-cli-args.json") else CLAUDE_VIA_WORKFLOW
+
+
 class _ClaudeUsage:
     """칸별 Claude 토큰과 추정 비용. CF usage가 저장한 작업별 cost를 더할 뿐 단가로 다시 계산하지 않는다."""
 
     def __init__(self, ledger: Ledger, run_dir: Path | None):
         self.known = run_dir is not None
         self.rows: dict[str, list[dict]] = {}
-        self.jobs: dict[str, set[tuple[int, str]]] = {}
+        self.jobs: dict[str, Counter] = {}
         self.basis: list[tuple[str, str]] = []
         self.superseded: list[float] | None = None
         self.first_review_rows: list[dict] = []
@@ -661,11 +666,10 @@ class _ClaudeUsage:
                 if isinstance(row.get("cell"), str):
                     self.rows.setdefault(row["cell"], []).append({**row, "round": rnd.no})
             for name in CLAUDE_JOB_FILES:
-                listed = _read_json(rd / name)
-                for entry in listed.get("jobs", []) if isinstance(listed, dict) and isinstance(listed.get("jobs"), list) else []:
-                    cell = _cell_of(ledger, entry["id"]) if isinstance(entry, dict) and isinstance(entry.get("id"), str) else None
+                for entry in claude_job_entries(_read_json(rd / name)):
+                    cell = _cell_of(ledger, entry["id"]) if isinstance(entry.get("id"), str) else None
                     if cell:
-                        self.jobs.setdefault(cell, set()).add((rnd.no, entry["id"]))
+                        self.jobs.setdefault(cell, Counter())[(rnd.no, entry["id"], _via_of_file(name))] += 1
 
     def _collect_first_review(self, ledger: Ledger) -> None:
         data = (assignment.ledger_profile(ledger).get("first_review") or {}).get("usage")
@@ -684,11 +688,13 @@ class _ClaudeUsage:
             if entry not in self.basis:
                 self.basis.append(entry)
 
-    def columns(self, rows: list[dict], jobs: set[tuple[int, str]], work: bool) -> tuple[str, str]:
-        """(토큰, 비용) 칸 글자. 이 칸에 Claude 작업이 있는데(work나 jobs) 기록이 없으면 미측정, 작업이 없으면 -."""
+    def columns(self, rows: list[dict], jobs: Counter, work: bool) -> tuple[str, str]:
+        """(토큰, 비용) 칸 글자. 이 칸에 Claude 작업이 있는데(work나 jobs) 기록이 없으면 미측정, 작업이 없으면 -.
+        같은 작업 id라도 CLI 호출과 Workflow 호출은 따로 센다(CLI 호출이 실패해 Workflow로 대체 실행한 작업은 둘 다 기록이 있어야 한다)."""
         if not rows and not (work or jobs):
             return "-", "-"
-        missing = len(jobs - {(row.get("round"), row.get("job_id")) for row in rows})
+        have = Counter((row.get("round"), row.get("job_id"), row.get("via", CLAUDE_VIA_WORKFLOW)) for row in rows)
+        missing = sum(max(0, n - have[key]) for key, n in jobs.items())
         if not rows:
             self.unmeasured += max(missing, 1)
             return UNMEASURED, UNMEASURED
@@ -696,11 +702,17 @@ class _ClaudeUsage:
         no_price = sum(1 for c in costs if c is None)
         self.shown.extend(rows)
         self.unmeasured += missing + no_price
-        tokens = "/".join(str(sum(_stored_number(row.get(k)) or 0 for row in rows)) for k in ("input", "output", "cache_read"))
+        keys = ("input", "output", "cache_read")
+        no_tokens = sum(1 for row in rows if _stored_number(row.get("input")) is None)
+        tokens = "/".join(str(sum(_stored_number(row.get(k)) or 0 for row in rows)) for k in keys)
+        lost = missing + no_tokens
         known = [c for c in costs if c is not None]
         cost = _money(sum(known)) if known else UNMEASURED
-        return (f"{tokens} 외 {UNMEASURED} {missing}건" if missing else tokens,
-                f"{cost} 외 {UNMEASURED} {missing + no_price}건" if known and missing + no_price else cost)
+        if no_tokens == len(rows):
+            tokens = UNMEASURED
+        elif lost:
+            tokens = f"{tokens} 외 {UNMEASURED} {lost}건"
+        return (tokens, f"{cost} 외 {UNMEASURED} {missing + no_price}건" if known and missing + no_price else cost)
 
     def total_lines(self) -> list[str]:
         if not self.shown:
@@ -737,14 +749,14 @@ def _calls_section(ledger: Ledger, run_dir: Path | None) -> list[str]:
            "| --- | ---: | ---: | ---: | ---: | ---: |"]
     for key in assignment.work_keys(profile["roles"], ledger.mode):
         fallback = _reason_text(reasons[key]) if key in reasons else "0" if calls is not None else "-"
-        claude_tokens, claude_cost = claude.columns(claude.rows.get(key, []), claude.jobs.get(key, set()), False)
+        claude_tokens, claude_cost = claude.columns(claude.rows.get(key, []), claude.jobs.get(key, Counter()), False)
         out.append(f"| {key} | {calls.get(key, 0) if calls is not None else '-'} | {fallback} | {claude_tokens} | "
                    f"{claude_cost} | {_token_text(tokens.get(key))} |")
     first = _first_review_runner(ledger)
     if first:
         attempts = _first_review_attempts(ledger)
         fallback = {attempts[-1].get("reason", "")} if attempts else set()
-        claude_tokens, claude_cost = claude.columns(claude.first_review_rows, set(), first == RUNNER_CLAUDE)
+        claude_tokens, claude_cost = claude.columns(claude.first_review_rows, Counter(), first == RUNNER_CLAUDE)
         out.append(f"| {reviewer_label(first)} 첫 검토 | 1 | {_reason_text({r: 1 for r in fallback})} | {claude_tokens} | "
                    f"{claude_cost} | - |")
     opinions = list(ledger.opinions)

@@ -7,7 +7,7 @@ from cascade.jobs import ROLES, RUNNER_CLAUDE
 from cascade.profiles import ROLE_KEYS, RUNNER_AUTO
 from cascade.review import CLAUDE_SOURCES, REVIEWER_AUTO, resolve
 from cascade.runners import RUNNER_CODEX, RUNNER_CURSOR
-from cascade.workers import DEFAULT_CURSOR_MODEL, RECIPIENTS, WORKERS_EXTERNAL
+from cascade.workers import CLAUDE_VIA_CLI, DEFAULT_CURSOR_MODEL, RECIPIENTS, WORKERS_EXTERNAL
 
 UNAVAILABLE_REASON = "미설치 또는 로그인 필요"
 NO_CONSENT_REASON = "전송 동의 없음"
@@ -266,6 +266,11 @@ def adjudicator_cell(ledger) -> dict:
 def job_workers(ledger) -> dict[str, dict] | None:
     workers = mode_workers(ledger_profile(ledger)["roles"], ledger.mode)
     return None if _is_claude_default(workers, ledger.mode) else workers
+
+
+def build_workers(ledger) -> dict[str, dict] | None:
+    """작업 파일을 만들 때 쓰는 칸 배정. `claude_via == cli`면 모두 Claude여도 작업마다 runner·워크트리를 싣도록 배정을 준다."""
+    return job_workers(ledger) or (mode_workers(ledger_profile(ledger)["roles"], ledger.mode) if ledger.claude_via == CLAUDE_VIA_CLI else None)
 
 
 def apply_sandbox_substitution(ledger, before: dict[str, dict], after: dict[str, dict], reason: str) -> None:
