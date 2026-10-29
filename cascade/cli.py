@@ -1877,14 +1877,34 @@ def _pick_workflow(pending: list[s.Action], saved: list[s.Action], output: str |
 
 def _go_stop(run_dir: Path, reason: str, actions: list[s.Action], then: str | None = None) -> int:
     shown = [action for action in actions if not action.hidden]
+    has_workflow = any(action.kind == "workflow" for action in shown)
+    pending_workflow = False
     print(f"멈춤: {reason}")
     print("다음:")
     for action in shown:
         print(f"  {action.text}")
+        if action.kind == "workflow" and not action.out_path.is_file():
+            pending_workflow = True
+            try:
+                data = json.loads(action.args_path.read_text(encoding="utf-8"))
+                args_json = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+            except (OSError, ValueError):
+                continue
+            if len(args_json) <= 8000:
+                print(f"    args: {args_json}")
     if then:
         print(f"  {then}")
-    elif any(action.kind == "workflow" for action in shown):
+    elif has_workflow:
         print(f"  (Workflow가 끝나면) {s._cmd('go', run_dir, '--workflow-output <완료 알림의 output-file>', '--workflow <Workflow 실행 id>')}")
+    if pending_workflow:
+        script_path = Path(run_dir).resolve() / "run-jobs.js"
+        try:
+            script = s.RUN_JOBS.read_bytes()
+            if not script_path.exists() or script_path.read_bytes() != script:
+                script_path.write_bytes(script)
+        except OSError:
+            return 0
+        print(f"    scriptPath: {script_path}")
     return 0
 
 

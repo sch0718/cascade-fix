@@ -7,7 +7,7 @@ from pathlib import Path
 
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SKILL_ROOT))
-from cascade.usage import PRICE_SOURCE, PRICES_AS_OF, read_session  # noqa: E402
+from cascade.usage import CACHE_WRITE_1H_MULTIPLIER, PRICE_SOURCE, PRICES, PRICES_AS_OF, read_session  # noqa: E402
 
 STEP = re.compile(r"(?:cascade\.cli\"?|\bCF)\s+(init|start|go|report)\b")
 GO_REPORTED = "멈춤: report까지 끝났다"
@@ -137,6 +137,27 @@ def measure(path: Path) -> list[dict]:
     return rows
 
 
+def project(row: dict, removed_requests: int) -> dict:
+    """지적당 비용 범위. 캐시 쓰기는 비용 비중이 가장 큰 모델의 1시간 TTL 단가(입력 단가의 2배)로 추정한다."""
+    requests = row["requests"]
+    if removed_requests < 0 or removed_requests > requests:
+        raise ValueError("줄일 요청 수는 0 이상 전체 요청 수 이하여야 한다")
+    total, findings = row["cost"], row["findings"]
+    if total is None or not requests or not findings:
+        return {"lower": None, "upper": None}
+    ratio = (requests - removed_requests) / requests
+    lower = total * ratio / findings
+    if not row["cache_write"]:
+        return {"lower": lower, "upper": lower}
+    by_model = row["by_model"]
+    model = max(by_model, key=lambda m: by_model[m] or 0, default="")
+    prices = PRICES.get(model)
+    if prices is None:
+        return {"lower": lower, "upper": None}
+    fixed = min(total, row["cache_write"] * prices["input"] * CACHE_WRITE_1H_MULTIPLIER / 1_000_000)
+    return {"lower": lower, "upper": (fixed + (total - fixed) * ratio) / findings}
+
+
 def unique_runs(rows: list[dict]) -> list[dict]:
     """포크한 세션에 같은 실행이 겹쳐 있으면 하나만 남긴다."""
     seen: dict[tuple[str, str], dict] = {}
@@ -171,14 +192,20 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="실제 cascade-fix 사용 세션에서 메인 세션의 진행 비용을 추정한다")
     parser.add_argument("--session", action="append", required=True, help="메인 세션 기록 JSONL(여러 번 줄 수 있다)")
     parser.add_argument("--json")
+    parser.add_argument("--remove-requests", type=int, help="이 수만큼 요청을 줄였을 때 지적당 비용 범위를 추정한다")
     args = parser.parse_args(argv)
     rows = unique_runs([row for path in args.session for row in measure(Path(path))])
+    if args.remove_requests is not None and (args.remove_requests < 0 or any(args.remove_requests > r["requests"] for r in rows)):
+        parser.error("줄일 요청 수는 0 이상 각 실행의 전체 요청 수 이하여야 한다")
     result = {"scope": SCOPE, "prices_as_of": PRICES_AS_OF, "price_source": PRICE_SOURCE, "runs": rows, "fit": fit(rows)}
     print("| 세션 | 실행 | 프로필 | dry-run | 지적 | 진행 비용 |")
     print("| --- | --- | --- | --- | ---: | ---: |")
     for r in rows:
         print(f"| {r['session'][:8]} | {Path(r['run_dir']).name} | {r['profile']} | {'예' if r['dry_run'] else '아니오'} "
               f"| {r['findings']} | {money(r['cost'])} |")
+        if args.remove_requests is not None:
+            estimate = project(r, args.remove_requests)
+            print(f"추정: 요청 {args.remove_requests}건 감소 시 지적당 {money(estimate['lower'])}~{money(estimate['upper'])}")
     f = result["fit"]
     print(f"\n맞춤: 고정 {money(f['fixed'])} + 지적당 {money(f['per_finding'])} (실행 {f['runs']}회), "
           f"지적 1건 실행 {money(f['one_finding_run'])}, 평균 규모 {f['mean_findings'] or 0:.1f}건에서 지적당 {money(f['per_finding_at_mean'])}")

@@ -3,6 +3,7 @@ import io
 import json
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -56,6 +57,11 @@ class StartGoTest(CliTestBase):
         self.assertIn("--workflow-output", p.stdout)
         self.assertTrue((self.run_dir / "round-1" / "stage1-args.json").is_file())
         self.assertEqual(p.stdout.count("다음:"), 1)
+        args_line = next(line for line in p.stdout.splitlines() if line.startswith("    args: "))
+        self.assertEqual(json.loads(args_line.removeprefix("    args: ")),
+                         json.loads((self.run_dir / "round-1" / "stage1-args.json").read_text(encoding="utf-8")))
+        self.assertIn(f"    scriptPath: {self.run_dir / 'run-jobs.js'}", p.stdout)
+        self.assertEqual((self.run_dir / "run-jobs.js").read_bytes(), cli_steps.RUN_JOBS.read_bytes())
 
     def test_go_saves_workflow_result_and_judges_then_stops_for_adjudicator(self):
         self.start()
@@ -380,6 +386,85 @@ class StartGoTest(CliTestBase):
         run_dir = Path(next(x for x in out.getvalue().splitlines() if x.startswith("run_dir=")).split("=", 1)[1])
         self.assertFalse((run_dir / "round-1" / "stage1-args.json").exists())
         self.assertIn(" go ", out.getvalue())
+
+
+class GoStopTest(unittest.TestCase):
+    def setUp(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        self.run_dir = Path(td.name)
+        self.args_path = self.run_dir / "stage1-args.json"
+
+    def stop(self, actions):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cli._go_stop(self.run_dir, "Workflow 결과가 필요하다", actions)
+        self.assertEqual(code, 0)
+        return out.getvalue()
+
+    def workflow(self):
+        return cli_steps._workflow_action(self.args_path, self.run_dir / "stage1.json")
+
+    def test_args_are_compact_json_on_the_line_after_the_workflow(self):
+        self.args_path.write_text('{\n  "jobs": [{"label": "한글", "promptPath": "줄\\n바꿈.md"}]\n}', encoding="utf-8")
+        action = self.workflow()
+        text = self.stop([action])
+        lines = text.splitlines()
+        self.assertEqual(lines[lines.index(f"  {action.text}") + 1],
+                         '    args: {"jobs":[{"label":"한글","promptPath":"줄\\n바꿈.md"}]}')
+        self.assertEqual(text.count("Workflow 실행:"), 1)
+
+    def test_args_over_8000_characters_are_omitted(self):
+        for size, shown in ((7992, True), (7993, False)):
+            with self.subTest(size=size):
+                self.args_path.write_text(json.dumps({"x": "가" * size}, ensure_ascii=False), encoding="utf-8")
+                text = self.stop([self.workflow()])
+                self.assertEqual("    args: " in text, shown)
+
+    def test_missing_or_invalid_args_are_omitted(self):
+        self.assertNotIn("    args: ", self.stop([self.workflow()]))
+        self.args_path.write_text("{", encoding="utf-8")
+        self.assertNotIn("    args: ", self.stop([self.workflow()]))
+
+    def test_script_is_copied_once_after_the_next_list_and_updated_if_different(self):
+        action = self.workflow()
+        text = self.stop([action, cli_steps.Action("note", "안내")])
+        script = self.run_dir / "run-jobs.js"
+        self.assertEqual(script.read_bytes(), cli_steps.RUN_JOBS.read_bytes())
+        self.assertEqual(text.splitlines()[-1], f"    scriptPath: {script.resolve()}")
+        self.assertGreater(text.index("    scriptPath: "), text.index("  안내"))
+        os.utime(script, ns=(1_000_000_000, 1_000_000_000))
+        self.stop([action])
+        self.assertEqual(script.stat().st_mtime_ns, 1_000_000_000)
+        script.write_text("옛 스크립트", encoding="utf-8")
+        self.stop([action])
+        self.assertEqual(script.read_bytes(), cli_steps.RUN_JOBS.read_bytes())
+
+    def test_finished_workflow_has_no_args_or_script_path(self):
+        self.args_path.write_text('{"jobs":[]}', encoding="utf-8")
+        action = self.workflow()
+        action.out_path.write_text("{}", encoding="utf-8")
+        text = self.stop([action])
+        self.assertNotIn("    args: ", text)
+        self.assertNotIn("scriptPath:", text)
+        self.assertFalse((self.run_dir / "run-jobs.js").exists())
+
+    def test_script_copy_failure_omits_the_script_path_line(self):
+        self.args_path.write_text('{"jobs":[]}', encoding="utf-8")
+        with mock.patch.object(Path, "write_bytes", side_effect=PermissionError):
+            text = self.stop([self.workflow()])
+        self.assertIn("    args: ", text)
+        self.assertNotIn("scriptPath:", text)
+
+    def test_no_visible_workflow_has_no_args_or_script_path(self):
+        self.args_path.write_text('{"jobs":[]}', encoding="utf-8")
+        for actions in ([], [cli_steps.Action("note", "안내")],
+                        [cli_steps.Action("workflow", "숨김", args_path=self.args_path, hidden=True)]):
+            with self.subTest(actions=actions):
+                text = self.stop(actions)
+                self.assertNotIn("    args: ", text)
+                self.assertNotIn("scriptPath:", text)
+                self.assertFalse((self.run_dir / "run-jobs.js").exists())
 
 
 class RunStepTest(unittest.TestCase):
