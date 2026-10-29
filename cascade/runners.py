@@ -49,7 +49,7 @@ _PROFILE_DENY = {
     "worker": ["WebFetch(*)", "Mcp(*:*)"],
     "readonly": ["Write(**)", "WebFetch(*)", "Mcp(*:*)"],
 }
-_SERENA_CONFIG = "web_dashboard: false\nweb_dashboard_open_on_launch: false\n"
+_SERENA_CONFIG = "web_dashboard: false\nweb_dashboard_open_on_launch: false\nprojects: []\n"
 _TOOL_ROOTS = {"PYENV_ROOT": ".pyenv", "UV_PYTHON_INSTALL_DIR": ".local/share/uv/python"}
 
 _OUTPUT_INSTRUCTION = (

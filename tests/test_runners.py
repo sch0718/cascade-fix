@@ -468,6 +468,7 @@ class CursorHomeTest(unittest.TestCase):
             text = (home / ".serena" / "serena_config.yml").read_text(encoding="utf-8")
             self.assertIn("web_dashboard: false", text)
             self.assertIn("web_dashboard_open_on_launch: false", text)
+            self.assertIn("projects: []", text)
 
     def test_worker_profile_allows_shell_and_write(self):
         _, config = self.config("worker")
