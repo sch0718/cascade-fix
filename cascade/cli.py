@@ -1594,6 +1594,16 @@ def _hold_reason(f, rnd: RoundRecord, max_reached: bool, outside: set[str]) -> s
     return "재검토 상한 도달" if max_reached else "수렴: Critical 없고 2건 이하"
 
 
+def _locations_under_root(findings: list[Finding], rd: Path, ledger: Ledger) -> list[Finding]:
+    """임시 워크트리를 읽은 재검토가 그 안의 절대 경로를 적었으면 사용자 저장소 경로로 바꿔, 워크트리를 치운 뒤에도 위치가 유효하게 한다."""
+    repo_file = rd / s.RECHECK_REPO_FILE
+    repo = repo_file.read_text(encoding="utf-8").strip() if repo_file.is_file() else ""
+    if not repo or repo == ledger.root:
+        return findings
+    return [replace(f, location=ledger.root + f.location[len(repo):]) if f.location.startswith(repo + "/") else f
+            for f in findings]
+
+
 def _remove_recheck_worktree(ledger: Ledger, rnd: RoundRecord) -> None:
     snap = s.snapshot_of(ledger)
     name = s.recheck_worktree_name(rnd.no)
@@ -1630,6 +1640,7 @@ def cmd_recheck(args) -> int:
         resolved, new = parse_recheck(text, rnd.no + 1)
     except ParseError as e:
         raise s.CliError(f"재검토 결과 {e}", ExitCodes.PARSE_ERROR) from None
+    new = _locations_under_root(new, rd, ledger)
     has_header = any(line.strip() == RESOLUTION_HEADER for line in text.splitlines())
     if not has_header:
         print(f"경고: 「{RESOLUTION_HEADER}」 절이 없다. 고친 지적을 모두 해소 안 됨으로 본다")

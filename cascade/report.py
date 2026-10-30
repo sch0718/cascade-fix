@@ -597,13 +597,15 @@ def _first_review_attempts(ledger: Ledger) -> list[dict]:
 
 
 def _review_rows(runners: list[str], events: list[dict | None], fallback: str, what: str,
-                 claude: "_ClaudeUsage", cell: str) -> list[str]:
+                 claude: "_ClaudeUsage", cell: str, worker_reasons: dict[str, int] | None = None) -> list[str]:
     counts: dict[str, int] = {}
     reasons: dict[str, dict[str, int]] = {}
     for runner, event in zip(runners, events):
         counts[runner] = counts.get(runner, 0) + 1
         if event and event.get("fallback"):
             _add_reason(reasons, runner, str(event["fallback"].get("reason", "")))
+    for reason, n in (worker_reasons or {}).items():
+        reasons.setdefault(RUNNER_CLAUDE, {})[reason] = reasons.get(RUNNER_CLAUDE, {}).get(reason, 0) + n
     rows = []
     for r, n in counts.items():
         if r == RUNNER_CLAUDE:
@@ -764,7 +766,8 @@ def _calls_section(ledger: Ledger, run_dir: Path | None) -> list[str]:
                             review_cell(ledger, "opinion")["runner"], "의견", claude, f"{ledger.mode}.opinion"))
     rechecks = [r for r in ledger.rounds if r.recheck_opened]
     out.extend(_review_rows([_recheck_runner(ledger, r) for r in rechecks], [_recheck_event(ledger, r) for r in rechecks],
-                            review_cell(ledger, "recheck")["runner"], "재검토", claude, f"{ledger.mode}.recheck"))
+                            review_cell(ledger, "recheck")["runner"], "재검토", claude, f"{ledger.mode}.recheck",
+                            reasons.get(f"{ledger.mode}.recheck")))
     out.extend(["", *claude.total_lines()])
     usage = _cli_usage(ledger)
     if usage:

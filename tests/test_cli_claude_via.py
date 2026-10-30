@@ -656,6 +656,27 @@ class ClaudeViaRecheckTest(ClaudeViaTestBase):
         p = self.stage("workers", "--stage", "recheck", "--force", ok=False)
         self.assertIn("apply --force", p.stdout + p.stderr)
 
+    def test_absolute_location_in_temp_worktree_is_mapped_to_user_repo(self):
+        self.prepare_recheck()
+        wt = self.wt("recheck-r1")
+        text = RECHECK_RESULT.replace("Critical\n없음.", f"Critical\n1. 새 결함\n   위치: {wt}/calc.py:2\n   근거: x\n   제안: y")
+        self.env["FAKE_CLAUDE_RESULT"] = json.dumps({"text": text, "model_id": "reported"})
+        self.stage("workers", "--stage", "recheck")
+        self.stage("recheck", "--result", str(self.rd() / "recheck-cli.json"))
+        locations = [f["location"] for f in self.ledger().rounds[1].findings]
+        self.assertEqual(locations, [f"{self.ledger().root}/calc.py:2"])
+
+    def test_report_counts_cli_recheck_failure_as_fallback(self):
+        self.prepare_recheck()
+        self.env["FAKE_CLAUDE_ENVELOPE"] = json.dumps({"is_error": True, "result": "boom"})
+        self.stage("workers", "--stage", "recheck")
+        review_results = {"results": [{"id": "round-1:recheck", "output": {"text": RECHECK_RESULT, "model_id": "m"}}]}
+        cli_steps.write_json(self.rd() / "recheck.json", review_results)
+        self.stage("recheck", "--result", str(self.rd() / "recheck.json"))
+        text = report.render(self.ledger(), dry_run=True, run_dir=self.run_dir)
+        line = next(line for line in text.splitlines() if line.startswith("| Claude 재검토 |"))
+        self.assertRegex(line, r"\| 1 \| 1\(")
+
     def test_recheck_via_cli_only_for_cli_ledger_with_result_commit_and_no_external_docs(self):
         self.prepare_recheck()
         ledger, rnd = self.ledger(), self.ledger().rounds[0]
