@@ -691,6 +691,9 @@ class ClaudeViaRecheckTest(ClaudeViaTestBase):
         self.assertIn("recheck-r1", self.ledger().snapshot["worktrees"])
         rows = self.read(cli_steps.USAGE_FILE)["workflows"]["cli-recheck-1"]
         self.assertEqual([(r["job_id"], r["cost"]) for r in rows], [("round-1:recheck", 0.25)])
+        events = [e for e in self.ledger().rounds[0].events if e["step"] == "workers-recheck"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["usage"]["claude"]["input"], 100)
         text = report.render(self.ledger(), dry_run=True, run_dir=self.run_dir)
         line = next(line for line in text.splitlines() if line.startswith("| Claude 재검토 |"))
         self.assertRegex(line, r"\| 1 \| 1\(")
