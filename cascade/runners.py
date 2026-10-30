@@ -775,7 +775,7 @@ class ClaudeRunner:
         return [self.exe, "-p", "--model", job.model, "--effort", job.effort, "--output-format", "json",
                 "--json-schema", schema, "--setting-sources", "project", "--strict-mcp-config",
                 "--permission-mode", "acceptEdits" if job.writable else "default",
-                "--allowedTools", ",".join(tools), "--disallowedTools", ",".join(denied)]
+                "--tools", ",".join(tools), "--allowedTools", ",".join(tools), "--disallowedTools", ",".join(denied)]
 
     def _run_job(self, job: CliJob) -> Outcome:
         prompt = job.prompt_path.read_text(encoding="utf-8")
