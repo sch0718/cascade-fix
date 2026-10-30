@@ -93,6 +93,13 @@ class ClaudeRunnerTest(unittest.TestCase):
         self.assertNotIn("Edit", args[args.index("--allowedTools") + 1].split(","))
         self.assertTrue({"Edit", "Write", "NotebookEdit"} <= set(args[args.index("--disallowedTools") + 1].split(",")))
 
+    def test_tools_flag_shrinks_tool_definitions_to_the_role(self):
+        self.run_job()
+        self.assertEqual(self.option("--tools"), "Bash,Read,Grep,Glob,Edit,Write")
+        self.run_job(self.job(writable=False))
+        args = json.loads((self.log / "claude-2.args.json").read_text(encoding="utf-8"))
+        self.assertEqual(args[args.index("--tools") + 1], "Bash,Read,Grep,Glob")
+
     def test_result_text_json_block_is_used_without_structured_output(self):
         del os.environ["FAKE_CLAUDE_RESULT"]
         os.environ["FAKE_CLAUDE_ENVELOPE"] = json.dumps({"result": f"설명\n```json\n{result_json()}\n```\n"})
