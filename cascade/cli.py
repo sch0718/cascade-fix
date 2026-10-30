@@ -959,6 +959,16 @@ def _record_claude_usage(rd: Path, mode: str, entries: list[dict], outcomes: lis
                        "workflows": {**workflows, key: rows}})
 
 
+def _write_recheck_fallback(rd: Path, ledger: Ledger, rnd: RoundRecord, repo: str, failed: bool) -> None:
+    """재검토 CLI 호출이 실패하면 같은 임시 워크트리를 읽는 Workflow 입력(recheck-args.json)을 만든다. 성공하면 남은 입력을 치운다."""
+    if failed:
+        (rd / s.RECHECK_RESULTS).unlink(missing_ok=True)
+        s.write_review_args(rd, s.RECHECK_ARGS, ledger,
+                            [(s.recheck_job_id(rnd.no), f"회차 {rnd.no} recheck", s.read_text(rd / "recheck-prompt.md"), repo)], "recheck")
+    else:
+        (rd / s.RECHECK_ARGS).unlink(missing_ok=True)
+
+
 def _workers(args) -> int:
     run_dir = Path(args.run_dir)
     ledger = s.load_ledger(run_dir)
@@ -967,13 +977,14 @@ def _workers(args) -> int:
     if not s.step_done(rnd, "jobs"):
         raise s.CliError(f"회차 {rnd.no}의 jobs 단계를 먼저 한다")
     if s.judged_after_workers_input(rnd, args.stage):
-        consumer = {s.STAGE_ADJ: "adjudicate", s.STAGE_OPINION: "opinion/apply"}.get(args.stage, "judge")
-        raise s.CliError(f"회차 {rnd.no}의 {consumer}를 이미 했다. 작업자 결과를 다시 만들려면 jobs --force로 회차를 다시 연다")
+        consumer = {s.STAGE_ADJ: "adjudicate", s.STAGE_OPINION: "opinion/apply", s.STAGE_RECHECK: "recheck"}.get(args.stage, "judge")
+        reopen = "apply --force로 적용 단계를 다시 한다" if args.stage == s.STAGE_RECHECK else "jobs --force로 회차를 다시 연다"
+        raise s.CliError(f"회차 {rnd.no}의 {consumer}를 이미 했다. 작업자 결과를 다시 만들려면 {reopen}")
     if s.workers_done(rnd, args.stage) and not args.force:
         raise s.CliError(f"회차 {rnd.no}의 {step} 단계는 이미 했다. 다시 하려면 --force 를 붙인다")
     if args.stage == s.STAGE_CHECKER and not s.checker_pending(rnd):
         raise s.CliError(f"회차 {rnd.no}의 judge 단계를 먼저 한다(1차 호출이 점검자 작업을 만든다)")
-    if args.stage in (s.STAGE_ADJ, s.STAGE_OPINION) and not s.step_done(rnd, s.STAGE_INPUTS[args.stage]):
+    if args.stage in (s.STAGE_ADJ, s.STAGE_OPINION, s.STAGE_RECHECK) and not s.step_done(rnd, s.STAGE_INPUTS[args.stage]):
         raise s.CliError(f"회차 {rnd.no}의 {s.STAGE_INPUTS[args.stage]} 단계를 먼저 한다")
     rd = s.round_dir(run_dir, rnd.no)
     cli_args = rd / f"{args.stage}-cli-args.json"
@@ -984,12 +995,12 @@ def _workers(args) -> int:
     _pin_worktrees(rd / WORKTREE_INPUTS, [job.worktree for job in jobs if job.writable])
     profile = assignment.ledger_profile(ledger)
     cells = assignment.mode_workers(profile["roles"], ledger.mode)
-    exhausted = {} if args.stage == s.STAGE_OPINION and args.force else s.exhausted_runners(
-        rnd, args.stage if args.stage == s.STAGE_OPINION else None)
+    review_stage = args.stage in (s.STAGE_OPINION, s.STAGE_RECHECK)
+    exhausted = {} if review_stage and args.force else s.exhausted_runners(rnd, args.stage if review_stage else None)
     if args.stage == s.STAGE_ADJ:
         cells["adjudicator"] = assignment.adjudicator_cell(ledger)
     first = _run_cli_jobs(jobs, exhausted, max_parallel=1) if args.stage == s.STAGE_OPINION else _run_cli_jobs(jobs, exhausted)
-    reruns, second = ({}, {}) if args.stage in (s.STAGE_ADJ, s.STAGE_OPINION) else _rerun_with_fallbacks(
+    reruns, second = ({}, {}) if args.stage in (s.STAGE_ADJ, s.STAGE_OPINION, s.STAGE_RECHECK) else _rerun_with_fallbacks(
         entries, first, cells, set(profile["consented"]), exhausted)
     outcomes = [second.get(o.id, o) for o in first]
     out = rd / f"{args.stage}-cli.json"
@@ -1004,7 +1015,9 @@ def _workers(args) -> int:
     (rd / f"{args.stage}-fallback.json").unlink(missing_ok=True)
     if args.stage == s.STAGE1:
         s.clear_cli_outputs(rd, s.STAGE_CHECKER)
-    if unresolved and args.stage != s.STAGE_OPINION:
+    if args.stage == s.STAGE_RECHECK:
+        _write_recheck_fallback(rd, ledger, rnd, entries[0]["worktree"], bool(unresolved))
+    elif unresolved and args.stage != s.STAGE_OPINION:
         s.write_json(fallback_args, {"jobs": [s.fallback_job(e, cells.get(e["role"], {}))
                                               for e in entries if e["id"] in unresolved]})
     else:
@@ -1452,6 +1465,27 @@ def _remove_round_worktrees(ledger: Ledger, rnd: RoundRecord) -> None:
     ledger.snapshot = snap.to_dict()
 
 
+def _recheck_via_cli(ledger: Ledger, rnd: RoundRecord) -> bool:
+    """재검토를 `claude -p`로 돌릴 수 있는 경우. 읽을 상태가 커밋(result_commit)으로 있어야 하고, 사용자 저장소 밖 문서가 없어야 한다."""
+    return ledger.claude_via == CLAUDE_VIA_CLI and bool(rnd.result_commit) and not s.external_docs(ledger)
+
+
+def _recheck_worktree(ledger: Ledger, rnd: RoundRecord, recheck_repo: str) -> Path:
+    """재검토가 읽을 곳. dry-run은 이미 실행 소유 워크트리(result-rN)라 그대로 쓰고, 아니면 적용 뒤 상태의 복사를 새로 연다."""
+    if ledger.dry_run:
+        return Path(recheck_repo)
+    snap = s.snapshot_of(ledger)
+    name = s.recheck_worktree_name(rnd.no)
+    leftover = snap.run_dir / "wt" / name
+    if name not in snap.worktrees and leftover.exists():
+        snap.worktrees[name] = leftover
+    if name in snap.worktrees:
+        remove_worktree(snap, name)
+    wt = add_worktree(snap, name, rnd.result_commit)
+    ledger.snapshot = snap.to_dict()
+    return wt
+
+
 def cmd_apply(args) -> int:
     run_dir = Path(args.run_dir)
     ledger = s.load_ledger(run_dir)
@@ -1516,10 +1550,16 @@ def cmd_apply(args) -> int:
             diff = "".join(texts[f.id] for f in adopted)
         prompt = build_recheck_prompt(adopted, diff, ledger.mode)
         (rd / "recheck-prompt.md").write_text(prompt, encoding="utf-8")
+        recheck_cli = s.is_claude(ledger, "recheck") and _recheck_via_cli(ledger, rnd)
+        if recheck_cli:
+            recheck_repo = str(_recheck_worktree(ledger, rnd, recheck_repo))
         (rd / s.RECHECK_REPO_FILE).write_text(recheck_repo + "\n", encoding="utf-8")
         if s.is_claude(ledger, "recheck"):
-            s.write_review_args(rd, s.RECHECK_ARGS, ledger,
-                                [(s.recheck_job_id(rnd.no), f"회차 {rnd.no} recheck", prompt, recheck_repo)], "recheck")
+            items = [(s.recheck_job_id(rnd.no), f"회차 {rnd.no} recheck", prompt, recheck_repo)]
+            name, stale = (s.RECHECK_CLI_ARGS, s.RECHECK_ARGS) if recheck_cli else (s.RECHECK_ARGS, s.RECHECK_CLI_ARGS)
+            s.write_review_args(rd, name, ledger, items, "recheck", recheck_cli)
+            for stale_name in (stale, s.RECHECK_CLI_RESULTS, s.RECHECK_RESULTS):
+                (rd / stale_name).unlink(missing_ok=True)
         s.write_json(rd / s.RECHECK_SCOPE_FILE, scope)
         rnd.recheck_opened = True
         print(f"재검토 필요: {rd / 'recheck-prompt.md'} (--repo {recheck_repo})")
@@ -1552,6 +1592,14 @@ def _hold_reason(f, rnd: RoundRecord, max_reached: bool, outside: set[str]) -> s
     if f.severity == "Suggestion":
         return "재검토의 Suggestion: 회차를 열지 않음"
     return "재검토 상한 도달" if max_reached else "수렴: Critical 없고 2건 이하"
+
+
+def _remove_recheck_worktree(ledger: Ledger, rnd: RoundRecord) -> None:
+    snap = s.snapshot_of(ledger)
+    name = s.recheck_worktree_name(rnd.no)
+    if name in snap.worktrees:
+        remove_worktree(snap, name)
+        ledger.snapshot = snap.to_dict()
 
 
 def cmd_recheck(args) -> int:
@@ -1605,6 +1653,7 @@ def cmd_recheck(args) -> int:
         rnd.hold_findings.append(f.to_dict())
         rnd.decisions.append(Decision(f.id, OUTCOME_UNDECIDABLE, None, [reason]).to_dict())
     s.write_json(rd / "decisions.json", rnd.decisions)
+    _remove_recheck_worktree(ledger, rnd)
     s.mark(rnd, "recheck", **s.review_event_extra(ledger, "recheck"))
     print(f"해소 {sum(1 for v in resolved.values() if v)}건, 해소 안 됨 {len(unresolved)}건, 새 지적 {len(new)}건")
     next_round += carried
@@ -2522,7 +2571,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--review-dir", help="CF review가 만든 첫 검토 폴더(review_dir=로 찍힌 곳)")
     p.add_argument("--workflow", required=True, help="Workflow 실행 id 또는 그 기록 폴더 경로")
     p = add("workers", cmd_workers, round_no=True)
-    p.add_argument("--stage", choices=(s.STAGE1, s.STAGE_CHECKER, s.STAGE_ADJ, s.STAGE_OPINION), required=True)
+    p.add_argument("--stage", choices=(s.STAGE1, s.STAGE_CHECKER, s.STAGE_ADJ, s.STAGE_OPINION, s.STAGE_RECHECK), required=True)
     p = add("judge", cmd_judge, round_no=True)
     p.add_argument("--results")
     p.add_argument("--checker-results")

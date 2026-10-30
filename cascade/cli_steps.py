@@ -91,10 +91,12 @@ OPINION_ARGS = "opinion-args.json"
 OPINION_RESULTS = "opinion.json"
 RECHECK_ARGS = "recheck-args.json"
 RECHECK_RESULTS = "recheck.json"
+RECHECK_CLI_ARGS = "recheck-cli-args.json"
+RECHECK_CLI_RESULTS = "recheck-cli.json"
 USAGE_FILE = "claude-usage.json"
 CLAUDE_JOB_FILES = ("stage1-args.json", "stage1-cli-args.json", "stage1-fallback-args.json", "checker-args.json",
                     "checker-cli-args.json", "checker-fallback-args.json", "adj-args.json", "adj-cli-args.json",
-                    "adj-fallback-args.json", OPINION_ARGS, "opinion-cli-args.json", RECHECK_ARGS)
+                    "adj-fallback-args.json", OPINION_ARGS, "opinion-cli-args.json", RECHECK_ARGS, RECHECK_CLI_ARGS)
 
 
 def claude_job_entries(data) -> list[dict]:
@@ -104,10 +106,10 @@ def claude_job_entries(data) -> list[dict]:
 
 
 NON_PROGRESS_STEPS = ("cleanup", "usage")
-STAGE1, STAGE_CHECKER, STAGE_ADJ, STAGE_OPINION = "stage1", "checker", "adj", "opinion"
+STAGE1, STAGE_CHECKER, STAGE_ADJ, STAGE_OPINION, STAGE_RECHECK = "stage1", "checker", "adj", "opinion", "recheck"
 STAGE_ARGS = {STAGE1: "stage1-args.json", STAGE_CHECKER: "checker-args.json", STAGE_ADJ: "adj-args.json"}
 STAGE_OUTPUTS = {STAGE1: "stage1.json", STAGE_CHECKER: "checker.json", STAGE_ADJ: "adj.json"}
-STAGE_INPUTS = {STAGE1: "jobs", STAGE_CHECKER: "judge-checker", STAGE_ADJ: "judge", STAGE_OPINION: "adjudicate"}
+STAGE_INPUTS = {STAGE1: "jobs", STAGE_CHECKER: "judge-checker", STAGE_ADJ: "judge", STAGE_OPINION: "adjudicate", STAGE_RECHECK: "apply"}
 STOP_PARTS = {"tree": "작업 트리", "head": "HEAD", "head_ref": "현재 브랜치", "stash": "stash",
               "attached": "작업자 워크트리 브랜치"}
 
@@ -307,7 +309,7 @@ def judged_after_workers_input(rnd: RoundRecord, stage: str) -> bool:
     if stage == STAGE_OPINION:
         return any(e.get("step") == "apply" or str(e.get("step", "")).startswith("opinion:")
                    for e in rnd.events[source + 1:])
-    consumer = "adjudicate" if stage == STAGE_ADJ else "judge"
+    consumer = {STAGE_ADJ: "adjudicate", STAGE_RECHECK: "recheck"}.get(stage, "judge")
     return _last(rnd, consumer) > source
 
 
@@ -531,6 +533,10 @@ def approved_repro(rd: Path, allow: str | None) -> dict[str, list[str]] | None:
     if read_json(Path(allow)) != listed:
         raise CliError(f"--allow-repro 내용이 {Path(rd) / REPRO_FILE} 와 다르다. 승인한 목록 그대로 넘긴다")
     return listed
+
+
+def recheck_worktree_name(no: int) -> str:
+    return f"recheck-r{no}"
 
 
 def round_worktree_names(rnd: RoundRecord) -> list[str]:
@@ -971,6 +977,11 @@ def next_actions(ledger: Ledger, run_dir: Path) -> list[Action]:
     if not step_done(rnd, "apply"):
         return [_cmd_action("apply", run_dir, n)]
     if rnd.recheck_opened and not step_done(rnd, "recheck") and is_claude(ledger, "recheck"):
+        if (rd / RECHECK_CLI_ARGS).is_file():
+            if not workers_done(rnd, STAGE_RECHECK):
+                return [_cmd_action("workers", run_dir, n, "--stage recheck", background=True)]
+            if not (rd / RECHECK_ARGS).is_file():
+                return [_cmd_action("recheck", run_dir, n, f"--result {_q(rd / RECHECK_CLI_RESULTS)}")]
         return [
             _workflow_action(rd / RECHECK_ARGS, rd / RECHECK_RESULTS),
             _cmd_action("recheck", run_dir, n, f"--result {_q(rd / RECHECK_RESULTS)}"),

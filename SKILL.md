@@ -56,7 +56,7 @@ PYTHONPATH="${CLAUDE_SKILL_DIR}" python3 -m cascade.cli
    - 검증 명령 등록이 필요하면 같은 질문에서 `detect`가 낸 후보 명령을 보이고 확인받는다. 승인되면 `~/.claude/cascade-fix/repos.toml`(없으면 만든다)에 `[repos."<저장소 루트>"]` 항목을 적는다. 형식은 스킬 디렉터리의 `repos.toml` 머리 주석에 있다.
    - `detect`에 `참고: 이 기기 설정 전이다…` 줄이 있으면 선택지에 「먼저 설정」을 더한다. 고르면 「설정」 절을 마친 뒤 `detect`부터 다시 한다.
    - 사용자가 처음부터 `/cascade-fix`로 부르며 옵션까지 정했거나 「묻지 말고 진행」이라고 했으면 이 질문을 건너뛴다.
-   - Claude 1단계 작업을 `claude -p`로 돌리려면(`--claude-via cli`) 계획에 「1단계 Claude 작업을 CLI(`claude -p`)로 돌린다」를 한 줄 더하고, 확인을 받았을 때만 `start`·`init`에 `--claude-via cli`를 붙인다. 이 줄이 없으면 붙이지 않는다(기본 Workflow). 이 옵션은 1단계 작업자·점검자와 판가름·Claude 의견도 CLI로 돌린다. 재검토와 첫 검토는 이 옵션과 상관없이 Workflow다.
+   - Claude 1단계 작업을 `claude -p`로 돌리려면(`--claude-via cli`) 계획에 「1단계 Claude 작업을 CLI(`claude -p`)로 돌린다」를 한 줄 더하고, 확인을 받았을 때만 `start`·`init`에 `--claude-via cli`를 붙인다. 이 줄이 없으면 붙이지 않는다(기본 Workflow). 이 옵션은 1단계 작업자·점검자와 판가름·Claude 의견·Claude 재검토도 CLI로 돌린다. 첫 검토는 이 옵션과 상관없이 Workflow다.
    - 이 확인(또는 사용자의 명시적 호출)이 이번 실행에서 Workflow 도구를 쓰라는 사용자의 요청이다. 사용자가 이 스킬을 직접 요청하지 않았고 확인도 받지 않았으면 Workflow를 돌리지 않는다.
 3. **끝까지 진행** — 아래 「절차」의 「기본 경로: start와 go」를 따른다(멈춤 출력의 「다음:」이 다음 할 일이다). 단계 사이에 사용자에게 묻지도 알리지도 않는다(작업 목록 표시만 갱신한다). 첫 검토가 필요하면 「첫 검토」(`CF review`)부터 한다. 첫 검토 칸이 claude면 「Claude 단독 첫 검토」, codex·cursor면 「외부 첫 검토와 대체」를 따른다.
    - `init`이 출력한 「규모:」의 최대가 확인 때 말한 범위를 크게 넘으면(1단계 작업 10개 초과이고 등급을 고르지 않았으면) 한 번 더 묻는다: 「전부 / Critical·Warning만」. Critical·Warning만이면 `init`을 `--severity Critical,Warning`으로 다시 한다(앞 실행은 `cleanup`).
@@ -210,7 +210,7 @@ Claude·Cursor·`codex-doc` 결과는 형식이 같아 형식으로는 가릴 �
 2. `CF go --run-dir <run_dir> [--workflow-output <완료 알림의 output-file> --workflow <Workflow 실행 id>]` — 원장이 가리키는 다음 단계부터 멈출 곳까지 잇는다.
    - Workflow 결과를 주면 `.result`를 `round-N/`의 해당 파일에 저장하고(`python3 -c` 옮기기가 필요 없다), `--workflow`를 줬으면 `CF usage`도 한 뒤 이어 간다. 기다리는 작업과 다른 결과면 종료 코드 5로 거절한다. 결과를 저장했지만 뒤 명령이 실패해 끝나지 않은 단계에 새 결과를 주면 그 결과로 바꾼다.
    - 멈추면 `멈춤: <이유>`와 `다음:`을 출력한다. 멈추는 곳: Workflow가 필요할 때(`args:` 줄이 있으면 그 JSON을 Workflow `args`로 그대로 주고 인자 파일은 Read하지 않는다. `scriptPath:` 줄이 있으면 그 경로를 Workflow `scriptPath`로 준다. 거부되거나 줄이 없으면 아래 3번처럼 RJ를 Read해 `script`로 준다. 끝나면 `CF go`를 다시 부른다), `workers`와 Workflow를 동시에 띄워야 할 때(「외부 작업자 칸」), PR 재현 명령 승인이 필요할 때(승인받으면 `--allow-repro <파일>`), `workers`가 이미 돌고 있을 때(끝나면 `CF go`를 다시 부른다), 단계 명령이 모델 ID 경고를 냈을 때(사용자에게 알린다. 쓰지 않으려면 `jobs --force`, 그대로 쓰려면 `CF go`), `report`까지 끝났을 때(`cleanup`은 하지 않는다), 단계 명령이 0이 아닌 종료 코드로 끝났을 때(그 코드로 끝난다. 4·5·6은 「멈추는 곳」).
-   - `--claude-via cli`로 시작한 실행은 1단계 Claude 작업(`stage1-cli-args.json`의 `runner: claude`)과 판가름(`adj-cli-args.json`)·Claude 의견(`opinion-cli-args.json`)도 `go`가 `workers`로 돌려 Workflow를 띄우지 않는다. Claude 작업이 실패하면 그 작업만 `*-fallback-args.json` Workflow로 남고, 의견은 실패해도 대체 실행 없이 「호출 실패」로 적고 넘어간다. 재검토(Claude 칸일 때)는 계속 Workflow라 `go`가 그 Workflow 결과를 기다리며 멈춘다. 경로를 바꾸려면 판정·적용 전에 `jobs --force --claude-via <값>`을 한다.
+   - `--claude-via cli`로 시작한 실행은 1단계 Claude 작업(`stage1-cli-args.json`의 `runner: claude`)과 판가름(`adj-cli-args.json`)·Claude 의견(`opinion-cli-args.json`)도 `go`가 `workers`로 돌려 Workflow를 띄우지 않는다. Claude 작업이 실패하면 그 작업만 `*-fallback-args.json` Workflow로 남고, 의견은 실패해도 대체 실행 없이 「호출 실패」로 적고 넘어간다. 재검토(Claude 칸일 때)도 `apply`가 연 임시 워크트리(`recheck-cli-args.json`)에서 `workers --stage recheck`로 돌고, 실패하면 `recheck-args.json` Workflow가 남아 `go`가 그 결과를 기다리며 멈춘다. 경로를 바꾸려면 판정·적용 전에 `jobs --force --claude-via <값>`을 한다.
    - Codex·Cursor 의견·재검토 스크립트도 `go`가 순서대로 돌린다. 이미 한 단계는 다시 하지 않으므로 같은 `go`를 다시 불러도 된다.
 3. 보고하고 보류 후보 선택을 받으면 아래 13·14(`resume`·`cleanup`)를 한다.
 
