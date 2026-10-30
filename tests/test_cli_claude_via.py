@@ -677,6 +677,36 @@ class ClaudeViaRecheckTest(ClaudeViaTestBase):
         line = next(line for line in text.splitlines() if line.startswith("| Claude 재검토 |"))
         self.assertRegex(line, r"\| 1 \| 1\(")
 
+    def test_unparsable_cli_recheck_falls_back_to_workflow_instead_of_repeating(self):
+        self.prepare_recheck()
+        self.env["FAKE_CLAUDE_RESULT"] = json.dumps({"text": "형식 없는 답", "model_id": "reported"})
+        self.stage("workers", "--stage", "recheck")
+        p = self.stage("recheck", "--result", str(self.rd() / "recheck-cli.json"))
+        self.assertEqual(p.returncode, 0)
+        self.assertFalse(cli_steps.step_done(self.ledger().rounds[0], "recheck"))
+        [job] = self.read("recheck-args.json")["jobs"]
+        self.assertEqual(job["id"], "round-1:recheck")
+        self.assertEqual([a.kind for a in self.actions()], ["workflow", "cmd"])
+        self.assertIn("recheck.json", self.actions()[1].text)
+        self.assertIn("recheck-r1", self.ledger().snapshot["worktrees"])
+        rows = self.read(cli_steps.USAGE_FILE)["workflows"]["cli-recheck-1"]
+        self.assertEqual([(r["job_id"], r["cost"]) for r in rows], [("round-1:recheck", 0.25)])
+        text = report.render(self.ledger(), dry_run=True, run_dir=self.run_dir)
+        line = next(line for line in text.splitlines() if line.startswith("| Claude 재검토 |"))
+        self.assertRegex(line, r"\| 1 \| 1\(")
+        review_results = {"results": [{"id": "round-1:recheck", "output": {"text": RECHECK_RESULT, "model_id": "m"}}]}
+        cli_steps.write_json(self.rd() / "recheck.json", review_results)
+        p = self.stage("recheck", "--result", str(self.rd() / "recheck.json"))
+        self.assertIn("status=종료", p.stdout)
+        self.assertNotIn("recheck-r1", self.ledger().snapshot["worktrees"])
+
+    def test_go_does_not_repeat_when_cli_recheck_is_unparsable(self):
+        self.prepare_recheck()
+        self.env["FAKE_CLAUDE_RESULT"] = json.dumps({"text": "형식 없는 답", "model_id": "reported"})
+        p = self.cli("go", "--run-dir", str(self.run_dir))
+        self.assertIn("멈춤: Workflow 결과가 필요하다", p.stdout)
+        self.assertIn("recheck-args.json", p.stdout)
+
     def test_recheck_via_cli_only_for_cli_ledger_with_result_commit_and_no_external_docs(self):
         self.prepare_recheck()
         ledger, rnd = self.ledger(), self.ledger().rounds[0]

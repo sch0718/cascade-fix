@@ -96,6 +96,7 @@ from cascade.runners import (
     MAX_PARALLEL,
     RUNNER_CODEX,
     RUNNER_CURSOR,
+    STATUS_INVALID,
     STATUS_OK,
     STATUS_SKIPPED,
     ClaudeRunner,
@@ -1594,6 +1595,26 @@ def _hold_reason(f, rnd: RoundRecord, max_reached: bool, outside: set[str]) -> s
     return "재검토 상한 도달" if max_reached else "수렴: Critical 없고 2건 이하"
 
 
+def _recheck_parse_fallback(run_dir: Path, ledger: Ledger, rnd: RoundRecord, result: Path, problem: str) -> int:
+    """CLI 재검토 결과가 스키마는 통과했지만 지적 형식을 해석하지 못하면, 그 호출을 무효로 고쳐 적고 Workflow 대체 실행으로 넘긴다."""
+    rd = s.round_dir(run_dir, rnd.no)
+    data = s.read_json(result)
+    for outcome in data.get("outcomes", []):
+        if outcome.get("id") == s.recheck_job_id(rnd.no):
+            outcome.update(status=STATUS_INVALID, output=None, detail=f"재검토 결과 {problem}")
+    data["results"] = [{**item, "output": None} for item in data.get("results", [])]
+    s.write_json(result, data)
+    repo_file = rd / s.RECHECK_REPO_FILE
+    _write_recheck_fallback(rd, ledger, rnd, repo_file.read_text(encoding="utf-8").strip(), True)
+    ledger = s.load_ledger(run_dir)
+    rnd = s.get_round(ledger, rnd.no)
+    s.mark(rnd, "workers-recheck", counts={STATUS_INVALID: 1}, fallback=[s.recheck_job_id(rnd.no)], fallback_runs={})
+    s.save_ledger(run_dir, ledger)
+    print(f"CLI 재검토 결과를 해석하지 못해 Workflow로 대체한다: {problem}")
+    _print_next(ledger, run_dir)
+    return 0
+
+
 def _locations_under_root(findings: list[Finding], rd: Path, ledger: Ledger) -> list[Finding]:
     """임시 워크트리를 읽은 재검토가 그 안의 절대 경로를 적었으면 사용자 저장소 경로로 바꿔, 워크트리를 치운 뒤에도 위치가 유효하게 한다."""
     repo_file = rd / s.RECHECK_REPO_FILE
@@ -1639,7 +1660,9 @@ def cmd_recheck(args) -> int:
     try:
         resolved, new = parse_recheck(text, rnd.no + 1)
     except ParseError as e:
-        raise s.CliError(f"재검토 결과 {e}", ExitCodes.PARSE_ERROR) from None
+        if Path(args.result).name != s.RECHECK_CLI_RESULTS:
+            raise s.CliError(f"재검토 결과 {e}", ExitCodes.PARSE_ERROR) from None
+        return _recheck_parse_fallback(run_dir, ledger, rnd, Path(args.result), str(e))
     new = _locations_under_root(new, rd, ledger)
     has_header = any(line.strip() == RESOLUTION_HEADER for line in text.splitlines())
     if not has_header:
