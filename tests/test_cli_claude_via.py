@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import unittest
+import unittest.mock
 from collections import Counter
 from pathlib import Path
 
@@ -13,7 +14,8 @@ from cascade.cli_steps import claude_job_entries  # noqa: E402
 from cascade.rounds import RoundRecord  # noqa: E402
 from cascade.runners import Outcome  # noqa: E402
 from fake_cli import CLAUDE_BODY, install, result_json  # noqa: E402
-from test_cli_e2e import CALC, FIXTURES, CliTestBase, fix  # noqa: E402
+from helpers import git  # noqa: E402
+from test_cli_e2e import CALC, FIXTURES, RECHECK_RESULT, CliTestBase, fix  # noqa: E402
 
 INPUT = str(FIXTURES / "codex-code-e2e.final")
 CODE_FIXES = {
@@ -93,7 +95,7 @@ class ClaudeViaGoTest(ClaudeViaTestBase):
         self.assertNotIn("stage1-args.json 내용", before_stop)
         self.assertIn("멈춤: Workflow 결과가 필요하다", p.stdout)
         self.assertIn("recheck-args.json", p.stdout)
-        self.assertEqual(self.calls(), 4)
+        self.assertEqual(self.calls(), 5)
         outcomes = {d["finding_id"]: d["outcome"] for d in self.ledger().rounds[0].decisions}
         self.assertEqual(outcomes, {"r1-01": "합의-사실", "r1-02": "합의-사실"})
 
@@ -112,7 +114,7 @@ class ClaudeViaGoTest(ClaudeViaTestBase):
         outcome = Outcome("r1-01:a", "claude", "ok", None, {"input_tokens": 1, "cost_usd": 0.5}, "")
         cli._record_claude_usage(self.rd(), "code", entries, [outcome], "stage1")
         workflows = self.read(cli_steps.USAGE_FILE)["workflows"]
-        self.assertEqual(sorted(workflows), ["cli-stage1-1", "cli-stage1-2"])
+        self.assertEqual(sorted(k for k in workflows if k.startswith("cli-stage1-")), ["cli-stage1-1", "cli-stage1-2"])
         self.assertEqual(len(workflows["cli-stage1-1"]), 4)
 
     def test_attempt_without_envelope_is_recorded_as_unmeasured_row(self):
@@ -541,6 +543,232 @@ class ClaudeStageEventsTest(unittest.TestCase):
                     cli_steps.mark(rnd, source)
                     self.assertFalse(cli_steps.workers_done(rnd, stage))
                     self.assertFalse(cli_steps.judged_after_workers_input(rnd, stage))
+
+
+class ClaudeViaRecheckTest(ClaudeViaTestBase):
+    def stage(self, command, *extra, ok=True):
+        return self.cli(command, "--run-dir", str(self.run_dir), "--round", "1", *extra, ok=ok)
+
+    def prepare_recheck(self, *init_extra):
+        self.init("--claude-via", "cli", *init_extra)
+        self.stage("jobs")
+        self.stage("workers", "--stage", "stage1")
+        self.env["FAKE_MUTATE_WT"] = "{}"
+        self.stage("judge")
+        self.stage("apply")
+        self.env["FAKE_CLAUDE_RESULT"] = json.dumps({"text": RECHECK_RESULT, "model_id": "reported"})
+
+    def actions(self):
+        return cli_steps.next_actions(self.ledger(), self.run_dir)
+
+    def user_state(self):
+        return (git(self.repo, "status", "--porcelain=v1", "-uall"), git(self.repo, "diff", "--cached"),
+                (self.repo / ".git" / "index").read_bytes())
+
+    def test_recheck_cli_job_reads_a_temp_worktree_not_the_user_repo(self):
+        self.prepare_recheck()
+        self.assertFalse((self.rd() / "recheck-args.json").exists())
+        [job] = self.read("recheck-cli-args.json")["jobs"]
+        cell = cli_steps.review_cell(self.ledger(), "recheck")
+        self.assertEqual((job["id"], job["role"], job["kind"], job["runner"], job["writable"]),
+                         ("round-1:recheck", "recheck", "review", "claude", False))
+        self.assertEqual((job["model"], job["effort"]), (cell["model"], cell["effort"]))
+        wt = self.wt("recheck-r1")
+        self.assertEqual(Path(job["worktree"]), wt)
+        self.assertNotEqual(wt.resolve(), self.repo.resolve())
+        self.assertIn(str(wt), Path(job["promptPath"]).read_text())
+        self.assertEqual((wt / "calc.py").read_text(), (self.repo / "calc.py").read_text())
+        self.assertTrue(self.actions()[0].background)
+        self.assertIn("--stage recheck", self.actions()[0].text)
+
+    def test_recheck_workers_leave_user_repo_and_index_untouched(self):
+        self.prepare_recheck()
+        before = self.user_state()
+        self.stage("workers", "--stage", "recheck")
+        self.assertEqual(self.user_state(), before)
+        calls = sorted((self.tmp / "log").glob("claude-*.cwd"))
+        self.assertEqual(Path(calls[-1].read_text()).resolve(), self.wt("recheck-r1").resolve())
+
+    def test_recheck_cli_result_feeds_recheck_and_removes_temp_worktree(self):
+        self.prepare_recheck()
+        wt = self.wt("recheck-r1")
+        self.stage("workers", "--stage", "recheck")
+        self.assertEqual([a.argv[0] for a in self.actions()], ["recheck"])
+        self.assertIn("recheck-cli.json", self.actions()[0].text)
+        p = self.stage("recheck", "--result", str(self.rd() / "recheck-cli.json"))
+        self.assertIn("status=종료", p.stdout)
+        self.assertNotIn("recheck-r1", self.ledger().snapshot["worktrees"])
+        self.assertFalse(wt.exists())
+        rows = self.read(cli_steps.USAGE_FILE)["workflows"]["cli-recheck-1"]
+        self.assertEqual([(r["job_id"], r["cell"], r["via"], r["cost"]) for r in rows],
+                         [("round-1:recheck", "code.recheck", "cli", 0.25)])
+        text = report.render(self.ledger(), dry_run=True, run_dir=self.run_dir)
+        self.assertIn("| Claude 재검토 | 1 |", text)
+        self.assertNotEqual(self.stage("workers", "--stage", "recheck", "--force", ok=False).returncode, 0)
+
+    def test_failed_recheck_cli_falls_back_to_workflow_and_keeps_failed_cost(self):
+        self.prepare_recheck()
+        self.env["FAKE_CLAUDE_ENVELOPE"] = json.dumps({"is_error": True, "result": "boom"})
+        self.stage("workers", "--stage", "recheck")
+        [job] = self.read("recheck-args.json")["jobs"]
+        self.assertEqual(job["id"], "round-1:recheck")
+        self.assertIn(str(self.wt("recheck-r1")), Path(job["promptPath"]).read_text())
+        self.assertEqual([a.kind for a in self.actions()], ["workflow", "cmd"])
+        self.assertEqual(self.actions()[0].args_path, self.rd() / "recheck-args.json")
+        self.assertIn("recheck.json", self.actions()[1].text)
+        rows = self.read(cli_steps.USAGE_FILE)["workflows"]["cli-recheck-1"]
+        self.assertEqual([r["job_id"] for r in rows], ["round-1:recheck"])
+        review_results = {"results": [{"id": "round-1:recheck", "output": {"text": RECHECK_RESULT, "model_id": "m"}}]}
+        cli_steps.write_json(self.rd() / "recheck.json", review_results)
+        p = self.stage("recheck", "--result", str(self.rd() / "recheck.json"))
+        self.assertIn("status=종료", p.stdout)
+        self.assertNotIn("recheck-r1", self.ledger().snapshot["worktrees"])
+
+    def test_apply_force_clears_stale_workflow_result_and_leftover_worktree(self):
+        self.prepare_recheck()
+        self.env["FAKE_CLAUDE_ENVELOPE"] = json.dumps({"is_error": True, "result": "boom"})
+        self.stage("workers", "--stage", "recheck")
+        cli_steps.write_json(self.rd() / "recheck.json", {"results": []})
+        snap = self.ledger().snapshot
+        leftover = Path(snap["worktrees"]["recheck-r1"])
+        snap["worktrees"].pop("recheck-r1")
+        ledger = self.ledger()
+        ledger.snapshot = snap
+        ledger.save(self.run_dir / "ledger.json")
+        self.stage("apply", "--force")
+        self.assertTrue(leftover.is_dir())
+        self.assertFalse((self.rd() / "recheck.json").exists())
+        self.stage("workers", "--stage", "recheck", "--force")
+        self.assertFalse((self.rd() / "recheck.json").exists())
+        self.assertEqual([a.kind for a in self.actions()], ["workflow", "cmd"])
+
+    def test_go_finishes_through_a_successful_cli_recheck_without_workflow(self):
+        self.prepare_recheck()
+        p = self.cli("go", "--run-dir", str(self.run_dir))
+        self.assertNotIn("멈춤: Workflow", p.stdout)
+        self.assertTrue(cli_steps.step_done(self.ledger().rounds[0], "recheck"))
+        self.assertEqual(self.ledger().status, "종료")
+
+    def test_recheck_workers_rerun_after_recheck_points_to_apply_force(self):
+        self.prepare_recheck()
+        self.stage("workers", "--stage", "recheck")
+        self.stage("recheck", "--result", str(self.rd() / "recheck-cli.json"))
+        p = self.stage("workers", "--stage", "recheck", "--force", ok=False)
+        self.assertIn("apply --force", p.stdout + p.stderr)
+
+    def test_absolute_location_in_temp_worktree_is_mapped_to_user_repo(self):
+        self.prepare_recheck()
+        wt = self.wt("recheck-r1")
+        text = RECHECK_RESULT.replace("Critical\n없음.", f"Critical\n1. 새 결함\n   위치: {wt}/calc.py:2\n   근거: x\n   제안: y")
+        self.env["FAKE_CLAUDE_RESULT"] = json.dumps({"text": text, "model_id": "reported"})
+        self.stage("workers", "--stage", "recheck")
+        self.stage("recheck", "--result", str(self.rd() / "recheck-cli.json"))
+        locations = [f["location"] for f in self.ledger().rounds[1].findings]
+        self.assertEqual(locations, ["calc.py:2"])
+
+    def test_report_counts_cli_recheck_failure_as_fallback(self):
+        self.prepare_recheck()
+        self.env["FAKE_CLAUDE_ENVELOPE"] = json.dumps({"is_error": True, "result": "boom"})
+        self.stage("workers", "--stage", "recheck")
+        review_results = {"results": [{"id": "round-1:recheck", "output": {"text": RECHECK_RESULT, "model_id": "m"}}]}
+        cli_steps.write_json(self.rd() / "recheck.json", review_results)
+        self.stage("recheck", "--result", str(self.rd() / "recheck.json"))
+        text = report.render(self.ledger(), dry_run=True, run_dir=self.run_dir)
+        line = next(line for line in text.splitlines() if line.startswith("| Claude 재검토 |"))
+        self.assertRegex(line, r"\| 1 \| 1\(")
+
+    def test_unparsable_cli_recheck_falls_back_to_workflow_instead_of_repeating(self):
+        self.prepare_recheck()
+        self.env["FAKE_CLAUDE_RESULT"] = json.dumps({"text": "형식 없는 답", "model_id": "reported"})
+        self.stage("workers", "--stage", "recheck")
+        p = self.stage("recheck", "--result", str(self.rd() / "recheck-cli.json"))
+        self.assertEqual(p.returncode, 0)
+        self.assertFalse(cli_steps.step_done(self.ledger().rounds[0], "recheck"))
+        [job] = self.read("recheck-args.json")["jobs"]
+        self.assertEqual(job["id"], "round-1:recheck")
+        self.assertEqual([a.kind for a in self.actions()], ["workflow", "cmd"])
+        self.assertIn("recheck.json", self.actions()[1].text)
+        self.assertIn("recheck-r1", self.ledger().snapshot["worktrees"])
+        rows = self.read(cli_steps.USAGE_FILE)["workflows"]["cli-recheck-1"]
+        self.assertEqual([(r["job_id"], r["cost"]) for r in rows], [("round-1:recheck", 0.25)])
+        events = [e for e in self.ledger().rounds[0].events if e["step"] == "workers-recheck"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["usage"]["claude"]["input"], 100)
+        text = report.render(self.ledger(), dry_run=True, run_dir=self.run_dir)
+        line = next(line for line in text.splitlines() if line.startswith("| Claude 재검토 |"))
+        self.assertRegex(line, r"\| 1 \| 1\(")
+        review_results = {"results": [{"id": "round-1:recheck", "output": {"text": RECHECK_RESULT, "model_id": "m"}}]}
+        cli_steps.write_json(self.rd() / "recheck.json", review_results)
+        p = self.stage("recheck", "--result", str(self.rd() / "recheck.json"))
+        self.assertIn("status=종료", p.stdout)
+        self.assertNotIn("recheck-r1", self.ledger().snapshot["worktrees"])
+
+    def test_go_does_not_repeat_when_cli_recheck_is_unparsable(self):
+        self.prepare_recheck()
+        self.env["FAKE_CLAUDE_RESULT"] = json.dumps({"text": "형식 없는 답", "model_id": "reported"})
+        p = self.cli("go", "--run-dir", str(self.run_dir))
+        self.assertIn("멈춤: Workflow 결과가 필요하다", p.stdout)
+        self.assertIn("recheck-args.json", p.stdout)
+
+    def test_apply_is_refused_while_workers_holds_the_lock(self):
+        self.prepare_recheck()
+        wt = self.wt("recheck-r1")
+        with cli_steps.workers_lock(self.run_dir):
+            p = self.stage("apply", "--force", ok=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("workers가 이미 돈다", p.stdout + p.stderr)
+        self.assertTrue(wt.is_dir())
+
+    def test_recheck_is_refused_while_workers_holds_the_lock(self):
+        self.prepare_recheck()
+        self.stage("workers", "--stage", "recheck")
+        wt = self.wt("recheck-r1")
+        with cli_steps.workers_lock(self.run_dir):
+            p = self.stage("recheck", "--result", str(self.rd() / "recheck-cli.json"), ok=False)
+        self.assertIn("workers가 이미 돈다", p.stdout + p.stderr)
+        self.assertTrue(wt.is_dir())
+        self.assertFalse(cli_steps.step_done(self.ledger().rounds[0], "recheck"))
+
+    def test_eval_scorer_counts_cli_recheck_only_in_all_scope(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "eval"))
+        import score
+        self.prepare_recheck()
+        self.assertEqual(score.claude_jobs(self.rd(), "code", score.COST_ALL) - score.claude_jobs(self.rd(), "code", score.COST_CORE),
+                         {"round-1:recheck"})
+
+    def test_recheck_via_cli_only_for_cli_ledger_with_result_commit_and_no_external_docs(self):
+        self.prepare_recheck()
+        ledger, rnd = self.ledger(), self.ledger().rounds[0]
+        self.assertTrue(cli._recheck_via_cli(ledger, rnd))
+        ledger.claude_via = "workflow"
+        self.assertFalse(cli._recheck_via_cli(ledger, rnd))
+        ledger.claude_via = "cli"
+        rnd.result_commit = None
+        self.assertFalse(cli._recheck_via_cli(ledger, rnd))
+        rnd.result_commit = "abc"
+        with unittest.mock.patch.object(cli_steps, "external_docs", return_value={"doc.md": Path("/outside/doc.md")}):
+            self.assertFalse(cli._recheck_via_cli(ledger, rnd))
+
+    def test_dry_run_reads_the_result_worktree(self):
+        self.prepare_recheck("--dry-run")
+        [job] = self.read("recheck-cli-args.json")["jobs"]
+        self.assertEqual(Path(job["worktree"]), self.wt("result-r1"))
+        self.assertNotIn("recheck-r1", self.ledger().snapshot["worktrees"])
+        before = self.user_state()
+        self.stage("workers", "--stage", "recheck")
+        self.assertEqual(self.user_state(), before)
+        self.stage("recheck", "--result", str(self.rd() / "recheck-cli.json"))
+        self.assertIn("result-r1", self.ledger().snapshot["worktrees"])
+
+    def test_recheck_stage_uses_apply_input_and_recheck_consumer(self):
+        rnd = RoundRecord(1, [], [], [], False)
+        cli_steps.mark(rnd, "apply")
+        self.assertFalse(cli_steps.workers_done(rnd, "recheck"))
+        cli_steps.mark(rnd, "workers-recheck")
+        self.assertTrue(cli_steps.workers_done(rnd, "recheck"))
+        self.assertFalse(cli_steps.judged_after_workers_input(rnd, "recheck"))
+        cli_steps.mark(rnd, "recheck")
+        self.assertTrue(cli_steps.judged_after_workers_input(rnd, "recheck"))
 
 
 if __name__ == "__main__":

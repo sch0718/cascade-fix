@@ -9,7 +9,7 @@ sys.path.insert(0, str(SKILL_ROOT))
 from cascade.assignment import first_review_runner, job_cell_key  # noqa: E402
 from cascade.cli import PRE_FINAL_DECISIONS  # noqa: E402
 from cascade.cli_steps import CLAUDE_JOB_FILES as ALL_CLAUDE_JOB_FILES  # noqa: E402
-from cascade.cli_steps import OPINION_ARGS, RECHECK_ARGS, USAGE_FILE, claude_job_entries  # noqa: E402
+from cascade.cli_steps import OPINION_ARGS, RECHECK_ARGS, RECHECK_CLI_ARGS, USAGE_FILE, claude_job_entries  # noqa: E402
 from cascade.consensus import REASON_BOTH_PASS  # noqa: E402
 from cascade.jobs import RUNNER_CLAUDE  # noqa: E402
 from cascade.report import JOB_FILES  # noqa: E402
@@ -38,7 +38,8 @@ REASON_ADJUDICATED_NO = "판가름: 아님"
 UNMEASURED = "측정 불가(dry-run은 전체 테스트를 돌리지 않음)"
 PATH_KEYS = ("합의", "규칙 채택", "판가름", "Codex 검토", "사람")
 CLAUDE_FAMILIES = ("sonnet", "haiku", "opus")
-CLAUDE_JOB_FILES = tuple(name for name in ALL_CLAUDE_JOB_FILES if name not in (OPINION_ARGS, "opinion-cli-args.json", RECHECK_ARGS))
+REVIEW_JOB_FILES = (OPINION_ARGS, "opinion-cli-args.json", RECHECK_ARGS, RECHECK_CLI_ARGS)
+CLAUDE_JOB_FILES = tuple(name for name in ALL_CLAUDE_JOB_FILES if name not in REVIEW_JOB_FILES)
 USAGE_KEYS = ("input", "output", "cache_read")
 TRUTH_KEYS = (VERDICT_FACT, VERDICT_NO, VERDICT_UNREPRODUCIBLE)
 STEP_APPLY = "apply"
@@ -320,7 +321,7 @@ def fallback_job_ids(ledger: dict) -> list[str]:
 
 
 def claude_job_names(scope: str) -> tuple[str, ...]:
-    return (*CLAUDE_JOB_FILES, *((OPINION_ARGS, "opinion-cli-args.json", RECHECK_ARGS) if scope == COST_ALL else ()))
+    return (*CLAUDE_JOB_FILES, *(REVIEW_JOB_FILES if scope == COST_ALL else ()))
 
 
 def claude_jobs(round_dir: Path, mode: str, scope: str) -> set[str]:
@@ -347,7 +348,7 @@ def first_review_is_claude(ledger: dict, review: dict) -> bool:
 
 def add_cell_calls(cells: dict[str, dict], ledger: dict, rounds: list[Path], scope: str) -> None:
     mode = ledger.get("mode")
-    names = (*JOB_FILES, *((OPINION_ARGS, "opinion-cli-args.json", RECHECK_ARGS) if scope == COST_ALL else ()))
+    names = (*JOB_FILES, *(REVIEW_JOB_FILES if scope == COST_ALL else ()))
     for round_dir in rounds:
         results = read_optional(round_dir / "results.json")
         ids = job_ids(round_dir, names) | set(results if isinstance(results, dict) else ())
