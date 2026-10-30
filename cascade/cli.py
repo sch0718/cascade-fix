@@ -1488,6 +1488,11 @@ def _recheck_worktree(ledger: Ledger, rnd: RoundRecord, recheck_repo: str) -> Pa
 
 
 def cmd_apply(args) -> int:
+    with s.workers_lock(Path(args.run_dir)):
+        return _apply(args)
+
+
+def _apply(args) -> int:
     run_dir = Path(args.run_dir)
     ledger = s.load_ledger(run_dir)
     rnd = s.get_round(ledger, args.round)

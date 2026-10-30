@@ -707,6 +707,15 @@ class ClaudeViaRecheckTest(ClaudeViaTestBase):
         self.assertIn("멈춤: Workflow 결과가 필요하다", p.stdout)
         self.assertIn("recheck-args.json", p.stdout)
 
+    def test_apply_is_refused_while_workers_holds_the_lock(self):
+        self.prepare_recheck()
+        wt = self.wt("recheck-r1")
+        with cli_steps.workers_lock(self.run_dir):
+            p = self.stage("apply", "--force", ok=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("workers가 이미 돈다", p.stdout + p.stderr)
+        self.assertTrue(wt.is_dir())
+
     def test_recheck_via_cli_only_for_cli_ledger_with_result_commit_and_no_external_docs(self):
         self.prepare_recheck()
         ledger, rnd = self.ledger(), self.ledger().rounds[0]
