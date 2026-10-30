@@ -1621,13 +1621,12 @@ def _recheck_parse_fallback(run_dir: Path, ledger: Ledger, rnd: RoundRecord, res
 
 
 def _locations_under_root(findings: list[Finding], rd: Path, ledger: Ledger) -> list[Finding]:
-    """임시 워크트리를 읽은 재검토가 그 안의 절대 경로를 적었으면 사용자 저장소 경로로 바꿔, 워크트리를 치운 뒤에도 위치가 유효하게 한다."""
+    """임시 워크트리를 읽은 재검토가 그 안의 절대 경로를 적었으면 저장소 상대 경로로 바꿔, 워크트리를 치운 뒤에도 위치가 유효하고 범위 판정이 되게 한다."""
     repo_file = rd / s.RECHECK_REPO_FILE
     repo = repo_file.read_text(encoding="utf-8").strip() if repo_file.is_file() else ""
     if not repo or repo == ledger.root:
         return findings
-    return [replace(f, location=ledger.root + f.location[len(repo):]) if f.location.startswith(repo + "/") else f
-            for f in findings]
+    return [replace(f, location=f.location[len(repo) + 1:]) if f.location.startswith(repo + "/") else f for f in findings]
 
 
 def _remove_recheck_worktree(ledger: Ledger, rnd: RoundRecord) -> None:
@@ -1639,6 +1638,11 @@ def _remove_recheck_worktree(ledger: Ledger, rnd: RoundRecord) -> None:
 
 
 def cmd_recheck(args) -> int:
+    with s.workers_lock(Path(args.run_dir)):
+        return _recheck(args)
+
+
+def _recheck(args) -> int:
     run_dir = Path(args.run_dir)
     ledger = s.load_ledger(run_dir)
     rnd = s.get_round(ledger, args.round)

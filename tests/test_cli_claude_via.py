@@ -664,7 +664,7 @@ class ClaudeViaRecheckTest(ClaudeViaTestBase):
         self.stage("workers", "--stage", "recheck")
         self.stage("recheck", "--result", str(self.rd() / "recheck-cli.json"))
         locations = [f["location"] for f in self.ledger().rounds[1].findings]
-        self.assertEqual(locations, [f"{self.ledger().root}/calc.py:2"])
+        self.assertEqual(locations, ["calc.py:2"])
 
     def test_report_counts_cli_recheck_failure_as_fallback(self):
         self.prepare_recheck()
@@ -715,6 +715,23 @@ class ClaudeViaRecheckTest(ClaudeViaTestBase):
         self.assertNotEqual(p.returncode, 0)
         self.assertIn("workers가 이미 돈다", p.stdout + p.stderr)
         self.assertTrue(wt.is_dir())
+
+    def test_recheck_is_refused_while_workers_holds_the_lock(self):
+        self.prepare_recheck()
+        self.stage("workers", "--stage", "recheck")
+        wt = self.wt("recheck-r1")
+        with cli_steps.workers_lock(self.run_dir):
+            p = self.stage("recheck", "--result", str(self.rd() / "recheck-cli.json"), ok=False)
+        self.assertIn("workers가 이미 돈다", p.stdout + p.stderr)
+        self.assertTrue(wt.is_dir())
+        self.assertFalse(cli_steps.step_done(self.ledger().rounds[0], "recheck"))
+
+    def test_eval_scorer_counts_cli_recheck_only_in_all_scope(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "eval"))
+        import score
+        self.prepare_recheck()
+        self.assertEqual(score.claude_jobs(self.rd(), "code", score.COST_ALL) - score.claude_jobs(self.rd(), "code", score.COST_CORE),
+                         {"round-1:recheck"})
 
     def test_recheck_via_cli_only_for_cli_ledger_with_result_commit_and_no_external_docs(self):
         self.prepare_recheck()
