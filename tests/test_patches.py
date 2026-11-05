@@ -99,6 +99,16 @@ class PatchesTest(unittest.TestCase):
         )
         self.assertEqual(patches.cut_test_files(diff), [])
 
+    def test_cut_test_files_flags_binary_change_to_existing_test(self):
+        diff = (
+            "diff --git a/test_a.py b/test_a.py\nindex 1234567..89abcde 100644\n"
+            "GIT binary patch\nliteral 4\nLcmZ?d00001\n\n"
+            "diff --git a/test_new.py b/test_new.py\nnew file mode 100644\nindex 0000000..1234567\n"
+            "GIT binary patch\nliteral 4\nLcmZ?d00001\n\n"
+            "diff --git a/test_mode.py b/test_mode.py\nold mode 100644\nnew mode 100755\n"
+        )
+        self.assertEqual(patches.cut_test_files(diff), ["test_a.py"])
+
     def test_cut_test_files_counts_removed_line_that_looks_like_header(self):
         diff = (
             "diff --git a/test_a.py b/test_a.py\n--- a/test_a.py\n+++ b/test_a.py\n@@ -1 +1 @@\n"

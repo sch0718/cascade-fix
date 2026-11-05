@@ -13,6 +13,7 @@ NO_HOOKS = ["-c", "core.hooksPath=/dev/null"]
 STDERR_TAIL = 500
 DROPPED_PREFIXES = ("index ", "similarity index ", "dissimilarity index ")
 GIT_HEADER = "diff --git "
+BINARY_MARKERS = ("GIT binary patch", "Binary files ")
 DIFF_FLAGS = ["-U3", "--no-color", "--src-prefix=a/", "--dst-prefix=b/", "--no-renames", "--no-ext-diff", "--no-textconv", "--binary"]
 HUNK_HEADER = re.compile(r"^(@@ -\S+ \+\S+ @@).*$")
 SETUP_PATHS = "cascade-setup-paths"
@@ -168,10 +169,16 @@ def changed_files(diff: str) -> list[str]:
 
 def _cuts_lines(section: str) -> bool:
     in_hunk = False
+    new_file = False
     for line in section.split("\n")[1:]:
         if line.startswith("@@"):
             in_hunk = True
-        elif line.startswith("-" if in_hunk else "deleted file mode"):
+        elif in_hunk:
+            if line.startswith("-"):
+                return True
+        elif line.startswith("new file mode"):
+            new_file = True
+        elif line.startswith("deleted file mode") or (line.startswith(BINARY_MARKERS) and not new_file):
             return True
     return False
 
