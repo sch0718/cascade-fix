@@ -24,6 +24,7 @@ from cascade.consensus import (
     OUTCOME_HOLD,
     OUTCOME_UNDECIDABLE,
     REASON_SENSITIVE,
+    REASON_TESTS_CUT,
     VERDICT_FACT,
     Decision,
     after_adjudication,
@@ -53,7 +54,7 @@ from cascade.jobs import (
     split_job_args,
     write_job_args,
 )
-from cascade.patches import ApplyReport, apply_all, changed_files, extract
+from cascade.patches import ApplyReport, apply_all, changed_files, cut_test_files, extract
 from cascade.report import render, write_prepared
 from cascade.review import (
     CALL_FAILED_NOTE,
@@ -1068,7 +1069,8 @@ def _judge_code(ledger, rnd, f, results, snap, cfg, baseline, repro):
                 judged += extra
                 recorded += extra
     sensitive = s.is_sensitive(changed_files(pa) + changed_files(pb), cfg)
-    d = decide(a, b, va, vb, pa, pb, sensitive, ledger.adopt_on_both_pass)
+    tests_cut = bool(cut_test_files(pa) or cut_test_files(pb))
+    d = decide(a, b, va, vb, pa, pb, sensitive, ledger.adopt_on_both_pass, tests_cut)
     d = s.without_empty_patch(d, {"a": pa, "b": pb}, adjudicated=False)
     d = s.without_lossy_patch(d, lambda role: s.worktree(snap, f.id, role), base)
     workers = {"a": a, "b": b}
@@ -1249,6 +1251,8 @@ def cmd_adjudicate(args) -> int:
         vadj, vrecorded = _adjudicate_verify(ledger, rnd, f, wt, adj.patch, snap, cfg, rd)
         if ledger.mode == "code" and s.is_sensitive(changed_files(adj.patch), cfg) and REASON_SENSITIVE not in d.reasons:
             d.reasons.append(REASON_SENSITIVE)
+        if ledger.mode == "code" and cut_test_files(adj.patch) and REASON_TESTS_CUT not in d.reasons:
+            d.reasons.append(REASON_TESTS_CUT)
         patches = {role: s.worker_from(merged, f.id, role).patch for role in ("a", "b", "writer")}
         patches["adjudicator"] = adj.patch
         new = s.without_lossy_patch(s.without_empty_patch(after_adjudication(d, adj, vadj), patches, adjudicated=True),

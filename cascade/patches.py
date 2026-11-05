@@ -6,13 +6,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from cascade.config import RepoConfig
-from cascade.verify import run_format
+from cascade.verify import is_test_path, run_format
 
 INHERITED_GIT_ENV = ("GIT_INDEX_FILE", "GIT_DIR", "GIT_WORK_TREE")
 NO_HOOKS = ["-c", "core.hooksPath=/dev/null"]
 STDERR_TAIL = 500
 DROPPED_PREFIXES = ("index ", "similarity index ", "dissimilarity index ")
 GIT_HEADER = "diff --git "
+BINARY_MARKERS = ("GIT binary patch", "Binary files ")
 DIFF_FLAGS = ["-U3", "--no-color", "--src-prefix=a/", "--dst-prefix=b/", "--no-renames", "--no-ext-diff", "--no-textconv", "--binary"]
 HUNK_HEADER = re.compile(r"^(@@ -\S+ \+\S+ @@).*$")
 SETUP_PATHS = "cascade-setup-paths"
@@ -164,6 +165,27 @@ def changed_files(diff: str) -> list[str]:
             if path is not None and path not in files:
                 files.append(path)
     return files
+
+
+def _cuts_lines(section: str) -> bool:
+    in_hunk = False
+    new_file = False
+    for line in section.split("\n")[1:]:
+        if line.startswith("@@"):
+            in_hunk = True
+        elif in_hunk:
+            if line.startswith("-"):
+                return True
+        elif line.startswith("new file mode"):
+            new_file = True
+        elif line.startswith("deleted file mode") or (line.startswith(BINARY_MARKERS) and not new_file):
+            return True
+    return False
+
+
+def cut_test_files(diff: str) -> list[str]:
+    return list(dict.fromkeys(path for path, text in _sections(diff)
+                              if path is not None and is_test_path(path) and _cuts_lines(text)))
 
 
 def _sections(diff: str) -> list[tuple[str | None, str]]:

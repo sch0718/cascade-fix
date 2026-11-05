@@ -495,6 +495,33 @@ class CliEndToEndTest(CliTestBase):
         self.assertIn("이번 실행은 --adopt-on-both-pass 로 돌았다", p.stdout)
         self.assertIn("이 규칙으로 채택한 지적 1건", p.stdout)
 
+    def _judge_r1_01_with_test_change(self, test_calc):
+        self.init()
+        self.cli("jobs", "--run-dir", str(self.run_dir), "--round", "1")
+        for name in ("r1-01-a", "r1-01-b"):
+            wt = self.wt(name)
+            (wt / "calc.py").write_text(fix(CALC, "return a - b", "return a + b"), encoding="utf-8")
+            (wt / "test_calc.py").write_text(test_calc, encoding="utf-8")
+        stage1 = results_json(self.run_dir / "round-1" / "stage1.json", [
+            ("r1-01:a", worker_output("사실", "claude-sonnet-5-5")),
+            ("r1-01:b", worker_output("사실", "claude-haiku-5-5")),
+            ("r1-02:a", worker_output("아님", "claude-sonnet-5-5")),
+            ("r1-02:b", worker_output("아님", "claude-haiku-5-5")),
+        ])
+        self.cli("judge", "--run-dir", str(self.run_dir), "--round", "1", "--results", str(stage1))
+        return {x["finding_id"]: x for x in self.ledger().rounds[0].decisions}["r1-01"]
+
+    def test_patch_that_cuts_existing_test_is_not_adopted(self):
+        d = self._judge_r1_01_with_test_change(TEST_CALC.replace("self.assertEqual(ident(3), 3)", "pass"))
+        self.assertEqual((d["outcome"], d["patch_from"]), ("판단불가", None))
+        self.assertIn("기존 테스트 변경", d["reasons"])
+
+    def test_patch_that_only_adds_tests_is_adopted(self):
+        d = self._judge_r1_01_with_test_change(
+            TEST_CALC + "\n    def test_ident_zero(self):\n        self.assertEqual(ident(0), 0)\n")
+        self.assertEqual((d["outcome"], d["patch_from"]), ("합의-사실", "a"))
+        self.assertNotIn("기존 테스트 변경", d["reasons"])
+
     def _recheck(self, text):
         self.run_to_apply()
         result = self.tmp / "recheck.final"

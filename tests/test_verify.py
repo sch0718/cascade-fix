@@ -23,6 +23,13 @@ class VerifyTest(unittest.TestCase):
         self.addCleanup(self._td.cleanup)
         self.tmp = Path(self._td.name).resolve()
 
+    def test_is_test_path_by_name_and_dir(self):
+        for path in ("test_a.py", "pkg/a_test.py", "src/a.test.ts", "src/a.spec.js", "tests/helpers.py",
+                     "src/test/java/FooTest.java", "web/__tests__/a.js", "pkg/a_test.go"):
+            self.assertTrue(verify.is_test_path(path), path)
+        for path in ("a.py", "src/testing.py", "latest/a.py", "contest.py"):
+            self.assertFalse(verify.is_test_path(path), path)
+
     def test_related_tests_by_dir_name_and_import(self):
         repo = make_repo(self.tmp / "repo", {
             "src/pkg/mod.py": "x = 1\n",

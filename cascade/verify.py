@@ -20,6 +20,8 @@ FILES = "{files}"
 SKIP_REF_CHARS = ("~", "<", "$", "{")
 TEST_DIRS = {"tests", "test"}
 TEST_NAME = re.compile(r"^(?:test_.+\.py|.+_test\.py|.+\.test\..+|.+\.spec\..+)$")
+TEST_PATH_DIRS = {*TEST_DIRS, "__tests__"}
+TEST_PATH_NAME = re.compile(r"^.+_test\.go$")
 JS_SUFFIXES = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}
 DOC_EXTENSIONS = (".py", ".js", ".ts", ".md", ".toml", ".json", ".yaml", ".yml", ".sh", ".css", ".html")
 EXTERNAL_PREFIX = "외부/"
@@ -138,6 +140,11 @@ def _read_text(path: Path) -> str | None:
         return path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return None
+
+
+def is_test_path(path: str) -> bool:
+    p = Path(path)
+    return bool(TEST_NAME.match(p.name) or TEST_PATH_NAME.match(p.name) or TEST_PATH_DIRS & set(p.parts[:-1]))
 
 
 def related_tests(root: Path, changed: list[str]) -> list[str]:

@@ -21,6 +21,8 @@ REASON_NO_VERIFIER = "검증기 없음"
 REASON_SENSITIVE_NO_ADOPT = "보안 경로: 자동 채택 안 함"
 REASON_BOTH_PASS = "둘 다 검증 통과"
 REASON_TESTS_NOT_RUN = "테스트가 돌지 않음"
+REASON_TESTS_CUT = "기존 테스트 변경"
+REASON_TESTS_CUT_NO_ADOPT = "기존 테스트 변경: 자동 채택 안 함"
 VERDICTS = (VERDICT_FACT, VERDICT_NO, VERDICT_UNREPRODUCIBLE, VERDICT_UNDECIDED)
 
 
@@ -93,10 +95,10 @@ def _agree_on_verdict(a: WorkerResult, b: WorkerResult) -> Decision | None:
     return None
 
 
-def _flag_sensitive(d: Decision, sensitive: bool) -> Decision:
-    if not sensitive:
+def _flag(d: Decision, on: bool, reason: str) -> Decision:
+    if not on:
         return d
-    reasons = [*d.reasons, REASON_SENSITIVE]
+    reasons = [*d.reasons, reason]
     if d.outcome == OUTCOME_AGREED_FACT:
         return Decision(finding_id=d.finding_id, outcome=OUTCOME_UNDECIDABLE, patch_from=None, reasons=reasons)
     return Decision(finding_id=d.finding_id, outcome=d.outcome, patch_from=d.patch_from, reasons=reasons)
@@ -111,11 +113,12 @@ def decide(
     pb: str,
     sensitive: bool = False,
     adopt_on_both_pass: bool = False,
+    tests_cut: bool = False,
 ) -> Decision:
     d = _agree_on_verdict(a, b)
     if d is None:
         d = _decide_facts(a, va, vb, pa, pb, adopt_on_both_pass)
-    return _flag_sensitive(d, sensitive)
+    return _flag(_flag(d, sensitive, REASON_SENSITIVE), tests_cut, REASON_TESTS_CUT)
 
 
 def _decide_facts(
@@ -197,6 +200,8 @@ def after_adjudication(d: Decision, adj: WorkerResult, vadj: list[VerifyResult])
         return result(OUTCOME_DESIGN, None)
     if REASON_SENSITIVE in d.reasons:
         return result(OUTCOME_UNDECIDABLE, None, REASON_SENSITIVE_NO_ADOPT)
+    if REASON_TESTS_CUT in d.reasons:
+        return result(OUTCOME_UNDECIDABLE, None, REASON_TESTS_CUT_NO_ADOPT)
     if not _all_ok(vadj):
         return result(OUTCOME_UNDECIDABLE, None, "판가름 패치 검증 실패")
     if not adj.patch and d.patch_from in ("a", "b"):
