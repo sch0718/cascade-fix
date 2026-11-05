@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from cascade.config import RepoConfig
-from cascade.verify import run_format
+from cascade.verify import is_test_path, run_format
 
 INHERITED_GIT_ENV = ("GIT_INDEX_FILE", "GIT_DIR", "GIT_WORK_TREE")
 NO_HOOKS = ["-c", "core.hooksPath=/dev/null"]
@@ -164,6 +164,21 @@ def changed_files(diff: str) -> list[str]:
             if path is not None and path not in files:
                 files.append(path)
     return files
+
+
+def _cuts_lines(section: str) -> bool:
+    in_hunk = False
+    for line in section.split("\n")[1:]:
+        if line.startswith("@@"):
+            in_hunk = True
+        elif line.startswith("-" if in_hunk else "deleted file mode"):
+            return True
+    return False
+
+
+def cut_test_files(diff: str) -> list[str]:
+    return list(dict.fromkeys(path for path, text in _sections(diff)
+                              if path is not None and is_test_path(path) and _cuts_lines(text)))
 
 
 def _sections(diff: str) -> list[tuple[str | None, str]]:

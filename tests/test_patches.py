@@ -80,6 +80,32 @@ class PatchesTest(unittest.TestCase):
         rep = patches.ApplyReport(applied=["r1-01"], failed=[("r1-02", "err")])
         self.assertEqual(rep.to_dict(), {"applied": ["r1-01"], "failed": [["r1-02", "err"]]})
 
+    def test_cut_test_files_lists_removed_lines_and_deleted_tests(self):
+        diff = (
+            "diff --git a/tests/test_a.py b/tests/test_a.py\n--- a/tests/test_a.py\n+++ b/tests/test_a.py\n"
+            "@@ -1,2 +1,2 @@\n def test_a():\n-    assert f() == 1\n+    pass\n"
+            "diff --git a/b.test.js b/b.test.js\ndeleted file mode 100644\n--- a/b.test.js\n+++ /dev/null\n"
+            "@@ -1 +0,0 @@\n-test()\n"
+            "diff --git a/m.py b/m.py\n--- a/m.py\n+++ b/m.py\n@@ -1 +1 @@\n-x = 1\n+x = 2\n"
+        )
+        self.assertEqual(patches.cut_test_files(diff), ["tests/test_a.py", "b.test.js"])
+
+    def test_cut_test_files_allows_added_tests(self):
+        diff = (
+            "diff --git a/tests/test_a.py b/tests/test_a.py\n--- a/tests/test_a.py\n+++ b/tests/test_a.py\n"
+            "@@ -1,2 +1,4 @@\n def test_a():\n     assert f() == 1\n+def test_b():\n+    assert g() == 2\n"
+            "diff --git a/test_new.py b/test_new.py\nnew file mode 100644\n--- /dev/null\n+++ b/test_new.py\n"
+            "@@ -0,0 +1 @@\n+import unittest\n"
+        )
+        self.assertEqual(patches.cut_test_files(diff), [])
+
+    def test_cut_test_files_counts_removed_line_that_looks_like_header(self):
+        diff = (
+            "diff --git a/test_a.py b/test_a.py\n--- a/test_a.py\n+++ b/test_a.py\n@@ -1 +1 @@\n"
+            "--- comment\n+# comment\n"
+        )
+        self.assertEqual(patches.cut_test_files(diff), ["test_a.py"])
+
     def test_changed_files_ignores_hunk_body_lookalikes(self):
         diff = (
             "diff --git a/a.py b/a.py\nindex 1..2 100644\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n"

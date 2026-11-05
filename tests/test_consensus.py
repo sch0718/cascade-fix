@@ -141,6 +141,18 @@ class DecideTest(unittest.TestCase):
         self.assertEqual(d.outcome, consensus.OUTCOME_ADJUDICATE)
         self.assertIn("보안 경로", d.reasons)
 
+    def test_cut_tests_never_adopted(self):
+        d = consensus.decide(worker("a"), worker("b"), [ok()], [ok()], PATCH_X, PATCH_X, tests_cut=True)
+        self.assertEqual(d.outcome, consensus.OUTCOME_UNDECIDABLE)
+        self.assertIsNone(d.patch_from)
+        self.assertIn("기존 테스트 변경", d.reasons)
+        d = consensus.decide(worker("a"), worker("b"), [ok()], [ok()], PATCH_BIG, PATCH_X,
+                             tests_cut=True, adopt_on_both_pass=True)
+        self.assertEqual(d.outcome, consensus.OUTCOME_UNDECIDABLE)
+        d = consensus.decide(worker("a"), worker("b"), [ok()], [ok()], PATCH_X, PATCH_Y, tests_cut=True)
+        self.assertEqual(d.outcome, consensus.OUTCOME_ADJUDICATE)
+        self.assertIn("기존 테스트 변경", d.reasons)
+
     def test_adopt_on_both_pass_takes_smaller_patch(self):
         d = consensus.decide(worker("a"), worker("b"), [ok()], [ok()], PATCH_BIG, PATCH_X, adopt_on_both_pass=True)
         self.assertEqual(d.outcome, consensus.OUTCOME_AGREED_FACT)
@@ -349,6 +361,18 @@ class AfterAdjudicationTest(unittest.TestCase):
             d = consensus.after_adjudication(candidate, worker("adjudicator", verdict, design), [])
             self.assertEqual(d.outcome, outcome)
             self.assertNotIn("보안 경로: 자동 채택 안 함", d.reasons)
+
+    def test_after_adjudication_never_adopts_cut_tests(self):
+        cut = Decision(
+            finding_id="f1", outcome=consensus.OUTCOME_ADJUDICATE, patch_from="b", reasons=["한쪽만 검증 통과", "기존 테스트 변경"]
+        )
+        d = consensus.after_adjudication(cut, worker("adjudicator", patch=PATCH_X), [ok()])
+        self.assertEqual(d.outcome, consensus.OUTCOME_UNDECIDABLE)
+        self.assertIsNone(d.patch_from)
+        self.assertIn("기존 테스트 변경: 자동 채택 안 함", d.reasons)
+        d = consensus.after_adjudication(cut, worker("adjudicator", consensus.VERDICT_NO), [])
+        self.assertEqual(d.outcome, consensus.OUTCOME_ADJUDICATE)
+        self.assertNotIn("기존 테스트 변경: 자동 채택 안 함", d.reasons)
 
     def test_adjudicator_unknown_verdict_raises(self):
         with self.assertRaises(ValueError):
