@@ -43,7 +43,7 @@ Claude Code에 「리뷰하고 고쳐줘」라고 말하면 끝까지 진행합�
 
 필요한 것: **Claude Code**(Workflow 도구 사용 가능), **Python 3.11+**(외부 패키지 없음), **git**. PR 코멘트를 처리하려면 로그인된 `gh` CLI도 필요합니다.
 
-이 저장소는 비공개라서, 저장소에 접근할 수 있는 GitHub 계정으로 git 인증(예: `gh auth login`)이 되어 있어야 합니다. Claude Code 세션에서:
+Claude Code 세션에서:
 
 ```
 /plugin marketplace add sch0718/cascade-fix
@@ -74,6 +74,8 @@ ln -s ~/src/cascade-fix ~/.claude/skills/cascade-fix
 ```
 
 업데이트는 `git -C ~/src/cascade-fix pull`로 합니다.
+
+v1.6.6에서 저장소 이력을 새로 만들었으므로, 그 전에 clone한 폴더는 `pull`이 되지 않습니다. 지우고 다시 clone합니다.
 </details>
 
 ## 시작하기
@@ -211,8 +213,11 @@ Cursor의 Grok 4.7 low를 작업자 A에 넣은 구성도 같은 표본으로 1�
 
 버전별 변경은 [GitHub 릴리스](https://github.com/sch0718/cascade-fix/releases)와 태그에 있습니다.
 
+v1.6.6에서 저장소를 새로 만들어 공개했습니다. 그래서 문서에 나오는 `PR #N`처럼 그 전의 PR 번호는 이 저장소의 PR과 맞지 않습니다.
+
 | 버전   | 날짜       | 내용                                                         |
 | ------ | ---------- | ------------------------------------------------------------ |
+| v1.6.6 | 2026-11-16 | PolyForm Noncommercial 1.0.0 라이선스, 공개용으로 저장소 이력 정리 |
 | v1.6.5 | 2026-11-09 | 문서 갱신: README에 진행 비용 후속 측정과 `--claude-via cli` 안내 추가, 개발 문서의 테스트 수 정정 |
 | v1.6.4 | 2026-11-05 | 기존 테스트를 지우거나 고친 패치(바이너리 변경 포함)는 자동 채택하지 않고 판단 불가로 보냄 |
 | v1.6.3 | 2026-10-30 | `--claude-via cli` 재검토 경로, `claude -p` 도구 정의 축소(`--tools`), `go`의 Workflow 인자 직접 출력, 판가름 일부 제외 시 집계 재계산 |
