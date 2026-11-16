@@ -5,5 +5,6 @@
   "author": { "name": "sch0718" },
   "homepage": "https://github.com/sch0718/cascade-fix",
   "repository": "https://github.com/sch0718/cascade-fix",
+  "license": "PolyForm-Noncommercial-1.0.0",
   "keywords": ["code-review", "review-fix", "multi-agent", "workflow", "pr-comments", "korean"]
 }
